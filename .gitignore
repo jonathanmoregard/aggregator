@@ -1,0 +1,11 @@
+credentials/
+.env
+*.db
+raw/
+ingest.log
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
