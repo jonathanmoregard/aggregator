@@ -102,9 +102,13 @@ def _default_db_path() -> Path:
 class Store:
     """Thin wrapper around a per-process SQLite connection.
 
-    Not thread-safe — v1 assumes a single ingest process at a time
-    (systemd user timers are serialised per unit). If we later fan out, wrap
-    the connection in a lock or move to per-thread connections.
+    Not thread-safe within a process — v1 assumes a single ingest thread
+    per process. Cross-process concurrency IS supported (Codex Phase 2
+    MEDIUM #2): two systemd user timers (sessions + github) fire on the
+    same ``*:0/30`` schedule and both open a Store against the same
+    ``cache.db``. ``_c()`` enables WAL journal mode + a 5s busy_timeout
+    so the second writer waits for the first to release its lock instead
+    of failing with ``database is locked``.
     """
 
     def __init__(self, db_path: str | Path | None = None):
@@ -118,6 +122,25 @@ class Store:
             self._conn = sqlite3.connect(self.db_path)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON;")
+            # Codex Phase 2 MEDIUM #2: concurrent-writer safety. Two systemd
+            # user timers (sessions + github) fire on the same *:0/30
+            # schedule (nix/aggregator.nix) and both open Store instances
+            # against the same cache.db. Default rollback-journal + no
+            # busy_timeout means the second writer races into
+            # ``database is locked`` and its transaction fails.
+            #
+            # * WAL enables one concurrent writer + many concurrent readers.
+            # * busy_timeout=5000 makes SQLite retry lock acquisition for up
+            #   to 5s instead of failing immediately.
+            # * synchronous=NORMAL is safe with WAL and much faster than
+            #   FULL for the ingest write pattern (many small transactions).
+            #
+            # PRAGMA journal_mode returns the resulting mode; execute()
+            # requires we consume the row for the setting to actually apply
+            # on some sqlite builds — use fetchone() to be explicit.
+            self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            self._conn.execute("PRAGMA busy_timeout = 5000")
+            self._conn.execute("PRAGMA synchronous = NORMAL")
         return self._conn
 
     def close(self) -> None:

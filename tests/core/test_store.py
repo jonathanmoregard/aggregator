@@ -294,6 +294,107 @@ def test_rebuild_and_upsert_replaces_source_atomically(tmp_data_home):
     assert {r.stable_id for r in gh_rows} == {"github:owner/repo:1"}
 
 
+# --- Codex Phase 2 MEDIUM #2: concurrent-writer safety --------------------
+
+
+def _child_write_batch(db_path: str, prefix: str, n: int, q):
+    """Multiprocessing child target — must be top-level (picklable).
+
+    Opens its own Store against the same cache.db and writes ``n`` rows.
+    Reports any ``sqlite3.OperationalError`` via the queue so the parent
+    can assert lock-free behaviour.
+    """
+    import sqlite3
+
+    from aggregator.core.store import Store as _Store
+    from aggregator.sources.base import Record as _Record
+
+    try:
+        s = _Store(db_path)
+        # Both processes hammer .upsert() concurrently. Pre-fix, the second
+        # to acquire the write lock hits ``database is locked`` and raises.
+        s.upsert(
+            [
+                _Record(
+                    stable_id=f"{prefix}:{i}",
+                    source=prefix,
+                    subject=f"s{i}",
+                    body=f"body {i}",
+                    created_at=datetime(2026, 7, 25, tzinfo=UTC),
+                    updated_at=datetime(2026, 7, 25, tzinfo=UTC),
+                )
+                for i in range(n)
+            ]
+        )
+        s.close()
+        q.put(("ok", prefix, None))
+    except sqlite3.OperationalError as e:
+        q.put(("err", prefix, str(e)))
+    except Exception as e:  # noqa: BLE001
+        q.put(("err", prefix, f"unexpected: {e}"))
+
+
+def test_two_processes_concurrent_writes_succeed(tmp_data_home):
+    """Codex MEDIUM #2: two systemd user timers (sessions + github) fire on
+    the same ``*:0/30`` schedule and both open a Store against the same
+    ``cache.db``. Pre-fix (default rollback journal, no busy_timeout) the
+    second writer races into ``database is locked`` and its transaction
+    fails. Post-fix (WAL + busy_timeout=5000) both writers succeed.
+
+    Uses multiprocessing to mirror the actual failure mode (separate
+    processes, separate SQLite connections). Threads inside one process
+    can't reproduce it — SQLite enforces its own single-thread rule.
+
+    Sanity: also asserts the PRAGMAs are applied on each fresh connection
+    so a future edit that removes them fails loudly instead of just being
+    slow to reproduce the race.
+    """
+    import multiprocessing as mp
+
+    # Bootstrap the schema first so both writers race on writes, not on
+    # CREATE TABLE (which is a distinct — and much rarer — failure mode).
+    bootstrap = Store()
+    bootstrap.migrate()
+
+    # PRAGMA sanity — future edits that remove WAL/busy_timeout trip here.
+    row = bootstrap._c().execute("PRAGMA journal_mode").fetchone()
+    assert row[0].lower() == "wal", f"expected WAL, got {row[0]!r}"
+    busy = bootstrap._c().execute("PRAGMA busy_timeout").fetchone()
+    assert int(busy[0]) >= 5000, f"expected busy_timeout>=5000, got {busy[0]!r}"
+    bootstrap.close()
+
+    db_path = str(Store().db_path)
+
+    # ``spawn`` avoids fork-inherit warnings on Linux and matches how
+    # systemd would launch each timer's Python process from scratch.
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p1 = ctx.Process(
+        target=_child_write_batch, args=(db_path, "sessions", 50, q)
+    )
+    p2 = ctx.Process(target=_child_write_batch, args=(db_path, "github", 50, q))
+    p1.start()
+    p2.start()
+    p1.join(timeout=30)
+    p2.join(timeout=30)
+    assert p1.exitcode == 0 and p2.exitcode == 0, (
+        f"child processes exited abnormally: p1={p1.exitcode}, p2={p2.exitcode}"
+    )
+
+    results: list[tuple[str, str, str | None]] = []
+    while not q.empty():
+        results.append(q.get())
+    assert len(results) == 2, f"expected 2 results, got {results}"
+    errs = [r for r in results if r[0] == "err"]
+    assert not errs, f"concurrent writers hit errors: {errs}"
+
+    # Both sources should be fully persisted.
+    verify = Store()
+    verify.migrate()
+    assert verify.count(QueryAST(source="sessions")) == 50
+    assert verify.count(QueryAST(source="github")) == 50
+
+
 def test_store_wraps_records_on_return(tmp_data_home):
     """Store's query returns Records; the wrapping into ``<ExternalContent>``
     happens at the surface layer (MCP/CLI) via ``wrap_records``. Confirm the
