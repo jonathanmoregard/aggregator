@@ -40,7 +40,20 @@ WRITE_SCOPES = {
 
 
 class WriteCapableTokenError(RuntimeError):
-    """Raised when the gh token has write scopes and the override env var is not set."""
+    """Raised when the gh token has write scopes and the override env var is
+    not set — OR when scope verification failed (advisor round-1 HIGH-2:
+    fail-closed on unverifiable scopes, not fail-open)."""
+
+
+class ScopeFetchError(RuntimeError):
+    """Raised by ``_default_scope_fetcher`` when it cannot determine scopes.
+
+    Kept distinct from ``WriteCapableTokenError`` so custom fetchers can
+    signal "I don't know" without pretending to have parsed a response.
+    ``_check_scopes`` catches this AND arbitrary exceptions from the fetcher
+    and re-raises as ``WriteCapableTokenError`` (unless the operator has
+    set ``AGGREGATOR_ALLOW_WRITE_TOKEN=1``).
+    """
 
 
 def _parse_scopes(scopes_header: str) -> list[str]:
@@ -65,10 +78,15 @@ def _has_write_scope(scopes: list[str]) -> bool:
 def _default_scope_fetcher() -> list[str]:
     """Call `gh api -i /rate_limit` and parse X-Oauth-Scopes from headers.
 
-    Returns [] on any failure (missing gh, non-zero exit, no scopes header). An
-    empty scope set is treated as read-only by the caller — which is the safe
-    default if we truly cannot determine capability, since an empty token
-    cannot mutate anything either.
+    On failure (missing gh, non-zero exit, timeout) raises
+    ``ScopeFetchError``. ``_check_scopes`` converts that to a
+    ``WriteCapableTokenError`` unless ``AGGREGATOR_ALLOW_WRITE_TOKEN=1`` is
+    set. This is a change from the pre-HIGH-2 behaviour where failure
+    returned ``[]`` and was silently treated as read-only.
+
+    An empty ``X-Oauth-Scopes`` header (no scopes assigned) is still
+    returned as ``[]`` — that's a valid response from GitHub, not a fetch
+    failure.
     """
     try:
         result = subprocess.run(
@@ -81,11 +99,13 @@ def _default_scope_fetcher() -> list[str]:
         out = result.stdout
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
         log.warning("gh api -i /rate_limit failed: %s", e)
-        return []
+        raise ScopeFetchError(str(e)) from e
     for line in out.splitlines():
         if line.lower().startswith("x-oauth-scopes:"):
             return _parse_scopes(line)
-    return []
+    # Header absent from response: gh returned something but not the scopes
+    # header we expected. Treat as unverifiable — same fail-closed policy.
+    raise ScopeFetchError("no X-Oauth-Scopes header in gh api response")
 
 
 def _default_api_fetcher(path: str) -> list[dict]:
@@ -150,8 +170,26 @@ class GitHubSource:
         }
 
     def _check_scopes(self) -> None:
-        scopes = self._scope_fetcher()
-        if _has_write_scope(scopes) and os.environ.get("AGGREGATOR_ALLOW_WRITE_TOKEN") != "1":
+        override = os.environ.get("AGGREGATOR_ALLOW_WRITE_TOKEN") == "1"
+        try:
+            scopes = self._scope_fetcher()
+        except Exception as e:  # noqa: BLE001 -- ANY fetch failure is fail-closed
+            # Advisor round-1 HIGH-2: pre-fix, subprocess errors returned []
+            # which the check treated as read-only. Post-fix, unverifiable
+            # scopes are fail-closed unless the operator has explicitly opted
+            # out via AGGREGATOR_ALLOW_WRITE_TOKEN=1.
+            if override:
+                log.warning(
+                    "scope check bypassed (AGGREGATOR_ALLOW_WRITE_TOKEN=1); "
+                    "scope fetch failed: %s",
+                    e,
+                )
+                return
+            raise WriteCapableTokenError(
+                f"cannot verify GitHub token scope: {e}. "
+                "Set AGGREGATOR_ALLOW_WRITE_TOKEN=1 to proceed anyway."
+            ) from e
+        if _has_write_scope(scopes) and not override:
             offending = sorted(set(scopes) & WRITE_SCOPES)
             raise WriteCapableTokenError(
                 f"gh token has write-capable scopes {offending}. "

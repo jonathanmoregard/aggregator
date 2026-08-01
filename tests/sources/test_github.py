@@ -19,6 +19,7 @@ import pytest
 
 from aggregator.sources.github import (
     GitHubSource,
+    ScopeFetchError,
     WriteCapableTokenError,
     _default_scope_fetcher,
     _has_write_scope,
@@ -94,22 +95,93 @@ def test_default_scope_fetcher_parses_writeable_header(monkeypatch):
     assert _has_write_scope(scopes) is True
 
 
-def test_default_scope_fetcher_returns_empty_on_gh_missing():
+def test_default_scope_fetcher_raises_on_gh_missing():
+    """HIGH-2: pre-fix returned [] silently; post-fix raises so the check
+    fails-closed rather than treating unverifiable as read-only."""
     with patch(
         "aggregator.sources.github.subprocess.run",
         side_effect=FileNotFoundError("gh not installed"),
-    ):
-        scopes = _default_scope_fetcher()
-    assert scopes == []
+    ), pytest.raises(ScopeFetchError):
+        _default_scope_fetcher()
 
 
-def test_default_scope_fetcher_returns_empty_on_gh_failure():
+def test_default_scope_fetcher_raises_on_gh_failure():
     with patch(
         "aggregator.sources.github.subprocess.run",
         side_effect=subprocess.CalledProcessError(returncode=1, cmd=["gh"]),
-    ):
-        scopes = _default_scope_fetcher()
-    assert scopes == []
+    ), pytest.raises(ScopeFetchError):
+        _default_scope_fetcher()
+
+
+def test_default_scope_fetcher_raises_when_scopes_header_absent():
+    """gh returned a response but no X-Oauth-Scopes header: unverifiable."""
+    fake = subprocess.CompletedProcess(
+        args=["gh"], returncode=0, stdout="HTTP/2 200\nContent-Type: x\n\n{}", stderr=""
+    )
+    with patch("aggregator.sources.github.subprocess.run", return_value=fake), \
+         pytest.raises(ScopeFetchError):
+        _default_scope_fetcher()
+
+
+# -- fail-closed on scope-fetch failure (HIGH-2) ---------------------------
+
+
+def test_check_scopes_raises_when_scope_fetch_fails(monkeypatch):
+    """Advisor round-1 HIGH-2: pre-fix, gh CLI failure returned [] which the
+    scope check treated as read-only. Post-fix, unverifiable scopes must
+    fail-closed with ``WriteCapableTokenError`` unless the operator has
+    explicitly overridden via ``AGGREGATOR_ALLOW_WRITE_TOKEN=1``.
+    """
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+
+    def boom() -> list[str]:
+        raise FileNotFoundError("gh binary missing")
+
+    src = GitHubSource(_scope_fetcher=boom, _api_fetcher=lambda p: [])
+    with pytest.raises(WriteCapableTokenError) as excinfo:
+        src._check_scopes()
+    msg = str(excinfo.value)
+    assert "cannot verify" in msg.lower() or "verify" in msg.lower()
+    assert "AGGREGATOR_ALLOW_WRITE_TOKEN" in msg
+
+
+def test_check_scopes_env_override_bypasses_fetch_failure(monkeypatch):
+    """Same failure mode as above, but with the override set: proceed."""
+    monkeypatch.setenv("AGGREGATOR_ALLOW_WRITE_TOKEN", "1")
+
+    def boom() -> list[str]:
+        raise FileNotFoundError("gh binary missing")
+
+    src = GitHubSource(_scope_fetcher=boom, _api_fetcher=lambda p: [])
+    # Should not raise.
+    src._check_scopes()
+
+
+def test_check_scopes_raises_on_generic_exception(monkeypatch):
+    """Any exception from the scope fetcher is treated as unverifiable."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+
+    def boom() -> list[str]:
+        raise RuntimeError("transport error")
+
+    src = GitHubSource(_scope_fetcher=boom, _api_fetcher=lambda p: [])
+    with pytest.raises(WriteCapableTokenError):
+        src._check_scopes()
+
+
+def test_ingest_fails_closed_when_gh_missing(monkeypatch):
+    """End-to-end: ingest must refuse to run rather than treat a failed
+    scope check as "read-only OK"."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+
+    def gh_missing():
+        # Simulate the default fetcher's real failure mode by wrapping the
+        # scope-fetch subprocess call.
+        raise FileNotFoundError("gh")
+
+    src = GitHubSource(_scope_fetcher=gh_missing, _api_fetcher=lambda p: [])
+    with pytest.raises(WriteCapableTokenError):
+        src.ingest(since=None)
 
 
 # -- ingest scope enforcement ----------------------------------------------
