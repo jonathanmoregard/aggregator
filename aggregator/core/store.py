@@ -1,27 +1,28 @@
-"""SQLite + FTS5 store (spec §Storage, plan M2).
+"""SQLite + FTS5 store — Schema B (Langfuse-derived).
 
-Schema is single-table (``records``) plus a mirrored FTS5 virtual table
-(``records_fts``). Per-source specialisation lives in the ``extra`` JSON
-blob rather than per-source tables — v1 keeps the schema flat so the DSL /
-query path is source-agnostic. Individual sources can still specialise their
-own retrieval on top of ``extra`` by reading the JSON back at the surface.
+Ontology: ``sessions`` (Langfuse "trace") + ``observations`` (Langfuse
+"observation") for Claude Code JSONL sources. Standalone ``records`` +
+``records_fts`` are retained for row-per-unit-of-work sources (GitHub PRs +
+issues) — different ontology; see ``sources/base.py`` docstring.
 
-Stable-ID discipline (spec constraint 5): ``stable_id`` is the primary key.
-Upserting the same ``stable_id`` overwrites the record; a fresh ``stable_id``
-inserts a new row. Sources compute ``stable_id`` deterministically from the
-external identity (see ``sources/base.py::stable_id_for``), so ``rebuild`` +
-re-ingest yields the exact same IDs — round-trip safe.
+Everything under a session root is an indexed equality on the denormalized
+``observations.root_session_id`` — no recursion — the SOTA trick documented
+in the research report §2. Same trick lets ``sessions.root_session_id`` group
+top-level + subagent streams under one query.
 
-Every ``upsert`` runs through ``aggregator.core.scrub.scrub`` first (spec
-constraint 3, defense in depth: also runs pre-return at MCP/CLI boundary).
+SQLite is a **derived index**; JSONLs / GitHub API responses are the source of
+truth. Migration = full rebuild. Schema version bumps to 2 to signal the
+break; ``Store.rebuild_all()`` drops every table (records + sessions +
+observations + FTS shadows) and re-runs DDL.
 
-FTS5 tokenizer is ``unicode61 remove_diacritics 2`` per spec — Unicode-normal,
-tolerant of accented characters, and the same tokenizer used by SQLite's
-built-in FTS demos.
+FTS5 external-content pattern per ``sqlite.org/fts5.html`` §external content:
+one virtual table per base table with ``content=base_table content_rowid=rowid``,
+plus AFTER INSERT/DELETE/UPDATE triggers to keep the index in sync without
+duplicating body text.
 
-FTS5 syntax errors (e.g. unbalanced quotes) are caught and logged; the query
-returns ``[]`` rather than raising. The MCP surface (M3) surfaces this as
-``ok: false, reason, remediation`` per spec §DSL.
+Scrub-on-write (spec constraint 3, defense in depth: also runs pre-return at
+MCP/CLI boundary). WAL + busy_timeout=5000 (Codex Phase 2 MEDIUM #2 —
+concurrent-writer safety).
 """
 from __future__ import annotations
 
@@ -34,11 +35,17 @@ from datetime import datetime
 from pathlib import Path
 
 from aggregator.core.scrub import scrub
-from aggregator.sources.base import QueryAST, Record
+from aggregator.sources.base import (
+    ObservationRow,
+    QueryAST,
+    Record,
+    SessionEntity,
+    SessionRow,
+)
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class EmptyRebuildRefusedError(RuntimeError):
@@ -55,7 +62,80 @@ class EmptyRebuildRefusedError(RuntimeError):
     catch it specifically and turn it into a structured refusal.
     """
 
+
+# ---------------------------------------------------------------------------
+# DDL — three tables + three FTS shadows, all under one migration.
+# ---------------------------------------------------------------------------
 _DDL: list[str] = [
+    # --- v2: sessions (Langfuse "trace") ------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_id             TEXT PRIMARY KEY,
+        root_session_id        TEXT NOT NULL,
+        parent_session_id      TEXT,
+        kind                   TEXT NOT NULL CHECK(kind IN ('session','subagent')),
+        agent_id               TEXT,
+        agent_type             TEXT,
+        spawned_by_tool_use_id TEXT,
+        cwd                    TEXT,
+        git_branch             TEXT,
+        first_ts               TEXT NOT NULL,
+        last_ts                TEXT NOT NULL,
+        jsonl_path             TEXT NOT NULL
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS sessions_root ON sessions(root_session_id);",
+    "CREATE INDEX IF NOT EXISTS sessions_kind ON sessions(kind);",
+    "CREATE INDEX IF NOT EXISTS sessions_last_ts ON sessions(last_ts);",
+    # --- v2: observations (Langfuse "observation") --------------------
+    """
+    CREATE TABLE IF NOT EXISTS observations (
+        obs_id           TEXT PRIMARY KEY,
+        session_id       TEXT NOT NULL REFERENCES sessions(session_id),
+        root_session_id  TEXT NOT NULL,
+        parent_obs_id    TEXT,
+        type             TEXT NOT NULL,
+        ts               TEXT NOT NULL,
+        model            TEXT,
+        input_tokens     INTEGER,
+        output_tokens    INTEGER,
+        tool_name        TEXT,
+        tool_use_id      TEXT,
+        body             TEXT
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS obs_root_ts ON observations(root_session_id, ts);",
+    "CREATE INDEX IF NOT EXISTS obs_session_ts ON observations(session_id, ts);",
+    "CREATE INDEX IF NOT EXISTS obs_type ON observations(type);",
+    # FTS5 external-content over observations.body. Sync via triggers below.
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
+        body,
+        content='observations',
+        content_rowid='rowid',
+        tokenize='unicode61 remove_diacritics 2'
+    );
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations
+    BEGIN
+        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations
+    BEGIN
+        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations
+    BEGIN
+        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+    """,
+    # --- Legacy: records + records_fts for GitHub-shaped sources -------
     """
     CREATE TABLE IF NOT EXISTS records (
         stable_id  TEXT PRIMARY KEY,
@@ -89,6 +169,19 @@ _DDL: list[str] = [
 ]
 
 
+_DROP_ALL: list[str] = [
+    "DROP TRIGGER IF EXISTS observations_ai;",
+    "DROP TRIGGER IF EXISTS observations_ad;",
+    "DROP TRIGGER IF EXISTS observations_au;",
+    "DROP TABLE IF EXISTS obs_fts;",
+    "DROP TABLE IF EXISTS observations;",
+    "DROP TABLE IF EXISTS sessions;",
+    "DROP TABLE IF EXISTS records_fts;",
+    "DROP TABLE IF EXISTS records;",
+    "DROP TABLE IF EXISTS meta;",
+]
+
+
 def _default_db_path() -> Path:
     """Resolve ``$XDG_DATA_HOME/aggregator/cache.db`` (creating parents)."""
     root = Path(
@@ -115,29 +208,15 @@ class Store:
         self.db_path = Path(db_path) if db_path else _default_db_path()
         self._conn: sqlite3.Connection | None = None
 
-    # -- connection lifecycle -------------------------------------------------
+    # -- connection lifecycle ---------------------------------------------
 
     def _c(self) -> sqlite3.Connection:
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON;")
-            # Codex Phase 2 MEDIUM #2: concurrent-writer safety. Two systemd
-            # user timers (sessions + github) fire on the same *:0/30
-            # schedule (nix/aggregator.nix) and both open Store instances
-            # against the same cache.db. Default rollback-journal + no
-            # busy_timeout means the second writer races into
-            # ``database is locked`` and its transaction fails.
-            #
-            # * WAL enables one concurrent writer + many concurrent readers.
-            # * busy_timeout=5000 makes SQLite retry lock acquisition for up
-            #   to 5s instead of failing immediately.
-            # * synchronous=NORMAL is safe with WAL and much faster than
-            #   FULL for the ingest write pattern (many small transactions).
-            #
-            # PRAGMA journal_mode returns the resulting mode; execute()
-            # requires we consume the row for the setting to actually apply
-            # on some sqlite builds — use fetchone() to be explicit.
+            # Codex Phase 2 MEDIUM #2: concurrent-writer safety. See prior
+            # revision docstring; WAL + busy_timeout + synchronous=NORMAL.
             self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
             self._conn.execute("PRAGMA busy_timeout = 5000")
             self._conn.execute("PRAGMA synchronous = NORMAL")
@@ -148,20 +227,180 @@ class Store:
             self._conn.close()
             self._conn = None
 
-    # -- schema ---------------------------------------------------------------
+    # -- schema -----------------------------------------------------------
 
     def migrate(self) -> None:
-        """Create tables + FTS virtual table + meta row. Idempotent."""
+        """Create tables + FTS virtual tables + triggers. Idempotent.
+
+        Bumps ``PRAGMA user_version`` to SCHEMA_VERSION. A downgraded schema
+        won't be silently touched — callers detect via ``user_version`` and
+        run ``rebuild_all()`` to drop + recreate.
+        """
         c = self._c()
         for stmt in _DDL:
             c.executescript(stmt)
+        c.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
         c.commit()
 
-    # -- writes ---------------------------------------------------------------
+    def schema_version(self) -> int:
+        """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
+        c = self._c()
+        row = c.execute("PRAGMA user_version").fetchone()
+        return int(row[0]) if row else 0
+
+    def rebuild_all(self) -> None:
+        """Drop every table (records, sessions, observations, FTS shadows,
+        meta) and re-run DDL. Migration escape hatch: SQLite is a derived
+        index; JSONLs / API responses are source of truth. Callers detecting
+        a stale ``user_version`` invoke this before re-ingesting.
+        """
+        c = self._c()
+        for stmt in _DROP_ALL:
+            c.execute(stmt)
+        c.commit()
+        # Nuke connection state so cached PRAGMAs (foreign_keys) etc. don't
+        # linger against dropped tables. Force a fresh connection.
+        self.close()
+        self.migrate()
+
+    # -- writes: v2 sessions + observations -------------------------------
+
+    def upsert_entities(
+        self,
+        entities: Iterable[SessionEntity],
+        *,
+        _commit: bool = True,
+    ) -> None:
+        """Write ``SessionRow`` + ``ObservationRow`` items into the v2 tables.
+
+        Idempotent per primary key. Scrubs ``ObservationRow.body`` pre-write.
+        Sessions carry no user-authored text (only metadata) so scrub isn't
+        applied there — cwd / git_branch are structural.
+
+        Session rows must precede their observation rows in the iterable so
+        the FK check passes (the caller — ``sessions.py::iter_entities`` —
+        yields the session row first, then all its observations). If a caller
+        yields out of order, the FK error surfaces immediately.
+
+        ``_commit=False`` skips the trailing ``COMMIT`` so
+        ``rebuild_and_upsert_entities`` can nest the writes under its
+        SAVEPOINT (COMMIT inside a savepoint releases it, which then breaks
+        the surrounding RELEASE).
+        """
+        c = self._c()
+        for e in entities:
+            if isinstance(e, SessionRow):
+                c.execute(
+                    """
+                    INSERT INTO sessions(
+                        session_id, root_session_id, parent_session_id, kind,
+                        agent_id, agent_type, spawned_by_tool_use_id,
+                        cwd, git_branch, first_ts, last_ts, jsonl_path
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        root_session_id        = excluded.root_session_id,
+                        parent_session_id      = excluded.parent_session_id,
+                        kind                   = excluded.kind,
+                        agent_id               = excluded.agent_id,
+                        agent_type             = excluded.agent_type,
+                        spawned_by_tool_use_id = excluded.spawned_by_tool_use_id,
+                        cwd                    = excluded.cwd,
+                        git_branch             = excluded.git_branch,
+                        first_ts               = excluded.first_ts,
+                        last_ts                = excluded.last_ts,
+                        jsonl_path             = excluded.jsonl_path
+                    """,
+                    (
+                        e.session_id,
+                        e.root_session_id,
+                        e.parent_session_id,
+                        e.kind,
+                        e.agent_id,
+                        e.agent_type,
+                        e.spawned_by_tool_use_id,
+                        e.cwd,
+                        e.git_branch,
+                        e.first_ts.isoformat(),
+                        e.last_ts.isoformat(),
+                        e.jsonl_path,
+                    ),
+                )
+            elif isinstance(e, ObservationRow):
+                scrubbed_body = scrub(e.body).text if e.body else ""
+                # Delete-then-insert simplifies FTS trigger interaction and
+                # keeps upsert idempotent per obs_id.
+                c.execute("DELETE FROM observations WHERE obs_id = ?", (e.obs_id,))
+                c.execute(
+                    """
+                    INSERT INTO observations(
+                        obs_id, session_id, root_session_id, parent_obs_id,
+                        type, ts, model, input_tokens, output_tokens,
+                        tool_name, tool_use_id, body
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        e.obs_id,
+                        e.session_id,
+                        e.root_session_id,
+                        e.parent_obs_id,
+                        e.type,
+                        e.ts.isoformat(),
+                        e.model,
+                        e.input_tokens,
+                        e.output_tokens,
+                        e.tool_name,
+                        e.tool_use_id,
+                        scrubbed_body,
+                    ),
+                )
+            else:
+                raise TypeError(f"unknown entity type: {type(e)!r}")
+        if _commit:
+            c.commit()
+
+    def rebuild_and_upsert_entities(
+        self,
+        entities: Iterable[SessionEntity],
+        *,
+        min_sessions: int = 0,
+    ) -> None:
+        """Atomic replacement of ALL session + observation rows.
+
+        Materializes the iterable before opening the savepoint so
+        ``min_sessions`` guards against silent wipes on transient parse
+        failure — same round-3 HIGH pattern as the Record-shaped path.
+        Sessions source is monolithic (one call across all JSONLs) so no
+        per-file granularity is exposed here.
+        """
+        materialised = list(entities)
+        session_count = sum(1 for e in materialised if isinstance(e, SessionRow))
+        if session_count < min_sessions:
+            raise EmptyRebuildRefusedError(
+                f"refusing to rebuild sessions: got {session_count} session "
+                f"rows, min_sessions={min_sessions}"
+            )
+        c = self._c()
+        c.execute("SAVEPOINT rebuild_entities")
+        try:
+            c.execute("DELETE FROM observations")
+            c.execute("DELETE FROM sessions")
+            # _commit=False: don't COMMIT inside the savepoint (would release
+            # it prematurely and break the surrounding RELEASE).
+            self.upsert_entities(materialised, _commit=False)
+        except BaseException:
+            c.execute("ROLLBACK TO SAVEPOINT rebuild_entities")
+            c.execute("RELEASE SAVEPOINT rebuild_entities")
+            raise
+        c.execute("RELEASE SAVEPOINT rebuild_entities")
+        c.commit()
+
+    # -- writes: legacy records (GitHub) ----------------------------------
 
     def upsert(self, records: list[Record]) -> None:
         """Write records to the store, scrubbing every field pre-write.
@@ -198,8 +437,6 @@ class Store:
                     json.dumps(r.extra, default=str),
                 ),
             )
-            # FTS mirror: delete-then-insert avoids stale rows when the
-            # underlying record was updated.
             c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
             c.execute(
                 "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
@@ -215,17 +452,7 @@ class Store:
         c.commit()
 
     def rebuild(self, source: str) -> None:
-        """Drop all rows for one source; caller re-ingests.
-
-        Stable-ID persistence is guaranteed because the source's stable_id
-        function is deterministic on its external key (owner/repo:number,
-        session_uuid, etc.), so re-ingesting yields the same IDs.
-
-        NB: this method commits immediately. If the caller subsequently
-        faults during upsert the store is left empty for that source.
-        For a rebuild that must be all-or-nothing, prefer
-        ``rebuild_and_upsert`` (round-2 MEDIUM).
-        """
+        """Drop all Record-shaped rows for one source; caller re-ingests."""
         c = self._c()
         c.execute("DELETE FROM records WHERE source = ?", (source,))
         c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
@@ -238,33 +465,11 @@ class Store:
         *,
         min_records: int = 0,
     ) -> None:
-        """Atomic replacement of one source's rows.
+        """Atomic replacement of one source's records (GitHub path).
 
-        Round-2 MEDIUM: the two-step ``rebuild()`` + ``upsert()`` sequence
-        the CLI used to run was non-atomic — the DELETE committed
-        immediately, so a fault during upsert (bad row, disk full, source
-        yielding partway) left the store empty. This method runs the
-        DELETE + upsert inside a single transaction so a failure rolls
-        back to the pre-rebuild state.
-
-        ``records`` may be a lazy iterable (e.g. a source generator); it
-        is materialised *before* the savepoint opens so the ``min_records``
-        guard runs against the real count and no DELETE fires when the
-        guard trips. Generator faults during materialisation propagate to
-        the caller without touching the DB (nothing has been DELETEd yet).
-
-        Round-3 HIGH: ``min_records`` is a belt-and-braces guard against
-        silent wipes. When the caller knows this source has historically
-        held rows, passing ``min_records=1`` causes an empty (or short)
-        record list to raise ``EmptyRebuildRefusedError`` *before* any DELETE
-        runs — so a transient upstream failure that degrades every
-        endpoint to ``[]`` can't atomically DELETE-commit the store empty.
-        Default ``min_records=0`` preserves the pre-fix API (some callers
-        legitimately want to clear a source).
+        Round-2 MEDIUM / round-3 HIGH: DELETE + upsert inside one savepoint;
+        ``min_records`` guards against silent wipes.
         """
-        # Materialise BEFORE opening the savepoint so the guard runs on the
-        # real record count. Generator faults during materialisation propagate
-        # naturally to the caller without touching the DB.
         record_list = list(records)
         if len(record_list) < min_records:
             raise EmptyRebuildRefusedError(
@@ -272,67 +477,11 @@ class Store:
                 f"records, min_records={min_records}"
             )
         c = self._c()
-        # SAVEPOINT groups the DELETE + writes so a fault mid-upsert rolls
-        # back to the pre-rebuild state (avoids the non-atomic gap the
-        # standalone ``rebuild()`` still has). Prefer a savepoint over
-        # explicit BEGIN because sqlite3's autocommit boundary can otherwise
-        # end an implicit transaction at an unexpected point.
         c.execute("SAVEPOINT rebuild_and_upsert")
         try:
             c.execute("DELETE FROM records WHERE source = ?", (source,))
             c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
-
-            # Local closure (round-3 MEDIUM #2): keep the write path inside
-            # the savepoint scope rather than exposing it as a module-level
-            # "private-by-underscore" method that callers could reach past
-            # the transaction. Body kept in lockstep with ``upsert``; if the
-            # write path grows a new field, update both.
-            def _do_write(records: list[Record]) -> None:
-                for r in records:
-                    scrubbed_body = scrub(r.body).text
-                    scrubbed_subject = scrub(r.subject).text
-                    c.execute(
-                        """
-                        INSERT INTO records(
-                            stable_id, source, subject, body, tags,
-                            created_at, updated_at, extra
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(stable_id) DO UPDATE SET
-                            subject    = excluded.subject,
-                            body       = excluded.body,
-                            tags       = excluded.tags,
-                            updated_at = excluded.updated_at,
-                            extra      = excluded.extra
-                        """,
-                        (
-                            r.stable_id,
-                            r.source,
-                            scrubbed_subject,
-                            scrubbed_body,
-                            json.dumps(r.tags),
-                            r.created_at.isoformat() if r.created_at else None,
-                            r.updated_at.isoformat() if r.updated_at else None,
-                            json.dumps(r.extra, default=str),
-                        ),
-                    )
-                    c.execute(
-                        "DELETE FROM records_fts WHERE stable_id = ?",
-                        (r.stable_id,),
-                    )
-                    c.execute(
-                        "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (
-                            r.stable_id,
-                            r.source,
-                            scrubbed_subject,
-                            scrubbed_body,
-                            " ".join(r.tags),
-                        ),
-                    )
-
-            _do_write(record_list)
+            self._do_write_records(c, record_list)
         except BaseException:
             c.execute("ROLLBACK TO SAVEPOINT rebuild_and_upsert")
             c.execute("RELEASE SAVEPOINT rebuild_and_upsert")
@@ -340,15 +489,62 @@ class Store:
         c.execute("RELEASE SAVEPOINT rebuild_and_upsert")
         c.commit()
 
-    # -- reads ---------------------------------------------------------------
+    @staticmethod
+    def _do_write_records(c: sqlite3.Connection, records: list[Record]) -> None:
+        """Shared write body between ``upsert`` and ``rebuild_and_upsert``.
+
+        Kept static so the savepoint scope in the atomic path can call it
+        without touching module-level state. Body kept in lockstep with
+        ``upsert``; if the write path grows a new field, update both.
+        """
+        for r in records:
+            scrubbed_body = scrub(r.body).text
+            scrubbed_subject = scrub(r.subject).text
+            c.execute(
+                """
+                INSERT INTO records(
+                    stable_id, source, subject, body, tags,
+                    created_at, updated_at, extra
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stable_id) DO UPDATE SET
+                    subject    = excluded.subject,
+                    body       = excluded.body,
+                    tags       = excluded.tags,
+                    updated_at = excluded.updated_at,
+                    extra      = excluded.extra
+                """,
+                (
+                    r.stable_id,
+                    r.source,
+                    scrubbed_subject,
+                    scrubbed_body,
+                    json.dumps(r.tags),
+                    r.created_at.isoformat() if r.created_at else None,
+                    r.updated_at.isoformat() if r.updated_at else None,
+                    json.dumps(r.extra, default=str),
+                ),
+            )
+            c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
+            c.execute(
+                "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    r.stable_id,
+                    r.source,
+                    scrubbed_subject,
+                    scrubbed_body,
+                    " ".join(r.tags),
+                ),
+            )
+
+    # -- reads: legacy Record-shaped path (GitHub) ------------------------
 
     def _build_where(self, ast: QueryAST) -> tuple[str, list]:
-        """Shared WHERE builder for ``query`` and ``count`` (advisor HIGH-3:
-        ``total`` must reflect the real match count independent of pagination,
-        which requires a COUNT(*) with the same predicates)."""
+        """WHERE builder for records queries."""
         clauses = ["1=1"]
         params: list = []
-        if ast.source:
+        if ast.source and ast.source != "sessions":
             clauses.append("source = ?")
             params.append(ast.source)
         if ast.from_date:
@@ -360,22 +556,11 @@ class Store:
             iso = ast.to_date.isoformat()
             params.extend([iso, iso])
         for tag in ast.tags:
-            # Tags stored as JSON array; look for ``"tag"`` substring. Cheap +
-            # good enough for v1; if perf becomes an issue we can promote tags
-            # to a side table with an index.
             clauses.append("tags LIKE ?")
             params.append(f'%"{tag}"%')
         return " AND ".join(clauses), params
 
     def _fts_ids(self, text: str) -> set[str]:
-        """Set of stable_ids matching an FTS5 MATCH query.
-
-        Malformed queries raise ``sqlite3.OperationalError``; higher layers
-        (MCP) surface that via ``Store.probe_fts`` and translate to a
-        structured ``ok: false`` before reaching ``query``. This method
-        keeps the exception mode so a stray malformed call is loud rather
-        than silently returning ``[]`` — the M3 layer catches at the probe.
-        """
         c = self._c()
         rows = c.execute(
             "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
@@ -391,39 +576,30 @@ class Store:
     ) -> list[Record]:
         """Return records matching the AST, ordered by ``updated_at`` desc.
 
-        Filter order: source → date range → tag substring → FTS MATCH. The
-        FTS pass is a set intersection with the pre-filtered ID set.
+        Records-shaped path (GitHub). For sessions use ``query_sessions`` or
+        ``query_observations``.
 
-        Pre-HIGH-3 behaviour hardcoded ``LIMIT 500`` unconditionally, silently
-        truncating the caller's view. Post-fix:
-
-        * ``limit=None`` (default) returns every matching row.
-        * ``limit=N, offset=M`` returns a page (thin passthrough to SQL).
-
-        On FTS syntax errors we log a warning and return ``[]`` (M3 re-detects
-        via ``probe_fts`` and re-surfaces as ``ok: false`` with remediation).
+        ``source == 'sessions'`` falls through here as a no-op — sessions
+        aren't stored in ``records`` in v2. Callers that want session hits
+        should route through ``query_sessions``.
         """
+        if ast.source == "sessions":
+            return []
         where, params = self._build_where(ast)
         c = self._c()
         sql = f"SELECT * FROM records WHERE {where} ORDER BY updated_at DESC"
-        # SQLite requires LIMIT before OFFSET; use LIMIT -1 (all) when the
-        # caller only asks for offset without a limit.
         if limit is not None or offset:
             sql += " LIMIT ? OFFSET ?"
             params = [*params, (-1 if limit is None else int(limit)), int(offset)]
         try:
             rows = list(c.execute(sql, params))
         except sqlite3.OperationalError as e:
-            # Base query itself failing is unexpected; return [] rather than
-            # bubble up. FTS syntax errors are handled below.
             log.warning("store.query base SELECT failed for ast=%r: %s", ast, e)
             return []
         if ast.text:
             try:
                 fts_ids = self._fts_ids(ast.text)
             except sqlite3.OperationalError as e:
-                # Malformed FTS5 syntax (unbalanced quote, dangling operator).
-                # Surface layer (M3) turns this into ok:false + remediation.
                 log.warning("FTS5 syntax error for query %r: %s", ast.text, e)
                 return []
             allowed_ids = {row["stable_id"] for row in rows}
@@ -432,16 +608,9 @@ class Store:
         return [_row_to_record(row) for row in rows]
 
     def count(self, ast: QueryAST) -> int:
-        """Return the total number of records matching ``ast``.
-
-        Used by MCP's ``aggregator_query`` to populate ``total`` accurately
-        even when the caller is paginating (advisor HIGH-3: pre-fix, ``total``
-        was capped at 500 because ``query`` was capped at 500).
-
-        For text queries the count still requires intersection with the FTS
-        result set, so we cannot avoid loading the FTS ID set — but we skip
-        loading full rows.
-        """
+        """Return the total number of records matching ``ast`` (Records path)."""
+        if ast.source == "sessions":
+            return 0
         where, params = self._build_where(ast)
         c = self._c()
         if ast.text:
@@ -462,49 +631,267 @@ class Store:
     def count_by_source(self, source: str) -> int:
         """Return the number of rows currently held for ``source``.
 
-        Cheap COUNT used by the CLI's ``--rebuild`` guard (round-3 HIGH) to
-        decide whether an empty new record set is "safe to write" (source
-        was already empty — no wipe risk) or "refuse" (source had rows —
-        an empty new set would silently wipe them).
+        For ``sessions`` this counts the sessions table (not observations —
+        the guard cares about "is there historical data here" per source).
         """
         c = self._c()
-        row = c.execute(
-            "SELECT COUNT(*) AS n FROM records WHERE source = ?", (source,)
-        ).fetchone()
+        if source == "sessions":
+            row = c.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()
+        else:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM records WHERE source = ?", (source,)
+            ).fetchone()
         return int(row["n"]) if row else 0
 
     def probe_fts(self, text: str) -> None:
-        """Run a cheap MATCH probe to surface FTS5 syntax errors.
+        """Run cheap MATCH probes to surface FTS5 syntax errors.
 
-        Public replacement for MCP's private ``_probe_fts_syntax`` that used
-        to reach into ``store._c()`` (advisor MEDIUM). Raises
-        ``sqlite3.OperationalError`` on syntax errors; caller converts to a
-        structured MCP error.
+        Checks both records_fts and obs_fts so a syntactically bad query is
+        caught regardless of which index the actual query would hit.
         """
         c = self._c()
         c.execute(
             "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT 1",
             (text,),
         ).fetchone()
+        c.execute(
+            "SELECT rowid FROM obs_fts WHERE obs_fts MATCH ? LIMIT 1",
+            (text,),
+        ).fetchone()
 
-    def capabilities(self) -> dict:
-        """Return a summary of what the store currently holds.
+    # -- reads: v2 sessions + observations --------------------------------
 
-        Used by M3's ``aggregator_capabilities`` MCP tool + M5's CLI ``--help``
-        to feed ``format_help`` with real cached inventory.
+    def _sessions_where(self, ast: QueryAST) -> tuple[str, list]:
+        """Build WHERE for a ``sessions`` query.
+
+        Precedence: ``top_session_id`` (exact ``session_id``) > ``session_id``
+        (matches ``root_session_id`` — includes subagents) >
+        ``agent_id`` filter.
+        """
+        clauses = ["1=1"]
+        params: list = []
+        if ast.top_session_id:
+            clauses.append("session_id = ?")
+            params.append(ast.top_session_id)
+        elif ast.session_id:
+            clauses.append("root_session_id = ?")
+            params.append(ast.session_id)
+        if ast.agent_id:
+            clauses.append("agent_id = ?")
+            params.append(ast.agent_id)
+        if ast.active_from:
+            clauses.append("last_ts >= ?")
+            params.append(ast.active_from.isoformat())
+        if ast.active_to:
+            clauses.append("first_ts <= ?")
+            params.append(ast.active_to.isoformat())
+        # from_date/to_date map to activity window as well for backwards compat
+        # when the caller passes plain from:/to: rather than active_from/to.
+        if ast.from_date and not ast.active_from:
+            clauses.append("last_ts >= ?")
+            params.append(ast.from_date.isoformat())
+        if ast.to_date and not ast.active_to:
+            clauses.append("first_ts <= ?")
+            params.append(ast.to_date.isoformat())
+        return " AND ".join(clauses), params
+
+    def _obs_where(self, ast: QueryAST) -> tuple[str, list]:
+        """Build WHERE for an ``observations`` query.
+
+        ``session_id`` matches ``root_session_id`` (Langfuse-style: includes
+        subagents). ``top_session_id`` matches the exact ``session_id`` (only
+        the top-level stream). ``agent_id`` filters via the parent session
+        row.
+        """
+        clauses = ["1=1"]
+        params: list = []
+        if ast.top_session_id:
+            clauses.append("session_id = ?")
+            params.append(ast.top_session_id)
+        elif ast.session_id:
+            clauses.append("root_session_id = ?")
+            params.append(ast.session_id)
+        if ast.agent_id:
+            clauses.append(
+                "session_id IN (SELECT session_id FROM sessions WHERE agent_id = ?)"
+            )
+            params.append(ast.agent_id)
+        if ast.obs_type:
+            clauses.append("type = ?")
+            params.append(ast.obs_type)
+        if ast.from_date:
+            clauses.append("ts >= ?")
+            params.append(ast.from_date.isoformat())
+        if ast.to_date:
+            clauses.append("ts <= ?")
+            params.append(ast.to_date.isoformat())
+        return " AND ".join(clauses), params
+
+    def query_sessions(
+        self,
+        ast: QueryAST,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[SessionRow]:
+        """Return session rows matching the AST.
+
+        Ordered by ``last_ts`` descending — most-recently-active first.
+        Text search flows through obs_fts and back to sessions via the
+        denormalized ``root_session_id`` so a hit anywhere in a subagent
+        stream still surfaces the top-level session.
+        """
+        where, params = self._sessions_where(ast)
+        c = self._c()
+        if ast.text:
+            try:
+                root_ids = self._fts_root_session_ids(ast.text)
+            except sqlite3.OperationalError as e:
+                log.warning("FTS5 syntax error in query_sessions %r: %s", ast.text, e)
+                return []
+            if not root_ids:
+                return []
+            placeholders = ",".join("?" * len(root_ids))
+            where += f" AND root_session_id IN ({placeholders})"
+            params = [*params, *root_ids]
+        sql = f"SELECT * FROM sessions WHERE {where} ORDER BY last_ts DESC"
+        if limit is not None or offset:
+            sql += " LIMIT ? OFFSET ?"
+            params = [*params, (-1 if limit is None else int(limit)), int(offset)]
+        try:
+            rows = list(c.execute(sql, params))
+        except sqlite3.OperationalError as e:
+            log.warning("query_sessions failed: %s", e)
+            return []
+        return [_row_to_session(row) for row in rows]
+
+    def count_sessions(self, ast: QueryAST) -> int:
+        """Match count for ``query_sessions`` (for MCP ``total``)."""
+        where, params = self._sessions_where(ast)
+        c = self._c()
+        if ast.text:
+            try:
+                root_ids = self._fts_root_session_ids(ast.text)
+            except sqlite3.OperationalError:
+                return 0
+            if not root_ids:
+                return 0
+            placeholders = ",".join("?" * len(root_ids))
+            where += f" AND root_session_id IN ({placeholders})"
+            params = [*params, *root_ids]
+        row = c.execute(
+            f"SELECT COUNT(*) AS n FROM sessions WHERE {where}", params
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def query_observations(
+        self,
+        ast: QueryAST,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[ObservationRow]:
+        """Return observation rows matching the AST, ordered by ``ts``."""
+        where, params = self._obs_where(ast)
+        c = self._c()
+        if ast.text:
+            try:
+                obs_ids = self._fts_obs_ids(ast.text)
+            except sqlite3.OperationalError as e:
+                log.warning("FTS5 syntax error in query_observations %r: %s", ast.text, e)
+                return []
+            if not obs_ids:
+                return []
+            placeholders = ",".join("?" * len(obs_ids))
+            where += f" AND obs_id IN ({placeholders})"
+            params = [*params, *obs_ids]
+        sql = f"SELECT * FROM observations WHERE {where} ORDER BY ts ASC"
+        if limit is not None or offset:
+            sql += " LIMIT ? OFFSET ?"
+            params = [*params, (-1 if limit is None else int(limit)), int(offset)]
+        try:
+            rows = list(c.execute(sql, params))
+        except sqlite3.OperationalError as e:
+            log.warning("query_observations failed: %s", e)
+            return []
+        return [_row_to_observation(row) for row in rows]
+
+    def count_observations(self, ast: QueryAST) -> int:
+        where, params = self._obs_where(ast)
+        c = self._c()
+        if ast.text:
+            try:
+                obs_ids = self._fts_obs_ids(ast.text)
+            except sqlite3.OperationalError:
+                return 0
+            if not obs_ids:
+                return 0
+            placeholders = ",".join("?" * len(obs_ids))
+            where += f" AND obs_id IN ({placeholders})"
+            params = [*params, *obs_ids]
+        row = c.execute(
+            f"SELECT COUNT(*) AS n FROM observations WHERE {where}", params
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def _fts_root_session_ids(self, text: str) -> list[str]:
+        """FTS text → list of matching root_session_ids (dedup ordered).
+
+        Used to project obs_fts hits back up to the sessions layer for
+        session-level hit lists.
         """
         c = self._c()
-        sources = [r["source"] for r in c.execute(
-            "SELECT DISTINCT source FROM records"
-        )]
+        rows = c.execute(
+            """
+            SELECT DISTINCT o.root_session_id AS root
+            FROM obs_fts f
+            JOIN observations o ON o.rowid = f.rowid
+            WHERE obs_fts MATCH ?
+            """,
+            (text,),
+        ).fetchall()
+        return [r["root"] for r in rows if r["root"]]
+
+    def _fts_obs_ids(self, text: str) -> list[str]:
+        c = self._c()
+        rows = c.execute(
+            """
+            SELECT o.obs_id AS obs_id
+            FROM obs_fts f
+            JOIN observations o ON o.rowid = f.rowid
+            WHERE obs_fts MATCH ?
+            """,
+            (text,),
+        ).fetchall()
+        return [r["obs_id"] for r in rows]
+
+    # -- capabilities -----------------------------------------------------
+
+    def capabilities(self) -> dict:
+        """Read-only summary used by ``aggregator_capabilities``.
+
+        Reports records-shaped sources (github) and sessions/subagent counts
+        under a single ``sources`` list, plus session-side inventory (agent
+        types seen, activity range).
+        """
+        c = self._c()
+        sources: list[str] = [
+            r["source"] for r in c.execute("SELECT DISTINCT source FROM records")
+        ]
+        # v2: session presence is source "sessions"; subagent presence adds a
+        # nominal "subagents" bucket for capability discovery.
+        sess_count = c.execute("SELECT COUNT(*) AS n FROM sessions WHERE kind='session'").fetchone()
+        sub_count = c.execute("SELECT COUNT(*) AS n FROM sessions WHERE kind='subagent'").fetchone()
+        if sess_count and sess_count["n"] > 0:
+            sources.insert(0, "sessions")
+        if sub_count and sub_count["n"] > 0:
+            sources.insert(1 if "sessions" in sources else 0, "subagents")
+
         freshness: dict[str, str | None] = {}
         tags_by_source: dict[str, list[str]] = {}
-        for s in sources:
+        for s in [x for x in sources if x not in {"sessions", "subagents"}]:
             row = c.execute(
                 "SELECT MAX(updated_at) AS m FROM records WHERE source = ?", (s,)
             ).fetchone()
             freshness[s] = row["m"] if row else None
-            # Top-20 tag frequency from JSON blobs. Cheap for v1 volumes.
             tag_counter: dict[str, int] = {}
             for row in c.execute(
                 "SELECT tags FROM records WHERE source = ?", (s,)
@@ -516,12 +903,47 @@ class Store:
                     tag_counter.items(), key=lambda kv: kv[1], reverse=True
                 )
             ][:20]
+
+        if "sessions" in sources:
+            row = c.execute("SELECT MAX(last_ts) AS m FROM sessions WHERE kind='session'").fetchone()
+            freshness["sessions"] = row["m"] if row else None
+            tags_by_source["sessions"] = []
+        if "subagents" in sources:
+            row = c.execute("SELECT MAX(last_ts) AS m FROM sessions WHERE kind='subagent'").fetchone()
+            freshness["subagents"] = row["m"] if row else None
+            agents = [r["at"] for r in c.execute(
+                "SELECT DISTINCT agent_type AS at FROM sessions "
+                "WHERE kind='subagent' AND agent_type IS NOT NULL LIMIT 20"
+            )]
+            tags_by_source["subagents"] = agents
+
+        # Date range across everything (records + sessions).
         row = c.execute(
             "SELECT MIN(created_at) AS lo, MAX(updated_at) AS hi FROM records"
         ).fetchone()
+        lo, hi = (row["lo"], row["hi"]) if row else (None, None)
+        s_row = c.execute(
+            "SELECT MIN(first_ts) AS lo, MAX(last_ts) AS hi FROM sessions"
+        ).fetchone()
+        if s_row and s_row["lo"]:
+            lo = min(lo, s_row["lo"]) if lo else s_row["lo"]
+        if s_row and s_row["hi"]:
+            hi = max(hi, s_row["hi"]) if hi else s_row["hi"]
         date_range: tuple[str, str] | None = None
-        if row and row["lo"] and row["hi"]:
-            date_range = (row["lo"][:10], row["hi"][:10])
+        if lo and hi:
+            date_range = (lo[:10], hi[:10])
+
+        counts = {
+            "sessions": int(sess_count["n"]) if sess_count else 0,
+            "subagents": int(sub_count["n"]) if sub_count else 0,
+            "observations": int(
+                c.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"]
+            ),
+            "records": int(
+                c.execute("SELECT COUNT(*) AS n FROM records").fetchone()["n"]
+            ),
+        }
+
         return {
             "sources": sources,
             "freshness": freshness,
@@ -529,6 +951,7 @@ class Store:
             "date_range": date_range,
             "cache_path": str(self.db_path),
             "schema_version": SCHEMA_VERSION,
+            "counts": counts,
         }
 
 
@@ -542,6 +965,40 @@ def _row_to_record(row: sqlite3.Row) -> Record:
         created_at=_parse_iso(row["created_at"]),
         updated_at=_parse_iso(row["updated_at"]),
         extra=json.loads(row["extra"] or "{}"),
+    )
+
+
+def _row_to_session(row: sqlite3.Row) -> SessionRow:
+    return SessionRow(
+        session_id=row["session_id"],
+        root_session_id=row["root_session_id"],
+        parent_session_id=row["parent_session_id"],
+        kind=row["kind"],
+        agent_id=row["agent_id"],
+        agent_type=row["agent_type"],
+        spawned_by_tool_use_id=row["spawned_by_tool_use_id"],
+        cwd=row["cwd"],
+        git_branch=row["git_branch"],
+        first_ts=_parse_iso(row["first_ts"]),
+        last_ts=_parse_iso(row["last_ts"]),
+        jsonl_path=row["jsonl_path"],
+    )
+
+
+def _row_to_observation(row: sqlite3.Row) -> ObservationRow:
+    return ObservationRow(
+        obs_id=row["obs_id"],
+        session_id=row["session_id"],
+        root_session_id=row["root_session_id"],
+        parent_obs_id=row["parent_obs_id"],
+        type=row["type"],
+        ts=_parse_iso(row["ts"]),
+        model=row["model"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        tool_name=row["tool_name"],
+        tool_use_id=row["tool_use_id"],
+        body=row["body"] or "",
     )
 
 

@@ -1,6 +1,14 @@
 import pytest
 
-from aggregator.sources.base import IngestResult, QueryAST, Record, Source, stable_id_for
+from aggregator.sources.base import (
+    IngestResult,
+    ObservationRow,
+    QueryAST,
+    Record,
+    SessionRow,
+    Source,
+    stable_id_for,
+)
 
 
 def test_record_defaults():
@@ -24,18 +32,28 @@ def test_query_ast_defaults():
     assert ast.to_date is None
     assert ast.text is None
     assert ast.extra == {}
+    # v2 keys default to None so unset queries don't accidentally route to the
+    # sessions path.
+    assert ast.session_id is None
+    assert ast.top_session_id is None
+    assert ast.agent_id is None
+    assert ast.obs_type is None
+    assert ast.active_from is None
+    assert ast.active_to is None
 
 
 def test_source_protocol_declares_required_methods():
-    """Source protocol must expose ingest, search, record_shape per spec §Components."""
-    # Protocols in typing declare methods; check they exist on the class.
+    """v2 Source protocol keeps ingest + record_shape as core.
+
+    ``iter_records`` (Record-shaped) and ``iter_entities`` (v2 entity-shaped)
+    are per-source additions; the CLI's dispatch checks for one or the other.
+    """
     assert hasattr(Source, "ingest")
-    assert hasattr(Source, "search")
     assert hasattr(Source, "record_shape")
 
 
 def test_source_protocol_structural_check_accepts_conforming_class():
-    """A class implementing name/ingest/search/record_shape must satisfy the protocol at runtime."""
+    """A class implementing name/ingest/record_shape satisfies the shape."""
 
     class Fake:
         name = "fake"
@@ -43,20 +61,49 @@ def test_source_protocol_structural_check_accepts_conforming_class():
         def ingest(self, since):
             return IngestResult(added=0, updated=0, skipped=0)
 
-        def search(self, ast):
-            return []
-
         def record_shape(self):
             return {"stable_id": "str"}
 
-    # Protocol classes aren't runtime-checkable by default; use isinstance only when
-    # decorated with @runtime_checkable. This test asserts the shape is present,
-    # which is what the DSL help generator will duck-type against in M2.
     f = Fake()
     assert f.name == "fake"
     assert isinstance(f.ingest(None), IngestResult)
-    assert f.search(QueryAST()) == []
     assert f.record_shape() == {"stable_id": "str"}
+
+
+def test_session_row_and_observation_row_dataclass_shapes():
+    """v2 entities carry the shape the store writes into sessions/observations."""
+    from datetime import UTC, datetime
+
+    s = SessionRow(
+        session_id="sess-x",
+        root_session_id="sess-x",
+        parent_session_id=None,
+        kind="session",
+        agent_id=None,
+        agent_type=None,
+        spawned_by_tool_use_id=None,
+        cwd="/x",
+        git_branch="main",
+        first_ts=datetime(2026, 7, 25, tzinfo=UTC),
+        last_ts=datetime(2026, 7, 25, tzinfo=UTC),
+        jsonl_path="/tmp/x.jsonl",
+    )
+    o = ObservationRow(
+        obs_id="o1",
+        session_id="sess-x",
+        root_session_id="sess-x",
+        parent_obs_id=None,
+        type="user",
+        ts=datetime(2026, 7, 25, tzinfo=UTC),
+        model=None,
+        input_tokens=None,
+        output_tokens=None,
+        tool_name=None,
+        tool_use_id=None,
+        body="hi",
+    )
+    assert s.kind in ("session", "subagent")
+    assert o.type == "user"
 
 
 def test_stable_id_for_formats_source_and_id():
