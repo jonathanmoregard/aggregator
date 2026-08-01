@@ -19,9 +19,11 @@ from unittest.mock import patch
 import pytest
 
 from aggregator.sources.github import (
+    GhApiError,
     GitHubSource,
     ScopeFetchError,
     WriteCapableTokenError,
+    _default_api_fetcher,
     _default_scope_fetcher,
     _has_write_scope,
     _parse_scopes,
@@ -249,6 +251,71 @@ def test_ingest_counts_records_from_all_endpoints(monkeypatch):
     # 2 pr queries (authored + review-requested) + 2 issue queries (authored + assigned) = 4
     assert result.added == 4
     assert result.errors == []
+
+
+# -- default fetcher raises on transport failure (Codex Phase 2 MEDIUM #1) -
+
+
+def test_default_api_fetcher_raises_on_called_process_error():
+    """Pre-fix, this returned []. Post-fix it must raise GhApiError so
+    iter_records' try/except surfaces the failure instead of counting a
+    silent zero-add."""
+    with patch(
+        "aggregator.sources.github.subprocess.run",
+        side_effect=subprocess.CalledProcessError(returncode=1, cmd=["gh"]),
+    ), pytest.raises(GhApiError):
+        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+
+
+def test_default_api_fetcher_raises_on_gh_missing():
+    with patch(
+        "aggregator.sources.github.subprocess.run",
+        side_effect=FileNotFoundError("gh not installed"),
+    ), pytest.raises(GhApiError):
+        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+
+
+def test_default_api_fetcher_raises_on_timeout():
+    with patch(
+        "aggregator.sources.github.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=1),
+    ), pytest.raises(GhApiError):
+        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+
+
+def test_default_api_fetcher_raises_on_non_json():
+    fake = subprocess.CompletedProcess(
+        args=["gh"], returncode=0, stdout="not json {", stderr=""
+    )
+    with patch(
+        "aggregator.sources.github.subprocess.run", return_value=fake
+    ), pytest.raises(GhApiError):
+        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+
+
+def test_iter_records_records_all_four_endpoint_errors_when_fetcher_raises(
+    monkeypatch,
+):
+    """Codex MEDIUM #1 end-to-end: when every endpoint's fetcher raises
+    (rate-limit outage / gh missing), iter_records must record one error
+    per endpoint in the shared errors sink and yield zero records. Combined
+    with the round-3 --rebuild guard, this makes the CLI refuse the wipe
+    that pre-fix silently committed."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+
+    def always_raise(path: str) -> list[dict]:
+        raise GhApiError(f"gh api {path} failed: mocked")
+
+    src = GitHubSource(
+        _scope_fetcher=lambda: ["public_repo"],
+        _api_fetcher=always_raise,
+    )
+    errors: list[str] = []
+    records = list(src.iter_records(since=None, errors=errors))
+    assert records == []
+    assert len(errors) == 4, (
+        f"expected one error per endpoint, got {len(errors)}: {errors}"
+    )
 
 
 def test_ingest_records_errors_without_crashing(monkeypatch):

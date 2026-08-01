@@ -60,6 +60,21 @@ class ScopeFetchError(RuntimeError):
     """
 
 
+class GhApiError(RuntimeError):
+    """Raised by ``_default_api_fetcher`` on any transport / decode failure.
+
+    Codex Phase 2 MEDIUM #1: pre-fix, the default fetcher returned ``[]`` on
+    ``CalledProcessError`` / ``FileNotFoundError`` / ``TimeoutExpired`` /
+    JSON decode errors. ``iter_records`` only recorded errors in the
+    ``errors`` sink when the fetcher *raised*, so real subprocess failures
+    silently degraded to "zero adds" and the CLI printed ``errors=0``. Rate
+    limits and gh outages became invisible. Post-fix, the fetcher raises
+    ``GhApiError`` on any failure so ``iter_records``' surrounding
+    try/except records the error and — combined with the round-3
+    ``--rebuild`` guard — refuses the wipe.
+    """
+
+
 def _parse_scopes(scopes_header: str) -> list[str]:
     """Parse an 'X-Oauth-Scopes: a, b, c' header line into a list.
 
@@ -115,8 +130,13 @@ def _default_scope_fetcher() -> list[str]:
 def _default_api_fetcher(path: str) -> list[dict]:
     """Call `gh api <path> --paginate` and return the JSON-decoded list.
 
-    Returns [] on failure so ingest can continue with partial data. The caller
-    records the resulting empty page as zero adds without error.
+    Codex Phase 2 MEDIUM #1: pre-fix, this returned ``[]`` on any subprocess
+    or JSON error, which silently degraded transient failures into "zero
+    adds" — the CLI printed ``errors=0`` even during rate-limit / outage
+    windows. Post-fix, any failure raises ``GhApiError``; ``iter_records``'
+    surrounding try/except catches it, appends to the shared ``errors``
+    sink, and — combined with the round-3 ``--rebuild`` refusal guard —
+    prevents an atomic wipe on transient failure.
     """
     try:
         result = subprocess.run(
@@ -127,14 +147,18 @@ def _default_api_fetcher(path: str) -> list[dict]:
             timeout=120,
         )
         out = result.stdout
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+    ) as e:
         log.warning("gh api %s failed: %s", path, e)
-        return []
+        raise GhApiError(f"gh api {path} failed: {e}") from e
     try:
         data = json.loads(out)
     except json.JSONDecodeError as e:
         log.warning("gh api %s returned non-JSON: %s", path, e)
-        return []
+        raise GhApiError(f"gh api {path} returned non-JSON: {e}") from e
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
