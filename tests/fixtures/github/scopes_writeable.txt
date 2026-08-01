@@ -1,0 +1,1 @@
+X-Oauth-Scopes: repo, admin:repo_hook, delete_repo

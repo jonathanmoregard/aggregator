@@ -1,0 +1,13 @@
+{
+  "id": 99,
+  "number": 7,
+  "title": "Investigate slow query",
+  "state": "open",
+  "user": {"login": "someone-else"},
+  "assignees": [{"login": "jonathan-more"}],
+  "html_url": "https://github.com/acme/api/issues/7",
+  "body": "Query on `sessions` table takes 4s.",
+  "updated_at": "2026-07-29T09:00:00Z",
+  "created_at": "2026-07-25T12:00:00Z",
+  "repository_url": "https://api.github.com/repos/acme/api"
+}
