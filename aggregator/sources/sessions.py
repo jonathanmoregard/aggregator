@@ -142,17 +142,26 @@ class SessionsSource:
         """
         yield from self.iter_records(since=None)
 
-    def iter_records(self, since: datetime | None) -> Iterator[Record]:
+    def iter_records(
+        self,
+        since: datetime | None,
+        errors: list[str] | None = None,
+    ) -> Iterator[Record]:
         """Yield records parsed from every JSONL project file.
 
         Applies the same ``since`` bound as the old ``ingest``: skip records
         whose ``ended`` timestamp precedes ``since``. The caller is
         responsible for persisting the yielded records (see
         ``cli._cmd_ingest``).
+
+        When ``errors`` is provided, parse errors are appended so callers
+        that need structured error surfacing (``ingest`` returns them in
+        ``IngestResult.errors``) can share the same iteration path — no
+        double-walk of the JSONL tree required (round-2 MEDIUM).
         """
-        errors: list[str] = []
+        sink = errors if errors is not None else []
         for path in self._iter_jsonl_files():
-            for agg in self._parse_file(path, errors):
+            for agg in self._parse_file(path, sink):
                 if since and agg.ended and agg.ended < since:
                     continue
                 yield self._to_record(agg, source_path=path)
@@ -197,18 +206,16 @@ class SessionsSource:
     def ingest(self, since: datetime | None) -> IngestResult:
         """Count-only path retained for protocol compat + integration tests.
 
-        Persistence happens in ``cli._cmd_ingest`` via ``iter_records`` +
-        ``store.upsert``. This method exhausts the same iterator so counts
-        stay in lockstep with what the CLI would persist, and it re-collects
-        parse errors via a fresh walk (kept simple; ingest is not on a hot
-        path).
+        Round-2 MEDIUM: pre-fix, this re-walked the JSONL tree once purely
+        to collect parse errors (because ``iter_records`` had no way to
+        surface them), then walked again via ``iter_records`` to count.
+        Post-fix, ``iter_records`` accepts a shared ``errors`` sink, so
+        one pass produces both the count and the parse-error list.
+
+        Persistence is the CLI's job — this method only counts.
         """
-        # Re-walk to collect parse errors: iter_records swallows them.
         errors: list[str] = []
-        for path in self._iter_jsonl_files():
-            for _ in self._parse_file(path, errors):
-                pass
-        added = sum(1 for _ in self.iter_records(since))
+        added = sum(1 for _ in self.iter_records(since, errors=errors))
         return IngestResult(added=added, updated=0, skipped=0, errors=errors)
 
     def search(self, ast: QueryAST) -> list[Record]:

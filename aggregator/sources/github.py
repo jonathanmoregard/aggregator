@@ -268,13 +268,20 @@ class GitHubSource:
         ("issue", "assigned", "/search/issues?q=is:issue+assignee:@me"),
     ]
 
-    def iter_records(self, since: datetime | None) -> Iterator[Record]:
+    def iter_records(
+        self,
+        since: datetime | None,
+        errors: list[str] | None = None,
+    ) -> Iterator[Record]:
         """Yield PR + issue records from all four search endpoints.
 
         Enforces the read-only scope check up front (same fail-closed policy
         as ``ingest``). Per-endpoint transport failures are logged and
         skipped — partial ingest beats total loss (spec §Error handling).
-        The caller (``cli._cmd_ingest``) is responsible for persistence.
+        When ``errors`` is provided, per-endpoint failures are appended
+        (``f"{path}: {e}"``) so callers that need structured error surfacing
+        (``ingest`` returns them in ``IngestResult.errors``) can share the
+        same iteration path as callers that only want the records (the CLI).
 
         Round-2 HIGH: when ``since`` is truthy, append GitHub search's
         ``+updated:>=YYYY-MM-DD`` qualifier to each endpoint path so the
@@ -288,6 +295,8 @@ class GitHubSource:
                 rows = self._api_fetcher(scoped_path)
             except Exception as e:  # noqa: BLE001 -- degrade gracefully
                 log.warning("gh api %s failed during iter_records: %s", scoped_path, e)
+                if errors is not None:
+                    errors.append(f"{scoped_path}: {e}")
                 continue
             for row in rows:
                 if kind == "pr":
@@ -308,28 +317,18 @@ class GitHubSource:
     def ingest(self, since: datetime | None) -> IngestResult:
         """Count-only path retained for protocol compat + integration tests.
 
-        Persistence happens in ``cli._cmd_ingest`` via ``iter_records`` +
-        ``store.upsert``. This method fans out over the same endpoints so
-        per-endpoint transport failures still land in ``errors`` (which
-        ``iter_records`` cannot surface — it just logs and skips).
+        Round-2 MEDIUM: previously duplicated ``iter_records``' fan-out
+        body verbatim, drifting on any change (round-2 HIGH's ``since``
+        push-down would have needed doing twice). Now this delegates to
+        ``iter_records`` with a shared ``errors`` sink, preserving the
+        per-endpoint error surfacing that ``IngestResult.errors``
+        promises while removing the duplicate loop.
 
-        Raises ``WriteCapableTokenError`` before any fetch if the token is
-        write-capable and the override is unset (fail-closed on credential
-        shape).
+        Persistence is the CLI's job — this method only counts. Scope
+        check happens inside ``iter_records`` so we don't double-check.
         """
-        self._check_scopes()
-        added = 0
         errors: list[str] = []
-        for kind, subkind, path in self._ENDPOINTS:
-            try:
-                for row in self._api_fetcher(path):
-                    if kind == "pr":
-                        _ = self._pr_to_record(row)
-                    else:
-                        _ = self._issue_to_record(row, kind=subkind)
-                    added += 1
-            except Exception as e:  # noqa: BLE001 -- ingest degrades gracefully
-                errors.append(f"{path}: {e}")
+        added = sum(1 for _ in self.iter_records(since, errors=errors))
         return IngestResult(added=added, updated=0, skipped=0, errors=errors)
 
     def search(self, ast: QueryAST) -> list[Record]:
