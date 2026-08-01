@@ -4,7 +4,14 @@ Personal "everything about me, currently, one prompt" aggregator. Caches Claude 
 
 ## Status
 
-M0 scaffold. See `docs/superpowers/plans/2026-08-01-aggregator-plan.md` for the chunked build plan and `docs/superpowers/specs/2026-08-01-aggregator-design.md` for the design spec.
+v1: two sources (Claude Code sessions, GitHub PRs + issues via `gh api /search/issues`), SQLite+FTS5 store with WAL-mode concurrent-writer safety, four surfaces:
+
+- **FastMCP** (`aggregator-mcp`) — three read-only tools: `aggregator_query`, `aggregator_capabilities`, `aggregator_ingest` (a human-approve gate that only prints the CLI command).
+- **CLI** (`aggregator`) — `query`, `ingest SOURCE [--since ISO] [--rebuild]`, `status`.
+- **Raycast** — scripts in `scripts/raycast/` wrap the CLI for one-shot triage.
+- **Nix module** (`nix/aggregator.nix`) — home-manager module with systemd user timers on `*:0/30` for both sources.
+
+Design docs: `docs/superpowers/plans/2026-08-01-aggregator-plan.md` (chunked build plan) and `docs/superpowers/specs/2026-08-01-aggregator-design.md` (design spec).
 
 ## Non-negotiables (from spec)
 
@@ -14,7 +21,7 @@ M0 scaffold. See `docs/superpowers/plans/2026-08-01-aggregator-plan.md` for the 
 - All returned content wrapped in `<ExternalContent source="…">` delimiters.
 - Stable local IDs persist across `--rebuild`.
 
-## Dev setup (M0)
+## Dev setup
 
 ```
 nix develop
