@@ -6,6 +6,7 @@ Every source's `ingest()` scrubs pre-store (Presidio + gitleaks) via core/scrub.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
@@ -57,6 +58,16 @@ class Source(Protocol):
     generator (M2) can duck-type registered sources via isinstance()."""
 
     name: str
+
+    def iter_records(self, since: datetime | None) -> Iterator[Record]:
+        """Yield fresh records for the given window. The CALLER persists.
+
+        This is the persistence-oriented seam. ``ingest()`` remains on the
+        protocol for backwards compatibility but should only count records
+        (typically by exhausting ``iter_records`` itself); the actual write
+        to storage is the caller's job (see ``cli._cmd_ingest``).
+        """
+        ...
 
     def ingest(self, since: datetime | None) -> IngestResult: ...
 

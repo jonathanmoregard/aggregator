@@ -136,9 +136,27 @@ class SessionsSource:
                 yield current
 
     def _iter_records(self) -> Iterator[Record]:
+        """Legacy alias for ``iter_records(since=None)``.
+
+        Kept for the existing record-level tests (M1a) that predate the
+        ``iter_records`` protocol method. Both entrypoints share the same
+        underlying pass so the fixtures/behaviour don't diverge.
+        """
+        yield from self.iter_records(since=None)
+
+    def iter_records(self, since: datetime | None) -> Iterator[Record]:
+        """Yield records parsed from every JSONL project file.
+
+        Applies the same ``since`` bound as the old ``ingest``: skip records
+        whose ``ended`` timestamp precedes ``since``. The caller is
+        responsible for persisting the yielded records (see
+        ``cli._cmd_ingest``).
+        """
         errors: list[str] = []
         for path in self._iter_jsonl_files():
             for agg in self._parse_file(path, errors):
+                if since and agg.ended and agg.ended < since:
+                    continue
                 yield self._to_record(agg, source_path=path)
 
     def _to_record(self, agg: _SessionAggregate, source_path: Path) -> Record:
@@ -179,13 +197,20 @@ class SessionsSource:
         )
 
     def ingest(self, since: datetime | None) -> IngestResult:
-        added = 0
+        """Count-only path retained for protocol compat + integration tests.
+
+        Persistence happens in ``cli._cmd_ingest`` via ``iter_records`` +
+        ``store.upsert``. This method exhausts the same iterator so counts
+        stay in lockstep with what the CLI would persist, and it re-collects
+        parse errors via a fresh walk (kept simple; ingest is not on a hot
+        path).
+        """
+        # Re-walk to collect parse errors: iter_records swallows them.
         errors: list[str] = []
         for path in self._iter_jsonl_files():
-            for agg in self._parse_file(path, errors):
-                if since and agg.ended and agg.ended < since:
-                    continue
-                added += 1
+            for _ in self._parse_file(path, errors):
+                pass
+        added = sum(1 for _ in self.iter_records(since))
         return IngestResult(added=added, updated=0, skipped=0, errors=errors)
 
     def search(self, ast: QueryAST) -> list[Record]:

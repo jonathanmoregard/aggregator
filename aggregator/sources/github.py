@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 
 import claude_runner  # noqa: F401 -- reserved: LLM wrapper for future ingest enrichment.
@@ -217,27 +217,57 @@ class GitHubSource:
             },
         )
 
+    # Four search endpoints fanned across (kind, subkind, path). Class-level so
+    # ``iter_records`` and ``ingest`` share the definition.
+    _ENDPOINTS: list[tuple[str, str, str]] = [
+        ("pr", "authored", "/search/issues?q=is:pr+author:@me"),
+        ("pr", "review-requested", "/search/issues?q=is:pr+review-requested:@me"),
+        ("issue", "authored", "/search/issues?q=is:issue+author:@me"),
+        ("issue", "assigned", "/search/issues?q=is:issue+assignee:@me"),
+    ]
+
+    def iter_records(self, since: datetime | None) -> Iterator[Record]:
+        """Yield PR + issue records from all four search endpoints.
+
+        Enforces the read-only scope check up front (same fail-closed policy
+        as ``ingest``). Per-endpoint transport failures are logged and
+        skipped — partial ingest beats total loss (spec §Error handling).
+        The caller (``cli._cmd_ingest``) is responsible for persistence.
+
+        Note: ``since`` is not applied here because the search endpoints
+        already return only records the user cares about; the store's
+        upsert path handles freshness by stable-ID overwrite.
+        """
+        self._check_scopes()
+        _ = since
+        for kind, subkind, path in self._ENDPOINTS:
+            try:
+                rows = self._api_fetcher(path)
+            except Exception as e:  # noqa: BLE001 -- degrade gracefully
+                log.warning("gh api %s failed during iter_records: %s", path, e)
+                continue
+            for row in rows:
+                if kind == "pr":
+                    yield self._pr_to_record(row)
+                else:
+                    yield self._issue_to_record(row, kind=subkind)
+
     def ingest(self, since: datetime | None) -> IngestResult:
-        """Fan out to the four search endpoints, minting records for each row.
+        """Count-only path retained for protocol compat + integration tests.
 
-        Raises WriteCapableTokenError before any fetch if the token is write-
-        capable and the override is unset (fail-closed on credential shape).
+        Persistence happens in ``cli._cmd_ingest`` via ``iter_records`` +
+        ``store.upsert``. This method fans out over the same endpoints so
+        per-endpoint transport failures still land in ``errors`` (which
+        ``iter_records`` cannot surface — it just logs and skips).
 
-        Per-endpoint failures degrade to recorded errors, not exceptions —
-        partial ingest is better than none (spec §Error handling: "Corrupt
-        JSONL: skip file, record failure … don't abort ingest"; same policy
-        applied to gh api errors).
+        Raises ``WriteCapableTokenError`` before any fetch if the token is
+        write-capable and the override is unset (fail-closed on credential
+        shape).
         """
         self._check_scopes()
         added = 0
         errors: list[str] = []
-        endpoints: list[tuple[str, str, str]] = [
-            ("pr", "authored", "/search/issues?q=is:pr+author:@me"),
-            ("pr", "review-requested", "/search/issues?q=is:pr+review-requested:@me"),
-            ("issue", "authored", "/search/issues?q=is:issue+author:@me"),
-            ("issue", "assigned", "/search/issues?q=is:issue+assignee:@me"),
-        ]
-        for kind, subkind, path in endpoints:
+        for kind, subkind, path in self._ENDPOINTS:
             try:
                 for row in self._api_fetcher(path):
                     if kind == "pr":

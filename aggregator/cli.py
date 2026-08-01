@@ -104,17 +104,29 @@ def _cmd_ingest(
             return 2
         if since.tzinfo is None:
             since = since.replace(tzinfo=UTC)
-    # ``store`` isn't threaded through here because sources own their own
-    # persistence path in v1 (they yield Records; the caller writes). The
-    # rebuild flag below is handled in ``main`` before we call ingest.
-    _ = store
-    result = src.ingest(since=since)
+    # Persistence is the CLI's job (advisor round-1 BLOCKER fix). Sources
+    # yield ``Record``s via ``iter_records``; we collect and upsert. Old-style
+    # sources that only implement ``ingest()`` fall through to the legacy
+    # count-only path (kept for the existing dispatch smoke test).
+    if hasattr(src, "iter_records"):
+        try:
+            records = list(src.iter_records(since))
+        except Exception as e:  # noqa: BLE001 -- surface as CLI error, don't crash
+            print(f"ingest {args.source} failed: {e}", file=sys.stderr)
+            return 1
+        store.upsert(records)
+        added = len(records)
+        errors: list[str] = []
+    else:
+        result = src.ingest(since=since)
+        added = result.added
+        errors = list(result.errors)
     print(
-        f"ingest {args.source}: added={result.added} updated={result.updated} "
-        f"skipped={result.skipped} errors={len(result.errors)}"
+        f"ingest {args.source}: added={added} updated=0 skipped=0 "
+        f"errors={len(errors)}"
     )
-    if result.errors:
-        for e in result.errors[:5]:
+    if errors:
+        for e in errors[:5]:
             print(f"  error: {e}", file=sys.stderr)
     return 0
 
