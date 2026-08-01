@@ -174,6 +174,61 @@ def test_store_upsert_overwrites_same_stable_id(tmp_data_home):
     assert r[0].body == "body v2"
 
 
+# --- HIGH-3: no silent LIMIT 500 truncation, plus pagination + count ------
+
+
+def test_store_query_returns_all_records_beyond_500(tmp_data_home):
+    """Pre-fix (advisor HIGH-3): Store.query hardcoded LIMIT 500, silently
+    truncating without any signal to the caller. Post-fix: no default limit;
+    the store returns every matching row unless the caller asks otherwise.
+    """
+    s = Store()
+    s.migrate()
+    s.upsert(
+        [_rec(f"sessions:{i}", "sessions", f"s{i}", f"body {i}") for i in range(501)]
+    )
+    rows = s.query(QueryAST(source="sessions"))
+    assert len(rows) == 501
+
+
+def test_store_query_limit_and_offset(tmp_data_home):
+    """Explicit limit/offset carve out a page. Enables MCP pagination on top
+    without every caller paying the "load everything into memory" cost."""
+    s = Store()
+    s.migrate()
+    s.upsert(
+        [_rec(f"sessions:{i:04d}", "sessions", f"s{i}", f"body {i}") for i in range(50)]
+    )
+    page = s.query(QueryAST(source="sessions"), limit=10, offset=10)
+    assert len(page) == 10
+
+
+def test_store_count_matches_query_size(tmp_data_home):
+    """Store.count(ast) is the new source-of-truth for MCP's ``total`` field."""
+    s = Store()
+    s.migrate()
+    s.upsert(
+        [_rec(f"sessions:{i}", "sessions", f"s{i}", f"body {i}") for i in range(501)]
+    )
+    assert s.count(QueryAST(source="sessions")) == 501
+
+
+def test_store_probe_fts_public(tmp_data_home):
+    """MEDIUM: MCP no longer reaches into store._c(); use Store.probe_fts."""
+    import sqlite3
+
+    s = Store()
+    s.migrate()
+    s.upsert([_rec("sessions:a", "sessions", "s", "hello world")])
+    # Well-formed query: no exception.
+    s.probe_fts("hello")
+    # Malformed FTS5 syntax: raise OperationalError so callers can convert
+    # to a structured error (same behaviour as the private probe used to have).
+    import pytest as _pytest
+    with _pytest.raises(sqlite3.OperationalError):
+        s.probe_fts('"unterminated')
+
+
 def test_store_wraps_records_on_return(tmp_data_home):
     """Store's query returns Records; the wrapping into ``<ExternalContent>``
     happens at the surface layer (MCP/CLI) via ``wrap_records``. Confirm the

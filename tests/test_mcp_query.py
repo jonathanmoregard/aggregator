@@ -169,6 +169,21 @@ def test_query_pagination_last_page_has_no_next_token(tmp_data_home):
     assert "next_page_token" not in result
 
 
+def test_query_pagination_beyond_500_rows(tmp_data_home):
+    """HIGH-3: pre-fix, store.query capped at 500 so ``total`` under-reported
+    the true row count and ``next_page_token`` never appeared past 500.
+    Post-fix: total reflects the real count; next_page_token fires whenever
+    more rows remain."""
+    store = Store()
+    _seed(store, n=501)
+    result = aggregator_query(
+        dsl="source:sessions", fields="summary", page_size=200, _store=store
+    )
+    assert result["ok"] is True
+    assert result["total"] == 501
+    assert "next_page_token" in result
+
+
 def test_query_pagination_second_page_returns_remainder(tmp_data_home):
     store = Store()
     _seed(store, n=3)

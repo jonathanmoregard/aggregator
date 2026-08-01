@@ -84,18 +84,14 @@ def _parse_page_token(token: str | None) -> int:
 
 
 def _probe_fts_syntax(store: Store, text: str) -> None:
-    """Run a cheap MATCH probe to surface FTS5 syntax errors.
+    """Thin adapter around ``Store.probe_fts`` (kept for local naming).
 
-    ``Store.query`` swallows ``OperationalError`` to ``[]`` (see store.py
-    lines 231–235). Without this probe we can't distinguish "bad query"
-    from "no matches". Probe raises ``sqlite3.OperationalError`` on syntax
-    errors; caller converts to a structured MCP error.
+    ``Store.query`` swallows ``OperationalError`` to ``[]``; without this
+    probe we can't distinguish "bad query" from "no matches". Raises
+    ``sqlite3.OperationalError`` on syntax errors; caller converts to a
+    structured MCP error.
     """
-    conn = store._c()
-    conn.execute(
-        "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT 1",
-        (text,),
-    ).fetchone()
+    store.probe_fts(text)
 
 
 def _scrub_record(r: Record) -> Record:
@@ -192,21 +188,8 @@ def aggregator_query(
                 ),
             }
 
-    # 3. Execute
-    try:
-        records = store.query(ast)
-    except Exception as e:  # noqa: BLE001 -- surface as structured error
-        log.exception("store.query failed for dsl=%r", dsl)
-        return {
-            "ok": False,
-            "reason": f"query failed: {type(e).__name__}",
-            "remediation": (
-                "Simplify the query and try again. If this persists, call "
-                "aggregator_capabilities() to confirm the store is healthy."
-            ),
-        }
-
-    # 4. Pagination + field selection
+    # 3. Field mode + pagination shape (must be settled before we hit the
+    #    store so we don't waste a full query on a bad ``fields`` value).
     if fields not in ("summary", "full"):
         return {
             "ok": False,
@@ -220,7 +203,25 @@ def aggregator_query(
         )
     page_size = max(1, int(page_size))
     offset = _parse_page_token(page_token)
-    page_records = records[offset : offset + page_size]
+
+    # 4. Execute: fetch page_size + 1 to detect "more" without a second query,
+    #    and count separately so ``total`` reflects the real match set (advisor
+    #    HIGH-3: pre-fix, the store hardcoded LIMIT 500, so total under-reported).
+    try:
+        page_plus_one = store.query(ast, limit=page_size + 1, offset=offset)
+        total = store.count(ast)
+    except Exception as e:  # noqa: BLE001 -- surface as structured error
+        log.exception("store.query failed for dsl=%r", dsl)
+        return {
+            "ok": False,
+            "reason": f"query failed: {type(e).__name__}",
+            "remediation": (
+                "Simplify the query and try again. If this persists, call "
+                "aggregator_capabilities() to confirm the store is healthy."
+            ),
+        }
+    has_more = len(page_plus_one) > page_size
+    page_records = page_plus_one[:page_size]
 
     # 5. Scrub-on-return + wrap
     items = [_record_to_item(_scrub_record(r), fields) for r in page_records]
@@ -228,11 +229,10 @@ def aggregator_query(
     result: dict[str, Any] = {
         "ok": True,
         "records": items,
-        "total": len(records),
+        "total": total,
     }
-    next_offset = offset + page_size
-    if next_offset < len(records):
-        result["next_page_token"] = str(next_offset)
+    if has_more:
+        result["next_page_token"] = str(offset + page_size)
     if fields != "full":
         result["notice"] = (
             "Content bodies omitted (fields='summary'). "

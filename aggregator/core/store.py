@@ -189,15 +189,10 @@ class Store:
 
     # -- reads ---------------------------------------------------------------
 
-    def query(self, ast: QueryAST) -> list[Record]:
-        """Return records matching the AST, ordered by ``updated_at`` desc.
-
-        Filter order: source → date range → tag substring → FTS MATCH. The
-        FTS pass is a set intersection with the pre-filtered ID set; on FTS
-        syntax errors we log a warning and return ``[]`` (M3 will re-surface
-        as ``ok: false`` with remediation).
-        """
-        c = self._c()
+    def _build_where(self, ast: QueryAST) -> tuple[str, list]:
+        """Shared WHERE builder for ``query`` and ``count`` (advisor HIGH-3:
+        ``total`` must reflect the real match count independent of pagination,
+        which requires a COUNT(*) with the same predicates)."""
         clauses = ["1=1"]
         params: list = []
         if ast.source:
@@ -217,26 +212,113 @@ class Store:
             # to a side table with an index.
             clauses.append("tags LIKE ?")
             params.append(f'%"{tag}"%')
-        sql = (
-            f"SELECT * FROM records WHERE {' AND '.join(clauses)} "
-            "ORDER BY updated_at DESC LIMIT 500"
-        )
-        rows = list(c.execute(sql, params))
+        return " AND ".join(clauses), params
+
+    def _fts_ids(self, text: str) -> set[str]:
+        """Set of stable_ids matching an FTS5 MATCH query.
+
+        Malformed queries raise ``sqlite3.OperationalError``; higher layers
+        (MCP) surface that via ``Store.probe_fts`` and translate to a
+        structured ``ok: false`` before reaching ``query``. This method
+        keeps the exception mode so a stray malformed call is loud rather
+        than silently returning ``[]`` — the M3 layer catches at the probe.
+        """
+        c = self._c()
+        rows = c.execute(
+            "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
+            (text,),
+        ).fetchall()
+        return {row["stable_id"] for row in rows}
+
+    def query(
+        self,
+        ast: QueryAST,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Record]:
+        """Return records matching the AST, ordered by ``updated_at`` desc.
+
+        Filter order: source → date range → tag substring → FTS MATCH. The
+        FTS pass is a set intersection with the pre-filtered ID set.
+
+        Pre-HIGH-3 behaviour hardcoded ``LIMIT 500`` unconditionally, silently
+        truncating the caller's view. Post-fix:
+
+        * ``limit=None`` (default) returns every matching row.
+        * ``limit=N, offset=M`` returns a page (thin passthrough to SQL).
+
+        On FTS syntax errors we log a warning and return ``[]`` (M3 re-detects
+        via ``probe_fts`` and re-surfaces as ``ok: false`` with remediation).
+        """
+        where, params = self._build_where(ast)
+        c = self._c()
+        sql = f"SELECT * FROM records WHERE {where} ORDER BY updated_at DESC"
+        # SQLite requires LIMIT before OFFSET; use LIMIT -1 (all) when the
+        # caller only asks for offset without a limit.
+        if limit is not None or offset:
+            sql += " LIMIT ? OFFSET ?"
+            params = [*params, (-1 if limit is None else int(limit)), int(offset)]
+        try:
+            rows = list(c.execute(sql, params))
+        except sqlite3.OperationalError as e:
+            # Base query itself failing is unexpected; return [] rather than
+            # bubble up. FTS syntax errors are handled below.
+            log.warning("store.query base SELECT failed for ast=%r: %s", ast, e)
+            return []
         if ast.text:
             try:
-                fts_rows = c.execute(
-                    "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
-                    (ast.text,),
-                ).fetchall()
+                fts_ids = self._fts_ids(ast.text)
             except sqlite3.OperationalError as e:
                 # Malformed FTS5 syntax (unbalanced quote, dangling operator).
                 # Surface layer (M3) turns this into ok:false + remediation.
                 log.warning("FTS5 syntax error for query %r: %s", ast.text, e)
                 return []
             allowed_ids = {row["stable_id"] for row in rows}
-            fts_ids = {row["stable_id"] for row in fts_rows}
-            rows = [row for row in rows if row["stable_id"] in (allowed_ids & fts_ids)]
+            keep = allowed_ids & fts_ids
+            rows = [row for row in rows if row["stable_id"] in keep]
         return [_row_to_record(row) for row in rows]
+
+    def count(self, ast: QueryAST) -> int:
+        """Return the total number of records matching ``ast``.
+
+        Used by MCP's ``aggregator_query`` to populate ``total`` accurately
+        even when the caller is paginating (advisor HIGH-3: pre-fix, ``total``
+        was capped at 500 because ``query`` was capped at 500).
+
+        For text queries the count still requires intersection with the FTS
+        result set, so we cannot avoid loading the FTS ID set — but we skip
+        loading full rows.
+        """
+        where, params = self._build_where(ast)
+        c = self._c()
+        if ast.text:
+            try:
+                fts_ids = self._fts_ids(ast.text)
+            except sqlite3.OperationalError as e:
+                log.warning("FTS5 syntax error in count for %r: %s", ast.text, e)
+                return 0
+            id_rows = c.execute(
+                f"SELECT stable_id FROM records WHERE {where}", params
+            ).fetchall()
+            return sum(1 for row in id_rows if row["stable_id"] in fts_ids)
+        row = c.execute(
+            f"SELECT COUNT(*) AS n FROM records WHERE {where}", params
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def probe_fts(self, text: str) -> None:
+        """Run a cheap MATCH probe to surface FTS5 syntax errors.
+
+        Public replacement for MCP's private ``_probe_fts_syntax`` that used
+        to reach into ``store._c()`` (advisor MEDIUM). Raises
+        ``sqlite3.OperationalError`` on syntax errors; caller converts to a
+        structured MCP error.
+        """
+        c = self._c()
+        c.execute(
+            "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT 1",
+            (text,),
+        ).fetchone()
 
     def capabilities(self) -> dict:
         """Return a summary of what the store currently holds.
