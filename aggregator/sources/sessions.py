@@ -15,13 +15,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from claude_runner import run_sync  # noqa: F401
-
-# reserved: LLM wrapper for future ingest enrichment (see spec §Error handling).
-# v1 makes no LLM calls; the import documents the seam so later contributors
-# don't reach for a raw HTTP client. The plan pinned `ClaudeRunner` but the
-# installed package exports `run_sync`; substituting a real symbol keeps the
-# import meaningful without a NameError at import time.
+# Reserved seam: LLM wrapper for future ingest enrichment (see spec §Error
+# handling). v1 makes no LLM calls, so the import previously wired here was
+# dropped (advisor round-1 MEDIUM: dead `run_sync` import). When enrichment
+# lands, wire the runner at the call site, not as an unused module-level
+# import.
 from aggregator.sources.base import IngestResult, QueryAST, Record
 
 log = logging.getLogger(__name__)

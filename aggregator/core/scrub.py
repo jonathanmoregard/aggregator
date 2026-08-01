@@ -77,14 +77,73 @@ SECRET_PATTERNS: dict[str, re.Pattern] = {
 }
 
 # --- PII regex patterns (always run; Presidio is additive)
+#
+# Advisor round-1 MEDIUM: added credit_card (Luhn-shape via a custom check
+# below), ipv4, ipv6, iban. These are not exhaustive — Presidio adds broader
+# coverage when installed. Order matters: `iban` must run BEFORE `phone`
+# because the phone regex would otherwise nibble the trailing digits of an
+# IBAN (verified via the failing test we wrote first).
+#
+# `credit_card` is NOT in this dict because it uses Luhn-check-gated
+# substitution rather than a bare regex sub. See ``_scrub_credit_cards``.
 PII_PATTERNS: dict[str, re.Pattern] = {
     "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
     "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+    # IBAN: 2 letters + 2 digits + 11..30 alphanumerics. Boundaries prevent
+    # partial matches inside longer alphanumeric runs.
+    "iban": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
+    # IPv6: full 8-group form (loose match; misses ``::`` shorthand — good
+    # enough for v1, and low-false-positive because of the strict shape).
+    "ipv6": re.compile(
+        r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b"
+    ),
+    # IPv4: four dotted octets, each 0-255.
+    "ipv4": re.compile(
+        r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}"
+        r"(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b"
+    ),
+    # Marker so PII_PATTERNS test can assert the credit-card path is present.
+    # The actual substitution is Luhn-gated in ``_scrub_credit_cards``; this
+    # regex would be too noisy on its own (would flag any 16-digit run).
+    "credit_card": re.compile(
+        r"\b(?:\d{4}[-\s]?){3}\d{4}\b"
+    ),
     # Loose international phone: optional +CC, then 3-3-4 with -/space/nothing.
     "phone": re.compile(
         r"\+?\d{1,3}[-\s]?\d{3}[-\s]?\d{3}[-\s]?\d{4}"
     ),
 }
+
+
+def _luhn_ok(digits: str) -> bool:
+    """Standard Luhn checksum on a digits-only string."""
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _scrub_credit_cards(text: str, counts: dict[str, int]) -> str:
+    """Regex-scan for 16-digit runs, then redact only those that pass Luhn.
+
+    Prevents flagging arbitrary 16-digit strings (order numbers, hashes) that
+    would false-positive under a bare regex.
+    """
+    pat = PII_PATTERNS["credit_card"]
+
+    def _repl(m: re.Match) -> str:
+        digits = re.sub(r"\D", "", m.group(0))
+        if len(digits) == 16 and _luhn_ok(digits):
+            counts["credit_card"] = counts.get("credit_card", 0) + 1
+            return "[REDACTED:credit_card]"
+        return m.group(0)
+
+    return pat.sub(_repl, text)
 
 
 @dataclass
@@ -173,9 +232,16 @@ def scrub(text: str) -> ScrubResult:
     """
     counts: dict[str, int] = {}
     text = _run_patterns(text, SECRET_PATTERNS, counts)
+    # Credit-card Luhn-gated pass runs BEFORE the generic PII loop so a
+    # Luhn-valid 16-digit sequence isn't fragmented by another pattern first
+    # (e.g. the phone regex).
+    text = _scrub_credit_cards(text, counts)
     # PII regex always runs — Presidio doesn't catch our fixture formats
     # (SSN, +1-555-… phones) reliably. See module docstring.
-    text = _run_patterns(text, PII_PATTERNS, counts)
+    # ``credit_card`` is excluded from the generic loop: it's handled above
+    # with Luhn validation so we don't false-positive on 16-digit non-cards.
+    _generic_pii = {k: v for k, v in PII_PATTERNS.items() if k != "credit_card"}
+    text = _run_patterns(text, _generic_pii, counts)
     if _PRESIDIO_OK:
         text = _scrub_pii_presidio(text, counts)
     return ScrubResult(text=text, counts=counts)

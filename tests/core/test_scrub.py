@@ -96,3 +96,58 @@ def test_scrub_is_idempotent():
     once = scrub(txt).text
     twice = scrub(once).text
     assert once == twice
+
+
+# --- MEDIUM: additional regex fallbacks (advisor round-1) ------------------
+# These formats aren't reliably covered by Presidio's stock recognizers under
+# the score threshold we use, so we add explicit regex fallbacks. Presidio
+# still runs on top when available for broader coverage.
+
+
+def test_credit_card_luhn_shape_redacted():
+    """A Luhn-valid card number in text must be redacted.
+
+    Uses a well-known Visa test PAN (4111111111111111). Written as split
+    literals + hyphenated form to test both variants."""
+    hyphenated = "4111-1111-1111-1111"
+    contiguous = "4111" + "111111111111"
+    for text in (hyphenated, contiguous):
+        result = scrub(f"Card: {text}")
+        assert hyphenated not in result.text
+        assert contiguous not in result.text
+        assert result.counts.get("credit_card", 0) >= 1
+
+
+def test_credit_card_luhn_invalid_not_flagged_by_regex_layer():
+    """A 16-digit run that FAILS the Luhn check must not be redacted by the
+    regex layer (Presidio may still catch it independently; that's a
+    separate layer). We invoke the private helper directly so this test is
+    Presidio-independent.
+    """
+    from aggregator.core.scrub import _scrub_credit_cards
+
+    counts: dict[str, int] = {}
+    bad = "1234-5678-1234-5678"  # Luhn-invalid
+    out = _scrub_credit_cards(f"num {bad} end", counts)
+    assert bad in out
+    assert counts.get("credit_card", 0) == 0
+
+
+def test_ipv4_address_redacted():
+    result = scrub("connect to 192.168.1.42 on port 8080")
+    assert "192.168.1.42" not in result.text
+    assert result.counts.get("ipv4", 0) >= 1
+
+
+def test_ipv6_address_redacted():
+    result = scrub("host at 2001:0db8:85a3:0000:0000:8a2e:0370:7334 lives")
+    assert "2001:0db8:85a3:0000:0000:8a2e:0370:7334" not in result.text
+    assert result.counts.get("ipv6", 0) >= 1
+
+
+def test_iban_shape_redacted():
+    """IBAN example (GB Nat West test IBAN, publicly documented format)."""
+    iban = "GB82WEST12345698765432"
+    result = scrub(f"send to {iban} thanks")
+    assert iban not in result.text
+    assert result.counts.get("iban", 0) >= 1

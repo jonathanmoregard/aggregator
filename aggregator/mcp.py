@@ -35,9 +35,9 @@ Pagination: opaque string token = string of an integer offset. v1 keeps this
 simple; if we ever need cursor-based pagination we swap the encoding without
 changing the tool signature.
 
-``claude_runner`` is imported for the seam even though this module doesn't
-call it directly — MCP-side agent enrichment might land in later milestones
-and keeping the import here documents the dependency at the surface layer.
+Note: the ``claude_runner`` import that used to live here was pure
+placeholder — MCP has no LLM call site (advisor round-1 MEDIUM: the
+"reserved seam" pattern lives in sources/ where enrichment might land).
 """
 from __future__ import annotations
 
@@ -46,7 +46,6 @@ import sqlite3
 from dataclasses import replace
 from typing import Any
 
-import claude_runner  # noqa: F401 -- reserved seam for MCP-side agent enrichment
 from fastmcp import FastMCP
 
 from aggregator.core.dsl import DSLError, format_help, parse
@@ -83,15 +82,11 @@ def _parse_page_token(token: str | None) -> int:
         return 0
 
 
-def _probe_fts_syntax(store: Store, text: str) -> None:
-    """Thin adapter around ``Store.probe_fts`` (kept for local naming).
-
-    ``Store.query`` swallows ``OperationalError`` to ``[]``; without this
-    probe we can't distinguish "bad query" from "no matches". Raises
-    ``sqlite3.OperationalError`` on syntax errors; caller converts to a
-    structured MCP error.
-    """
-    store.probe_fts(text)
+# Prior MCP versions had a private `_probe_fts_syntax(store, text)` helper
+# that reached into `store._c()`. That reach-through moved to a public
+# `Store.probe_fts(text)` in HIGH-3 (advisor MEDIUM: no more private
+# reach-through from the surface layer). Call sites use `store.probe_fts`
+# directly now.
 
 
 def _scrub_record(r: Record) -> Record:
@@ -175,7 +170,7 @@ def aggregator_query(
     #    matches").
     if ast.text:
         try:
-            _probe_fts_syntax(store, ast.text)
+            store.probe_fts(ast.text)
         except sqlite3.OperationalError as e:
             return {
                 "ok": False,

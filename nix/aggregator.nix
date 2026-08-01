@@ -15,11 +15,13 @@ in {
     sessions = {
       interval = lib.mkOption {
         type = lib.types.str;
-        default = "1h";
+        default = "30min";
         description = ''
           systemd OnCalendar interval for sessions ingest.
-          Note: the timer below uses the plan-specified "*:0/30" (every 30min);
-          set this option for documentation/override in downstream modules.
+          The timer below uses "*:0/30" (every 30min) to match the github
+          timer; set this option for documentation/override in downstream
+          modules (advisor round-1 MEDIUM: prior default was a misleading
+          "1h" that didn't match what the timer actually did).
         '';
       };
     };
@@ -59,8 +61,8 @@ in {
     systemd.user.timers.aggregator-sessions = {
       Unit.Description = "Aggregator: sessions ingest timer";
       Timer = {
-        # Plan §M4: sessions hourly; using "*:0/30" per plan step 2 comment.
-        # Adjust downstream by overriding this module if you need strict 1h.
+        # Both timers run every 30min ("*:0/30"). If you need a different
+        # cadence per source, override this via a downstream module.
         OnCalendar = "*:0/30";
         Persistent = true;
       };
