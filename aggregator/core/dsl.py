@@ -31,7 +31,22 @@ class DSLError(ValueError):
 
 # Reserved top-level keys. Everything else falls through to ``ast.extra`` so
 # per-source ``Source.search()`` can interpret its own vocabulary.
-KNOWN_KEYS = {"source", "tag", "from", "to"}
+#
+# v2 (Schema B) session-ontology keys:
+#   session:X   — everything under a session root (matches root_session_id;
+#                 includes any subagents spawned by that session).
+#   top:X       — only the top-level stream (matches session_id; excludes
+#                 subagents).
+#   agent:Y     — only rows belonging to the named subagent.
+#   type:T      — filter observations by type
+#                 (user|assistant|tool_use|tool_result|system|other).
+#   active:A..B — sessions whose activity window overlaps [A, B]
+#                 (first_ts <= B AND last_ts >= A). A or B may be omitted:
+#                 ``active:..2026-07-01`` or ``active:2026-07-01..``.
+KNOWN_KEYS = {
+    "source", "tag", "from", "to",
+    "session", "top", "agent", "type", "active",
+}
 
 _TOKEN_RE = re.compile(r"\S+")
 
@@ -61,6 +76,18 @@ def parse(query: str) -> QueryAST:
             ast.from_date = _parse_date(val, "from")
         elif key == "to":
             ast.to_date = _parse_date(val, "to")
+        elif key == "session":
+            ast.session_id = val
+        elif key == "top":
+            ast.top_session_id = val
+        elif key == "agent":
+            ast.agent_id = val
+        elif key == "type":
+            ast.obs_type = val
+        elif key == "active":
+            lo, hi = _parse_active_range(val)
+            ast.active_from = lo
+            ast.active_to = hi
         else:
             ast.extra[key] = val
     if text_bits:
@@ -79,6 +106,23 @@ def _parse_date(val: str, label: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def _parse_active_range(val: str) -> tuple[datetime | None, datetime | None]:
+    """Parse ``active:LO..HI`` (either side optional).
+
+    Examples: ``active:2026-07-30..2026-08-01``, ``active:..2026-07-30``,
+    ``active:2026-07-30..``. Empty string returns (None, None) — degenerate
+    but not an error.
+    """
+    if ".." not in val:
+        raise DSLError(
+            f"bad active: expected LO..HI or ..HI or LO.. (got {val!r})"
+        )
+    lo_str, _, hi_str = val.partition("..")
+    lo = _parse_date(lo_str, "active-from") if lo_str else None
+    hi = _parse_date(hi_str, "active-to") if hi_str else None
+    return lo, hi
 
 
 def format_help(
@@ -113,4 +157,17 @@ def format_help(
         "mergeable:conflict author:@me"
     )
     lines.append("  sessions: project:<name> model:<name>")
+    lines.append("")
+    lines.append("Session-ontology keys (v2, Schema B):")
+    lines.append("  session:<id>   everything under a session root (incl. subagents)")
+    lines.append("  top:<id>       only the top-level stream (no subagents)")
+    lines.append("  agent:<id>     only rows from that subagent")
+    lines.append(
+        "  type:<T>       observations of type user|assistant|tool_use|"
+        "tool_result|system|other"
+    )
+    lines.append(
+        "  active:LO..HI  sessions whose activity window overlaps [LO, HI] "
+        "(dates ISO8601)"
+    )
     return "\n".join(lines)
