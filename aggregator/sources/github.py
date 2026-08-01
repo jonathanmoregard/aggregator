@@ -276,23 +276,34 @@ class GitHubSource:
         skipped — partial ingest beats total loss (spec §Error handling).
         The caller (``cli._cmd_ingest``) is responsible for persistence.
 
-        Note: ``since`` is not applied here because the search endpoints
-        already return only records the user cares about; the store's
-        upsert path handles freshness by stable-ID overwrite.
+        Round-2 HIGH: when ``since`` is truthy, append GitHub search's
+        ``+updated:>=YYYY-MM-DD`` qualifier to each endpoint path so the
+        API returns only records touched in the window we care about
+        (pre-fix, every timer fire refetched lifetime PRs/issues).
         """
         self._check_scopes()
-        _ = since
         for kind, subkind, path in self._ENDPOINTS:
+            scoped_path = self._apply_since(path, since)
             try:
-                rows = self._api_fetcher(path)
+                rows = self._api_fetcher(scoped_path)
             except Exception as e:  # noqa: BLE001 -- degrade gracefully
-                log.warning("gh api %s failed during iter_records: %s", path, e)
+                log.warning("gh api %s failed during iter_records: %s", scoped_path, e)
                 continue
             for row in rows:
                 if kind == "pr":
                     yield self._pr_to_record(row)
                 else:
                     yield self._issue_to_record(row, kind=subkind)
+
+    @staticmethod
+    def _apply_since(path: str, since: datetime | None) -> str:
+        """Append ``+updated:>=YYYY-MM-DD`` to a search path when ``since``
+        is truthy. All four ``_ENDPOINTS`` already contain a ``q=`` segment
+        with ``+``-joined qualifiers, so appending is safe. Day-precision
+        matches GitHub search's supported granularity."""
+        if not since:
+            return path
+        return f"{path}+updated:>={since.strftime('%Y-%m-%d')}"
 
     def ingest(self, since: datetime | None) -> IngestResult:
         """Count-only path retained for protocol compat + integration tests.

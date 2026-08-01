@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -331,3 +332,51 @@ def test_record_shape_documents_filters():
     assert "mergeable" in shape
     assert "author" in shape
     assert "checks" in shape
+
+
+# -- since window pushed down to GitHub search (round-2 HIGH) --------------
+
+
+def test_iter_records_appends_updated_filter_to_all_endpoints(monkeypatch):
+    """Round-2 HIGH: pre-fix, ``iter_records`` had ``_ = since`` and refetched
+    lifetime of PRs/issues on every timer fire. Post-fix, a truthy ``since``
+    must be pushed into the GitHub search query as ``+updated:>=YYYY-MM-DD``
+    so the endpoint returns only the freshness window we want.
+    """
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+    called_paths: list[str] = []
+
+    def spy(path: str) -> list[dict]:
+        called_paths.append(path)
+        return []
+
+    src = GitHubSource(
+        _scope_fetcher=lambda: ["public_repo"],
+        _api_fetcher=spy,
+    )
+    since = datetime(2026, 7, 1, tzinfo=UTC)
+    list(src.iter_records(since=since))
+    assert len(called_paths) == 4  # all four endpoints
+    for path in called_paths:
+        assert "+updated:>=2026-07-01" in path, (
+            f"expected since window pushed into path, got: {path}"
+        )
+
+
+def test_iter_records_omits_updated_filter_when_since_is_none(monkeypatch):
+    """No ``since`` = no filter; behaviour unchanged from the pre-fix path."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+    called_paths: list[str] = []
+
+    def spy(path: str) -> list[dict]:
+        called_paths.append(path)
+        return []
+
+    src = GitHubSource(
+        _scope_fetcher=lambda: ["public_repo"],
+        _api_fetcher=spy,
+    )
+    list(src.iter_records(since=None))
+    assert len(called_paths) == 4
+    for path in called_paths:
+        assert "+updated:" not in path
