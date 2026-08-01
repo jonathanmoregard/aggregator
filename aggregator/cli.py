@@ -28,7 +28,7 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from aggregator.core.store import Store
+from aggregator.core.store import EmptyRebuildRefusedError, Store
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
@@ -109,8 +109,18 @@ def _cmd_ingest(
     # sources that only implement ``ingest()`` fall through to the legacy
     # count-only path (kept for the existing dispatch smoke test).
     if hasattr(src, "iter_records"):
+        errors: list[str] = []
         try:
-            records = list(src.iter_records(since))
+            # Round-3 HIGH/MEDIUM#3: plumb the errors sink into iter_records
+            # so we can (a) refuse a wipe when every endpoint degrades to []
+            # with errors present and (b) surface warnings post-ingest.
+            # Older iter_records signatures without an ``errors`` kwarg
+            # (e.g. the CLI persistence stub) are handled via TypeError
+            # fallback so we don't break narrow test doubles.
+            try:
+                records = list(src.iter_records(since, errors=errors))
+            except TypeError:
+                records = list(src.iter_records(since))
         except Exception as e:  # noqa: BLE001 -- surface as CLI error, don't crash
             print(f"ingest {args.source} failed: {e}", file=sys.stderr)
             return 1
@@ -119,11 +129,38 @@ def _cmd_ingest(
         # for the source. Without --rebuild the plain upsert path is fine
         # (idempotent per stable_id; no destructive prior step).
         if args.rebuild:
-            store.rebuild_and_upsert(args.source, records)
+            # Round-3 HIGH: refuse a rebuild that would silently wipe rows.
+            # Two overlapping conditions trip the refusal:
+            #   (a) records is empty AND at least one endpoint reported an
+            #       error — classic transient-failure wipe pattern;
+            #   (b) records is empty AND the store currently holds rows for
+            #       this source — historical data is at stake, so demand
+            #       positive evidence (a nonzero record set) before allowing
+            #       the DELETE to commit.
+            existing = store.count_by_source(args.source)
+            if not records and (errors or existing > 0):
+                print(
+                    f"ERROR: refusing to rebuild {args.source}: iterator "
+                    f"yielded 0 records but {len(errors)} errors occurred "
+                    f"(store has {existing} existing rows); store left intact",
+                    file=sys.stderr,
+                )
+                for e in errors[:5]:
+                    print(f"  error: {e}", file=sys.stderr)
+                return 1
+            # Belt-and-braces: pass the store guard too, in case a future
+            # caller reaches this path without the CLI's early return.
+            min_records = 1 if existing > 0 else 0
+            try:
+                store.rebuild_and_upsert(
+                    args.source, records, min_records=min_records
+                )
+            except EmptyRebuildRefusedError as e:
+                print(f"ERROR: {e}; store left intact", file=sys.stderr)
+                return 1
         else:
             store.upsert(records)
         added = len(records)
-        errors: list[str] = []
     else:
         result = src.ingest(since=since)
         added = result.added

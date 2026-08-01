@@ -40,6 +40,21 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
+
+class EmptyRebuildRefusedError(RuntimeError):
+    """Raised by ``Store.rebuild_and_upsert`` when the incoming record list is
+    smaller than the caller-declared ``min_records`` floor.
+
+    Round-3 HIGH: ``rebuild_and_upsert`` runs a DELETE + upsert atomically,
+    so calling it with an empty list DELETEs every row for the source and
+    commits. That's a silent wipe when the caller genuinely had records the
+    last time round and the current pass just failed to fetch them (network
+    hiccup, upstream outage). Callers that know the source has held records
+    before pass ``min_records=1`` to trip this guard rather than allow the
+    wipe. Kept as its own type (not RuntimeError) so CLI/MCP callers can
+    catch it specifically and turn it into a structured refusal.
+    """
+
 _DDL: list[str] = [
     """
     CREATE TABLE IF NOT EXISTS records (
@@ -194,7 +209,11 @@ class Store:
         c.commit()
 
     def rebuild_and_upsert(
-        self, source: str, records: Iterable[Record]
+        self,
+        source: str,
+        records: Iterable[Record],
+        *,
+        min_records: int = 0,
     ) -> None:
         """Atomic replacement of one source's rows.
 
@@ -208,70 +227,93 @@ class Store:
         ``records`` may be a lazy iterable (e.g. a source generator); it
         is materialised inside the transaction so that generator faults
         also trigger the rollback.
+
+        Round-3 HIGH: ``min_records`` is a belt-and-braces guard against
+        silent wipes. When the caller knows this source has historically
+        held rows, passing ``min_records=1`` causes an empty (or short)
+        record list to raise ``EmptyRebuildRefusedError`` *before* any DELETE
+        runs — so a transient upstream failure that degrades every
+        endpoint to ``[]`` can't atomically DELETE-commit the store empty.
+        Default ``min_records=0`` preserves the pre-fix API (some callers
+        legitimately want to clear a source).
         """
+        # Materialise BEFORE opening the savepoint so the guard runs on the
+        # real record count. Generator faults during materialisation propagate
+        # naturally to the caller without touching the DB.
+        record_list = list(records)
+        if len(record_list) < min_records:
+            raise EmptyRebuildRefusedError(
+                f"refusing to rebuild {source!r}: got {len(record_list)} "
+                f"records, min_records={min_records}"
+            )
         c = self._c()
-        # Explicit BEGIN — sqlite3's autocommit boundary can otherwise
-        # end the implicit transaction at an unexpected point.
+        # SAVEPOINT groups the DELETE + writes so a fault mid-upsert rolls
+        # back to the pre-rebuild state (avoids the non-atomic gap the
+        # standalone ``rebuild()`` still has). Prefer a savepoint over
+        # explicit BEGIN because sqlite3's autocommit boundary can otherwise
+        # end an implicit transaction at an unexpected point.
         c.execute("SAVEPOINT rebuild_and_upsert")
         try:
             c.execute("DELETE FROM records WHERE source = ?", (source,))
             c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
-            # Materialise inside the savepoint so generator faults roll back.
-            record_list = list(records)
-            self._upsert_no_commit(record_list)
+
+            # Local closure (round-3 MEDIUM #2): keep the write path inside
+            # the savepoint scope rather than exposing it as a module-level
+            # "private-by-underscore" method that callers could reach past
+            # the transaction. Body kept in lockstep with ``upsert``; if the
+            # write path grows a new field, update both.
+            def _do_write(records: list[Record]) -> None:
+                for r in records:
+                    scrubbed_body = scrub(r.body).text
+                    scrubbed_subject = scrub(r.subject).text
+                    c.execute(
+                        """
+                        INSERT INTO records(
+                            stable_id, source, subject, body, tags,
+                            created_at, updated_at, extra
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(stable_id) DO UPDATE SET
+                            subject    = excluded.subject,
+                            body       = excluded.body,
+                            tags       = excluded.tags,
+                            updated_at = excluded.updated_at,
+                            extra      = excluded.extra
+                        """,
+                        (
+                            r.stable_id,
+                            r.source,
+                            scrubbed_subject,
+                            scrubbed_body,
+                            json.dumps(r.tags),
+                            r.created_at.isoformat() if r.created_at else None,
+                            r.updated_at.isoformat() if r.updated_at else None,
+                            json.dumps(r.extra, default=str),
+                        ),
+                    )
+                    c.execute(
+                        "DELETE FROM records_fts WHERE stable_id = ?",
+                        (r.stable_id,),
+                    )
+                    c.execute(
+                        "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            r.stable_id,
+                            r.source,
+                            scrubbed_subject,
+                            scrubbed_body,
+                            " ".join(r.tags),
+                        ),
+                    )
+
+            _do_write(record_list)
         except BaseException:
             c.execute("ROLLBACK TO SAVEPOINT rebuild_and_upsert")
             c.execute("RELEASE SAVEPOINT rebuild_and_upsert")
             raise
         c.execute("RELEASE SAVEPOINT rebuild_and_upsert")
         c.commit()
-
-    def _upsert_no_commit(self, records: list[Record]) -> None:
-        """Same as ``upsert`` but does not commit — used inside a
-        transaction by ``rebuild_and_upsert`` so DELETE + writes commit
-        atomically. Body kept in lockstep with ``upsert``; if the write
-        path grows a new field, update both."""
-        c = self._c()
-        for r in records:
-            scrubbed_body = scrub(r.body).text
-            scrubbed_subject = scrub(r.subject).text
-            c.execute(
-                """
-                INSERT INTO records(
-                    stable_id, source, subject, body, tags,
-                    created_at, updated_at, extra
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(stable_id) DO UPDATE SET
-                    subject    = excluded.subject,
-                    body       = excluded.body,
-                    tags       = excluded.tags,
-                    updated_at = excluded.updated_at,
-                    extra      = excluded.extra
-                """,
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    json.dumps(r.tags),
-                    r.created_at.isoformat() if r.created_at else None,
-                    r.updated_at.isoformat() if r.updated_at else None,
-                    json.dumps(r.extra, default=str),
-                ),
-            )
-            c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
-            c.execute(
-                "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    " ".join(r.tags),
-                ),
-            )
 
     # -- reads ---------------------------------------------------------------
 
@@ -389,6 +431,20 @@ class Store:
             return sum(1 for row in id_rows if row["stable_id"] in fts_ids)
         row = c.execute(
             f"SELECT COUNT(*) AS n FROM records WHERE {where}", params
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def count_by_source(self, source: str) -> int:
+        """Return the number of rows currently held for ``source``.
+
+        Cheap COUNT used by the CLI's ``--rebuild`` guard (round-3 HIGH) to
+        decide whether an empty new record set is "safe to write" (source
+        was already empty — no wipe risk) or "refuse" (source had rows —
+        an empty new set would silently wipe them).
+        """
+        c = self._c()
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM records WHERE source = ?", (source,)
         ).fetchone()
         return int(row["n"]) if row else 0
 
