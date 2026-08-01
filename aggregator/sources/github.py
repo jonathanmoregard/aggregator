@@ -14,8 +14,12 @@ import subprocess
 from collections.abc import Callable, Iterator
 from datetime import datetime
 
-import claude_runner  # noqa: F401 -- reserved: LLM wrapper for future ingest enrichment.
-
+# Reserved seam: LLM wrapper for future ingest enrichment (see spec §Error
+# handling). v1 makes no LLM calls, so the import previously wired here was
+# dropped (advisor round-2 BLOCKER: sessions.py had already dropped its
+# equivalent; github.py still carried the dead import). When enrichment
+# lands, wire the runner at the call site, not as an unused module-level
+# import.
 from aggregator.sources.base import IngestResult, QueryAST, Record, stable_id_for
 
 log = logging.getLogger(__name__)
