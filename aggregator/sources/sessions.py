@@ -12,7 +12,7 @@ import time
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Reserved seam: LLM wrapper for future ingest enrichment (see spec §Error
@@ -162,8 +162,24 @@ class SessionsSource:
         sink = errors if errors is not None else []
         for path in self._iter_jsonl_files():
             for agg in self._parse_file(path, sink):
-                if since and agg.ended and agg.ended < since:
-                    continue
+                if since and agg.ended:
+                    # Round-3 LOW: JSONL logs with a Z suffix parse to
+                    # UTC-aware; logs missing tz yield naive datetimes.
+                    # Comparing naive < aware raises TypeError in Py3 —
+                    # a malformed log used to abort the whole ingest.
+                    # Normalise both sides to UTC-aware for the compare.
+                    ended = (
+                        agg.ended
+                        if agg.ended.tzinfo is not None
+                        else agg.ended.replace(tzinfo=UTC)
+                    )
+                    since_utc = (
+                        since
+                        if since.tzinfo is not None
+                        else since.replace(tzinfo=UTC)
+                    )
+                    if ended < since_utc:
+                        continue
                 yield self._to_record(agg, source_path=path)
 
     def _to_record(self, agg: _SessionAggregate, source_path: Path) -> Record:

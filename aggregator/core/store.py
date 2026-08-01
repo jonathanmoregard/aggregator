@@ -225,8 +225,10 @@ class Store:
         back to the pre-rebuild state.
 
         ``records`` may be a lazy iterable (e.g. a source generator); it
-        is materialised inside the transaction so that generator faults
-        also trigger the rollback.
+        is materialised *before* the savepoint opens so the ``min_records``
+        guard runs against the real count and no DELETE fires when the
+        guard trips. Generator faults during materialisation propagate to
+        the caller without touching the DB (nothing has been DELETEd yet).
 
         Round-3 HIGH: ``min_records`` is a belt-and-braces guard against
         silent wipes. When the caller knows this source has historically

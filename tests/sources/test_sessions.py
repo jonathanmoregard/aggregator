@@ -63,3 +63,33 @@ def test_record_shape_documents_extra_fields():
     assert "session_id" in shape
     assert "project" in shape
     assert "model" in shape
+
+
+def test_iter_records_since_handles_naive_ended_without_typeerror(tmp_path):
+    """Round-3 LOW: sessions log lines with a ``Z`` suffix parse into
+    UTC-aware datetimes, but a fixture that omits the ``Z`` (or any tz)
+    yields a naive ``ended``. Comparing naive < aware raises TypeError in
+    Python 3, so an old/malformed log used to abort the whole ingest.
+
+    Fix: normalise both sides to UTC-aware for the comparison (or skip the
+    record when ``ended`` is naive — either is fine, but no TypeError).
+    """
+    from datetime import UTC, datetime
+
+    jsonl = tmp_path / "naive.jsonl"
+    jsonl.write_text(
+        '{"type": "session_start", "session_id": "sess-naive", '
+        '"cwd": "/x", "started_at": "2026-07-01T10:00:00Z", "model": "m"}\n'
+        '{"type": "user", "text": "hi"}\n'
+        '{"type": "session_end", "ended_at": "2026-07-20T10:00:00"}\n'
+    )
+    old = time.time() - 24 * 60 * 60
+    os.utime(jsonl, (old, old))
+
+    src = SessionsSource(projects_root=str(tmp_path))
+    aware_since = datetime(2026, 7, 15, tzinfo=UTC)
+    # Pre-fix: TypeError raised here. Post-fix: iteration completes
+    # (either yielding the record or skipping it, both are acceptable).
+    records = list(src.iter_records(since=aware_since))
+    # No assertion on count — the important thing is "did not TypeError".
+    assert isinstance(records, list)
