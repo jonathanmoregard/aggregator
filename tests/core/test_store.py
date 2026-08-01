@@ -8,6 +8,7 @@ The store owns four contracts:
   (stable-ID discipline, spec constraint 5).
 * Every write goes through the scrubber (defense in depth, spec constraint 3).
 """
+import contextlib
 from datetime import UTC, datetime
 
 from aggregator.core.store import Store
@@ -227,6 +228,70 @@ def test_store_probe_fts_public(tmp_data_home):
     import pytest as _pytest
     with _pytest.raises(sqlite3.OperationalError):
         s.probe_fts('"unterminated')
+
+
+# --- MEDIUM (round-2): atomic rebuild_and_upsert --------------------------
+
+
+def test_rebuild_and_upsert_rolls_back_on_error(tmp_data_home):
+    """Round-2 MEDIUM: pre-fix, ``store.rebuild`` committed the DELETE
+    immediately; if the caller's subsequent ``upsert`` faulted the store
+    was left empty. Post-fix, ``rebuild_and_upsert`` runs the DELETE +
+    upsert inside a single transaction so a failure mid-upsert rolls
+    back to the pre-rebuild state.
+    """
+    s = Store()
+    s.migrate()
+    original = [
+        _rec("sessions:a", "sessions", "sa", "body a"),
+        _rec("sessions:b", "sessions", "sb", "body b"),
+        _rec("sessions:c", "sessions", "sc", "body c"),
+    ]
+    s.upsert(original)
+
+    class Boom:
+        """Iterable that yields one good record then raises. Simulates a
+        source that faults partway through iteration."""
+
+        def __iter__(self):
+            yield _rec("sessions:new", "sessions", "sn", "body new")
+            raise RuntimeError("simulated source fault")
+
+    with contextlib.suppress(RuntimeError):
+        s.rebuild_and_upsert("sessions", Boom())  # expected to raise
+
+    # Original 3 rows must still be present; the partial "sessions:new" must
+    # NOT be committed.
+    rows = s.query(QueryAST(source="sessions"))
+    ids = {r.stable_id for r in rows}
+    assert ids == {"sessions:a", "sessions:b", "sessions:c"}, (
+        f"rebuild_and_upsert should have rolled back; got {ids}"
+    )
+
+
+def test_rebuild_and_upsert_replaces_source_atomically(tmp_data_home):
+    """Happy path: successful call clears old rows and writes new ones,
+    leaving other sources untouched."""
+    s = Store()
+    s.migrate()
+    s.upsert(
+        [
+            _rec("sessions:old1", "sessions", "o1", "old body 1"),
+            _rec("sessions:old2", "sessions", "o2", "old body 2"),
+            _rec("github:owner/repo:1", "github", "pr", "unrelated"),
+        ]
+    )
+    s.rebuild_and_upsert(
+        "sessions",
+        [
+            _rec("sessions:new1", "sessions", "n1", "new body 1"),
+        ],
+    )
+    session_rows = s.query(QueryAST(source="sessions"))
+    assert {r.stable_id for r in session_rows} == {"sessions:new1"}
+    # Other source untouched.
+    gh_rows = s.query(QueryAST(source="github"))
+    assert {r.stable_id for r in gh_rows} == {"github:owner/repo:1"}
 
 
 def test_store_wraps_records_on_return(tmp_data_home):

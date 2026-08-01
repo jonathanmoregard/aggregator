@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sqlite3
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 
@@ -181,11 +182,96 @@ class Store:
         Stable-ID persistence is guaranteed because the source's stable_id
         function is deterministic on its external key (owner/repo:number,
         session_uuid, etc.), so re-ingesting yields the same IDs.
+
+        NB: this method commits immediately. If the caller subsequently
+        faults during upsert the store is left empty for that source.
+        For a rebuild that must be all-or-nothing, prefer
+        ``rebuild_and_upsert`` (round-2 MEDIUM).
         """
         c = self._c()
         c.execute("DELETE FROM records WHERE source = ?", (source,))
         c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
         c.commit()
+
+    def rebuild_and_upsert(
+        self, source: str, records: Iterable[Record]
+    ) -> None:
+        """Atomic replacement of one source's rows.
+
+        Round-2 MEDIUM: the two-step ``rebuild()`` + ``upsert()`` sequence
+        the CLI used to run was non-atomic — the DELETE committed
+        immediately, so a fault during upsert (bad row, disk full, source
+        yielding partway) left the store empty. This method runs the
+        DELETE + upsert inside a single transaction so a failure rolls
+        back to the pre-rebuild state.
+
+        ``records`` may be a lazy iterable (e.g. a source generator); it
+        is materialised inside the transaction so that generator faults
+        also trigger the rollback.
+        """
+        c = self._c()
+        # Explicit BEGIN — sqlite3's autocommit boundary can otherwise
+        # end the implicit transaction at an unexpected point.
+        c.execute("SAVEPOINT rebuild_and_upsert")
+        try:
+            c.execute("DELETE FROM records WHERE source = ?", (source,))
+            c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
+            # Materialise inside the savepoint so generator faults roll back.
+            record_list = list(records)
+            self._upsert_no_commit(record_list)
+        except BaseException:
+            c.execute("ROLLBACK TO SAVEPOINT rebuild_and_upsert")
+            c.execute("RELEASE SAVEPOINT rebuild_and_upsert")
+            raise
+        c.execute("RELEASE SAVEPOINT rebuild_and_upsert")
+        c.commit()
+
+    def _upsert_no_commit(self, records: list[Record]) -> None:
+        """Same as ``upsert`` but does not commit — used inside a
+        transaction by ``rebuild_and_upsert`` so DELETE + writes commit
+        atomically. Body kept in lockstep with ``upsert``; if the write
+        path grows a new field, update both."""
+        c = self._c()
+        for r in records:
+            scrubbed_body = scrub(r.body).text
+            scrubbed_subject = scrub(r.subject).text
+            c.execute(
+                """
+                INSERT INTO records(
+                    stable_id, source, subject, body, tags,
+                    created_at, updated_at, extra
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stable_id) DO UPDATE SET
+                    subject    = excluded.subject,
+                    body       = excluded.body,
+                    tags       = excluded.tags,
+                    updated_at = excluded.updated_at,
+                    extra      = excluded.extra
+                """,
+                (
+                    r.stable_id,
+                    r.source,
+                    scrubbed_subject,
+                    scrubbed_body,
+                    json.dumps(r.tags),
+                    r.created_at.isoformat() if r.created_at else None,
+                    r.updated_at.isoformat() if r.updated_at else None,
+                    json.dumps(r.extra, default=str),
+                ),
+            )
+            c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
+            c.execute(
+                "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    r.stable_id,
+                    r.source,
+                    scrubbed_subject,
+                    scrubbed_body,
+                    " ".join(r.tags),
+                ),
+            )
 
     # -- reads ---------------------------------------------------------------
 

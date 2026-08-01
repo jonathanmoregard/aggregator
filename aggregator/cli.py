@@ -114,7 +114,14 @@ def _cmd_ingest(
         except Exception as e:  # noqa: BLE001 -- surface as CLI error, don't crash
             print(f"ingest {args.source} failed: {e}", file=sys.stderr)
             return 1
-        store.upsert(records)
+        # Round-2 MEDIUM: when --rebuild is set, run the DELETE + upsert
+        # atomically so a fault during upsert can't leave the store empty
+        # for the source. Without --rebuild the plain upsert path is fine
+        # (idempotent per stable_id; no destructive prior step).
+        if args.rebuild:
+            store.rebuild_and_upsert(args.source, records)
+        else:
+            store.upsert(records)
         added = len(records)
         errors: list[str] = []
     else:
@@ -174,8 +181,11 @@ def main(
     if args.cmd == "status":
         return _cmd_status(args, store)
     if args.cmd == "ingest":
-        if args.rebuild:
-            store.rebuild(args.source)
+        # Round-2 MEDIUM: the atomic DELETE + upsert lives inside
+        # ``_cmd_ingest`` via ``store.rebuild_and_upsert`` when
+        # ``args.rebuild`` is set. Do NOT call ``store.rebuild`` here —
+        # doing so would commit the DELETE before the transaction and
+        # reintroduce the non-atomic gap this fix closes.
         return _cmd_ingest(args, store, sources)
     return 2
 
