@@ -1,24 +1,41 @@
-"""Sessions source: walk Claude Code JSONL project logs into Records.
+"""Sessions source (v2, Schema B): emit ``SessionRow`` + ``ObservationRow``.
 
-Skips files modified within the last 5 minutes (live session heuristic).
-Corrupt JSONL lines are skipped and logged, never abort the ingest.
+Walks ``~/.claude/projects/**/*.jsonl``. Each JSONL line becomes one
+``ObservationRow``; each unique (file, sessionId) pair becomes one
+``SessionRow``. Subagent files (``<sessionId>/subagents/agent-<agentId>.jsonl``)
+become ``kind='subagent'`` sessions with synthesized composite key
+``<parentSessionId>:<agentId>`` and ``parent_session_id`` derived from the
+parent dir name.
 
-Real Claude Code JSONL shape (empirically verified 2026-08-01):
-    Per-line JSON with a ``type`` field. There is NO synthetic
-    ``session_start`` / ``session_end`` bracketing — sessions are
-    identified by the ``sessionId`` field present on every message-type
-    line. Types observed include ``queue-operation`` (control, no cwd),
-    ``user``, ``assistant``, ``system``, ``rate_limit_event``,
-    ``tool_use``, ``tool_result``, ``permission-mode``,
-    ``file-history-snapshot``, ``attachment``, ``last-prompt``.
+Design decisions (documented for the migration):
 
-    Only ``user`` / ``assistant`` lines carry conversational content in
-    ``message.content`` (list of blocks: ``text``, ``tool_use``,
-    ``tool_result``, ``thinking``, ...). ``message.model`` appears on
-    assistant lines. Timestamps are ISO-8601 with ``Z``.
-
-    Grouping is per ``sessionId`` INSIDE each file (rare but possible
-    to see mixed sessionIds in one file — we handle it).
+* **Row-per-JSONL-line granularity** (spec §Work step 2). One observation per
+  line — mirrors the file's own event granularity. Multi-block ``message.content``
+  is collapsed: first text block into ``body``, first tool_use/tool_result block
+  into ``tool_name`` / ``tool_use_id``. Multi-block messages are rare in
+  practice; the collapse keeps queries simple. If richer per-block indexing is
+  ever needed, split into multiple observations with synthesized child uuids.
+* **Subagent detection**: by path first (``/subagents/agent-*.jsonl``) — the
+  authoritative signal in current Claude Code layouts (2.1.x per research §5).
+  Fallback: if every line has ``isSidechain: true``, treat as subagent even
+  outside the expected path (legacy root-level layout).
+* **Resume prefix-copy**: JSONL files under ``--resume`` start with a prefix
+  copy of the parent session under the OLD sessionId, then switch to the NEW
+  sessionId. We detect the switch and only ingest lines under the file's
+  DOMINANT sessionId (the one the file was named after), matching research
+  §5's guidance ("only ingest the NEW-sessionId portion under the new
+  sessionId"). Non-matching-sessionId lines are dropped for that file — they
+  belong to the parent file's stream.
+* **Spawned_by_tool_use_id recovery**: best-effort. On first pass we collect
+  Task ``tool_use`` entries per parent session with their ts + tool_use_id.
+  On second pass, for each subagent, we look up Task calls in the parent whose
+  ts is <= the subagent's first observation ts (closest predecessor within a
+  60s window). Store ``None`` when ambiguous — concurrent subagents produce
+  overlapping Task windows.
+* **Live-file skip** (5-min window) preserved. File mtime is a container
+  signal, per research §5 (never the source of truth for observation ts).
+* **Timestamps** parsed from record ``timestamp``; session ``first_ts`` /
+  ``last_ts`` = min/max across the session's own observations.
 """
 from __future__ import annotations
 
@@ -26,109 +43,151 @@ import json
 import logging
 import os
 import time
-from collections import Counter
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-# Reserved seam: LLM wrapper for future ingest enrichment (see spec §Error
-# handling). v1 makes no LLM calls, so the import previously wired here was
-# dropped (advisor round-1 MEDIUM: dead `run_sync` import). When enrichment
-# lands, wire the runner at the call site, not as an unused module-level
-# import.
-from aggregator.sources.base import IngestResult, QueryAST, Record
+from aggregator.sources.base import (
+    IngestResult,
+    ObservationRow,
+    SessionEntity,
+    SessionRow,
+)
 
 log = logging.getLogger(__name__)
 
 LIVE_WINDOW_SECONDS = 5 * 60
+SPAWN_LOOKBACK_SECONDS = 60  # Task tool_use → subagent-start ts window
 
-# Line ``type`` values that carry no conversational content — skipped for
-# text extraction but still consulted for ``sessionId`` grouping when the
-# field is present (rare; control lines usually omit it or share the file's
-# sole session).
-_CONTROL_TYPES = frozenset(
-    {
-        "queue-operation",
-        "permission-mode",
-        "file-history-snapshot",
-        "attachment",
-        "last-prompt",
-        "rate_limit_event",
-        "system",
-    }
+
+# Line ``type`` values we still record (as observations of type ``system`` or
+# ``other``) but that carry no message.content. We keep them because the model
+# ``system`` events sometimes carry noteworthy state (permission-mode,
+# rate_limit_event). Nothing here is dropped; the ``type`` column preserves
+# provenance.
+_KNOWN_TYPES = frozenset(
+    {"user", "assistant", "tool_use", "tool_result", "system"}
 )
-
-
-def _project_from_cwd(cwd: str) -> str:
-    """Encoded cwd -> short project label (last path component)."""
-    if not cwd:
-        return "unknown"
-    return Path(cwd).name or "unknown"
 
 
 def _parse_iso(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
 
 
-def _extract_text(content: Any) -> str:
-    """Flatten a message.content payload into plain text.
+def _has_tool_result_block(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content
+    )
 
-    Real content is either a string (older sessions) or a list of blocks
-    like ``{"type": "text", "text": "..."}``. Non-text blocks (tool_use,
-    tool_result, thinking) are skipped for the conversational body — the
-    tool call counter picks up ``tool_use`` names separately.
+
+def _extract_text_and_tools(content: Any) -> tuple[str, str | None, str | None]:
+    """From a ``message.content`` payload return ``(body_text, tool_name, tool_use_id)``.
+
+    Per the design decision (docstring §Row-per-JSONL-line granularity):
+
+    * ``body_text`` = first ``text`` block's ``text`` (or the whole thing when
+      ``content`` is a bare string). Multi-block bodies collapse to the first
+      text; documented tradeoff.
+    * ``tool_name`` = first ``tool_use.name`` block's name, if any.
+    * ``tool_use_id`` = first ``tool_use.id`` OR ``tool_result.tool_use_id``.
+
+    Both tool fields may be non-None simultaneously — assistant messages can
+    interleave text + tool_use in one message.content list.
     """
     if content is None:
-        return ""
+        return "", None, None
     if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text":
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
-    # Unknown shape — degrade to str() so callers still see something.
-    return str(content)
-
-
-def _iter_tool_use_names(content: Any) -> Iterator[str]:
-    """Yield tool_use ``name`` values from an assistant message.content list."""
+        return content, None, None
     if not isinstance(content, list):
-        return
+        return str(content), None, None
+
+    body_text = ""
+    tool_name: str | None = None
+    tool_use_id: str | None = None
     for block in content:
-        if isinstance(block, dict) and block.get("type") == "tool_use":
-            name = block.get("name")
-            if isinstance(name, str) and name:
-                yield name
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text" and not body_text:
+            t = block.get("text")
+            if isinstance(t, str):
+                body_text = t
+        elif btype == "tool_use" and tool_name is None:
+            n = block.get("name")
+            if isinstance(n, str):
+                tool_name = n
+            tid = block.get("id")
+            if isinstance(tid, str) and tool_use_id is None:
+                tool_use_id = tid
+        elif btype == "tool_result" and tool_use_id is None:
+            tid = block.get("tool_use_id")
+            if isinstance(tid, str):
+                tool_use_id = tid
+            # Record tool_result content as body text so FTS catches it.
+            if not body_text:
+                rc = block.get("content")
+                if isinstance(rc, str):
+                    body_text = rc
+                elif isinstance(rc, list):
+                    for sub in rc:
+                        if isinstance(sub, dict) and sub.get("type") == "text":
+                            t = sub.get("text")
+                            if isinstance(t, str):
+                                body_text = t
+                                break
+        elif btype == "thinking" and not body_text:
+            t = block.get("text") or block.get("thinking")
+            if isinstance(t, str):
+                body_text = t
+    return body_text, tool_name, tool_use_id
 
 
 @dataclass
-class _SessionAggregate:
+class _ParsedLine:
+    """One JSONL line, parsed enough to bucket into sessions."""
+
     session_id: str
-    project: str = "unknown"
-    started: datetime | None = None
-    ended: datetime | None = None
-    model: str = ""
-    cost_usd: float | None = None
-    user_turns: list[str] = field(default_factory=list)
-    assistant_turns: list[str] = field(default_factory=list)
-    tool_call_counter: Counter = field(default_factory=Counter)
-    first_user_prompt: str = ""
+    uuid: str
+    parent_uuid: str | None
+    ts: datetime | None
+    line_type: str
+    is_sidechain: bool
+    agent_id: str | None
+    agent_type: str | None
+    cwd: str | None
+    git_branch: str | None
+    body: str
+    tool_name: str | None
+    tool_use_id: str | None
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
 
 
 class SessionsSource:
+    """v2 sessions source. Yields ``SessionRow`` + ``ObservationRow``.
+
+    Ingest lifecycle (called from CLI):
+    1. First pass — walk every JSONL, collect Task ``tool_use`` ts+id per
+       top-level session (for spawn-id recovery).
+    2. Second pass — walk every JSONL, emit sessions + observations. Subagents
+       receive ``spawned_by_tool_use_id`` from the pass-1 index when a unique
+       predecessor exists.
+    """
+
     name = "sessions"
 
     def __init__(self, projects_root: str | None = None):
@@ -139,17 +198,29 @@ class SessionsSource:
     def record_shape(self) -> dict[str, str]:
         return {
             "session_id": "str",
-            "project": "str (last path segment of cwd)",
-            "started": "datetime UTC",
-            "ended": "datetime UTC",
-            "model": "str",
-            "cost_usd": "float | None (real logs carry usage, not cost)",
-            "first_user_prompt": "str",
-            "top_tool_calls": "list[{name, count}]",
-            "tail_summary": "str (last user + assistant turn)",
+            "root_session_id": "str",
+            "parent_session_id": "str | None",
+            "kind": "'session' | 'subagent'",
+            "agent_id": "str | None",
+            "agent_type": "str | None",
+            "spawned_by_tool_use_id": "str | None (recovered from Task tool_use window)",
+            "cwd": "str | None",
+            "git_branch": "str | None",
+            "first_ts": "datetime (min message ts)",
+            "last_ts": "datetime (max message ts)",
+            "obs_type": "'user'|'assistant'|'tool_use'|'tool_result'|'system'|'other'",
         }
 
+    # -- filesystem walk --------------------------------------------------
+
     def _iter_jsonl_files(self) -> Iterator[Path]:
+        """Yield every non-live JSONL under the projects root.
+
+        Live-file skip (5-min window) matches v1 semantics — an actively
+        appended file could split observations mid-record. File mtime is a
+        container signal only (research §5); we still consult it here to
+        avoid reading a partial line.
+        """
         if not self.projects_root.exists():
             return
         now = time.time()
@@ -162,34 +233,137 @@ class SessionsSource:
                 continue
             yield path
 
-    def _parse_file(
-        self, path: Path, errors: list[str]
-    ) -> Iterator[_SessionAggregate]:
-        """Group lines by ``sessionId`` within the file, yield one
-        aggregate per group.
+    @staticmethod
+    def _is_subagent_path(path: Path) -> bool:
+        """Path-based subagent detection (research §5, current 2.1.x layout).
 
-        Real Claude Code JSONLs have no explicit start/end record — every
-        message-type line carries ``sessionId``. Multiple sessionIds per
-        file are possible (rare), so we bucket rather than assume one
-        session per file. Missing-sessionId lines (control chatter) are
-        threaded onto the most recently seen sessionId or discarded when
-        no session has appeared yet.
+        ``.../<sessionId>/subagents/agent-<agentId>.jsonl`` → subagent.
+        Legacy ``.../agent-*.jsonl`` at project root also matched.
         """
-        aggregates: dict[str, _SessionAggregate] = {}
-        # Preserve first-seen order for deterministic yield.
-        order: list[str] = []
-        last_session_id: str | None = None
+        parts = path.parts
+        if "subagents" in parts:
+            return True
+        # Legacy layout — ``agent-<hex>.jsonl`` at project root, no subagents/ dir
+        # in path. Only claim it as a subagent if the filename actually matches.
+        return path.name.startswith("agent-") and path.suffix == ".jsonl"
 
-        def _get(sid: str) -> _SessionAggregate:
-            agg = aggregates.get(sid)
-            if agg is None:
-                agg = _SessionAggregate(session_id=sid)
-                aggregates[sid] = agg
-                order.append(sid)
-            return agg
+    @staticmethod
+    def _parent_session_from_path(path: Path) -> str | None:
+        """For a subagent file, return the parent's sessionId from the dir name.
 
-        with path.open(encoding="utf-8", errors="replace") as f:
-            for lineno, raw in enumerate(f, 1):
+        Current layout: ``<project>/<sessionId>/subagents/agent-<agentId>.jsonl``
+        → parent = ``<sessionId>``. Legacy layout puts ``agent-*.jsonl`` at the
+        project root with no session-scoped parent dir; return None so the
+        caller records ``parent_session_id=NULL``.
+        """
+        parts = path.parts
+        if "subagents" in parts:
+            idx = parts.index("subagents")
+            if idx > 0:
+                return parts[idx - 1]
+        return None
+
+    @staticmethod
+    def _agent_id_from_path(path: Path) -> str | None:
+        """Extract ``<agentId>`` from ``agent-<agentId>.jsonl``."""
+        stem = path.stem
+        if stem.startswith("agent-"):
+            return stem[len("agent-"):]
+        return None
+
+    # -- JSONL line parsing ----------------------------------------------
+
+    @staticmethod
+    def _parse_line(obj: dict) -> _ParsedLine | None:
+        sid = obj.get("sessionId")
+        uid = obj.get("uuid")
+        if not isinstance(sid, str) or not sid:
+            return None
+        if not isinstance(uid, str) or not uid:
+            # Control lines (queue-operation, rate_limit_event ...) often omit
+            # uuid; without one we have no primary key, so drop.
+            return None
+        parent_uuid = obj.get("parentUuid")
+        if not isinstance(parent_uuid, str):
+            parent_uuid = None
+        ts = _parse_iso(obj.get("timestamp"))
+        line_type = obj.get("type") or "other"
+        if not isinstance(line_type, str):
+            line_type = "other"
+        if line_type not in _KNOWN_TYPES:
+            line_type = "other"
+        is_sidechain = bool(obj.get("isSidechain"))
+        agent_id = obj.get("agentId") if isinstance(obj.get("agentId"), str) else None
+        agent_type = obj.get("agentType") if isinstance(obj.get("agentType"), str) else None
+        cwd = obj.get("cwd") if isinstance(obj.get("cwd"), str) else None
+        git_branch = obj.get("gitBranch") if isinstance(obj.get("gitBranch"), str) else None
+
+        body_text = ""
+        tool_name: str | None = None
+        tool_use_id: str | None = None
+        model: str | None = None
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+
+        message = obj.get("message")
+        if isinstance(message, dict):
+            body_text, tool_name, tool_use_id = _extract_text_and_tools(
+                message.get("content")
+            )
+            m = message.get("model")
+            if isinstance(m, str):
+                model = m
+            usage = message.get("usage")
+            if isinstance(usage, dict):
+                it = usage.get("input_tokens")
+                ot = usage.get("output_tokens")
+                if isinstance(it, int):
+                    input_tokens = it
+                if isinstance(ot, int):
+                    output_tokens = ot
+
+        # Refine line_type from message content when the top-level ``type`` is
+        # generic. E.g. an assistant line with a tool_use block gets promoted
+        # to ``tool_use`` observation type so the DSL type: filter finds it.
+        # A user line whose message.content is a tool_result block set gets
+        # promoted to 'tool_result' (detection: message.content is a list
+        # containing at least one tool_result block).
+        if line_type == "assistant" and tool_name:
+            line_type = "tool_use"
+        elif line_type == "user" and _has_tool_result_block(
+            message.get("content") if isinstance(message, dict) else None
+        ):
+            line_type = "tool_result"
+
+        return _ParsedLine(
+            session_id=sid,
+            uuid=uid,
+            parent_uuid=parent_uuid,
+            ts=ts,
+            line_type=line_type,
+            is_sidechain=is_sidechain,
+            agent_id=agent_id,
+            agent_type=agent_type,
+            cwd=cwd,
+            git_branch=git_branch,
+            body=body_text,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def _iter_parsed(
+        self, path: Path, errors: list[str]
+    ) -> Iterator[_ParsedLine]:
+        try:
+            fh = path.open(encoding="utf-8", errors="replace")
+        except OSError as e:
+            errors.append(f"{path}: open failed: {e}")
+            return
+        try:
+            for lineno, raw in enumerate(fh, 1):
                 line = raw.strip()
                 if not line:
                     continue
@@ -200,178 +374,278 @@ class SessionsSource:
                     continue
                 if not isinstance(obj, dict):
                     continue
+                parsed = self._parse_line(obj)
+                if parsed is not None:
+                    yield parsed
+        finally:
+            fh.close()
 
-                sid = obj.get("sessionId")
-                if not isinstance(sid, str) or not sid:
-                    # Some pure-control lines omit sessionId; fall back to
-                    # the last one we saw so their timestamp still updates
-                    # the aggregate window if useful. If there is none
-                    # yet, skip — nothing to attach to.
-                    sid = last_session_id
-                    if sid is None:
-                        continue
-                last_session_id = sid
+    @staticmethod
+    def _dominant_session_id(parsed_lines: list[_ParsedLine], path: Path) -> str | None:
+        """For a top-level file, pick the sessionId that "owns" the file.
 
-                agg = _get(sid)
-
-                # Timestamp window (every message-type line has one).
-                ts = _parse_iso(obj.get("timestamp"))
-                if ts is not None:
-                    if agg.started is None or ts < agg.started:
-                        agg.started = ts
-                    if agg.ended is None or ts > agg.ended:
-                        agg.ended = ts
-
-                # cwd -> project label (first non-null wins).
-                if agg.project == "unknown":
-                    cwd = obj.get("cwd")
-                    if isinstance(cwd, str) and cwd:
-                        agg.project = _project_from_cwd(cwd)
-
-                t = obj.get("type")
-                if t in _CONTROL_TYPES:
-                    continue
-
-                message = obj.get("message")
-                if not isinstance(message, dict):
-                    continue
-                content = message.get("content")
-
-                if t == "user":
-                    text = _extract_text(content)
-                    if text:
-                        if not agg.first_user_prompt:
-                            agg.first_user_prompt = text[:280]
-                        agg.user_turns.append(text)
-                elif t == "assistant":
-                    text = _extract_text(content)
-                    if text:
-                        agg.assistant_turns.append(text)
-                    model = message.get("model")
-                    if isinstance(model, str) and model:
-                        # Last-seen assistant model wins.
-                        agg.model = model
-                    for name in _iter_tool_use_names(content):
-                        agg.tool_call_counter[name] += 1
-
-        for sid in order:
-            agg = aggregates[sid]
-            # Fall back to a stable project label when cwd never appeared
-            # (all control lines) — preserves _project_from_cwd("")'s
-            # "unknown" default without a second helper call.
-            yield agg
-
-    def _iter_records(self) -> Iterator[Record]:
-        """Legacy alias for ``iter_records(since=None)``.
-
-        Kept for the existing record-level tests (M1a) that predate the
-        ``iter_records`` protocol method. Both entrypoints share the same
-        underlying pass so the fixtures/behaviour don't diverge.
+        Resume produces a prefix copy under the parent's sessionId, then the
+        real (new) sessionId. The filename is the NEW sessionId. Match by
+        filename stem when possible; fall back to the sessionId with the most
+        lines.
         """
-        yield from self.iter_records(since=None)
+        stem = path.stem
+        counts: dict[str, int] = {}
+        for p in parsed_lines:
+            counts[p.session_id] = counts.get(p.session_id, 0) + 1
+        if not counts:
+            return None
+        if stem in counts:
+            return stem
+        # Fallback: max-count sessionId (deterministic tiebreak by string).
+        return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
 
-    def iter_records(
+    # -- Pass 1: collect Task tool_use ts per top-level session ----------
+
+    def _collect_task_calls(
+        self, errors: list[str]
+    ) -> dict[str, list[tuple[datetime, str]]]:
+        """Return ``{parent_session_id: [(ts, tool_use_id), ...]}`` for Task
+        tool_use entries in every top-level JSONL. Used in pass 2 to recover
+        ``spawned_by_tool_use_id`` for subagents.
+        """
+        index: dict[str, list[tuple[datetime, str]]] = {}
+        for path in self._iter_jsonl_files():
+            if self._is_subagent_path(path):
+                continue
+            parsed = list(self._iter_parsed(path, errors))
+            dominant = self._dominant_session_id(parsed, path)
+            if dominant is None:
+                continue
+            for p in parsed:
+                if p.session_id != dominant:
+                    continue
+                if p.tool_name == "Task" and p.tool_use_id and p.ts:
+                    index.setdefault(dominant, []).append((p.ts, p.tool_use_id))
+        # Sort each list by ts ascending — used for closest-predecessor lookup.
+        for lst in index.values():
+            lst.sort(key=lambda t: t[0])
+        return index
+
+    @staticmethod
+    def _recover_spawn_tool_use_id(
+        task_index: dict[str, list[tuple[datetime, str]]],
+        parent_session_id: str | None,
+        subagent_first_ts: datetime | None,
+    ) -> str | None:
+        """Best-effort: closest Task ``tool_use_id`` in the parent whose ts
+        precedes the subagent's first observation by ≤ ``SPAWN_LOOKBACK_SECONDS``.
+
+        Returns ``None`` when:
+        * parent session unknown (legacy layout),
+        * no Task tool_use in that parent,
+        * two or more Task calls fall in the window (ambiguous → concurrent
+          subagents, we refuse to guess),
+        * subagent has no observations (nothing to anchor to).
+        """
+        if not parent_session_id or subagent_first_ts is None:
+            return None
+        calls = task_index.get(parent_session_id, [])
+        if not calls:
+            return None
+        window_start = subagent_first_ts.timestamp() - SPAWN_LOOKBACK_SECONDS
+        window_end = subagent_first_ts.timestamp()
+        candidates = [
+            (ts, tid) for ts, tid in calls
+            if window_start <= ts.timestamp() <= window_end
+        ]
+        if len(candidates) == 1:
+            return candidates[0][1]
+        return None
+
+    # -- Pass 2: yield SessionRow + ObservationRow ------------------------
+
+    def iter_entities(
         self,
-        since: datetime | None,
+        since: datetime | None = None,
         errors: list[str] | None = None,
-    ) -> Iterator[Record]:
-        """Yield records parsed from every JSONL project file.
+    ) -> Iterator[SessionEntity]:
+        """Main ingest entrypoint. Yields SessionRow before its ObservationRows.
 
-        Applies the same ``since`` bound as the old ``ingest``: skip records
-        whose ``ended`` timestamp precedes ``since``. The caller is
-        responsible for persisting the yielded records (see
-        ``cli._cmd_ingest``).
-
-        When ``errors`` is provided, parse errors are appended so callers
-        that need structured error surfacing (``ingest`` returns them in
-        ``IngestResult.errors``) can share the same iteration path — no
-        double-walk of the JSONL tree required (round-2 MEDIUM).
+        ``since`` filters observations by ts (advisory — a session with any
+        observation past ``since`` is emitted in full).
         """
         sink = errors if errors is not None else []
-        for path in self._iter_jsonl_files():
-            for agg in self._parse_file(path, sink):
-                if since and agg.ended:
-                    # Round-3 LOW: JSONL logs with a Z suffix parse to
-                    # UTC-aware; logs missing tz yield naive datetimes.
-                    # Comparing naive < aware raises TypeError in Py3 —
-                    # a malformed log used to abort the whole ingest.
-                    # Normalise both sides to UTC-aware for the compare.
-                    ended = (
-                        agg.ended
-                        if agg.ended.tzinfo is not None
-                        else agg.ended.replace(tzinfo=UTC)
-                    )
-                    since_utc = (
-                        since
-                        if since.tzinfo is not None
-                        else since.replace(tzinfo=UTC)
-                    )
-                    if ended < since_utc:
-                        continue
-                yield self._to_record(agg, source_path=path)
+        task_index = self._collect_task_calls(sink)
 
-    def _to_record(self, agg: _SessionAggregate, source_path: Path) -> Record:
-        tail = ""
-        if agg.user_turns:
-            tail += f"USER: {agg.user_turns[-1]}\n"
-        if agg.assistant_turns:
-            tail += f"ASSISTANT: {agg.assistant_turns[-1]}\n"
-        body = "\n".join(
-            [f"USER: {u}" for u in agg.user_turns]
-            + [f"ASSISTANT: {a}" for a in agg.assistant_turns]
+        for path in self._iter_jsonl_files():
+            yield from self._iter_file_entities(path, task_index, since, sink)
+
+    def _iter_file_entities(
+        self,
+        path: Path,
+        task_index: dict[str, list[tuple[datetime, str]]],
+        since: datetime | None,
+        errors: list[str],
+    ) -> Iterator[SessionEntity]:
+        parsed = list(self._iter_parsed(path, errors))
+        if not parsed:
+            return
+
+        is_subagent_file = self._is_subagent_path(path)
+        if is_subagent_file:
+            # All lines in a subagent file belong to that stream. Group by
+            # sessionId still (defensive; typically only one).
+            for entity in self._emit_subagent(path, parsed, task_index, since):
+                yield entity
+        else:
+            dominant = self._dominant_session_id(parsed, path)
+            if dominant is None:
+                return
+            # Only ingest lines matching the dominant sessionId — drops the
+            # resume prefix-copy portion (which belongs to the parent file).
+            own_lines = [p for p in parsed if p.session_id == dominant]
+            for entity in self._emit_top_level(path, dominant, own_lines, since):
+                yield entity
+
+    def _emit_top_level(
+        self,
+        path: Path,
+        session_id: str,
+        lines: list[_ParsedLine],
+        since: datetime | None,
+    ) -> Iterator[SessionEntity]:
+        if not lines:
+            return
+        tss = [p.ts for p in lines if p.ts is not None]
+        if not tss:
+            return
+        first_ts, last_ts = min(tss), max(tss)
+        since_utc = _normalise_utc(since) if since else None
+        if since_utc and last_ts < since_utc:
+            return
+        cwd = next((p.cwd for p in lines if p.cwd), None)
+        git_branch = next((p.git_branch for p in lines if p.git_branch), None)
+        yield SessionRow(
+            session_id=session_id,
+            root_session_id=session_id,
+            parent_session_id=None,
+            kind="session",
+            agent_id=None,
+            agent_type=None,
+            spawned_by_tool_use_id=None,
+            cwd=cwd,
+            git_branch=git_branch,
+            first_ts=first_ts,
+            last_ts=last_ts,
+            jsonl_path=str(path),
         )
-        top_tools = [
-            {"name": n, "count": c}
-            for n, c in agg.tool_call_counter.most_common(10)
-        ]
-        tags = [agg.project]
-        if agg.model:
-            tags.append(agg.model)
-        return Record(
-            stable_id=f"sessions:{agg.session_id}",
-            source="sessions",
-            subject=agg.first_user_prompt or f"session {agg.session_id}",
-            body=body,
-            tags=tags,
-            created_at=agg.started,
-            updated_at=agg.ended or agg.started,
-            extra={
-                "session_id": agg.session_id,
-                "project": agg.project,
-                "model": agg.model,
-                "cost_usd": agg.cost_usd,
-                "first_user_prompt": agg.first_user_prompt,
-                "top_tool_calls": top_tools,
-                "tail_summary": tail,
-                "source_path": str(source_path),
-            },
+        for p in lines:
+            if p.ts is None:
+                continue
+            yield ObservationRow(
+                obs_id=p.uuid,
+                session_id=session_id,
+                root_session_id=session_id,
+                parent_obs_id=p.parent_uuid,
+                type=p.line_type,
+                ts=p.ts,
+                model=p.model,
+                input_tokens=p.input_tokens,
+                output_tokens=p.output_tokens,
+                tool_name=p.tool_name,
+                tool_use_id=p.tool_use_id,
+                body=p.body,
+            )
+
+    def _emit_subagent(
+        self,
+        path: Path,
+        lines: list[_ParsedLine],
+        task_index: dict[str, list[tuple[datetime, str]]],
+        since: datetime | None,
+    ) -> Iterator[SessionEntity]:
+        parent_sid = self._parent_session_from_path(path)
+        # Agent id: prefer the file name (authoritative); fall back to first
+        # line's ``agentId`` field.
+        agent_id = self._agent_id_from_path(path)
+        if agent_id is None:
+            agent_id = next((p.agent_id for p in lines if p.agent_id), None)
+        if agent_id is None:
+            # Nothing to name the composite key with. Give up on this file —
+            # would collide with any other unknown-id subagent.
+            return
+        # Composite key: parent_sid may be None in legacy layout; use "orphan"
+        # sentinel so keys still collide-avoid across orphan subagents.
+        composite_key = f"{parent_sid or 'orphan'}:{agent_id}"
+        root_session_id = parent_sid or composite_key
+        # A subagent file may have multiple sessionIds in it (e.g. its own
+        # unique id + prefix-copied context). Only take the lines whose
+        # sessionId matches the file's dominant id.
+        dominant = self._dominant_session_id(lines, path)
+        own_lines = [p for p in lines if p.session_id == dominant]
+
+        tss = [p.ts for p in own_lines if p.ts is not None]
+        if not tss:
+            return
+        first_ts, last_ts = min(tss), max(tss)
+        since_utc = _normalise_utc(since) if since else None
+        if since_utc and last_ts < since_utc:
+            return
+        agent_type = next((p.agent_type for p in own_lines if p.agent_type), None)
+        spawned = self._recover_spawn_tool_use_id(task_index, parent_sid, first_ts)
+        cwd = next((p.cwd for p in own_lines if p.cwd), None)
+        git_branch = next((p.git_branch for p in own_lines if p.git_branch), None)
+        yield SessionRow(
+            session_id=composite_key,
+            root_session_id=root_session_id,
+            parent_session_id=parent_sid,
+            kind="subagent",
+            agent_id=agent_id,
+            agent_type=agent_type,
+            spawned_by_tool_use_id=spawned,
+            cwd=cwd,
+            git_branch=git_branch,
+            first_ts=first_ts,
+            last_ts=last_ts,
+            jsonl_path=str(path),
         )
+        for p in own_lines:
+            if p.ts is None:
+                continue
+            yield ObservationRow(
+                obs_id=p.uuid,
+                session_id=composite_key,
+                root_session_id=root_session_id,
+                parent_obs_id=p.parent_uuid,
+                type=p.line_type,
+                ts=p.ts,
+                model=p.model,
+                input_tokens=p.input_tokens,
+                output_tokens=p.output_tokens,
+                tool_name=p.tool_name,
+                tool_use_id=p.tool_use_id,
+                body=p.body,
+            )
+
+    # -- Protocol methods -------------------------------------------------
 
     def ingest(self, since: datetime | None) -> IngestResult:
         """Count-only path retained for protocol compat + integration tests.
 
-        Round-2 MEDIUM: pre-fix, this re-walked the JSONL tree once purely
-        to collect parse errors (because ``iter_records`` had no way to
-        surface them), then walked again via ``iter_records`` to count.
-        Post-fix, ``iter_records`` accepts a shared ``errors`` sink, so
-        one pass produces both the count and the parse-error list.
-
-        Persistence is the CLI's job — this method only counts.
+        Persistence is the CLI's job — this method only counts sessions +
+        observations emitted, and surfaces per-file parse errors.
         """
         errors: list[str] = []
-        added = sum(1 for _ in self.iter_records(since, errors=errors))
-        return IngestResult(added=added, updated=0, skipped=0, errors=errors)
+        sessions = 0
+        observations = 0
+        for e in self.iter_entities(since, errors=errors):
+            if isinstance(e, SessionRow):
+                sessions += 1
+            elif isinstance(e, ObservationRow):
+                observations += 1
+        return IngestResult(
+            added=sessions + observations,
+            updated=0,
+            skipped=0,
+            errors=errors,
+        )
 
-    def search(self, ast: QueryAST) -> list[Record]:
-        """Sessions.search() is a thin passthrough; M2's Store handles FTS.
-        In M1a this iterates + filters in Python for the record-level tests."""
-        out: list[Record] = []
-        for r in self._iter_records():
-            if ast.from_date and r.created_at and r.created_at < ast.from_date:
-                continue
-            if ast.to_date and r.created_at and r.created_at > ast.to_date:
-                continue
-            if ast.text and ast.text.lower() not in r.body.lower():
-                continue
-            out.append(r)
-        return out
+
+def _normalise_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
