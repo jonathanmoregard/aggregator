@@ -363,6 +363,39 @@ def test_iter_records_appends_updated_filter_to_all_endpoints(monkeypatch):
         )
 
 
+def test_iter_records_since_normalises_to_utc_for_search_query(monkeypatch):
+    """Round-3 MEDIUM #1: GitHub's ``updated:>=YYYY-MM-DD`` search filter is
+    UTC. If ``since`` carries a non-UTC tz (e.g. ``+02:00``) and we
+    ``strftime`` directly, we can send yesterday's date and re-fetch a day of
+    already-indexed rows (worst case: skip a day's freshness window). Fix:
+    ``since.astimezone(UTC).strftime(...)`` so the date is always the UTC
+    calendar date.
+
+    Concrete case: 2026-07-01 00:30 in ``+02:00`` = 2026-06-30 22:30 UTC, so
+    the correct search date is ``2026-06-30``, not ``2026-07-01``.
+    """
+    from datetime import timedelta, timezone
+
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+    called_paths: list[str] = []
+
+    def spy(path: str) -> list[dict]:
+        called_paths.append(path)
+        return []
+
+    src = GitHubSource(
+        _scope_fetcher=lambda: ["public_repo"],
+        _api_fetcher=spy,
+    )
+    stockholm = timezone(timedelta(hours=2))
+    since = datetime(2026, 7, 1, 0, 30, tzinfo=stockholm)  # = 2026-06-30 22:30 UTC
+    list(src.iter_records(since=since))
+    for path in called_paths:
+        assert "+updated:>=2026-06-30" in path, (
+            f"expected UTC-normalised date, got: {path}"
+        )
+
+
 def test_iter_records_omits_updated_filter_when_since_is_none(monkeypatch):
     """No ``since`` = no filter; behaviour unchanged from the pre-fix path."""
     monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)

@@ -12,7 +12,7 @@ import logging
 import os
 import subprocess
 from collections.abc import Callable, Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 
 # Reserved seam: LLM wrapper for future ingest enrichment (see spec §Error
 # handling). v1 makes no LLM calls, so the import previously wired here was
@@ -309,10 +309,21 @@ class GitHubSource:
         """Append ``+updated:>=YYYY-MM-DD`` to a search path when ``since``
         is truthy. All four ``_ENDPOINTS`` already contain a ``q=`` segment
         with ``+``-joined qualifiers, so appending is safe. Day-precision
-        matches GitHub search's supported granularity."""
+        matches GitHub search's supported granularity.
+
+        Round-3 MEDIUM #1: normalise ``since`` to UTC before formatting.
+        GitHub's ``updated:>=YYYY-MM-DD`` filter is UTC; if the caller
+        passes an aware ``datetime`` in a non-UTC zone (e.g. ``+02:00``)
+        the raw ``strftime`` yields the local date, which can be off by
+        one from the UTC calendar date and refetch (or miss) a day's
+        worth of already-indexed rows. Naive datetimes are treated as UTC
+        (matching the CLI's ``_cmd_ingest`` which stamps naive ``--since``
+        with ``UTC``)."""
         if not since:
             return path
-        return f"{path}+updated:>={since.strftime('%Y-%m-%d')}"
+        aware = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
+        utc_date = aware.astimezone(UTC).strftime("%Y-%m-%d")
+        return f"{path}+updated:>={utc_date}"
 
     def ingest(self, since: datetime | None) -> IngestResult:
         """Count-only path retained for protocol compat + integration tests.
