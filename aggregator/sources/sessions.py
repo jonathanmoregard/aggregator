@@ -2,6 +2,23 @@
 
 Skips files modified within the last 5 minutes (live session heuristic).
 Corrupt JSONL lines are skipped and logged, never abort the ingest.
+
+Real Claude Code JSONL shape (empirically verified 2026-08-01):
+    Per-line JSON with a ``type`` field. There is NO synthetic
+    ``session_start`` / ``session_end`` bracketing — sessions are
+    identified by the ``sessionId`` field present on every message-type
+    line. Types observed include ``queue-operation`` (control, no cwd),
+    ``user``, ``assistant``, ``system``, ``rate_limit_event``,
+    ``tool_use``, ``tool_result``, ``permission-mode``,
+    ``file-history-snapshot``, ``attachment``, ``last-prompt``.
+
+    Only ``user`` / ``assistant`` lines carry conversational content in
+    ``message.content`` (list of blocks: ``text``, ``tool_use``,
+    ``tool_result``, ``thinking``, ...). ``message.model`` appears on
+    assistant lines. Timestamps are ISO-8601 with ``Z``.
+
+    Grouping is per ``sessionId`` INSIDE each file (rare but possible
+    to see mixed sessionIds in one file — we handle it).
 """
 from __future__ import annotations
 
@@ -14,6 +31,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # Reserved seam: LLM wrapper for future ingest enrichment (see spec §Error
 # handling). v1 makes no LLM calls, so the import previously wired here was
@@ -25,6 +43,22 @@ from aggregator.sources.base import IngestResult, QueryAST, Record
 log = logging.getLogger(__name__)
 
 LIVE_WINDOW_SECONDS = 5 * 60
+
+# Line ``type`` values that carry no conversational content — skipped for
+# text extraction but still consulted for ``sessionId`` grouping when the
+# field is present (rare; control lines usually omit it or share the file's
+# sole session).
+_CONTROL_TYPES = frozenset(
+    {
+        "queue-operation",
+        "permission-mode",
+        "file-history-snapshot",
+        "attachment",
+        "last-prompt",
+        "rate_limit_event",
+        "system",
+    }
+)
 
 
 def _project_from_cwd(cwd: str) -> str:
@@ -43,6 +77,43 @@ def _parse_iso(s: str | None) -> datetime | None:
         return None
 
 
+def _extract_text(content: Any) -> str:
+    """Flatten a message.content payload into plain text.
+
+    Real content is either a string (older sessions) or a list of blocks
+    like ``{"type": "text", "text": "..."}``. Non-text blocks (tool_use,
+    tool_result, thinking) are skipped for the conversational body — the
+    tool call counter picks up ``tool_use`` names separately.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    # Unknown shape — degrade to str() so callers still see something.
+    return str(content)
+
+
+def _iter_tool_use_names(content: Any) -> Iterator[str]:
+    """Yield tool_use ``name`` values from an assistant message.content list."""
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            name = block.get("name")
+            if isinstance(name, str) and name:
+                yield name
+
+
 @dataclass
 class _SessionAggregate:
     session_id: str
@@ -50,7 +121,7 @@ class _SessionAggregate:
     started: datetime | None = None
     ended: datetime | None = None
     model: str = ""
-    cost_usd: float = 0.0
+    cost_usd: float | None = None
     user_turns: list[str] = field(default_factory=list)
     assistant_turns: list[str] = field(default_factory=list)
     tool_call_counter: Counter = field(default_factory=Counter)
@@ -72,7 +143,7 @@ class SessionsSource:
             "started": "datetime UTC",
             "ended": "datetime UTC",
             "model": "str",
-            "cost_usd": "float",
+            "cost_usd": "float | None (real logs carry usage, not cost)",
             "first_user_prompt": "str",
             "top_tool_calls": "list[{name, count}]",
             "tail_summary": "str (last user + assistant turn)",
@@ -94,7 +165,29 @@ class SessionsSource:
     def _parse_file(
         self, path: Path, errors: list[str]
     ) -> Iterator[_SessionAggregate]:
-        current: _SessionAggregate | None = None
+        """Group lines by ``sessionId`` within the file, yield one
+        aggregate per group.
+
+        Real Claude Code JSONLs have no explicit start/end record — every
+        message-type line carries ``sessionId``. Multiple sessionIds per
+        file are possible (rare), so we bucket rather than assume one
+        session per file. Missing-sessionId lines (control chatter) are
+        threaded onto the most recently seen sessionId or discarded when
+        no session has appeared yet.
+        """
+        aggregates: dict[str, _SessionAggregate] = {}
+        # Preserve first-seen order for deterministic yield.
+        order: list[str] = []
+        last_session_id: str | None = None
+
+        def _get(sid: str) -> _SessionAggregate:
+            agg = aggregates.get(sid)
+            if agg is None:
+                agg = _SessionAggregate(session_id=sid)
+                aggregates[sid] = agg
+                order.append(sid)
+            return agg
+
         with path.open(encoding="utf-8", errors="replace") as f:
             for lineno, raw in enumerate(f, 1):
                 line = raw.strip()
@@ -105,33 +198,68 @@ class SessionsSource:
                 except json.JSONDecodeError:
                     errors.append(f"{path}:{lineno} corrupt line")
                     continue
+                if not isinstance(obj, dict):
+                    continue
+
+                sid = obj.get("sessionId")
+                if not isinstance(sid, str) or not sid:
+                    # Some pure-control lines omit sessionId; fall back to
+                    # the last one we saw so their timestamp still updates
+                    # the aggregate window if useful. If there is none
+                    # yet, skip — nothing to attach to.
+                    sid = last_session_id
+                    if sid is None:
+                        continue
+                last_session_id = sid
+
+                agg = _get(sid)
+
+                # Timestamp window (every message-type line has one).
+                ts = _parse_iso(obj.get("timestamp"))
+                if ts is not None:
+                    if agg.started is None or ts < agg.started:
+                        agg.started = ts
+                    if agg.ended is None or ts > agg.ended:
+                        agg.ended = ts
+
+                # cwd -> project label (first non-null wins).
+                if agg.project == "unknown":
+                    cwd = obj.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        agg.project = _project_from_cwd(cwd)
+
                 t = obj.get("type")
-                if t == "session_start":
-                    current = _SessionAggregate(
-                        session_id=obj.get("session_id", f"unknown-{path.name}"),
-                        project=_project_from_cwd(obj.get("cwd", "")),
-                        started=_parse_iso(obj.get("started_at")),
-                        model=obj.get("model", ""),
-                    )
-                elif t == "user" and current is not None:
-                    text = obj.get("text", "")
-                    if not current.first_user_prompt:
-                        current.first_user_prompt = text[:280]
-                    current.user_turns.append(text)
-                elif t == "assistant" and current is not None:
-                    current.assistant_turns.append(obj.get("text", ""))
-                    for tc in obj.get("tool_calls", []) or []:
-                        name = tc.get("name", "unknown")
-                        count = tc.get("count", 1)
-                        current.tool_call_counter[name] += count
-                elif t == "session_end" and current is not None:
-                    current.ended = _parse_iso(obj.get("ended_at"))
-                    current.cost_usd = float(obj.get("cost_usd", 0.0))
-                    yield current
-                    current = None
-            # yield unclosed session at EOF too (crashed session)
-            if current is not None:
-                yield current
+                if t in _CONTROL_TYPES:
+                    continue
+
+                message = obj.get("message")
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+
+                if t == "user":
+                    text = _extract_text(content)
+                    if text:
+                        if not agg.first_user_prompt:
+                            agg.first_user_prompt = text[:280]
+                        agg.user_turns.append(text)
+                elif t == "assistant":
+                    text = _extract_text(content)
+                    if text:
+                        agg.assistant_turns.append(text)
+                    model = message.get("model")
+                    if isinstance(model, str) and model:
+                        # Last-seen assistant model wins.
+                        agg.model = model
+                    for name in _iter_tool_use_names(content):
+                        agg.tool_call_counter[name] += 1
+
+        for sid in order:
+            agg = aggregates[sid]
+            # Fall back to a stable project label when cwd never appeared
+            # (all control lines) — preserves _project_from_cwd("")'s
+            # "unknown" default without a second helper call.
+            yield agg
 
     def _iter_records(self) -> Iterator[Record]:
         """Legacy alias for ``iter_records(since=None)``.

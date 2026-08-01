@@ -1,4 +1,7 @@
-{"type": "session_start", "session_id": "sess-corrupt", "cwd": "/home/u/x", "started_at": "2026-07-26T10:00:00Z", "model": "claude-opus-4-7"}
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-26T10:00:00.000Z","sessionId":"sess-corrupt"}
+{"parentUuid":null,"isSidechain":false,"promptId":"pc1","type":"user","message":{"role":"user","content":"should still parse despite garbage below"},"uuid":"uc1","timestamp":"2026-07-26T10:00:01.000Z","userType":"external","cwd":"/home/u/x","sessionId":"sess-corrupt","version":"2.1.92","gitBranch":"main"}
 this is not valid json and should be skipped without aborting
-{"type": "user", "text": "should still parse"}
-{"type": "session_end", "session_id": "sess-corrupt", "ended_at": "2026-07-26T10:01:00Z", "cost_usd": 0.01}
+{"parentUuid":"uc1","isSidechain":false,"message":{"model":"claude-opus-4-7","id":"mc1","type":"message","role":"assistant","content":[{"type":"text","text":"parsed the good lines"}]},"requestId":"rc1","type":"assistant","uuid":"ac1","timestamp":"2026-07-26T10:00:30.000Z","userType":"external","cwd":"/home/u/x","sessionId":"sess-corrupt","version":"2.1.92","gitBranch":"main"}
+{"this is also broken json,,,
+{"parentUuid":"ac1","isSidechain":false,"promptId":"pc2","type":"user","message":{"role":"user","content":"nice"},"uuid":"uc2","timestamp":"2026-07-26T10:01:00.000Z","userType":"external","cwd":"/home/u/x","sessionId":"sess-corrupt","version":"2.1.92","gitBranch":"main"}
+{trailing garbage line 3
