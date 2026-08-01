@@ -1,15 +1,6 @@
 """Regression: `aggregator ingest` must actually persist records to the store.
 
-Pre-fix behaviour (BLOCKER from advisor round-1): ``_cmd_ingest`` called
-``src.ingest(since)`` which only counted records and threw them away; the
-store passed in was discarded (``_ = store``). Result: the CLI happily
-reported "added=N" while ``store.query()`` still returned zero rows.
-
-This test drives the fix. It seeds a stub source that yields two records,
-runs the ``ingest`` subcommand against a temp store, and asserts the store
-actually holds them afterwards. It also covers the ``--rebuild`` path: the
-store must be dropped for the source BEFORE the new records are written,
-not after (else the rebuild wipes the freshly-written data).
+Covers both the Record path (github) and the v2 entity path (sessions).
 """
 from __future__ import annotations
 
@@ -17,18 +8,21 @@ from datetime import UTC, datetime
 
 from aggregator import cli
 from aggregator.core.store import Store
-from aggregator.sources.base import IngestResult, QueryAST, Record
+from aggregator.sources.base import (
+    IngestResult,
+    ObservationRow,
+    QueryAST,
+    Record,
+    SessionRow,
+)
+
+# --- Record path (github) -------------------------------------------------
 
 
-class _StubSource:
-    """Yields a fixed set of records via ``iter_records``.
+class _StubRecordSource:
+    """Yields a fixed Record set via ``iter_records``. Github-shaped source."""
 
-    ``ingest`` is retained for backwards-compat with the Source protocol;
-    the CLI is expected to call ``iter_records`` and persist those records
-    itself, not to delegate persistence to ``ingest``.
-    """
-
-    name = "sessions"
+    name = "github"
 
     def __init__(self, records: list[Record]):
         self._records = records
@@ -40,14 +34,13 @@ class _StubSource:
             yield r
 
     def ingest(self, since):
-        # Preserved for protocol conformance; not called by the CLI post-fix.
         return IngestResult(
             added=sum(1 for _ in self.iter_records(since)),
             updated=0,
             skipped=0,
         )
 
-    def search(self, ast):  # pragma: no cover - unused in this test
+    def search(self, ast):  # pragma: no cover
         return []
 
     def record_shape(self):
@@ -57,54 +50,47 @@ class _StubSource:
 def _mk_records() -> list[Record]:
     return [
         Record(
-            stable_id="sessions:persist-1",
-            source="sessions",
+            stable_id="github:acme/api:1",
+            source="github",
             subject="first",
             body="body one",
-            tags=["proj-alpha"],
+            tags=["pr"],
             created_at=datetime(2026, 7, 25, tzinfo=UTC),
             updated_at=datetime(2026, 7, 25, tzinfo=UTC),
         ),
         Record(
-            stable_id="sessions:persist-2",
-            source="sessions",
+            stable_id="github:acme/api:2",
+            source="github",
             subject="second",
             body="body two",
-            tags=["proj-alpha"],
+            tags=["pr"],
             created_at=datetime(2026, 7, 26, tzinfo=UTC),
             updated_at=datetime(2026, 7, 26, tzinfo=UTC),
         ),
     ]
 
 
-def test_ingest_persists_records_to_store(tmp_data_home):
-    """RED against the pre-fix CLI: source-yielded records must land in the store."""
+def test_ingest_records_persists_to_store(tmp_data_home):
     store = Store()
     store.migrate()
-    source = _StubSource(_mk_records())
+    source = _StubRecordSource(_mk_records())
 
     rc = cli.main(
-        ["ingest", "sessions"], _store=store, _sources={"sessions": source}
+        ["ingest", "github"], _store=store, _sources={"github": source}
     )
     assert rc == 0
 
-    stored = store.query(QueryAST(source="sessions"))
+    stored = store.query(QueryAST(source="github"))
     stored_ids = {r.stable_id for r in stored}
-    assert stored_ids == {"sessions:persist-1", "sessions:persist-2"}
+    assert stored_ids == {"github:acme/api:1", "github:acme/api:2"}
 
 
-def test_ingest_rebuild_drops_before_persist(tmp_data_home):
-    """``--rebuild`` must drop the source's rows BEFORE persisting new ones.
-
-    Otherwise a rebuild pass would wipe the records it just wrote. Seed a
-    stale row for the source; after ``ingest --rebuild`` the stale row must
-    be gone AND the fresh records must be present.
-    """
+def test_ingest_records_rebuild_drops_before_persist(tmp_data_home):
     store = Store()
     store.migrate()
     stale = Record(
-        stable_id="sessions:stale",
-        source="sessions",
+        stable_id="github:acme/api:stale",
+        source="github",
         subject="stale",
         body="stale body",
         created_at=datetime(2026, 7, 1, tzinfo=UTC),
@@ -112,14 +98,113 @@ def test_ingest_rebuild_drops_before_persist(tmp_data_home):
     )
     store.upsert([stale])
 
-    source = _StubSource(_mk_records())
+    source = _StubRecordSource(_mk_records())
+    rc = cli.main(
+        ["ingest", "github", "--rebuild"],
+        _store=store,
+        _sources={"github": source},
+    )
+    assert rc == 0
+    stored_ids = {r.stable_id for r in store.query(QueryAST(source="github"))}
+    assert "github:acme/api:stale" not in stored_ids
+    assert stored_ids == {"github:acme/api:1", "github:acme/api:2"}
+
+
+# --- v2 entity path (sessions) --------------------------------------------
+
+
+class _StubEntitySource:
+    """Yields SessionRow + ObservationRow entities via iter_entities."""
+
+    name = "sessions"
+
+    def __init__(self, entities):
+        self._entities = list(entities)
+
+    def iter_entities(self, since, errors=None):
+        yield from self._entities
+
+    def ingest(self, since):  # pragma: no cover
+        return IngestResult(added=len(self._entities), updated=0, skipped=0)
+
+    def record_shape(self):
+        return {}
+
+
+def _mk_entities():
+    now = datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+    return [
+        SessionRow(
+            session_id="sess-a",
+            root_session_id="sess-a",
+            parent_session_id=None,
+            kind="session",
+            agent_id=None,
+            agent_type=None,
+            spawned_by_tool_use_id=None,
+            cwd="/x",
+            git_branch="main",
+            first_ts=now,
+            last_ts=now,
+            jsonl_path="/tmp/a.jsonl",
+        ),
+        ObservationRow(
+            obs_id="o-a-1",
+            session_id="sess-a",
+            root_session_id="sess-a",
+            parent_obs_id=None,
+            type="user",
+            ts=now,
+            model=None,
+            input_tokens=None,
+            output_tokens=None,
+            tool_name=None,
+            tool_use_id=None,
+            body="hello world",
+        ),
+    ]
+
+
+def test_ingest_entities_persists_to_store(tmp_data_home):
+    store = Store()
+    store.migrate()
+    source = _StubEntitySource(_mk_entities())
+
+    rc = cli.main(
+        ["ingest", "sessions"], _store=store, _sources={"sessions": source}
+    )
+    assert rc == 0
+    sessions = store.query_sessions(QueryAST())
+    assert {s.session_id for s in sessions} == {"sess-a"}
+    obs = store.query_observations(QueryAST(top_session_id="sess-a"))
+    assert {o.obs_id for o in obs} == {"o-a-1"}
+
+
+def test_ingest_entities_rebuild_drops_before_persist(tmp_data_home):
+    store = Store()
+    store.migrate()
+    stale_session = SessionRow(
+        session_id="sess-stale",
+        root_session_id="sess-stale",
+        parent_session_id=None,
+        kind="session",
+        agent_id=None,
+        agent_type=None,
+        spawned_by_tool_use_id=None,
+        cwd=None,
+        git_branch=None,
+        first_ts=datetime(2026, 7, 1, tzinfo=UTC),
+        last_ts=datetime(2026, 7, 1, tzinfo=UTC),
+        jsonl_path="/tmp/stale.jsonl",
+    )
+    store.upsert_entities([stale_session])
+
+    source = _StubEntitySource(_mk_entities())
     rc = cli.main(
         ["ingest", "sessions", "--rebuild"],
         _store=store,
         _sources={"sessions": source},
     )
     assert rc == 0
-
-    stored_ids = {r.stable_id for r in store.query(QueryAST(source="sessions"))}
-    assert "sessions:stale" not in stored_ids
-    assert stored_ids == {"sessions:persist-1", "sessions:persist-2"}
+    ids = {s.session_id for s in store.query_sessions(QueryAST())}
+    assert ids == {"sess-a"}, ids

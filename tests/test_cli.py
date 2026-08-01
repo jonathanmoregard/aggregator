@@ -1,16 +1,12 @@
-"""M5: aggregator CLI. RED tests first.
+"""M5: aggregator CLI (v2, Schema B).
 
-Covers the five subcommand behaviours specified in the M5 plan:
+Covers:
 
-* ``query`` — human-readable wrapped output (default mode)
-* ``query --json`` — machine-readable JSON envelope
-* ``status`` — capabilities dump (sources, freshness, cache path)
-* ``ingest <source>`` — dispatches to the real source's ``ingest()``
-* Bad DSL surfaces a non-zero exit and a structured error on stderr
-
-All tests use the ``tmp_data_home`` fixture (conftest.py) so cache.db lives
-in a per-test tmpdir, and inject dependencies via the ``_store`` / ``_sources``
-seams so unit tests never hit the real gh CLI or ``~/.claude/projects``.
+* ``query`` — human-readable wrapped output for records + session hit lists.
+* ``query --json`` — machine-readable JSON envelope.
+* ``status`` — capabilities dump.
+* ``ingest <source>`` — dispatches to the real source's ingest.
+* Bad DSL surfaces a non-zero exit and a structured error on stderr.
 """
 from __future__ import annotations
 
@@ -22,16 +18,16 @@ from aggregator.core.store import Store
 from aggregator.sources.base import IngestResult, Record
 
 
-def _seed(store: Store) -> None:
+def _seed_records(store: Store) -> None:
     store.migrate()
     store.upsert(
         [
             Record(
-                stable_id="sessions:a",
-                source="sessions",
+                stable_id="github:acme/api:1",
+                source="github",
                 subject="hi",
                 body="refactor foo.py",
-                tags=["proj-alpha"],
+                tags=["pr"],
                 created_at=datetime(2026, 7, 25, tzinfo=UTC),
                 updated_at=datetime(2026, 7, 25, tzinfo=UTC),
             ),
@@ -41,21 +37,21 @@ def _seed(store: Store) -> None:
 
 def test_query_command_prints_wrapped_content(tmp_data_home, capsys):
     store = Store()
-    _seed(store)
-    rc = cli.main(["query", "source:sessions", "--fields", "full"], _store=store)
+    _seed_records(store)
+    rc = cli.main(["query", "source:github", "--fields", "full"], _store=store)
     assert rc == 0
     out = capsys.readouterr().out
-    assert '<ExternalContent source="sessions:a">' in out
+    assert '<ExternalContent source="github:acme/api:1">' in out
     assert "refactor foo.py" in out
 
 
 def test_status_command_prints_capabilities(tmp_data_home, capsys):
     store = Store()
-    _seed(store)
+    _seed_records(store)
     rc = cli.main(["status"], _store=store)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "sessions" in out
+    assert "github" in out
     assert "cache_path" in out or "cache.db" in out
 
 
@@ -91,17 +87,16 @@ def test_bad_dsl_returns_nonzero(tmp_data_home, capsys):
 
 def test_query_json_output(tmp_data_home, capsys):
     store = Store()
-    _seed(store)
-    rc = cli.main(["query", "source:sessions", "--json"], _store=store)
+    _seed_records(store)
+    rc = cli.main(["query", "source:github", "--json"], _store=store)
     assert rc == 0
     out = capsys.readouterr().out
     data = json.loads(out)
     assert data["ok"] is True
-    assert data["records"][0]["source"] == "sessions"
+    assert data["records"][0]["source"] == "github"
 
 
 def test_unknown_source_returns_nonzero(tmp_data_home, capsys):
-    """Ingest against an unregistered source is a user-input error, not a crash."""
     store = Store()
     store.migrate()
     rc = cli.main(
@@ -110,3 +105,49 @@ def test_unknown_source_returns_nonzero(tmp_data_home, capsys):
     assert rc != 0
     err = capsys.readouterr().err
     assert "nope" in err
+
+
+def test_query_drilldown_flag_present(tmp_data_home, capsys):
+    """--drilldown is accepted; on sessions path returns observation rows."""
+    store = Store()
+    store.migrate()
+    from aggregator.sources.base import ObservationRow, SessionRow
+    store.upsert_entities(
+        [
+            SessionRow(
+                session_id="sess-a",
+                root_session_id="sess-a",
+                parent_session_id=None,
+                kind="session",
+                agent_id=None,
+                agent_type=None,
+                spawned_by_tool_use_id=None,
+                cwd=None,
+                git_branch=None,
+                first_ts=datetime(2026, 7, 25, tzinfo=UTC),
+                last_ts=datetime(2026, 7, 25, tzinfo=UTC),
+                jsonl_path="/tmp/x",
+            ),
+            ObservationRow(
+                obs_id="o1",
+                session_id="sess-a",
+                root_session_id="sess-a",
+                parent_obs_id=None,
+                type="user",
+                ts=datetime(2026, 7, 25, tzinfo=UTC),
+                model=None,
+                input_tokens=None,
+                output_tokens=None,
+                tool_name=None,
+                tool_use_id=None,
+                body="hello",
+            ),
+        ]
+    )
+    rc = cli.main(
+        ["query", "source:sessions", "--drilldown", "--json"], _store=store
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert data["mode"] == "observations"
