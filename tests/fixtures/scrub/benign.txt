@@ -1,0 +1,3 @@
+The rate limit is 5000 requests per hour.
+Contact the on-call rotation for outages.
+Version 1.2.3 was released on Tuesday.

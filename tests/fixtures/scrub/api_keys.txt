@@ -1,0 +1,5 @@
+openai key example: sk-proj-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQR_A-b
+anthropic key example: sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQR_C-d
+github pat example: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
+jwt example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+aws access key example: AKIAIOSFODNN7EXAMPLE

@@ -1,0 +1,3 @@
+SSN: 123-45-6789
+Email: aggregator@example.com
+Phone: +1-555-123-4567

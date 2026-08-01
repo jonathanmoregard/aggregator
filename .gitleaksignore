@@ -1,0 +1,5 @@
+# Test fixtures for aggregator/core/scrub.py. These are intentionally-shaped
+# credential literals whose whole purpose is to exercise the scrubber's regex
+# patterns. Whitelisted by fingerprint so a real leak elsewhere still trips
+# the hook.
+tests/fixtures/scrub/api_keys.txt:jwt:4
