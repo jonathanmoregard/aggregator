@@ -151,3 +151,28 @@ def test_iban_shape_redacted():
     result = scrub(f"send to {iban} thanks")
     assert iban not in result.text
     assert result.counts.get("iban", 0) >= 1
+
+
+# --- MEDIUM (round-2): ipv6 regex must not over-match hash chains ---------
+
+
+def test_ipv6_regex_does_not_match_sha256_hash_chain():
+    """Round-2 MEDIUM: pre-fix, the ipv6 regex (7 hex groups + colon + hex
+    tail) fired on benign chains like ``sha256:aa:bb:cc:dd:ee:ff:11:22``
+    that share the same shape. Post-fix, boundaries on both sides require
+    a non-hex/colon context so the ``sha256:`` prefix disqualifies the run.
+    """
+    chain = "sha256:aa:bb:cc:dd:ee:ff:11:22"
+    result = scrub(f"integrity: {chain}")
+    assert chain in result.text, (
+        f"ipv6 pattern over-matched sha256 chain; text: {result.text!r}"
+    )
+    assert result.counts.get("ipv6", 0) == 0
+
+
+def test_ipv6_full_length_still_redacted():
+    """Regression guard: tighter regex must still catch a real IPv6."""
+    addr = "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+    result = scrub(f"host at {addr} lives")
+    assert addr not in result.text
+    assert result.counts.get("ipv6", 0) >= 1

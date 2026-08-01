@@ -92,10 +92,15 @@ PII_PATTERNS: dict[str, re.Pattern] = {
     # IBAN: 2 letters + 2 digits + 11..30 alphanumerics. Boundaries prevent
     # partial matches inside longer alphanumeric runs.
     "iban": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
-    # IPv6: full 8-group form (loose match; misses ``::`` shorthand — good
-    # enough for v1, and low-false-positive because of the strict shape).
+    # IPv6: full 8-group form (misses ``::`` shorthand — good enough for
+    # v1). Round-2 MEDIUM: pre-fix ``\b`` anchors let the pattern fire on
+    # benign hex-and-colon chains like ``sha256:aa:bb:cc:dd:ee:ff:11:22``
+    # because ``\b`` sits between ``:`` (non-word) and hex (word), so the
+    # prefix boundary matched inside the chain. Post-fix uses lookarounds
+    # that reject any hex-or-colon character on either side of the run,
+    # so the ``sha256:`` prefix disqualifies the match.
     "ipv6": re.compile(
-        r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b"
+        r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f:])"
     ),
     # IPv4: four dotted octets, each 0-255.
     "ipv4": re.compile(
