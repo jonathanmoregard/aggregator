@@ -1,0 +1,4 @@
+{"type": "session_start", "session_id": "sess-corrupt", "cwd": "/home/u/x", "started_at": "2026-07-26T10:00:00Z", "model": "claude-opus-4-7"}
+this is not valid json and should be skipped without aborting
+{"type": "user", "text": "should still parse"}
+{"type": "session_end", "session_id": "sess-corrupt", "ended_at": "2026-07-26T10:01:00Z", "cost_usd": 0.01}

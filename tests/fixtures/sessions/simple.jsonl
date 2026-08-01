@@ -1,0 +1,6 @@
+{"type": "session_start", "session_id": "sess-simple-001", "cwd": "/home/u/proj-alpha", "started_at": "2026-07-25T10:00:00Z", "model": "claude-opus-4-7"}
+{"type": "user", "text": "please refactor foo.py"}
+{"type": "assistant", "text": "I refactored foo.py to extract the helper.", "tool_calls": [{"name": "Edit", "count": 1}]}
+{"type": "user", "text": "great, run the tests"}
+{"type": "assistant", "text": "Tests pass.", "tool_calls": [{"name": "Bash", "count": 1}]}
+{"type": "session_end", "session_id": "sess-simple-001", "ended_at": "2026-07-25T10:05:00Z", "cost_usd": 0.42}
