@@ -161,12 +161,20 @@ class GitHubSource:
         self._api_fetcher = _api_fetcher
 
     def record_shape(self) -> dict[str, str]:
-        """Return the DSL-facing field surface. Consumed by M2 help generator."""
+        """Return the DSL-facing field surface. Consumed by M2 help generator.
+
+        ``mergeable`` / ``mergeable_state`` are advertised as always-``None`` in
+        v1: we source PRs via ``/search/issues`` (issue-shape rows) rather than
+        the PULLs endpoint, and search hits don't include those fields. A
+        follow-up per-PR fetch would populate them but the extra API cost +
+        rate-limit hazard fails the low-maintenance principle. Kept in the
+        shape so DSL/help output is stable; downstream filters that reference
+        them are no-ops today (Codex Phase 2 BLOCKER)."""
         return {
             "repo": "str (owner/name)",
             "number": "int",
             "state": "'open'|'closed'",
-            "mergeable": "bool | None",
+            "mergeable": "None (search API does not return this)",
             "checks": "'pass'|'fail'|'pending'|None",
             "author": "str (@login)",
             "url": "str",
@@ -201,8 +209,28 @@ class GitHubSource:
                 "(recommended: public_repo, repo:status, read:org)."
             )
 
-    def _pr_to_record(self, pr: dict) -> Record:
-        repo = pr.get("base", {}).get("repo", {}).get("full_name") or "unknown/unknown"
+    def _pr_to_record(self, pr: dict) -> Record | None:
+        """Convert a /search/issues search hit (PR variant) to a ``Record``.
+
+        Codex Phase 2 BLOCKER: pre-fix we read ``pr["base"]["repo"]["full_name"]``
+        which is the shape returned by ``/repos/OWNER/REPO/pulls/N`` (PULLs
+        endpoint), NOT ``/search/issues`` (which is what all four iterator
+        endpoints hit). Search hits use ``repository_url`` and never populate
+        ``base``, ``mergeable``, or ``mergeable_state``. Falling back to
+        ``unknown/unknown`` caused every PR to collide on
+        ``github:unknown/unknown:<n>``, silently overwriting rows across
+        repos. Now we derive ``repo`` from ``repository_url`` (or ``html_url``
+        as a defensive fallback) and drop unparseable rows entirely rather
+        than emit a collision-prone sentinel.
+        """
+        repo = _extract_repo(pr)
+        if repo is None:
+            log.warning(
+                "github PR row missing repository_url and unparseable html_url; "
+                "skipping (number=%r, id=%r)",
+                pr.get("number"), pr.get("id"),
+            )
+            return None
         number = pr.get("number", 0)
         checks = (pr.get("_checks") or {}).get("summary")
         body = pr.get("body") or ""
@@ -218,8 +246,10 @@ class GitHubSource:
                 "repo": repo,
                 "number": number,
                 "state": pr.get("state"),
-                "mergeable": pr.get("mergeable"),
-                "mergeable_state": pr.get("mergeable_state"),
+                # /search/issues never returns these; kept in the shape for
+                # DSL stability, always None. See ``record_shape`` docstring.
+                "mergeable": None,
+                "mergeable_state": None,
                 "checks": checks,
                 "author": (pr.get("user") or {}).get("login"),
                 "url": pr.get("html_url"),
@@ -228,15 +258,22 @@ class GitHubSource:
             },
         )
 
-    def _issue_to_record(self, issue: dict, *, kind: str) -> Record:
-        # repo comes from `repository_url` on the issues endpoint:
-        #   https://api.github.com/repos/owner/name  →  owner/name
-        repo_url = issue.get("repository_url", "")
-        if repo_url:
-            parts = repo_url.rsplit("/", 2)
-            repo = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else "unknown/unknown"
-        else:
-            repo = "unknown/unknown"
+    def _issue_to_record(self, issue: dict, *, kind: str) -> Record | None:
+        """Convert a /search/issues search hit (issue variant) to a ``Record``.
+
+        Same derivation logic as ``_pr_to_record``: derive ``repo`` from
+        ``repository_url`` (or ``html_url`` as a defensive fallback); skip
+        the row rather than emit ``unknown/unknown`` on missing/malformed
+        input (Codex Phase 2 BLOCKER).
+        """
+        repo = _extract_repo(issue)
+        if repo is None:
+            log.warning(
+                "github issue row missing repository_url and unparseable "
+                "html_url; skipping (number=%r, id=%r)",
+                issue.get("number"), issue.get("id"),
+            )
+            return None
         number = issue.get("number", 0)
         body = issue.get("body") or ""
         return Record(
@@ -300,9 +337,14 @@ class GitHubSource:
                 continue
             for row in rows:
                 if kind == "pr":
-                    yield self._pr_to_record(row)
+                    rec = self._pr_to_record(row)
                 else:
-                    yield self._issue_to_record(row, kind=subkind)
+                    rec = self._issue_to_record(row, kind=subkind)
+                # Codex Phase 2 BLOCKER: converter may return None when the
+                # row is malformed enough that we can't derive a repo — skip
+                # rather than emit a `unknown/unknown` collision magnet.
+                if rec is not None:
+                    yield rec
 
     @staticmethod
     def _apply_since(path: str, since: datetime | None) -> str:
@@ -349,6 +391,8 @@ class GitHubSource:
         out: list[Record] = []
         for pr in self._api_fetcher("/search/issues?q=is:pr+author:@me"):
             r = self._pr_to_record(pr)
+            if r is None:
+                continue
             wanted_state = ast.extra.get("state")
             if wanted_state and r.extra["state"] != wanted_state:
                 continue
@@ -366,3 +410,33 @@ def _parse_iso(s: str | None) -> datetime | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _extract_repo(row: dict) -> str | None:
+    """Derive ``owner/name`` from a /search/issues row.
+
+    Codex Phase 2 BLOCKER: search API rows carry ``repository_url`` (e.g.
+    ``https://api.github.com/repos/acme/api``) — parse the last two segments.
+    If that's missing or unparseable, fall back to ``html_url`` (e.g.
+    ``https://github.com/acme/api/pull/42``) — parse segments after the host.
+    If BOTH are unusable, return ``None`` so the caller can skip + log
+    rather than emit a ``unknown/unknown`` sentinel that collides across
+    every unparseable row.
+    """
+    repo_url = row.get("repository_url") or ""
+    if repo_url:
+        # Expect .../repos/OWNER/NAME  → OWNER/NAME
+        _, sep, tail = repo_url.partition("/repos/")
+        if sep and tail:
+            parts = [p for p in tail.split("/") if p]
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+    html_url = row.get("html_url") or ""
+    if html_url:
+        # Expect https://github.com/OWNER/NAME/(pull|issues)/N  → OWNER/NAME
+        _, sep, tail = html_url.partition("github.com/")
+        if sep and tail:
+            parts = [p for p in tail.split("/") if p]
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+    return None

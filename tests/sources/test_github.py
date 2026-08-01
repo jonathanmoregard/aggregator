@@ -277,7 +277,9 @@ def test_pr_to_record_shape():
     assert r.source == "github"
     assert "rate limiter" in r.subject.lower()
     assert r.extra["state"] == "open"
-    assert r.extra["mergeable"] is True
+    # /search/issues never populates mergeable / mergeable_state — set to None.
+    assert r.extra["mergeable"] is None
+    assert r.extra["mergeable_state"] is None
     assert r.extra["checks"] == "pass"
     assert "acme/api" in r.tags
 
@@ -288,7 +290,9 @@ def test_pr_closed_failing_record_shape():
     r = src._pr_to_record(pr)
     assert r.stable_id == "github:acme/api:41"
     assert r.extra["state"] == "closed"
-    assert r.extra["mergeable"] is False
+    # /search/issues never populates mergeable / mergeable_state — set to None.
+    assert r.extra["mergeable"] is None
+    assert r.extra["mergeable_state"] is None
     assert r.extra["checks"] == "fail"
     assert r.extra["author"] == "jonathan-more"
     assert r.extra["url"].endswith("/pull/41")
@@ -308,21 +312,26 @@ def test_record_body_excerpt_is_bounded():
     src = GitHubSource(_scope_fetcher=lambda: ["public_repo"])
     big = "x" * 2000
     pr = {
-        "base": {"repo": {"full_name": "acme/api"}},
+        "repository_url": "https://api.github.com/repos/acme/api",
         "number": 1,
         "title": "big",
         "state": "open",
         "body": big,
+        "html_url": "https://github.com/acme/api/pull/1",
+        "pull_request": {"url": "https://api.github.com/repos/acme/api/pulls/1"},
     }
     r = src._pr_to_record(pr)
     assert len(r.extra["body_excerpt"]) == 500
 
 
-def test_pr_missing_repo_falls_back_gracefully():
-    """gh api occasionally returns malformed rows; must not crash."""
+def test_pr_missing_repo_returns_none_not_unknown():
+    """Codex BLOCKER: pre-fix, an unparseable row fell back to
+    `unknown/unknown` — which collided with every other unparseable row
+    from anywhere, silently overwriting. Post-fix, an unparseable row is
+    dropped (returns None) with a warning."""
     src = GitHubSource(_scope_fetcher=lambda: ["public_repo"])
     r = src._pr_to_record({"number": 5, "title": "x", "state": "open"})
-    assert r.stable_id == "github:unknown/unknown:5"
+    assert r is None
 
 
 def test_record_shape_documents_filters():
@@ -394,6 +403,128 @@ def test_iter_records_since_normalises_to_utc_for_search_query(monkeypatch):
         assert "+updated:>=2026-06-30" in path, (
             f"expected UTC-normalised date, got: {path}"
         )
+
+
+# -- search-shape parsing (Phase 2 Codex BLOCKER) --------------------------
+#
+# The /search/issues endpoint returns issue-shaped rows for both PRs and
+# issues. Search hits have `repository_url` (never `base.repo`), lack
+# `mergeable` / `mergeable_state`, and carry a `pull_request` marker on rows
+# that are actually PRs. Deriving `repo` from `base.repo.full_name` (the
+# PULLs endpoint shape) falls through to `unknown/unknown` on every real
+# search row — so PR #42 from `acme/api` and PR #42 from `beta/svc` collide
+# on the same stable_id and the second overwrites the first.
+
+
+def _search_pr_row(*, repository_url: str, number: int, title: str = "pr") -> dict:
+    """Build a realistic /search/issues row for a PR (has `pull_request` marker,
+    `repository_url`, no `base`, no `mergeable_state`)."""
+    _, _, tail = repository_url.rpartition("/repos/")
+    return {
+        "id": 100000 + number,
+        "number": number,
+        "title": title,
+        "state": "open",
+        "user": {"login": "jonathan-more"},
+        "html_url": f"https://github.com/{tail}/pull/{number}",
+        "body": "pr body",
+        "created_at": "2026-07-25T10:00:00Z",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "repository_url": repository_url,
+        "pull_request": {
+            "url": f"{repository_url}/pulls/{number}",
+            "html_url": f"https://github.com/{tail}/pull/{number}",
+        },
+    }
+
+
+def test_pr_search_shape_two_repos_same_number_do_not_collide():
+    """Codex BLOCKER: /search/issues returns issue-shape (no base.repo). Both
+    rows would fall back to `unknown/unknown` on the pre-fix code and collide
+    on `github:unknown/unknown:42`, silently overwriting one repo's PR with
+    the other's. Post-fix, `repo` must be derived from `repository_url` so
+    the two rows land on distinct stable_ids."""
+    src = GitHubSource(_scope_fetcher=lambda: ["public_repo"])
+    row_acme = _search_pr_row(
+        repository_url="https://api.github.com/repos/acme/api",
+        number=42,
+        title="acme pr",
+    )
+    row_beta = _search_pr_row(
+        repository_url="https://api.github.com/repos/beta/svc",
+        number=42,
+        title="beta pr",
+    )
+    r_acme = src._pr_to_record(row_acme)
+    r_beta = src._pr_to_record(row_beta)
+    assert r_acme.stable_id == "github:acme/api:42"
+    assert r_beta.stable_id == "github:beta/svc:42"
+    assert r_acme.stable_id != r_beta.stable_id
+    assert r_acme.extra["repo"] == "acme/api"
+    assert r_beta.extra["repo"] == "beta/svc"
+
+
+def test_pr_search_shape_falls_back_to_html_url_when_repository_url_absent():
+    """If `repository_url` is missing (defensive), parse `html_url` instead of
+    silently emitting `unknown/unknown`."""
+    src = GitHubSource(_scope_fetcher=lambda: ["public_repo"])
+    row = {
+        "number": 7,
+        "title": "x",
+        "state": "open",
+        "html_url": "https://github.com/gamma/tool/pull/7",
+        "pull_request": {"url": "https://api.github.com/repos/gamma/tool/pulls/7"},
+    }
+    r = src._pr_to_record(row)
+    assert r.stable_id == "github:gamma/tool:7"
+    assert r.extra["repo"] == "gamma/tool"
+
+
+def test_pr_search_shape_skips_when_repo_cannot_be_derived(caplog):
+    """Neither `repository_url` nor a parseable `html_url`: skip the record
+    (return None) and log a warning rather than emit `unknown/unknown` which
+    causes cross-repo collisions."""
+    import logging
+
+    src = GitHubSource(_scope_fetcher=lambda: ["public_repo"])
+    row = {"number": 5, "title": "orphan", "state": "open"}
+    with caplog.at_level(logging.WARNING, logger="aggregator.sources.github"):
+        r = src._pr_to_record(row)
+    assert r is None
+    assert any("repo" in rec.message.lower() for rec in caplog.records)
+
+
+def test_pr_search_shape_drops_mergeable_fields():
+    """Search results don't include `mergeable` / `mergeable_state`. We set
+    both to None and document the limitation rather than emitting stale
+    per-source shape that only ever gets populated by a PULLs-endpoint
+    fetch we deliberately don't do."""
+    src = GitHubSource(_scope_fetcher=lambda: ["public_repo"])
+    row = _search_pr_row(
+        repository_url="https://api.github.com/repos/acme/api", number=1
+    )
+    r = src._pr_to_record(row)
+    assert r.extra["mergeable"] is None
+    assert r.extra["mergeable_state"] is None
+
+
+def test_iter_records_distinguishes_pr_from_issue_via_pull_request_marker(
+    monkeypatch,
+):
+    """Both `is:pr` and `is:issue` endpoints hit /search/issues and return
+    issue-shape rows. The way to tell a PR search hit from a real issue is
+    the presence of the `pull_request` key on the row. iter_records must
+    respect the endpoint's KIND (which is what already drives dispatch) —
+    this test just documents that PR-endpoint rows shouldn't be issue-shaped
+    in the fixtures we ship."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+    pr_row = _search_pr_row(
+        repository_url="https://api.github.com/repos/acme/api", number=42
+    )
+    assert "pull_request" in pr_row, (
+        "fixture builder must include the marker that distinguishes a PR "
+        "search hit from a plain issue search hit"
+    )
 
 
 def test_iter_records_omits_updated_filter_when_since_is_none(monkeypatch):
