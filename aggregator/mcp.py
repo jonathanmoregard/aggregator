@@ -61,7 +61,7 @@ from fastmcp import FastMCP
 
 from aggregator.core.dsl import DSLError, format_help, parse
 from aggregator.core.scrub import scrub
-from aggregator.core.store import Store
+from aggregator.core.store import CHAT_ORIGINS, Store
 from aggregator.core.wrap import wrap_record
 from aggregator.sources.base import ObservationRow, QueryAST, Record, SessionRow
 
@@ -118,8 +118,14 @@ def _session_to_item(
 
     ``content`` (M1): empty in summary mode (no body to wrap, subject already
     shown in the CLI header); wrapped first-user-prompt preview in full mode.
+
+    v3: chat-export rows label their card with the origin (``chatgpt`` /
+    ``claude-web``) rather than the claude-code kind buckets.
     """
-    source = "sessions" if s.kind == "session" else "subagents"
+    if s.origin in CHAT_ORIGINS:
+        source = s.origin
+    else:
+        source = "sessions" if s.kind == "session" else "subagents"
     if fields == "full":
         content = wrap_record(
             Record(
@@ -177,8 +183,11 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
     }
 
 
-# Ontology labels for routing.
-_SESSIONS_SOURCES = {"sessions", "subagents", "observations"}
+# Ontology labels for routing. v3: chat-export origins (chatgpt, claude-web)
+# are session-shaped — one session per exported conversation, observations
+# per message — so they route through the sessions path; the store filters
+# them on ``sessions.origin``.
+_SESSIONS_SOURCES = {"sessions", "subagents", "observations", *CHAT_ORIGINS}
 _RECORDS_SOURCES = {"github", "records"}
 
 # Records-only extra keys (interpreted by the github Source in its extra dict).

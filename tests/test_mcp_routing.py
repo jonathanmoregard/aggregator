@@ -61,7 +61,9 @@ def _sess(
     agent_id=None,
     first_ts: datetime | None = None,
     last_ts: datetime | None = None,
+    origin: str | None = None,
 ) -> SessionRow:
+    kwargs = {} if origin is None else {"origin": origin}
     return SessionRow(
         session_id=session_id,
         root_session_id=root or session_id,
@@ -75,6 +77,7 @@ def _sess(
         first_ts=first_ts or datetime(2026, 7, 25, 10, 0, tzinfo=UTC),
         last_ts=last_ts or datetime(2026, 7, 25, 10, 5, tzinfo=UTC),
         jsonl_path="/tmp/x.jsonl",
+        **kwargs,
     )
 
 
@@ -440,6 +443,45 @@ def test_union_pagination_records_fts_reaches_deep_matches(tmp_data_home):
         f"expected all 10 needle records reachable in a single page, "
         f"got {len(needle_ids)}; ids={sorted(needle_ids)}"
     )
+
+
+# --- v3: chat-export origins route to the sessions path -------------------
+
+
+def test_source_chatgpt_routes_to_sessions_mode(tmp_data_home):
+    """``source:chatgpt`` is session-shaped — must route mode='sessions'
+    and return only chatgpt-origin rows, labelled with their origin."""
+    store = Store()
+    store.migrate()
+    store.upsert_entities(
+        [
+            _sess("cc-sess"),
+            _sess("chatgpt:conv-1", origin="chatgpt"),
+            _obs("cg-o1", "chatgpt:conv-1", "exported chat body"),
+        ]
+    )
+    r = aggregator_query(dsl="source:chatgpt", _store=store)
+    assert r["ok"] is True
+    assert r["mode"] == "sessions"
+    ids = {rec["stable_id"] for rec in r["records"]}
+    assert ids == {"chatgpt:conv-1"}
+    assert all(rec["source"] == "chatgpt" for rec in r["records"])
+
+
+def test_source_claude_web_routes_to_sessions_mode(tmp_data_home):
+    store = Store()
+    store.migrate()
+    store.upsert_entities(
+        [
+            _sess("cc-sess"),
+            _sess("claude-web:conv-1", origin="claude-web"),
+        ]
+    )
+    r = aggregator_query(dsl="source:claude-web", _store=store)
+    assert r["ok"] is True
+    assert r["mode"] == "sessions"
+    ids = {rec["stable_id"] for rec in r["records"]}
+    assert ids == {"claude-web:conv-1"}
 
 
 def test_cross_source_no_filters_unions(tmp_data_home):

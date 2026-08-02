@@ -42,7 +42,11 @@ def _sess(
     first_ts: datetime | None = None,
     last_ts: datetime | None = None,
     path: str = "/tmp/x.jsonl",
+    origin: str | None = None,
 ) -> SessionRow:
+    # ``origin`` passed only when explicitly requested so the helper also
+    # exercises the dataclass default ('claude-code') on the common path.
+    kwargs = {} if origin is None else {"origin": origin}
     return SessionRow(
         session_id=session_id,
         root_session_id=root or session_id,
@@ -56,6 +60,7 @@ def _sess(
         first_ts=first_ts or datetime(2026, 7, 25, 10, 0, tzinfo=UTC),
         last_ts=last_ts or datetime(2026, 7, 25, 10, 5, tzinfo=UTC),
         jsonl_path=path,
+        **kwargs,
     )
 
 
@@ -464,10 +469,10 @@ def test_two_processes_concurrent_writes_succeed(tmp_data_home):
 # --- v2 sessions + observations -------------------------------------------
 
 
-def test_schema_version_is_2(tmp_data_home):
+def test_schema_version_is_3(tmp_data_home):
     s = Store()
     s.migrate()
-    assert s.schema_version() == SCHEMA_VERSION == 2
+    assert s.schema_version() == SCHEMA_VERSION == 3
 
 
 def test_upsert_entities_writes_sessions_and_observations(tmp_data_home):
@@ -661,6 +666,137 @@ def test_capabilities_reports_v2_counts(tmp_data_home):
     assert caps["counts"]["subagents"] == 1
     assert caps["counts"]["observations"] == 2
     assert caps["counts"]["records"] == 1
+
+
+# --- v3: sessions.origin (chat-export sources) -----------------------------
+
+
+def test_migrate_upgrades_v2_db_in_place_without_data_loss(tmp_data_home):
+    """v2 → v3 must be an in-place ``ALTER TABLE sessions ADD COLUMN origin``
+    guarded by a ``PRAGMA table_info`` probe — the live DB is 616MB and a
+    rebuild costs hours. Pre-existing rows must survive and backfill to
+    ``origin='claude-code'`` via the column default.
+    """
+    s = Store()
+    s.migrate()
+    s.upsert_entities([_sess("pre-v3"), _obs("o-pre", "pre-v3", "kept body")])
+    # Downgrade to the v2 shape: drop origin (and any index on it), reset
+    # user_version. This reconstructs what a real v2 cache.db looks like.
+    c = s._c()
+    c.execute("DROP INDEX IF EXISTS sessions_origin")
+    c.execute("ALTER TABLE sessions DROP COLUMN origin")
+    c.execute("PRAGMA user_version = 2")
+    c.commit()
+    s.close()
+
+    s2 = Store()
+    s2.migrate()
+    assert s2.schema_version() == SCHEMA_VERSION == 3
+    cols = {r[1] for r in s2._c().execute("PRAGMA table_info(sessions)")}
+    assert "origin" in cols
+    rows = s2.query_sessions(QueryAST(top_session_id="pre-v3"))
+    assert len(rows) == 1
+    assert rows[0].origin == "claude-code"
+    obs = s2.query_observations(QueryAST(top_session_id="pre-v3"))
+    assert {o.obs_id for o in obs} == {"o-pre"}
+
+
+def test_session_origin_round_trip(tmp_data_home):
+    s = Store()
+    s.migrate()
+    s.upsert_entities([_sess("chatgpt:conv-1", origin="chatgpt")])
+    rows = s.query_sessions(QueryAST(top_session_id="chatgpt:conv-1"))
+    assert len(rows) == 1
+    assert rows[0].origin == "chatgpt"
+
+
+def test_source_filters_split_by_origin(tmp_data_home):
+    """``source:chatgpt`` / ``source:claude-web`` filter on origin;
+    ``source:sessions`` stays claude-code-only — chat-export rows are
+    kind='session' too and must NOT leak into the existing bucket.
+    """
+    from aggregator.core.dsl import parse
+
+    s = Store()
+    s.migrate()
+    s.upsert_entities(
+        [
+            _sess("cc-sess"),
+            _sess("chatgpt:conv-1", origin="chatgpt"),
+            _sess("claude-web:conv-1", origin="claude-web"),
+        ]
+    )
+    got = {r.session_id for r in s.query_sessions(parse("source:chatgpt"))}
+    assert got == {"chatgpt:conv-1"}
+    got = {r.session_id for r in s.query_sessions(parse("source:claude-web"))}
+    assert got == {"claude-web:conv-1"}
+    got = {r.session_id for r in s.query_sessions(parse("source:sessions"))}
+    assert got == {"cc-sess"}, f"chat rows leaked into source:sessions: {got}"
+
+
+def test_source_subagents_excludes_chat_origins(tmp_data_home):
+    """Defensive: the subagents bucket implicitly means claude-code. Even a
+    (malformed) chat-origin row with kind='subagent' must not surface.
+    """
+    from aggregator.core.dsl import parse
+
+    s = Store()
+    s.migrate()
+    s.upsert_entities(
+        [
+            _sess("cc-root"),
+            _sess(
+                "cc-root:agent1",
+                kind="subagent",
+                root="cc-root",
+                parent="cc-root",
+                agent_id="agent1",
+            ),
+            _sess("chatgpt:weird", kind="subagent", origin="chatgpt"),
+        ]
+    )
+    got = {r.session_id for r in s.query_sessions(parse("source:subagents"))}
+    assert got == {"cc-root:agent1"}
+
+
+def test_obs_filter_by_origin(tmp_data_home):
+    """Observation queries mirror the origin filter via a sessions subselect."""
+    from aggregator.core.dsl import parse
+
+    s = Store()
+    s.migrate()
+    s.upsert_entities(
+        [
+            _sess("cc-sess"),
+            _sess("chatgpt:conv-1", origin="chatgpt"),
+            _obs("cc-o1", "cc-sess", "claude code body"),
+            _obs("cg-o1", "chatgpt:conv-1", "exported chat body"),
+        ]
+    )
+    got = {o.obs_id for o in s.query_observations(parse("source:chatgpt"))}
+    assert got == {"cg-o1"}
+    got = {o.obs_id for o in s.query_observations(parse("source:sessions"))}
+    assert got == {"cc-o1"}, f"chat obs leaked into source:sessions: {got}"
+
+
+def test_capabilities_reports_chat_origin_counts(tmp_data_home):
+    """Per-origin counts surface when nonzero; existing keys keep their
+    claude-code semantics; zero-row origins are omitted entirely."""
+    s = Store()
+    s.migrate()
+    s.upsert_entities(
+        [
+            _sess("cc-sess"),
+            _sess("chatgpt:conv-1", origin="chatgpt"),
+        ]
+    )
+    caps = s.capabilities()
+    assert caps["counts"]["sessions"] == 1  # claude-code only
+    assert caps["counts"]["chatgpt"] == 1
+    assert "chatgpt" in caps["sources"]
+    assert caps["freshness"]["chatgpt"] is not None
+    assert "claude-web" not in caps["sources"]
+    assert "claude-web" not in caps["counts"]
 
 
 def test_wal_files_land_in_db_dir(tmp_data_home):

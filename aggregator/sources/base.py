@@ -58,6 +58,12 @@ class SessionRow:
     ``<sessionId>/subagents/agent-*.jsonl`` files. For subagents the
     ``session_id`` is synthesized as ``<parent_sessionId>:<agentId>`` so it's
     unique across the two kinds without needing a compound key.
+
+    v3: ``origin`` distinguishes where the stream came from —
+    ``'claude-code'`` (default; local JSONLs) | ``'chatgpt'`` |
+    ``'claude-web'`` (vendor data-export drops). Kept LAST with a default so
+    existing constructors (all keyword-based) and any positional
+    construction stay valid without changes.
     """
 
     session_id: str          # sessionId (top-level) or sessionId:agentId (subagent)
@@ -72,6 +78,7 @@ class SessionRow:
     first_ts: datetime       # min timestamp across observations
     last_ts: datetime        # max timestamp across observations
     jsonl_path: str
+    origin: str = "claude-code"  # 'claude-code' | 'chatgpt' | 'claude-web'
 
 
 @dataclass

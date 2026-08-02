@@ -62,6 +62,17 @@ def test_top_level_session_row(fixtures_dir):
     assert top.last_ts.isoformat().startswith("2026-07-25T10:04:00")
 
 
+def test_emitted_session_rows_default_origin_claude_code(fixtures_dir):
+    """v3: sessions.py's emission is untouched — every SessionRow it yields
+    must land with origin='claude-code' via the dataclass default."""
+    src = SessionsSource(projects_root=str(fixtures_dir))
+    sessions, _obs, _errs = _split_entities(src)
+    assert sessions, "fixtures must yield at least one session row"
+    assert all(s.origin == "claude-code" for s in sessions), (
+        f"non-claude-code origins: {[(s.session_id, s.origin) for s in sessions if s.origin != 'claude-code']}"
+    )
+
+
 def test_subagent_session_row_with_composite_key(fixtures_dir):
     src = SessionsSource(projects_root=str(fixtures_dir))
     sessions, _obs, _errs = _split_entities(src)

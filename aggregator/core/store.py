@@ -32,9 +32,12 @@ in the research report §2. Same trick lets ``sessions.root_session_id``
 group top-level + subagent streams under one query.
 
 SQLite is a **derived index**; JSONLs / GitHub API responses are the source
-of truth. Migration = full rebuild. Schema version bumps to 2 to signal the
-break; ``Store.rebuild_all()`` drops every table (records + sessions +
-observations + FTS shadows) and re-runs DDL.
+of truth. v1→v2 migration = full rebuild (schema version bumped to 2 to
+signal the break; ``Store.rebuild_all()`` drops every table — records +
+sessions + observations + FTS shadows — and re-runs DDL). v2→v3 is additive
+and migrates IN PLACE: ``migrate()`` adds ``sessions.origin`` via ALTER
+TABLE with a ``'claude-code'`` default (chat-export sources land as
+``origin='chatgpt'`` / ``'claude-web'``); no rebuild needed.
 
 FTS5 external-content pattern per ``sqlite.org/fts5.html`` §external content:
 one virtual table per base table with ``content=base_table content_rowid=rowid``,
@@ -66,7 +69,12 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# v3 chat-export origins. ``sessions.origin`` values are these plus the
+# default 'claude-code'. Kept as a module constant so the WHERE builders,
+# capabilities, and the MCP routing layer stay in lockstep.
+CHAT_ORIGINS = ("chatgpt", "claude-web")
 
 
 class EmptyRebuildRefusedError(RuntimeError):
@@ -102,12 +110,14 @@ _DDL: list[str] = [
         git_branch             TEXT,
         first_ts               TEXT NOT NULL,
         last_ts                TEXT NOT NULL,
-        jsonl_path             TEXT NOT NULL
+        jsonl_path             TEXT NOT NULL,
+        origin                 TEXT NOT NULL DEFAULT 'claude-code'
     );
     """,
     "CREATE INDEX IF NOT EXISTS sessions_root ON sessions(root_session_id);",
     "CREATE INDEX IF NOT EXISTS sessions_kind ON sessions(kind);",
     "CREATE INDEX IF NOT EXISTS sessions_last_ts ON sessions(last_ts);",
+    "CREATE INDEX IF NOT EXISTS sessions_origin ON sessions(origin);",
     # --- v2: observations (Langfuse "observation") --------------------
     """
     CREATE TABLE IF NOT EXISTS observations (
@@ -266,8 +276,18 @@ class Store:
         Bumps ``PRAGMA user_version`` to SCHEMA_VERSION. A downgraded schema
         won't be silently touched — callers detect via ``user_version`` and
         run ``rebuild_all()`` to drop + recreate.
+
+        v2 → v3 upgrades in place: ``ALTER TABLE sessions ADD COLUMN origin``
+        with the ``'claude-code'`` default backfilling every existing row.
+        NO rebuild — the live cache.db is hundreds of MB and SQLite ADD
+        COLUMN with a constant default is a metadata-only change. The ALTER
+        runs BEFORE the DDL pass because the v3 DDL also creates an index on
+        ``origin``, which would fail against a v2-shaped table. Guarded by a
+        ``PRAGMA table_info`` probe (not user_version) so it only fires when
+        the column is genuinely absent; fresh DBs get the column via DDL.
         """
         c = self._c()
+        self._ensure_sessions_origin_column(c)
         for stmt in _DDL:
             c.executescript(stmt)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -276,6 +296,27 @@ class Store:
             (str(SCHEMA_VERSION),),
         )
         c.commit()
+
+    @staticmethod
+    def _ensure_sessions_origin_column(c: sqlite3.Connection) -> None:
+        """v2 → v3 in-place upgrade: add ``sessions.origin`` when absent.
+
+        Probes ``PRAGMA table_info(sessions)`` rather than ``user_version``
+        so a half-applied state (column present, version stale) can't run
+        the ALTER twice. No-op on fresh DBs (no sessions table yet — DDL
+        creates it with the column) and on already-v3 DBs.
+        """
+        table_exists = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+        ).fetchone()
+        if not table_exists:
+            return
+        cols = {row[1] for row in c.execute("PRAGMA table_info(sessions)")}
+        if "origin" not in cols:
+            c.execute(
+                "ALTER TABLE sessions ADD COLUMN origin "
+                "TEXT NOT NULL DEFAULT 'claude-code'"
+            )
 
     def schema_version(self) -> int:
         """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
@@ -330,9 +371,9 @@ class Store:
                     INSERT INTO sessions(
                         session_id, root_session_id, parent_session_id, kind,
                         agent_id, agent_type, spawned_by_tool_use_id,
-                        cwd, git_branch, first_ts, last_ts, jsonl_path
+                        cwd, git_branch, first_ts, last_ts, jsonl_path, origin
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         root_session_id        = excluded.root_session_id,
                         parent_session_id      = excluded.parent_session_id,
@@ -344,7 +385,8 @@ class Store:
                         git_branch             = excluded.git_branch,
                         first_ts               = excluded.first_ts,
                         last_ts                = excluded.last_ts,
-                        jsonl_path             = excluded.jsonl_path
+                        jsonl_path             = excluded.jsonl_path,
+                        origin                 = excluded.origin
                     """,
                     (
                         e.session_id,
@@ -359,6 +401,7 @@ class Store:
                         e.first_ts.isoformat(),
                         e.last_ts.isoformat(),
                         e.jsonl_path,
+                        e.origin,
                     ),
                 )
             elif isinstance(e, ObservationRow):
@@ -719,15 +762,24 @@ class Store:
         ``source:subagents`` filters to subagent rows (``kind='subagent'``).
         Both route through the sessions ontology upstream, but without the
         kind filter they returned identical rows.
+
+        v3: the kind buckets implicitly mean claude-code, so both also pin
+        ``origin='claude-code'`` — chat-export rows are kind='session' too
+        and must not leak in. ``source:chatgpt`` / ``source:claude-web``
+        filter on origin alone (chat exports carry no subagents, so no kind
+        constraint).
         """
         clauses = ["1=1"]
         params: list = []
         if ast.source == "sessions":
-            clauses.append("kind = ?")
+            clauses.append("kind = ? AND origin = 'claude-code'")
             params.append("session")
         elif ast.source == "subagents":
-            clauses.append("kind = ?")
+            clauses.append("kind = ? AND origin = 'claude-code'")
             params.append("subagent")
+        elif ast.source in CHAT_ORIGINS:
+            clauses.append("origin = ?")
+            params.append(ast.source)
         if ast.top_session_id:
             clauses.append("session_id = ?")
             params.append(ast.top_session_id)
@@ -764,15 +816,25 @@ class Store:
         Codex Phase 2 MEDIUM: ``source:sessions`` / ``source:subagents``
         restrict to observations owned by that kind (via the sessions
         table). Kept in lockstep with ``_sessions_where``.
+
+        v3: kind buckets also pin ``origin='claude-code'``;
+        ``source:chatgpt`` / ``source:claude-web`` filter on the owning
+        session's origin via the same subselect pattern.
         """
         clauses = ["1=1"]
         params: list = []
         if ast.source in ("sessions", "subagents"):
             kind = "session" if ast.source == "sessions" else "subagent"
             clauses.append(
-                "session_id IN (SELECT session_id FROM sessions WHERE kind = ?)"
+                "session_id IN (SELECT session_id FROM sessions "
+                "WHERE kind = ? AND origin = 'claude-code')"
             )
             params.append(kind)
+        elif ast.source in CHAT_ORIGINS:
+            clauses.append(
+                "session_id IN (SELECT session_id FROM sessions WHERE origin = ?)"
+            )
+            params.append(ast.source)
         if ast.top_session_id:
             clauses.append("session_id = ?")
             params.append(ast.top_session_id)
@@ -1061,6 +1123,12 @@ class Store:
         Reports records-shaped sources (github) and sessions/subagent counts
         under a single ``sources`` list, plus session-side inventory (agent
         types seen, activity range).
+
+        v3: the ``sessions``/``subagents`` buckets count claude-code rows
+        only (matching the query-filter semantics); chat-export origins
+        (chatgpt, claude-web) surface as their own source + count +
+        freshness entries when nonzero. Zero-row origins are omitted so the
+        pre-v3 response shape is unchanged until chat data actually lands.
         """
         c = self._c()
         sources: list[str] = [
@@ -1068,16 +1136,32 @@ class Store:
         ]
         # v2: session presence is source "sessions"; subagent presence adds a
         # nominal "subagents" bucket for capability discovery.
-        sess_count = c.execute("SELECT COUNT(*) AS n FROM sessions WHERE kind='session'").fetchone()
-        sub_count = c.execute("SELECT COUNT(*) AS n FROM sessions WHERE kind='subagent'").fetchone()
+        sess_count = c.execute(
+            "SELECT COUNT(*) AS n FROM sessions "
+            "WHERE kind='session' AND origin='claude-code'"
+        ).fetchone()
+        sub_count = c.execute(
+            "SELECT COUNT(*) AS n FROM sessions "
+            "WHERE kind='subagent' AND origin='claude-code'"
+        ).fetchone()
         if sess_count and sess_count["n"] > 0:
             sources.insert(0, "sessions")
         if sub_count and sub_count["n"] > 0:
             sources.insert(1 if "sessions" in sources else 0, "subagents")
+        # v3: chat-export origins, only when rows exist.
+        origin_counts: dict[str, int] = {}
+        for origin in CHAT_ORIGINS:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM sessions WHERE origin = ?", (origin,)
+            ).fetchone()
+            if row and row["n"] > 0:
+                origin_counts[origin] = int(row["n"])
+                sources.append(origin)
 
         freshness: dict[str, str | None] = {}
         tags_by_source: dict[str, list[str]] = {}
-        for s in [x for x in sources if x not in {"sessions", "subagents"}]:
+        session_shaped = {"sessions", "subagents", *CHAT_ORIGINS}
+        for s in [x for x in sources if x not in session_shaped]:
             row = c.execute(
                 "SELECT MAX(updated_at) AS m FROM records WHERE source = ?", (s,)
             ).fetchone()
@@ -1095,17 +1179,30 @@ class Store:
             ][:20]
 
         if "sessions" in sources:
-            row = c.execute("SELECT MAX(last_ts) AS m FROM sessions WHERE kind='session'").fetchone()
+            row = c.execute(
+                "SELECT MAX(last_ts) AS m FROM sessions "
+                "WHERE kind='session' AND origin='claude-code'"
+            ).fetchone()
             freshness["sessions"] = row["m"] if row else None
             tags_by_source["sessions"] = []
         if "subagents" in sources:
-            row = c.execute("SELECT MAX(last_ts) AS m FROM sessions WHERE kind='subagent'").fetchone()
+            row = c.execute(
+                "SELECT MAX(last_ts) AS m FROM sessions "
+                "WHERE kind='subagent' AND origin='claude-code'"
+            ).fetchone()
             freshness["subagents"] = row["m"] if row else None
             agents = [r["at"] for r in c.execute(
                 "SELECT DISTINCT agent_type AS at FROM sessions "
                 "WHERE kind='subagent' AND agent_type IS NOT NULL LIMIT 20"
             )]
             tags_by_source["subagents"] = agents
+        for origin in origin_counts:
+            row = c.execute(
+                "SELECT MAX(last_ts) AS m FROM sessions WHERE origin = ?",
+                (origin,),
+            ).fetchone()
+            freshness[origin] = row["m"] if row else None
+            tags_by_source[origin] = []
 
         # Date range across everything (records + sessions).
         row = c.execute(
@@ -1132,6 +1229,7 @@ class Store:
             "records": int(
                 c.execute("SELECT COUNT(*) AS n FROM records").fetchone()["n"]
             ),
+            **origin_counts,
         }
 
         return {
@@ -1172,6 +1270,7 @@ def _row_to_session(row: sqlite3.Row) -> SessionRow:
         first_ts=_parse_iso(row["first_ts"]),
         last_ts=_parse_iso(row["last_ts"]),
         jsonl_path=row["jsonl_path"],
+        origin=row["origin"],
     )
 
 
