@@ -73,13 +73,100 @@ def test_subagent_session_row_with_composite_key(fixtures_dir):
     assert sub.agent_type == "analyzer"
 
 
-def test_subagent_spawn_id_recovered_from_task_tool_use_window(fixtures_dir):
-    """The Task tool_use (tu-task-1) fires at 10:02:05; subagent first obs at
-    10:02:10 → within lookback window, unique → spawn id recovered."""
+def test_subagent_spawn_id_recovered_from_agent_toolresult_structured(fixtures_dir):
+    """B1 fix: parent Agent tool_result carries the child agentId in a
+    structured ``toolUseResult.agentId`` field. Parser joins agentId → the
+    parent's Agent tool_use_id (exact match, no time-window fuzz).
+
+    Fixture: tu-task-1 (Agent tool) → tool_result on line 6 with
+    ``toolUseResult.agentId == "agent001"`` → subagent agent001 recovers.
+    """
     src = SessionsSource(projects_root=str(fixtures_dir))
     sessions, _obs, _errs = _split_entities(src)
     sub = next(s for s in sessions if s.kind == "subagent")
     assert sub.spawned_by_tool_use_id == "tu-task-1"
+
+
+def test_subagent_spawn_id_recovered_from_agentid_text_fallback(tmp_path):
+    """B1 fix, fallback path: some parent tool_results only echo the child
+    agentId in the LLM-facing text (``agentId: <id>``) without a top-level
+    ``toolUseResult`` field. Parser must still recover via regex.
+    """
+    proj = tmp_path / "proj" / "sess-parent-xyz"
+    proj.mkdir(parents=True)
+    subdir = proj / "subagents"
+    subdir.mkdir()
+    # Parent JSONL — Agent tool_use + tool_result WITHOUT toolUseResult;
+    # only text-echoes the agentId.
+    parent_path = tmp_path / "proj" / "sess-parent-xyz.jsonl"
+    parent_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "sess-parent-xyz",
+                "uuid": "u-p-1",
+                "cwd": "/x",
+                "timestamp": "2026-07-27T10:00:00.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "tu-agent-42", "name": "Agent",
+                         "input": {"description": "d"}},
+                    ],
+                },
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "user",
+                "sessionId": "sess-parent-xyz",
+                "uuid": "u-p-2",
+                "cwd": "/x",
+                "timestamp": "2026-07-27T10:00:05.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu-agent-42",
+                            "content": [
+                                {"type": "text",
+                                 "text": "Async agent launched successfully.\n"
+                                          "agentId: xff42abcdef1234 (internal ID)"},
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n"
+    )
+    # Subagent file for xff42abcdef1234
+    sub_path = subdir / "agent-xff42abcdef1234.jsonl"
+    sub_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": "xff42abcdef1234",
+                "uuid": "u-s-1",
+                "cwd": "/x",
+                "timestamp": "2026-07-27T10:00:10.000Z",
+                "agentId": "xff42abcdef1234",
+                "isSidechain": True,
+                "message": {"role": "user", "content": "start"},
+            }
+        )
+        + "\n"
+    )
+    old = time.time() - 24 * 60 * 60
+    for f in (parent_path, sub_path):
+        os.utime(f, (old, old))
+    src = SessionsSource(projects_root=str(tmp_path))
+    sessions, _obs, _errs = _split_entities(src)
+    sub = next(s for s in sessions if s.kind == "subagent")
+    assert sub.agent_id == "xff42abcdef1234"
+    assert sub.spawned_by_tool_use_id == "tu-agent-42"
 
 
 def test_resume_prefix_copy_is_filtered(fixtures_dir):

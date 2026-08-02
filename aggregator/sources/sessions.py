@@ -26,12 +26,25 @@ Design decisions (documented for the migration):
   §5's guidance ("only ingest the NEW-sessionId portion under the new
   sessionId"). Non-matching-sessionId lines are dropped for that file — they
   belong to the parent file's stream.
-* **Spawned_by_tool_use_id recovery**: best-effort. On first pass we collect
-  Task ``tool_use`` entries per parent session with their ts + tool_use_id.
-  On second pass, for each subagent, we look up Task calls in the parent whose
-  ts is <= the subagent's first observation ts (closest predecessor within a
-  60s window). Store ``None`` when ambiguous — concurrent subagents produce
-  overlapping Task windows.
+* **Spawned_by_tool_use_id recovery** (B1 fix — real-data-verified). Claude
+  Code 2026 layout emits async subagent launches via the ``Agent`` tool
+  (previously assumed ``Task``, which produced 0/1170 recovery). The
+  ``tool_result`` for that ``Agent`` call carries the child ``agentId`` in TWO
+  places:
+
+  1. As a top-level ``toolUseResult.agentId`` sibling to ``message`` — the
+     structured, authoritative source.
+  2. Embedded in the tool_result text as ``"agentId: <id> (internal ID …)"``
+     — the LLM-facing echo string. Same value.
+
+  Pass 1 walks every top-level JSONL, collects ``{parent_session_id:
+  {child_agent_id: tool_use_id}}`` from either channel (structured first,
+  text-regex fallback). Pass 2 looks up each subagent's ``agent_id`` in its
+  parent's map — an EXACT-MATCH JOIN, no fuzzy time windows. Real-cache
+  measurement: 1084/1207 = 89.8% recovery (up from 0.0%). The remaining ~10%
+  is truly irrecoverable — parent JSONL not on disk (deleted / not yet
+  ingested / cache leftover from moved projects). ``None`` is preserved for
+  those.
 * **Live-file skip** (5-min window) preserved. File mtime is a container
   signal, per research §5 (never the source of truth for observation ts).
 * **Timestamps** parsed from record ``timestamp``; session ``first_ts`` /
@@ -42,6 +55,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -59,7 +73,13 @@ from aggregator.sources.base import (
 log = logging.getLogger(__name__)
 
 LIVE_WINDOW_SECONDS = 5 * 60
-SPAWN_LOOKBACK_SECONDS = 60  # Task tool_use → subagent-start ts window
+
+# Regex for the LLM-facing echo of a spawned agentId inside a tool_result
+# text block: e.g. "agentId: a54062c3d0038bcfa (internal ID - do not mention…)".
+# Character class permits hex ids AND human-tagged ones (e.g.
+# ``aside_question-24844801cae43a91`` — seen in real cache). Length range
+# 10–50 keeps stray matches out.
+_AGENT_ID_TEXT_RE = re.compile(r"agentId:\s*([A-Za-z0-9_\-]{10,50})")
 
 
 # Line ``type`` values we still record (as observations of type ``system`` or
@@ -232,7 +252,7 @@ class SessionsSource:
             "kind": "'session' | 'subagent'",
             "agent_id": "str | None",
             "agent_type": "str | None",
-            "spawned_by_tool_use_id": "str | None (recovered from Task tool_use window)",
+            "spawned_by_tool_use_id": "str | None (Agent tool_use_id from parent JSONL, exact-matched via agentId)",
             "cwd": "str | None",
             "git_branch": "str | None",
             "first_ts": "datetime (min message ts)",
@@ -429,63 +449,128 @@ class SessionsSource:
         # Fallback: max-count sessionId (deterministic tiebreak by string).
         return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
 
-    # -- Pass 1: collect Task tool_use ts per top-level session ----------
+    # -- Pass 1: agentId → Agent-tool_use_id index (B1 fix) --------------
 
-    def _collect_task_calls(
+    def _collect_agent_spawn_index(
         self, errors: list[str]
-    ) -> dict[str, list[tuple[datetime, str]]]:
-        """Return ``{parent_session_id: [(ts, tool_use_id), ...]}`` for Task
-        tool_use entries in every top-level JSONL. Used in pass 2 to recover
-        ``spawned_by_tool_use_id`` for subagents.
+    ) -> dict[str, dict[str, str]]:
+        """Return ``{parent_session_id: {child_agent_id: tool_use_id}}``.
+
+        Walks every top-level JSONL and joins each parent-side
+        ``Agent``-tool ``tool_result`` back to the child ``agentId`` it
+        launched. Two data channels are consulted (real-cache verified):
+
+        1. **Structured** (preferred): the top-level ``toolUseResult`` object
+           on the tool-result JSONL line carries ``agentId`` as a sibling of
+           ``prompt``/``agentType``/``content``. The corresponding
+           ``message.content[].tool_result.tool_use_id`` in the same line
+           gives us the parent's Agent tool_use_id.
+        2. **Text regex** (fallback): the ``tool_result.content`` text block
+           echoes ``"agentId: <id> (internal ID …)"``. Same value, LLM-facing
+           form. Regex used when the structured field is missing.
+
+        This is an EXACT-MATCH join — no time windows, no ambiguity.
         """
-        index: dict[str, list[tuple[datetime, str]]] = {}
+        index: dict[str, dict[str, str]] = {}
         for path in self._iter_jsonl_files():
             if self._is_subagent_path(path):
                 continue
-            parsed = list(self._iter_parsed(path, errors))
-            dominant = self._dominant_session_id(parsed, path)
-            if dominant is None:
+            dominant_id = path.stem  # filename == top-level sessionId
+            try:
+                fh = path.open(encoding="utf-8", errors="replace")
+            except OSError as e:
+                errors.append(f"{path}: open failed: {e}")
                 continue
-            for p in parsed:
-                if p.session_id != dominant:
-                    continue
-                if p.tool_name == "Task" and p.tool_use_id and p.ts:
-                    index.setdefault(dominant, []).append((p.ts, p.tool_use_id))
-        # Sort each list by ts ascending — used for closest-predecessor lookup.
-        for lst in index.values():
-            lst.sort(key=lambda t: t[0])
+            try:
+                for lineno, raw in enumerate(fh, 1):
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        errors.append(f"{path}:{lineno} corrupt line")
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    if obj.get("sessionId") != dominant_id:
+                        # Resume prefix-copy: skip lines that don't belong
+                        # to this file's dominant session.
+                        continue
+                    self._index_agent_launch(obj, dominant_id, index)
+            finally:
+                fh.close()
         return index
 
     @staticmethod
+    def _index_agent_launch(
+        obj: dict[str, Any],
+        parent_sid: str,
+        index: dict[str, dict[str, str]],
+    ) -> None:
+        """Extract (agent_id, tool_use_id) from an Agent-tool_result JSONL
+        line and record it under ``index[parent_sid]``. No-op when the line
+        isn't a tool_result carrying an agentId."""
+        message = obj.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return
+        # Find the tool_result block's tool_use_id — the parent's Agent id.
+        tool_use_id: str | None = None
+        text_body = ""
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
+                continue
+            tid = block.get("tool_use_id")
+            if isinstance(tid, str) and tool_use_id is None:
+                tool_use_id = tid
+            bc = block.get("content")
+            if isinstance(bc, str):
+                text_body += bc
+            elif isinstance(bc, list):
+                for sub in bc:
+                    if isinstance(sub, dict) and sub.get("type") == "text":
+                        t = sub.get("text")
+                        if isinstance(t, str):
+                            text_body += t
+        if tool_use_id is None:
+            return
+        # Strategy 1 (preferred): structured toolUseResult.agentId
+        tur = obj.get("toolUseResult")
+        if isinstance(tur, dict):
+            aid = tur.get("agentId")
+            if isinstance(aid, str) and aid:
+                index.setdefault(parent_sid, {})[aid] = tool_use_id
+                return
+        # Strategy 2 (fallback): text regex on the tool_result body
+        m = _AGENT_ID_TEXT_RE.search(text_body)
+        if m:
+            index.setdefault(parent_sid, {}).setdefault(m.group(1), tool_use_id)
+
+    @staticmethod
     def _recover_spawn_tool_use_id(
-        task_index: dict[str, list[tuple[datetime, str]]],
+        spawn_index: dict[str, dict[str, str]],
         parent_session_id: str | None,
-        subagent_first_ts: datetime | None,
+        agent_id: str | None,
     ) -> str | None:
-        """Best-effort: closest Task ``tool_use_id`` in the parent whose ts
-        precedes the subagent's first observation by ≤ ``SPAWN_LOOKBACK_SECONDS``.
+        """Exact-match lookup: parent's Agent tool_use_id for ``agent_id``.
 
         Returns ``None`` when:
-        * parent session unknown (legacy layout),
-        * no Task tool_use in that parent,
-        * two or more Task calls fall in the window (ambiguous → concurrent
-          subagents, we refuse to guess),
-        * subagent has no observations (nothing to anchor to).
+        * parent session unknown (legacy / orphan layout),
+        * parent JSONL not on disk / not walked (no index entry),
+        * the parent's index has no record of spawning this agent_id
+          (parent file may exist but the launching line was skipped —
+          e.g. live-window skip, or the launch used a mechanism we don't
+          yet parse).
         """
-        if not parent_session_id or subagent_first_ts is None:
+        if not parent_session_id or not agent_id:
             return None
-        calls = task_index.get(parent_session_id, [])
-        if not calls:
+        by_parent = spawn_index.get(parent_session_id)
+        if not by_parent:
             return None
-        window_start = subagent_first_ts.timestamp() - SPAWN_LOOKBACK_SECONDS
-        window_end = subagent_first_ts.timestamp()
-        candidates = [
-            (ts, tid) for ts, tid in calls
-            if window_start <= ts.timestamp() <= window_end
-        ]
-        if len(candidates) == 1:
-            return candidates[0][1]
-        return None
+        return by_parent.get(agent_id)
 
     # -- Pass 2: yield SessionRow + ObservationRow ------------------------
 
@@ -500,15 +585,15 @@ class SessionsSource:
         observation past ``since`` is emitted in full).
         """
         sink = errors if errors is not None else []
-        task_index = self._collect_task_calls(sink)
+        spawn_index = self._collect_agent_spawn_index(sink)
 
         for path in self._iter_jsonl_files():
-            yield from self._iter_file_entities(path, task_index, since, sink)
+            yield from self._iter_file_entities(path, spawn_index, since, sink)
 
     def _iter_file_entities(
         self,
         path: Path,
-        task_index: dict[str, list[tuple[datetime, str]]],
+        spawn_index: dict[str, dict[str, str]],
         since: datetime | None,
         errors: list[str],
     ) -> Iterator[SessionEntity]:
@@ -520,7 +605,7 @@ class SessionsSource:
         if is_subagent_file:
             # All lines in a subagent file belong to that stream. Group by
             # sessionId still (defensive; typically only one).
-            for entity in self._emit_subagent(path, parsed, task_index, since):
+            for entity in self._emit_subagent(path, parsed, spawn_index, since):
                 yield entity
         else:
             dominant = self._dominant_session_id(parsed, path)
@@ -586,7 +671,7 @@ class SessionsSource:
         self,
         path: Path,
         lines: list[_ParsedLine],
-        task_index: dict[str, list[tuple[datetime, str]]],
+        spawn_index: dict[str, dict[str, str]],
         since: datetime | None,
     ) -> Iterator[SessionEntity]:
         parent_sid = self._parent_session_from_path(path)
@@ -617,7 +702,7 @@ class SessionsSource:
         if since_utc and last_ts < since_utc:
             return
         agent_type = next((p.agent_type for p in own_lines if p.agent_type), None)
-        spawned = self._recover_spawn_tool_use_id(task_index, parent_sid, first_ts)
+        spawned = self._recover_spawn_tool_use_id(spawn_index, parent_sid, agent_id)
         cwd = next((p.cwd for p in own_lines if p.cwd), None)
         git_branch = next((p.git_branch for p in own_lines if p.git_branch), None)
         yield SessionRow(
