@@ -21,10 +21,18 @@ let
         # picked up without a rebuild. Fail loudly (`set -e`) if the file
         # is missing rather than silently ingesting anonymously and
         # hitting rate limits.
+        #
+        # Round-1 MEDIUM: keep the assignment and the export on separate
+        # lines. `export FOO=$(cmd)` masks `cmd`'s exit — the outer
+        # `export` builtin returns 0 regardless — so `set -e` never
+        # trips on a missing token file. Splitting into `token=$(cat ...)`
+        # then `export GH_TOKEN="$token"` lets `set -e` see the cat
+        # failure and abort the unit before we hand off to the CLI.
         "${pkgs.bash}/bin/bash -c '"
           + "set -e; "
-          + "export GH_TOKEN=\"$(${pkgs.coreutils}/bin/cat "
+          + "token=\"$(${pkgs.coreutils}/bin/cat "
           + lib.escapeShellArg tokenFile + ")\"; "
+          + "export GH_TOKEN=\"$token\"; "
           + "exec ${base}"
           + "'";
 

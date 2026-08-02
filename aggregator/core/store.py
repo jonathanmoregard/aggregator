@@ -836,9 +836,12 @@ class Store:
         subagents were ingested but whose top-level JSONL is missing (B2).
 
         Uses the subagents' first_ts/last_ts range as the parent window and
-        borrows cwd/git_branch from the earliest subagent so the surface has
-        sane display metadata. Returns None when no subagents reference the
-        id either — genuinely unknown session, don't fabricate.
+        borrows cwd/git_branch via ``MIN()`` across the subagents — the
+        alphabetically smallest non-null string wins, chosen just so the
+        surface has a stable non-null display metadata (not an "earliest"
+        signal — round-1 MEDIUM docstring correction). Returns None when
+        no subagents reference the id either — genuinely unknown session,
+        don't fabricate.
         """
         c = self._c()
         row = c.execute(

@@ -466,6 +466,17 @@ class SessionsSource:
         real (new) sessionId. The filename is the NEW sessionId. Match by
         filename stem when possible; fall back to the sessionId with the most
         lines.
+
+        Caveat — resume-of-resume orphans spawns (round-1 MEDIUM): the caller
+        drops every non-dominant line (see ``_iter_file_entities``). If a
+        resume-of-resume happens, the prefix-copied lines from the middle
+        session's ``Agent`` tool_use are dropped along with the rest, so any
+        subagent spawned from that middle session ends up with no discoverable
+        parent tool_use_id in the spawn index — the parent file is on disk,
+        walked, but the specific spawn line was filtered out here. This is a
+        second orphan-spawn root cause distinct from "parent JSONL not
+        ingested". Optional future improvement: index Agent tool_use lines
+        across ALL sessionIds present in a file, not just the dominant one.
         """
         stem = path.stem
         counts: dict[str, int] = {}
@@ -589,10 +600,13 @@ class SessionsSource:
         Returns ``None`` when:
         * parent session unknown (legacy / orphan layout),
         * parent JSONL not on disk / not walked (no index entry),
-        * the parent's index has no record of spawning this agent_id
-          (parent file may exist but the launching line was skipped —
-          e.g. live-window skip, or the launch used a mechanism we don't
-          yet parse).
+        * the parent's index has no record of spawning this agent_id.
+          Several distinct causes:
+            - live-window skip when ingest ran while the parent was open;
+            - the launching line's sessionId was filtered out as
+              non-dominant (resume-of-resume — see caveat on
+              ``_dominant_session_id``);
+            - the launch used a mechanism we don't yet parse.
         """
         if not parent_session_id or not agent_id:
             return None
