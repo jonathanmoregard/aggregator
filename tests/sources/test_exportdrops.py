@@ -223,4 +223,42 @@ def test_export_file_label_and_read_bytes_for_bare_file(drops, downloads):
 
 def test_unknown_kind_raises():
     with pytest.raises(ValueError):
-        discover_export_files("substack")
+        discover_export_files("nope-not-a-kind")
+
+
+# -- substack (Chunk 5) -----------------------------------------------------
+
+
+def test_substack_zip_in_downloads_classified(drops, downloads):
+    zp = _write_zip(
+        downloads / "substack-export.zip",
+        {
+            "posts.csv": "post_id,title\n",
+            "email_list.honest.csv": "email\n",
+            "posts/100.hello.html": "<h1>Hello</h1>",
+            "posts/100.delivers.csv": "email,sent_at\n",
+            "posts/100.opens.csv": "email,opened_at\n",
+        },
+    )
+    found = discover_export_files("substack")
+    assert [(f.path, f.member) for f in found] == [(zp, None)]
+    # A substack zip is neither chatgpt nor claude-web.
+    assert discover_export_files("chatgpt") == []
+    assert discover_export_files("claude-web") == []
+
+
+def test_substack_bare_files_not_discovered(drops, downloads):
+    """Bare posts/ directory or bare HTML is chat-drops semantic and out
+    of scope for v1 (substack ships zip only)."""
+    posts = downloads / "posts"
+    posts.mkdir()
+    (posts / "100.hello.html").write_text("<h1>Hi</h1>")
+    assert discover_export_files("substack") == []
+
+
+def test_chat_zip_not_misclassified_as_substack(drops, downloads):
+    _write_zip(
+        downloads / "chatgpt-only.zip",
+        {"conversations.json": json.dumps(CHATGPT_CONVS)},
+    )
+    assert discover_export_files("substack") == []

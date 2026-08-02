@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 DEFAULT_DROPS_DIR = "~/.local/share/aggregator/drops"
 DEFAULT_DOWNLOADS_DIR = "~/Downloads"
 
-EXPORT_KINDS = ("chatgpt", "claude-web")
+EXPORT_KINDS = ("chatgpt", "claude-web", "substack")
 
 # Both the flat 2024-era single file and the 2026 sharded layout.
 _CONV_PATTERNS = ("conversations.json", "conversations-*.json")
@@ -173,18 +173,42 @@ def _classify_bare(
 def _classify_zip(
     path: Path, kind: str, found: list[ExportFile], sink: list[str]
 ) -> None:
+    """Classify a zip against the requested ``kind``.
+
+    Chat exports (chatgpt, claude-web) match on the presence of a
+    ``conversations.json`` / ``conversations-*.json`` member whose first
+    array element carries the vendor-discriminating key. Substack exports
+    match on ANY ``posts/*.html`` member (glob semantics; the top-level
+    ``posts.csv`` does not match — ``fnmatch`` on ``posts/*.html`` is
+    segment-literal). Chat sniff runs first so any theoretical
+    conversations-shaped payload sitting alongside posts/*.html would win
+    the chat kinds; substack classification is only checked when the
+    caller asked for kind='substack', so the two paths do not compete.
+    """
     try:
         with zipfile.ZipFile(path) as zf:
-            members = [m for m in sorted(zf.namelist()) if is_conversations_name(m)]
-            for member in members:
-                try:
-                    raw = zf.read(member)
-                except (OSError, zipfile.BadZipFile, KeyError) as e:
-                    sink.append(f"{path}!{member}: read failed: {e}")
-                    continue
-                data = _load_json(f"{path}!{member}", raw, sink)
-                if classify_export(data) == kind:
-                    found.append(ExportFile(path=path, member=member))
+            names = sorted(zf.namelist())
+            if kind in ("chatgpt", "claude-web"):
+                members = [m for m in names if is_conversations_name(m)]
+                for member in members:
+                    try:
+                        raw = zf.read(member)
+                    except (OSError, zipfile.BadZipFile, KeyError) as e:
+                        sink.append(f"{path}!{member}: read failed: {e}")
+                        continue
+                    data = _load_json(f"{path}!{member}", raw, sink)
+                    if classify_export(data) == kind:
+                        found.append(ExportFile(path=path, member=member))
+                return
+            if kind == "substack":
+                # Defensive: if this zip is ALSO a chat export, let the
+                # chat kinds own it — a well-formed substack export
+                # never carries a conversations.json member.
+                if any(is_conversations_name(m) for m in names):
+                    return
+                if any(fnmatch.fnmatch(m, "posts/*.html") for m in names):
+                    found.append(ExportFile(path=path))
+                return
     except (OSError, zipfile.BadZipFile) as e:
         # Downloads legitimately holds unrelated broken/partial archives —
         # skip without polluting the ingest error report.

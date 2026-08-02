@@ -13,8 +13,8 @@ GitHub keeps the Record path unchanged.
 
 Chunk 4 wiring: chat-export sources (``chatgpt``, ``claude-web``) ride the
 entity path (session-shaped; discovery scans the drops dir AND ~/Downloads);
-``research`` and ``sota-watch`` ride the Record path (records-shaped, like
-github).
+``research``, ``sota-watch``, and ``substack`` ride the Record path
+(records-shaped, like github).
 
 Injection seams:
 * ``_store`` — swap the SQLite backing for tests (default: XDG cache).
@@ -44,6 +44,7 @@ from aggregator.sources.github import GitHubSource
 from aggregator.sources.research_reports import ResearchReportsSource
 from aggregator.sources.sessions import SessionsSource
 from aggregator.sources.sota_watch import SotaWatchSource
+from aggregator.sources.substack import SubstackSource
 
 # Round-1 HIGH-2: partial-parse silent-wipe threshold.
 # When --rebuild would drop >20% of rows for a source that already holds
@@ -95,6 +96,7 @@ def _default_sources() -> dict[str, Any]:
         "claude-web": ClaudeWebSource(),
         "research": ResearchReportsSource(),
         "sota-watch": SotaWatchSource(),
+        "substack": SubstackSource(),
     }
 
 
@@ -442,7 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
         "source",
         help=(
             "source name: sessions | github | chatgpt | claude-web | "
-            "research | sota-watch"
+            "research | sota-watch | substack"
         ),
     )
     ing.add_argument("--since", help="ISO date to bound the ingest window")

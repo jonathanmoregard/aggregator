@@ -25,9 +25,10 @@ Security invariants (spec §Security):
 Routing: two ontologies, one DSL surface.
 
 * ``records`` + ``records_fts`` — row-per-unit-of-work sources (GitHub PRs +
-  issues; research reports; sota-watch proposals; future: Gmail, Calendar).
-  Filter keys: ``source:github``, ``source:research``, ``source:sota-watch``,
-  ``tag:``, ``state:``, ``check:``, ``mergeable:``, ``author:``.
+  issues; research reports; sota-watch proposals; substack posts; future:
+  Gmail, Calendar). Filter keys: ``source:github``, ``source:research``,
+  ``source:sota-watch``, ``source:substack``, ``tag:``, ``state:``,
+  ``check:``, ``mergeable:``, ``author:``.
 * ``sessions`` + ``observations`` + ``obs_fts`` — Claude Code conversation
   streams (Langfuse-derived). Filter keys: ``source:sessions``, ``session:``,
   ``top:``, ``agent:``, ``type:``, ``active:``.
@@ -36,7 +37,7 @@ Route selection (see ``_wants_sessions`` / ``_route_mode``):
 
 * Explicit ``source:sessions|subagents|observations`` → sessions path
   (chat-export origins ``chatgpt``/``claude-web`` too — session-shaped).
-* Explicit ``source:github|records|research|sota-watch`` → records path. If the query ALSO
+* Explicit ``source:github|records|research|sota-watch|substack`` → records path. If the query ALSO
   carries session-only keys the paths are incompatible — return empty +
   a structured ``notice`` explaining the ontology mismatch (records don't
   have session ids).
@@ -196,7 +197,7 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
 # sources and would return every session row.
 # Chunk 7: ``sota-watch`` (self-generated SOTA proposals) same shape.
 _SESSIONS_SOURCES = {"sessions", "subagents", "observations", *CHAT_ORIGINS}
-_RECORDS_SOURCES = {"github", "records", "research", "sota-watch"}
+_RECORDS_SOURCES = {"github", "records", "research", "sota-watch", "substack"}
 
 # Records-only extra keys (interpreted by the github Source in its extra dict).
 # When these show up on a sessions-scoped query the paths are incompatible.
