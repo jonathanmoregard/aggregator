@@ -213,6 +213,179 @@ def test_empty_rebuild_refused_is_exception_type():
     assert issubclass(EmptyRebuildRefusedError, Exception)
 
 
+# --- Round-1 HIGH-2: partial-parse ratio guard ----------------------------
+
+
+def test_rebuild_refuses_when_partial_parse_drops_more_than_20_percent(
+    tmp_data_home, capsys
+):
+    """Round-1 HIGH-2: silent-wipe threshold too permissive.
+
+    Pre-fix: guard only tripped when session_count/records was 0. A partial
+    parse yielding 100 records against 5678 existing (a 98% drop) silently
+    wiped 5578 rows. Fix: refuse when new < 0.8 * existing AND existing > 100.
+    """
+    store = Store()
+    store.migrate()
+    _seed(store, 200)  # historical
+
+    # Only 5 records returned this round (>20% drop).
+    partial = [
+        Record(
+            stable_id=f"github:acme/api:live-{i}",
+            source="github",
+            subject=f"live {i}",
+            body="body",
+            created_at=datetime(2026, 7, 25, tzinfo=UTC),
+            updated_at=datetime(2026, 7, 25, tzinfo=UTC),
+        )
+        for i in range(5)
+    ]
+    source = _StubSource(records=partial, errors=[])
+    rc = cli.main(
+        ["ingest", "github", "--rebuild"],
+        _store=store,
+        _sources={"github": source},
+    )
+    assert rc == 1, "CLI must refuse rebuild on >20% row drop"
+    remaining = store.query(QueryAST(source="github"))
+    assert len(remaining) == 200, "seed rows must be untouched"
+    combined = capsys.readouterr()
+    err = combined.out + combined.err
+    assert "refusing" in err.lower()
+    assert "20%" in err or "drop" in err.lower(), (
+        f"error message should mention the drop, got: {err!r}"
+    )
+    assert "--force" in err, "error must point at the --force override"
+
+
+def test_rebuild_proceeds_on_small_shrink_below_20_percent(tmp_data_home):
+    """Ratio guard must NOT trip when the shrink is within tolerance.
+
+    200 existing, 180 new = 10% drop. Legitimate for e.g. closed PRs
+    aging out of the query window.
+    """
+    store = Store()
+    store.migrate()
+    _seed(store, 200)
+
+    new = [
+        Record(
+            stable_id=f"github:acme/api:n-{i}",
+            source="github",
+            subject=f"n {i}",
+            body="body",
+            created_at=datetime(2026, 7, 25, tzinfo=UTC),
+            updated_at=datetime(2026, 7, 25, tzinfo=UTC),
+        )
+        for i in range(180)
+    ]
+    source = _StubSource(records=new, errors=[])
+    rc = cli.main(
+        ["ingest", "github", "--rebuild"],
+        _store=store,
+        _sources={"github": source},
+    )
+    assert rc == 0
+    ids = {r.stable_id for r in store.query(QueryAST(source="github"))}
+    assert len(ids) == 180
+
+
+def test_rebuild_proceeds_on_shrink_when_existing_below_100(tmp_data_home):
+    """Ratio guard only bites when existing_count > 100 (per finding).
+
+    50 existing rows, 5 new = 90% drop but tiny absolute scale — proceed.
+    """
+    store = Store()
+    store.migrate()
+    _seed(store, 50)
+
+    new = [
+        Record(
+            stable_id=f"github:acme/api:x-{i}",
+            source="github",
+            subject=f"x {i}",
+            body="body",
+            created_at=datetime(2026, 7, 25, tzinfo=UTC),
+            updated_at=datetime(2026, 7, 25, tzinfo=UTC),
+        )
+        for i in range(5)
+    ]
+    source = _StubSource(records=new, errors=[])
+    rc = cli.main(
+        ["ingest", "github", "--rebuild"],
+        _store=store,
+        _sources={"github": source},
+    )
+    assert rc == 0
+
+
+def test_rebuild_force_yes_overrides_ratio_guard(tmp_data_home):
+    """--force + --yes proceeds through the ratio guard for scripted use.
+
+    Same 200->5 drop as the refuse test, but with --force + --yes the
+    guard is bypassed and the rebuild commits.
+    """
+    store = Store()
+    store.migrate()
+    _seed(store, 200)
+
+    partial = [
+        Record(
+            stable_id=f"github:acme/api:f-{i}",
+            source="github",
+            subject=f"f {i}",
+            body="body",
+            created_at=datetime(2026, 7, 25, tzinfo=UTC),
+            updated_at=datetime(2026, 7, 25, tzinfo=UTC),
+        )
+        for i in range(5)
+    ]
+    source = _StubSource(records=partial, errors=[])
+    rc = cli.main(
+        ["ingest", "github", "--rebuild", "--force", "--yes"],
+        _store=store,
+        _sources={"github": source},
+    )
+    assert rc == 0
+    ids = {r.stable_id for r in store.query(QueryAST(source="github"))}
+    assert len(ids) == 5, f"force must have replaced all rows, got {ids}"
+
+
+def test_rebuild_force_without_yes_requires_stdin_confirm(
+    tmp_data_home, monkeypatch
+):
+    """--force without --yes must prompt on stdin. Answering 'n' refuses."""
+    store = Store()
+    store.migrate()
+    _seed(store, 200)
+
+    partial = [
+        Record(
+            stable_id=f"github:acme/api:p-{i}",
+            source="github",
+            subject=f"p {i}",
+            body="body",
+            created_at=datetime(2026, 7, 25, tzinfo=UTC),
+            updated_at=datetime(2026, 7, 25, tzinfo=UTC),
+        )
+        for i in range(5)
+    ]
+    source = _StubSource(records=partial, errors=[])
+
+    # 'n' on stdin → refuse.
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    rc = cli.main(
+        ["ingest", "github", "--rebuild", "--force"],
+        _store=store,
+        _sources={"github": source},
+    )
+    assert rc == 1
+    remaining = store.query(QueryAST(source="github"))
+    assert len(remaining) == 200, "refuse must leave the store intact"
+
+
 def test_cli_surfaces_endpoint_errors_after_successful_ingest(
     tmp_data_home, capsys
 ):

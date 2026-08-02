@@ -36,6 +36,40 @@ from aggregator.sources.base import ObservationRow, SessionRow
 from aggregator.sources.github import GitHubSource
 from aggregator.sources.sessions import SessionsSource
 
+# Round-1 HIGH-2: partial-parse silent-wipe threshold.
+# When --rebuild would drop >20% of rows for a source that already holds
+# >100 rows, refuse unless --force. --force still prompts on stdin unless
+# --yes is passed (scripted use). Small stores (<=100 existing) bypass the
+# ratio check — nothing to protect at that scale.
+_RATIO_GUARD_MIN_EXISTING = 100
+_RATIO_GUARD_KEEP_FRACTION = 0.8  # refuse if new < 0.8 * existing
+
+
+def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
+    """True when the shrink from ``existing`` to ``new`` exceeds the guard.
+
+    Guard: existing > 100 AND new < 0.8 * existing. Callers still need to
+    handle the empty-with-errors case separately (that's a different fault
+    mode — see the wipe-on-transient-failure guard around it)."""
+    return (
+        existing_count > _RATIO_GUARD_MIN_EXISTING
+        and new_count < _RATIO_GUARD_KEEP_FRACTION * existing_count
+    )
+
+
+def _confirm_force_on_stdin(prompt: str) -> bool:
+    """Ask stdin for a 'y' to confirm. Any other answer returns False.
+
+    Kept out of the ingest paths so tests can monkeypatch sys.stdin without
+    reaching into either. EOF / empty answer also returns False.
+    """
+    print(prompt, file=sys.stderr)
+    try:
+        answer = sys.stdin.readline().strip().lower()
+    except (EOFError, OSError):
+        return False
+    return answer == "y"
+
 
 def _default_sources() -> dict[str, Any]:
     """Real source registry. Kept in a function so tests can bypass with
@@ -136,6 +170,29 @@ def _cmd_ingest_entities(
             for e in errors[:5]:
                 print(f"  error: {e}", file=sys.stderr)
             return 1
+        # Round-1 HIGH-2: partial-parse ratio guard.
+        if _ratio_guard_would_trip(session_count, existing):
+            if not getattr(args, "force", False):
+                print(
+                    f"ERROR: refusing to rebuild {args.source}: got "
+                    f"{session_count} new but store has {existing} "
+                    f"(would drop >20%); use --force to override",
+                    file=sys.stderr,
+                )
+                return 1
+            if not getattr(args, "yes", False):
+                confirmed = _confirm_force_on_stdin(
+                    f"--force will drop {existing - session_count} rows "
+                    f"from {args.source} ({existing} -> {session_count}). "
+                    f"Continue? [y/N]"
+                )
+                if not confirmed:
+                    print(
+                        f"aborted: {args.source} rebuild not confirmed; "
+                        f"store left intact",
+                        file=sys.stderr,
+                    )
+                    return 1
         min_sessions = 1 if existing > 0 else 0
         try:
             store.rebuild_and_upsert_entities(entities, min_sessions=min_sessions)
@@ -218,6 +275,29 @@ def _cmd_ingest(
                 for e in errors[:5]:
                     print(f"  error: {e}", file=sys.stderr)
                 return 1
+            # Round-1 HIGH-2: partial-parse ratio guard (records path).
+            if _ratio_guard_would_trip(len(records), existing):
+                if not getattr(args, "force", False):
+                    print(
+                        f"ERROR: refusing to rebuild {args.source}: got "
+                        f"{len(records)} new but store has {existing} "
+                        f"(would drop >20%); use --force to override",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not getattr(args, "yes", False):
+                    confirmed = _confirm_force_on_stdin(
+                        f"--force will drop {existing - len(records)} rows "
+                        f"from {args.source} ({existing} -> {len(records)}). "
+                        f"Continue? [y/N]"
+                    )
+                    if not confirmed:
+                        print(
+                            f"aborted: {args.source} rebuild not confirmed; "
+                            f"store left intact",
+                            file=sys.stderr,
+                        )
+                        return 1
             # Belt-and-braces: pass the store guard too, in case a future
             # caller reaches this path without the CLI's early return.
             min_records = 1 if existing > 0 else 0
@@ -327,6 +407,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebuild",
         action="store_true",
         help="drop this source's rows and re-scan raw",
+    )
+    ing.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "bypass the >20%% row-drop guard on --rebuild (still requires "
+            "'y' confirmation on stdin unless --yes is also passed)"
+        ),
+    )
+    ing.add_argument(
+        "--yes",
+        action="store_true",
+        help="assume 'y' for any --force confirmation (scripted use)",
     )
 
     tks = sub.add_parser(
