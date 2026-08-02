@@ -1,0 +1,181 @@
+[
+  {
+    "uuid": "aaaa1111-2222-4333-8444-555566667777",
+    "name": "Aggregator design chat",
+    "created_at": "2026-07-01T10:00:00.123456Z",
+    "updated_at": "2026-07-01T10:06:00.999Z",
+    "account": {"uuid": "acc-0000"},
+    "chat_messages": [
+      {
+        "uuid": "11111111-aaaa-4bbb-8ccc-000000000001",
+        "text": "Hello Claude",
+        "content": [
+          {
+            "start_timestamp": "2026-07-01T10:00:01.000000Z",
+            "stop_timestamp": "2026-07-01T10:00:01.000000Z",
+            "type": "text",
+            "text": "Hello Claude"
+          }
+        ],
+        "sender": "human",
+        "created_at": "2026-07-01T10:00:01.000000Z",
+        "updated_at": "2026-07-01T10:00:01.000000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "00000000-0000-4000-8000-000000000000"
+      },
+      {
+        "uuid": "11111111-aaaa-4bbb-8ccc-000000000002",
+        "text": "Hello! How can I help?",
+        "content": [
+          {
+            "start_timestamp": "2026-07-01T10:00:05.000000Z",
+            "stop_timestamp": "2026-07-01T10:00:06.000000Z",
+            "type": "thinking",
+            "thinking": "The user greets me. Plan a helpful reply.",
+            "summaries": []
+          },
+          {
+            "start_timestamp": "2026-07-01T10:00:07.000000Z",
+            "stop_timestamp": "2026-07-01T10:00:08.000000Z",
+            "type": "text",
+            "text": "Hello! How can I help?"
+          },
+          {
+            "start_timestamp": "2026-07-01T10:00:08.000000Z",
+            "type": "voice_note",
+            "details": "unknown block type the parser must ignore"
+          }
+        ],
+        "sender": "assistant",
+        "created_at": "2026-07-01T10:00:05.000000Z",
+        "updated_at": "2026-07-01T10:00:08.000000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "11111111-aaaa-4bbb-8ccc-000000000001"
+      },
+      {
+        "uuid": "11111111-aaaa-4bbb-8ccc-000000000003",
+        "text": "Hi there — regenerated answer.",
+        "content": [
+          {
+            "start_timestamp": "2026-07-01T10:00:30.000000Z",
+            "stop_timestamp": "2026-07-01T10:00:31.000000Z",
+            "type": "text",
+            "text": "Hi there — regenerated answer."
+          }
+        ],
+        "sender": "assistant",
+        "created_at": "2026-07-01T10:00:30.000000Z",
+        "updated_at": "2026-07-01T10:00:31.000000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "11111111-aaaa-4bbb-8ccc-000000000001"
+      },
+      {
+        "uuid": "11111111-aaaa-4bbb-8ccc-000000000004",
+        "text": "Search the web for aggregator patterns",
+        "sender": "human",
+        "created_at": "2026-07-01T10:05:00.000000Z",
+        "updated_at": "2026-07-01T10:05:00.000000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "11111111-aaaa-4bbb-8ccc-000000000002"
+      },
+      {
+        "uuid": "11111111-aaaa-4bbb-8ccc-000000000005",
+        "text": "",
+        "content": [
+          {
+            "start_timestamp": "2026-07-01T10:05:30.000000Z",
+            "stop_timestamp": "2026-07-01T10:05:31.000000Z",
+            "type": "tool_use",
+            "id": "toolu_01ABC",
+            "name": "web_search",
+            "input": {"query": "aggregator patterns"}
+          }
+        ],
+        "sender": "assistant",
+        "created_at": "2026-07-01T10:05:29.000000Z",
+        "updated_at": "2026-07-01T10:05:31.000000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "11111111-aaaa-4bbb-8ccc-000000000004"
+      },
+      {
+        "uuid": "11111111-aaaa-4bbb-8ccc-000000000006",
+        "text": "Based on the search, Langfuse-style traces fit.",
+        "content": [
+          {
+            "start_timestamp": "2026-07-01T10:05:32.000000Z",
+            "stop_timestamp": "2026-07-01T10:05:33.000000Z",
+            "type": "tool_result",
+            "name": "web_search",
+            "tool_use_id": "toolu_01ABC",
+            "content": [
+              {"type": "text", "text": "Top result: langfuse traces."}
+            ],
+            "is_error": false
+          },
+          {
+            "start_timestamp": "2026-07-01T10:05:40.000000Z",
+            "stop_timestamp": "2026-07-01T10:05:41.000000Z",
+            "type": "text",
+            "text": "Based on the search, Langfuse-style traces fit."
+          }
+        ],
+        "sender": "assistant",
+        "created_at": "2026-07-01T10:05:32.000000Z",
+        "updated_at": "2026-07-01T10:05:41.000000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "11111111-aaaa-4bbb-8ccc-000000000005"
+      }
+    ]
+  },
+  {
+    "uuid": "bbbb1111-2222-4333-8444-555566667777",
+    "name": "Older small chat",
+    "created_at": "2026-06-01T09:00:00.000Z",
+    "updated_at": "2026-06-01T09:10:00.000Z",
+    "account": {"uuid": "acc-0000"},
+    "chat_messages": [
+      {
+        "uuid": "22222222-aaaa-4bbb-8ccc-000000000001",
+        "text": "Ping",
+        "content": [
+          {
+            "start_timestamp": "2026-06-01T09:00:01.000Z",
+            "stop_timestamp": "2026-06-01T09:00:01.000Z",
+            "type": "text",
+            "text": "Ping"
+          }
+        ],
+        "sender": "human",
+        "created_at": "2026-06-01T09:00:01.000Z",
+        "updated_at": "2026-06-01T09:00:01.000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "00000000-0000-4000-8000-000000000002"
+      },
+      {
+        "uuid": "22222222-aaaa-4bbb-8ccc-000000000002",
+        "text": "Pong",
+        "content": [
+          {
+            "start_timestamp": "2026-06-01T09:00:05.000Z",
+            "stop_timestamp": "2026-06-01T09:00:05.000Z",
+            "type": "text",
+            "text": "Pong"
+          }
+        ],
+        "sender": "assistant",
+        "created_at": "2026-06-01T09:00:05.000Z",
+        "updated_at": "2026-06-01T09:00:05.000Z",
+        "attachments": [],
+        "files": [],
+        "parent_message_uuid": "22222222-aaaa-4bbb-8ccc-000000000001"
+      }
+    ]
+  }
+]
