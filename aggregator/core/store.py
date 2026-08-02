@@ -739,6 +739,14 @@ class Store:
         Text search flows through obs_fts and back to sessions via the
         denormalized ``root_session_id`` so a hit anywhere in a subagent
         stream still surfaces the top-level session.
+
+        Orphan-root synthesis (B2 fix): if ``top_session_id=X`` is set and
+        no top-level session with ``session_id=X`` exists, but subagents
+        reference X via ``root_session_id``, synthesise one placeholder
+        SessionRow so the caller sees the session exists. Common cause: the
+        top-level JSONL was still being written when ingest ran and got
+        skipped by the 5-min live-file guard, while its subagent files
+        (older, quiescent) were ingested.
         """
         where, params = self._sessions_where(ast)
         c = self._c()
@@ -746,7 +754,7 @@ class Store:
             try:
                 root_ids = self._fts_root_session_ids(ast.text)
             except sqlite3.OperationalError as e:
-                log.warning("FTS5 syntax error in query_sessions %r: %s", ast.text, e)
+                log.warning("query_sessions FTS5 syntax %r: %s", ast.text, e)
                 return []
             if not root_ids:
                 return []
@@ -762,7 +770,17 @@ class Store:
         except sqlite3.OperationalError as e:
             log.warning("query_sessions failed: %s", e)
             return []
-        return [_row_to_session(row) for row in rows]
+        sessions = [_row_to_session(row) for row in rows]
+        if (
+            ast.top_session_id
+            and not sessions
+            and not ast.text
+            and offset == 0
+        ):
+            orphan = self._synthesise_orphan_root(ast.top_session_id)
+            if orphan is not None:
+                sessions.append(orphan)
+        return sessions
 
     def count_sessions(self, ast: QueryAST) -> int:
         """Match count for ``query_sessions`` (for MCP ``total``)."""
@@ -781,7 +799,52 @@ class Store:
         row = c.execute(
             f"SELECT COUNT(*) AS n FROM sessions WHERE {where}", params
         ).fetchone()
-        return int(row["n"]) if row else 0
+        n = int(row["n"]) if row else 0
+        if (
+            n == 0
+            and ast.top_session_id
+            and not ast.text
+            and self._synthesise_orphan_root(ast.top_session_id) is not None
+        ):
+            # Orphan-root synth: count 1 when only subagents exist.
+            n = 1
+        return n
+
+    def _synthesise_orphan_root(self, top_sid: str) -> SessionRow | None:
+        """Return a placeholder ``kind='session'`` row for a session id whose
+        subagents were ingested but whose top-level JSONL is missing (B2).
+
+        Uses the subagents' first_ts/last_ts range as the parent window and
+        borrows cwd/git_branch from the earliest subagent so the surface has
+        sane display metadata. Returns None when no subagents reference the
+        id either — genuinely unknown session, don't fabricate.
+        """
+        c = self._c()
+        row = c.execute(
+            """
+            SELECT MIN(first_ts) AS lo, MAX(last_ts) AS hi,
+                   MIN(cwd)      AS cwd, MIN(git_branch) AS git_branch
+            FROM sessions
+            WHERE kind='subagent' AND root_session_id=?
+            """,
+            (top_sid,),
+        ).fetchone()
+        if not row or row["lo"] is None:
+            return None
+        return SessionRow(
+            session_id=top_sid,
+            root_session_id=top_sid,
+            parent_session_id=None,
+            kind="session",
+            agent_id=None,
+            agent_type=None,
+            spawned_by_tool_use_id=None,
+            cwd=row["cwd"],
+            git_branch=row["git_branch"],
+            first_ts=_parse_iso(row["lo"]),
+            last_ts=_parse_iso(row["hi"]),
+            jsonl_path="(not ingested — top-level JSONL missing at scan time)",
+        )
 
     def query_observations(
         self,

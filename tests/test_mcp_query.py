@@ -231,6 +231,61 @@ def test_query_active_key_routes_to_sessions_path(tmp_data_home):
     assert result["mode"] == "sessions"
 
 
+def test_top_returns_single_top_row_when_top_and_subagents_present(tmp_data_home):
+    """B2 plan test: seed 1 top + 2 subagents; top:X returns 1 row (the top).
+
+    Regression guard: this codifies the intended semantics from the plan --
+    top: yields exactly the top-level session, session: yields top + subagents,
+    agent: yields just the named subagent.
+    """
+    store = Store()
+    store.migrate()
+    store.upsert_entities(
+        [
+            _sess("root-b2"),
+            _sess("root-b2:aY", kind="subagent", root="root-b2",
+                  parent="root-b2", agent_id="aY"),
+            _sess("root-b2:aZ", kind="subagent", root="root-b2",
+                  parent="root-b2", agent_id="aZ"),
+        ]
+    )
+    r_top = aggregator_query(dsl="top:root-b2", _store=store)
+    r_sess = aggregator_query(dsl="session:root-b2", _store=store)
+    r_agent = aggregator_query(dsl="agent:aY", _store=store)
+    assert r_top["total"] == 1, r_top
+    assert r_sess["total"] == 3, r_sess
+    assert r_agent["total"] == 1, r_agent
+
+
+def test_top_synthesises_orphan_root_when_top_not_ingested(tmp_data_home):
+    """B2 real-data repro: subagents present but top-level JSONL was live
+    at ingest time so parent session_id row was never written. Users still
+    want ``top:X`` to surface the session (via subagent roots) rather than
+    silently return 0. Fix: synthesise a minimal orphan-root SessionRow so
+    the caller sees "yes, this session exists" and can then drill down.
+    """
+    store = Store()
+    store.migrate()
+    store.upsert_entities(
+        [
+            # NO top row -- simulates live-file skip at ingest
+            _sess("orphan-root:aA", kind="subagent", root="orphan-root",
+                  parent="orphan-root", agent_id="aA"),
+            _sess("orphan-root:aB", kind="subagent", root="orphan-root",
+                  parent="orphan-root", agent_id="aB"),
+        ]
+    )
+    r_top = aggregator_query(dsl="top:orphan-root", _store=store)
+    assert r_top["total"] == 1, (
+        f"top: should synthesise orphan-root row when subagents reference it "
+        f"but the top-level JSONL was skipped at ingest (got total={r_top['total']})"
+    )
+    # Session queries should still return the two subagents (no orphan for
+    # session: because subagents already carry the root).
+    r_sess = aggregator_query(dsl="session:orphan-root", _store=store)
+    assert r_sess["total"] == 2, r_sess
+
+
 def test_query_sessions_observations_wrapped_content(tmp_data_home):
     store = Store()
     _seed_sessions(store)
