@@ -1,13 +1,17 @@
 """ChatGPT export source (Chunk 2, chat-exports plan 2026-08-02).
 
 Ingests ChatGPT data-export drops from ``~/.local/share/aggregator/drops/``
-(override via ``AGGREGATOR_DROPS_DIR`` or the constructor) into the
+(override via ``AGGREGATOR_DROPS_DIR`` or the constructor) AND
+``~/Downloads`` (override ``AGGREGATOR_DOWNLOADS_DIR``) into the
 sessions/observations ontology:
 
 * accepted inputs: vendor ``*.zip`` containing ``conversations.json`` or
-  sharded ``conversations-*.json``, OR those JSON files dropped bare in the
-  dir. Zips are read via :mod:`zipfile` without extraction; ``jsonl_path``
-  for zip members is ``<zip path>!<member name>``.
+  sharded ``conversations-*.json``, OR those JSON files dropped bare in
+  either dir. Discovery + vendor classification live in
+  :mod:`aggregator.sources.exportdrops` (content sniff: ``mapping`` in the
+  first array element marks a ChatGPT export; claude-web files are the
+  parallel source's). Zips are read via :mod:`zipfile` without extraction;
+  ``jsonl_path`` for zip members is ``<zip path>!<member name>``.
 * conversation → ``SessionRow``: session_id = ``chatgpt:<conversation_id or
   id>`` (prefix for collision safety against Claude Code session UUIDs —
   plan §Collision safety), origin='chatgpt', kind='session'. first_ts /
@@ -40,7 +44,6 @@ sessions/observations ontology:
 """
 from __future__ import annotations
 
-import fnmatch
 import json
 import logging
 import os
@@ -57,22 +60,13 @@ from aggregator.sources.base import (
     SessionEntity,
     SessionRow,
 )
+from aggregator.sources.exportdrops import (
+    DEFAULT_DROPS_DIR,
+    discover_export_files,
+    downloads_dir,
+)
 
 log = logging.getLogger(__name__)
-
-DEFAULT_DROPS_DIR = "~/.local/share/aggregator/drops"
-
-# Both the flat 2024-era single file and the 2026 sharded layout.
-_CONV_PATTERNS = ("conversations.json", "conversations-*.json")
-
-
-def _is_conversations_name(name: str) -> bool:
-    """Match a filename (or zip member path) against the accepted shapes.
-
-    Zip members may sit under a subdirectory; only the basename matters.
-    """
-    base = name.rsplit("/", 1)[-1]
-    return any(fnmatch.fnmatch(base, pat) for pat in _CONV_PATTERNS)
 
 
 def _epoch_to_dt(value: Any) -> datetime | None:
@@ -169,40 +163,22 @@ class ChatGPTSource:
     def _iter_conversation_payloads(
         self, errors: list[str]
     ) -> Iterator[tuple[str, bytes]]:
-        """Yield ``(source_label, raw_json_bytes)`` for every accepted input.
+        """Yield ``(source_label, raw_json_bytes)`` for every ChatGPT-owned
+        input across drops dir + Downloads.
 
-        Bare JSON files first, then zip members — both sorted for
-        deterministic emission order. Unreadable files/zips go to the
-        errors sink; the walk continues.
+        Discovery + vendor classification are the shared helper's job
+        (``exportdrops.discover_export_files``); claude-web-shaped files
+        never surface here. Unreadable files go to the errors sink; the
+        walk continues.
         """
-        if not self.drops_dir.is_dir():
-            return
-        for path in sorted(self.drops_dir.iterdir()):
-            if not path.is_file():
-                continue
-            if _is_conversations_name(path.name):
-                try:
-                    yield str(path), path.read_bytes()
-                except OSError as e:
-                    errors.append(f"{path}: read failed: {e}")
-            elif path.suffix.lower() == ".zip":
-                yield from self._iter_zip_members(path, errors)
-
-    @staticmethod
-    def _iter_zip_members(
-        zip_path: Path, errors: list[str]
-    ) -> Iterator[tuple[str, bytes]]:
-        try:
-            with zipfile.ZipFile(zip_path) as zf:
-                for member in sorted(zf.namelist()):
-                    if not _is_conversations_name(member):
-                        continue
-                    try:
-                        yield f"{zip_path}!{member}", zf.read(member)
-                    except (OSError, zipfile.BadZipFile, KeyError) as e:
-                        errors.append(f"{zip_path}!{member}: read failed: {e}")
-        except (OSError, zipfile.BadZipFile) as e:
-            errors.append(f"{zip_path}: not a readable zip: {e}")
+        files = discover_export_files(
+            "chatgpt", dirs=[self.drops_dir, downloads_dir()], errors=errors
+        )
+        for f in files:
+            try:
+                yield f.label, f.read_bytes()
+            except (OSError, zipfile.BadZipFile, KeyError) as e:
+                errors.append(f"{f.label}: read failed: {e}")
 
     # -- conversation parsing ---------------------------------------------
 
@@ -352,6 +328,14 @@ class ChatGPTSource:
                 continue
             if not isinstance(conversations, list):
                 sink.append(f"{source_label}: top level is not a conversation array")
+                continue
+            # Second guard behind the discovery helper's classification:
+            # a claude-web-shaped array is the parallel source's, not ours.
+            if (
+                conversations
+                and isinstance(conversations[0], dict)
+                and "chat_messages" in conversations[0]
+            ):
                 continue
             for conv in conversations:
                 yield from self._emit_conversation(conv, source_label, since_utc, sink)

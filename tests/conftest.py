@@ -10,6 +10,21 @@ def tmp_data_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _isolated_downloads_dir(tmp_path, monkeypatch):
+    """Chat-export discovery also scans ``~/Downloads`` (Chunk 4 owner change).
+
+    Tests must never touch the real Downloads dir — default the override env
+    to a nonexistent path so discovery only sees dirs a test explicitly
+    creates. Tests exercising the Downloads path monkeypatch
+    ``AGGREGATOR_DOWNLOADS_DIR`` themselves (test-body setenv wins over this
+    autouse default).
+    """
+    monkeypatch.setenv(
+        "AGGREGATOR_DOWNLOADS_DIR", str(tmp_path / "downloads-nonexistent")
+    )
+
+
 @pytest.fixture
 def repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -1220,6 +1220,15 @@ class Store:
         if lo and hi:
             date_range = (lo[:10], hi[:10])
 
+        # Chunk 4: per-record-source counts (github: N, research: M, ...) so
+        # records-shaped sources register under ``counts`` like the chat
+        # origins do — not just in the aggregate ``records`` total.
+        record_counts = {
+            row["source"]: int(row["n"])
+            for row in c.execute(
+                "SELECT source, COUNT(*) AS n FROM records GROUP BY source"
+            )
+        }
         counts = {
             "sessions": int(sess_count["n"]) if sess_count else 0,
             "subagents": int(sub_count["n"]) if sub_count else 0,
@@ -1229,6 +1238,7 @@ class Store:
             "records": int(
                 c.execute("SELECT COUNT(*) AS n FROM records").fetchone()["n"]
             ),
+            **record_counts,
             **origin_counts,
         }
 

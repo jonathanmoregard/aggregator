@@ -95,6 +95,37 @@ data + spawn logic untouched.)
 - No canonical-path filtering (keep whole DAG).
 - projects.json / users.json ignored v1.
 
+## Added scope (owner, 2026-08-02 evening)
+
+### Chunk 5: substack source (records-shaped)
+
+Substack data export (Settings → Exports → zip). One Record per post:
+stable_id `substack:<post-slug-or-id>`, subject=title, body=post text
+(HTML→text), tags=[substack, published|draft]. Format verified against
+the owner's actual export before implementation (posts.csv + posts/
+HTML files is the expected shape; confirm on disk).
+
+### Chunk 7: sota-watch source (records-shaped)
+
+`~/Repos/sota-watch/proposals/*.md` — cron-generated SOTA proposals
+flagging where the stack lags state-of-the-art. Same shape/pattern as
+research-reports source: glob top-level *.md, subject=first heading,
+body verbatim, tags=["sota-watch"], mtime → created/updated_at.
+stable_id `sota-watch:<stem>`. New env override
+`AGGREGATOR_SOTA_WATCH_DIR`. No quarantine subdir here — the source is
+self-generated (not scanned untrusted input) so no belt-and-braces
+guard needed beyond the top-level-only glob.
+
+### Chunk 6: research-reports source (records-shaped)
+
+`~/Repos/research-agent/reports/*.md` — reports that PASSED the
+injection scan (quarantined ones live in a quarantine dir and are
+excluded; verify the exact dir name — memory says `_quarantine`).
+One Record per report: stable_id `research:<report-id>` (filename
+stem), subject=first heading, body=markdown, tags=[research].
+updated_at=file mtime. Local-file source — no export ritual, timer
+can hit it directly.
+
 ## Test fixtures
 
 Hand-written minimal JSON per research shapes: chatgpt 1 conversation

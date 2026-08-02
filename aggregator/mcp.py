@@ -25,16 +25,18 @@ Security invariants (spec §Security):
 Routing: two ontologies, one DSL surface.
 
 * ``records`` + ``records_fts`` — row-per-unit-of-work sources (GitHub PRs +
-  issues; future: Gmail, Calendar). Filter keys: ``source:github``, ``tag:``,
-  ``state:``, ``check:``, ``mergeable:``, ``author:``.
+  issues; research reports; sota-watch proposals; future: Gmail, Calendar).
+  Filter keys: ``source:github``, ``source:research``, ``source:sota-watch``,
+  ``tag:``, ``state:``, ``check:``, ``mergeable:``, ``author:``.
 * ``sessions`` + ``observations`` + ``obs_fts`` — Claude Code conversation
   streams (Langfuse-derived). Filter keys: ``source:sessions``, ``session:``,
   ``top:``, ``agent:``, ``type:``, ``active:``.
 
 Route selection (see ``_wants_sessions`` / ``_route_mode``):
 
-* Explicit ``source:sessions|subagents|observations`` → sessions path.
-* Explicit ``source:github|records`` → records path. If the query ALSO
+* Explicit ``source:sessions|subagents|observations`` → sessions path
+  (chat-export origins ``chatgpt``/``claude-web`` too — session-shaped).
+* Explicit ``source:github|records|research|sota-watch`` → records path. If the query ALSO
   carries session-only keys the paths are incompatible — return empty +
   a structured ``notice`` explaining the ontology mismatch (records don't
   have session ids).
@@ -187,8 +189,14 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
 # are session-shaped — one session per exported conversation, observations
 # per message — so they route through the sessions path; the store filters
 # them on ``sessions.origin``.
+#
+# Chunk 4: ``research`` (research-agent reports) is records-shaped like
+# github. It MUST be in the records set: an unlisted source falls through
+# to union mode, whose sessions side has no origin filter for unknown
+# sources and would return every session row.
+# Chunk 7: ``sota-watch`` (self-generated SOTA proposals) same shape.
 _SESSIONS_SOURCES = {"sessions", "subagents", "observations", *CHAT_ORIGINS}
-_RECORDS_SOURCES = {"github", "records"}
+_RECORDS_SOURCES = {"github", "records", "research", "sota-watch"}
 
 # Records-only extra keys (interpreted by the github Source in its extra dict).
 # When these show up on a sessions-scoped query the paths are incompatible.
@@ -271,7 +279,8 @@ def aggregator_query(
     Args:
       dsl: filter string. Session-ontology keys (session:, top:, agent:,
            type:, active:) route through the v2 sessions/observations tables.
-           Records-shaped sources (github) fall through to the legacy path.
+           Records-shaped sources (github, research) fall through to the
+           legacy path.
            Call ``aggregator_capabilities()`` for the live inventory.
       fields: ``"summary"`` (default) or ``"full"``.
       page_size: cap per page. Defaults to 200 for summary, 40 for full.

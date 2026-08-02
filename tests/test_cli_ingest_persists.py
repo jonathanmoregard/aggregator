@@ -1,10 +1,13 @@
 """Regression: `aggregator ingest` must actually persist records to the store.
 
-Covers both the Record path (github) and the v2 entity path (sessions).
+Covers both the Record path (github) and the v2 entity path (sessions),
+plus the Chunk-4 wiring of the three new sources (chatgpt, claude-web,
+research) through the default registry.
 """
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 from aggregator import cli
 from aggregator.core.store import Store
@@ -208,3 +211,119 @@ def test_ingest_entities_rebuild_drops_before_persist(tmp_data_home):
     assert rc == 0
     ids = {s.session_id for s in store.query_sessions(QueryAST())}
     assert ids == {"sess-a"}, ids
+
+
+# --- Chunk 4: chatgpt / claude-web / research wired into the CLI -----------
+
+
+def test_default_sources_registry_includes_new_sources():
+    names = set(cli._default_sources())
+    assert {
+        "sessions",
+        "github",
+        "chatgpt",
+        "claude-web",
+        "research",
+        "sota-watch",
+    } <= names
+
+
+def test_ingest_research_persists_records(tmp_data_home, tmp_path, monkeypatch):
+    """`aggregator ingest research` through the DEFAULT registry lands
+    Records in the store (records path, like github)."""
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "abc123.md").write_text(
+        "# Export formats survey\n\nreport body text\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("AGGREGATOR_RESEARCH_REPORTS_DIR", str(reports))
+    store = Store()
+    store.migrate()
+    rc = cli.main(["ingest", "research"], _store=store)
+    assert rc == 0
+    stored = store.query(QueryAST(source="research"))
+    assert [r.stable_id for r in stored] == ["research:abc123"]
+    assert stored[0].subject == "Export formats survey"
+    assert stored[0].tags == ["research"]
+
+
+def test_ingest_sota_watch_persists_records(tmp_data_home, tmp_path, monkeypatch):
+    """`aggregator ingest sota-watch` through the DEFAULT registry lands
+    Records in the store (records path, like github + research)."""
+    proposals = tmp_path / "proposals"
+    proposals.mkdir()
+    (proposals / "2026-07-31-tts.md").write_text(
+        "# TTS proposal\n\nproposal body\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("AGGREGATOR_SOTA_WATCH_DIR", str(proposals))
+    store = Store()
+    store.migrate()
+    rc = cli.main(["ingest", "sota-watch"], _store=store)
+    assert rc == 0
+    stored = store.query(QueryAST(source="sota-watch"))
+    assert [r.stable_id for r in stored] == ["sota-watch:2026-07-31-tts"]
+    assert stored[0].subject == "TTS proposal"
+    assert stored[0].tags == ["sota-watch"]
+
+
+def test_ingest_chatgpt_persists_sessions(tmp_data_home, repo_root, monkeypatch):
+    """`aggregator ingest chatgpt` through the DEFAULT registry lands
+    SessionRows (origin=chatgpt) + ObservationRows via the entity path."""
+    fixtures = Path(repo_root) / "tests" / "fixtures" / "chatgpt"
+    monkeypatch.setenv("AGGREGATOR_DROPS_DIR", str(fixtures))
+    store = Store()
+    store.migrate()
+    rc = cli.main(["ingest", "chatgpt"], _store=store)
+    assert rc == 0
+    sessions = store.query_sessions(QueryAST(source="chatgpt"))
+    assert {s.session_id for s in sessions} == {
+        "chatgpt:conv-uuid-1",
+        "chatgpt:conv-uuid-2",
+    }
+    obs = store.query_observations(QueryAST(source="chatgpt"))
+    assert any(o.obs_id == "chatgpt:node-u1" for o in obs)
+
+
+def test_ingest_claude_web_persists_sessions(tmp_data_home, repo_root, monkeypatch):
+    fixtures = Path(repo_root) / "tests" / "fixtures" / "claude-web"
+    monkeypatch.setenv("AGGREGATOR_DROPS_DIR", str(fixtures))
+    store = Store()
+    store.migrate()
+    rc = cli.main(["ingest", "claude-web"], _store=store)
+    assert rc == 0
+    sessions = store.query_sessions(QueryAST(source="claude-web"))
+    assert len(sessions) == 2
+    assert all(s.origin == "claude-web" for s in sessions)
+
+
+def test_ingest_chatgpt_with_empty_drops_exits_zero(tmp_data_home, tmp_path,
+                                                    monkeypatch, capsys):
+    """No drops present → clean exit with 0 found, never a crash."""
+    empty = tmp_path / "empty-drops"
+    empty.mkdir()
+    monkeypatch.setenv("AGGREGATOR_DROPS_DIR", str(empty))
+    store = Store()
+    store.migrate()
+    rc = cli.main(["ingest", "chatgpt"], _store=store)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "sessions=0" in out
+
+
+def test_ingest_chat_source_rebuild_refused(tmp_data_home, repo_root,
+                                            monkeypatch, capsys):
+    """--rebuild on a chat-export source must refuse: the entity rebuild
+    path replaces the ENTIRE sessions/observations tables, which would wipe
+    every other origin's rows (claude-code sessions included)."""
+    store = Store()
+    store.migrate()
+    store.upsert_entities([_mk_entities()[0]])  # a claude-code session
+    fixtures = Path(repo_root) / "tests" / "fixtures" / "chatgpt"
+    monkeypatch.setenv("AGGREGATOR_DROPS_DIR", str(fixtures))
+    rc = cli.main(["ingest", "chatgpt", "--rebuild"], _store=store)
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "rebuild" in err.lower()
+    # The pre-existing claude-code session is untouched.
+    ids = {s.session_id for s in store.query_sessions(QueryAST())}
+    assert "sess-a" in ids

@@ -11,6 +11,11 @@ v2 (Schema B): sessions ingest routes through the entity path
 (``iter_entities`` → ``store.upsert_entities`` / ``rebuild_and_upsert_entities``).
 GitHub keeps the Record path unchanged.
 
+Chunk 4 wiring: chat-export sources (``chatgpt``, ``claude-web``) ride the
+entity path (session-shaped; discovery scans the drops dir AND ~/Downloads);
+``research`` and ``sota-watch`` ride the Record path (records-shaped, like
+github).
+
 Injection seams:
 * ``_store`` — swap the SQLite backing for tests (default: XDG cache).
 * ``_sources`` — swap the source registry for tests.
@@ -33,8 +38,12 @@ from aggregator.mcp import (
     aggregator_query as _mcp_query,
 )
 from aggregator.sources.base import ObservationRow, SessionRow
+from aggregator.sources.chatgpt import ChatGPTSource
+from aggregator.sources.claude_web import ClaudeWebSource
 from aggregator.sources.github import GitHubSource
+from aggregator.sources.research_reports import ResearchReportsSource
 from aggregator.sources.sessions import SessionsSource
+from aggregator.sources.sota_watch import SotaWatchSource
 
 # Round-1 HIGH-2: partial-parse silent-wipe threshold.
 # When --rebuild would drop >20% of rows for a source that already holds
@@ -74,8 +83,19 @@ def _confirm_force_on_stdin(prompt: str) -> bool:
 def _default_sources() -> dict[str, Any]:
     """Real source registry. Kept in a function so tests can bypass with
     ``_sources={...}`` without importing the real sources' heavy deps
-    (subprocess to ``gh``, ``~/.claude/projects`` filesystem scan)."""
-    return {"sessions": SessionsSource(), "github": GitHubSource()}
+    (subprocess to ``gh``, ``~/.claude/projects`` filesystem scan).
+
+    All constructors are side-effect-free (env/dir resolution only); no
+    filesystem or network work happens until the chosen source's ingest
+    runs."""
+    return {
+        "sessions": SessionsSource(),
+        "github": GitHubSource(),
+        "chatgpt": ChatGPTSource(),
+        "claude-web": ClaudeWebSource(),
+        "research": ResearchReportsSource(),
+        "sota-watch": SotaWatchSource(),
+    }
 
 
 def _cmd_query(args: argparse.Namespace, store: Store) -> int:
@@ -159,6 +179,23 @@ def _cmd_ingest_entities(
     obs_count = sum(1 for e in entities if isinstance(e, ObservationRow))
 
     if args.rebuild:
+        # Chunk 4 guard: `rebuild_and_upsert_entities` atomically replaces
+        # the ENTIRE sessions + observations tables — it has no per-origin
+        # granularity. Running it for a chat-export source (chatgpt,
+        # claude-web) would silently wipe every claude-code session. Only
+        # the sessions source (which scans all claude-code JSONLs) may
+        # drive the whole-table rebuild; chat exports re-ingest via the
+        # idempotent upsert instead.
+        if args.source != "sessions":
+            print(
+                f"ERROR: --rebuild is not supported for source "
+                f"{args.source!r}: the entity rebuild path replaces the "
+                f"entire sessions/observations tables and would wipe other "
+                f"origins' rows. Re-run without --rebuild (ingest is an "
+                f"idempotent upsert per session/observation id).",
+                file=sys.stderr,
+            )
+            return 2
         existing = store.count_by_source(args.source)
         if session_count == 0 and (errors or existing > 0):
             print(
@@ -401,7 +438,13 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--json", action="store_true")
 
     ing = sub.add_parser("ingest", help="run one source's ingest cycle")
-    ing.add_argument("source", help="source name, e.g. sessions or github")
+    ing.add_argument(
+        "source",
+        help=(
+            "source name: sessions | github | chatgpt | claude-web | "
+            "research | sota-watch"
+        ),
+    )
     ing.add_argument("--since", help="ISO date to bound the ingest window")
     ing.add_argument(
         "--rebuild",

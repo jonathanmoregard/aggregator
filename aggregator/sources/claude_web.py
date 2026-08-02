@@ -1,7 +1,9 @@
 """Claude.ai (claude-web) export source: ``conversations.json`` → Schema B.
 
 Parses Claude.ai data-export drops from ``~/.local/share/aggregator/drops/``
-(override via ``AGGREGATOR_DROPS_DIR``). Two accepted shapes per drop:
+(override via ``AGGREGATOR_DROPS_DIR``) AND ``~/Downloads`` (override
+``AGGREGATOR_DOWNLOADS_DIR`` — Chunk 4 owner change: vendor zips land in
+Downloads, no manual move). Two accepted shapes per drop:
 
 * ``*.zip`` — the vendor export zip; ``conversations.json`` is read straight
   from the archive via :mod:`zipfile` (no extraction). The zip's other members
@@ -11,11 +13,14 @@ Parses Claude.ai data-export drops from ``~/.local/share/aggregator/drops/``
 Design decisions (mirroring the plan's Claude.ai mapping section):
 
 * **Shape sniff, not filename ownership.** A parallel chatgpt source scans the
-  SAME drops dir and both vendors name their file ``conversations.json``. The
+  SAME dirs and both vendors name their file ``conversations.json``. The
   first array element disambiguates: Claude conversations carry
-  ``chat_messages``; ChatGPT ones carry ``mapping``. Files that don't match
-  OUR shape are skipped silently — the other source owns them. Unreadable
-  JSON, however, goes to the errors sink (corruption should not vanish).
+  ``chat_messages``; ChatGPT ones carry ``mapping``. Discovery + vendor
+  classification live in :mod:`aggregator.sources.exportdrops`; the local
+  ``_is_claude_shape`` check stays as a cheap second guard. Files that don't
+  match OUR shape are skipped silently — the other source owns them.
+  Unreadable JSON, however, goes to the errors sink (corruption should not
+  vanish).
 * **Stable-ID prefixing** (plan §Collision safety): vendor UUIDs share a
   namespace with Claude Code session UUIDs, so every stored id is prefixed —
   ``claude-web:<uuid>`` for sessions AND observations (parent pointers
@@ -53,8 +58,11 @@ from aggregator.sources.base import (
     SessionEntity,
     SessionRow,
 )
-
-DEFAULT_DROPS_DIR = "~/.local/share/aggregator/drops"
+from aggregator.sources.exportdrops import (
+    DEFAULT_DROPS_DIR,
+    discover_export_files,
+    downloads_dir,
+)
 
 _ID_PREFIX = "claude-web:"
 # Root-marker sentinel. Claude exports use a nil-style v4 UUID whose tail
@@ -131,43 +139,28 @@ class ClaudeWebSource:
         self, errors: list[str]
     ) -> Iterator[tuple[str, list[Any]]]:
         """Yield ``(source_path, conversations)`` for every Claude-shaped
-        drop. ``source_path`` is the bare file path, or ``<zip>!<member>``
-        for zip members."""
-        root = self.drops_dir
-        if not root.exists():
-            return
-        for zpath in sorted(root.rglob("*.zip")):
-            matches: list[tuple[str, list[Any]]] = []
+        drop across drops dir + Downloads. ``source_path`` is the bare file
+        path, or ``<zip>!<member>`` for zip members.
+
+        Discovery + vendor classification are the shared helper's job;
+        ``_is_claude_shape`` re-checks the parsed payload as a cheap second
+        guard."""
+        files = discover_export_files(
+            "claude-web", dirs=[self.drops_dir, downloads_dir()], errors=errors
+        )
+        for f in files:
             try:
-                with zipfile.ZipFile(zpath) as zf:
-                    for member in zf.namelist():
-                        if member.rsplit("/", 1)[-1] != "conversations.json":
-                            continue  # users.json / projects.json / etc.
-                        src_path = f"{zpath}!{member}"
-                        try:
-                            with zf.open(member) as fh:
-                                data = json.load(fh)
-                        except json.JSONDecodeError as e:
-                            errors.append(f"{src_path}: invalid JSON: {e}")
-                            continue
-                        if self._is_claude_shape(data):
-                            matches.append((src_path, data))
-            except (zipfile.BadZipFile, OSError) as e:
-                errors.append(f"{zpath}: unreadable zip: {e}")
+                raw = f.read_bytes()
+            except (OSError, zipfile.BadZipFile, KeyError) as e:
+                errors.append(f"{f.label}: read failed: {e}")
                 continue
-            yield from matches
-        for jpath in sorted(root.rglob("conversations.json")):
             try:
-                with jpath.open(encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except json.JSONDecodeError as e:
-                errors.append(f"{jpath}: invalid JSON: {e}")
-                continue
-            except OSError as e:
-                errors.append(f"{jpath}: open failed: {e}")
+                data = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                errors.append(f"{f.label}: invalid JSON: {e}")
                 continue
             if self._is_claude_shape(data):
-                yield str(jpath), data
+                yield f.label, data
 
     @staticmethod
     def _is_claude_shape(data: Any) -> bool:

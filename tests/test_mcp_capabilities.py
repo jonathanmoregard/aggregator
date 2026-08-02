@@ -129,6 +129,59 @@ def test_capabilities_on_empty_store(tmp_data_home):
     assert caps["sources"] == []
 
 
+def test_capabilities_registers_research_like_github(tmp_data_home):
+    """Chunk 4: research records register in sources / freshness /
+    tags_by_source / counts — same automatic path as github, plus a
+    per-record-source entry under ``counts``."""
+    store = Store()
+    store.migrate()
+    store.upsert(
+        [
+            Record(
+                stable_id=f"research:rep{i}",
+                source="research",
+                subject=f"report {i}",
+                body="body",
+                tags=["research"],
+                created_at=datetime(2026, 7, 30, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 30, tzinfo=UTC),
+            )
+            for i in range(2)
+        ]
+    )
+    caps = aggregator_capabilities(_store=store)
+    assert "research" in caps["sources"]
+    assert caps["freshness"]["research"] is not None
+    assert caps["tags_by_source"]["research"] == ["research"]
+    assert caps["counts"]["research"] == 2
+
+
+def test_capabilities_registers_sota_watch_like_github(tmp_data_home):
+    """Chunk 7: sota-watch records register in sources / freshness /
+    tags_by_source / counts — same automatic records-source path."""
+    store = Store()
+    store.migrate()
+    store.upsert(
+        [
+            Record(
+                stable_id=f"sota-watch:2026-07-3{i}-topic",
+                source="sota-watch",
+                subject=f"proposal {i}",
+                body="proposal body",
+                tags=["sota-watch"],
+                created_at=datetime(2026, 7, 30, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 30, tzinfo=UTC),
+            )
+            for i in range(2)
+        ]
+    )
+    caps = aggregator_capabilities(_store=store)
+    assert "sota-watch" in caps["sources"]
+    assert caps["freshness"]["sota-watch"] is not None
+    assert caps["tags_by_source"]["sota-watch"] == ["sota-watch"]
+    assert caps["counts"]["sota-watch"] == 2
+
+
 def test_capabilities_help_includes_dsl_syntax(tmp_data_home):
     store = Store()
     _seed(store)

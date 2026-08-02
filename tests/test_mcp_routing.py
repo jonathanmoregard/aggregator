@@ -484,6 +484,88 @@ def test_source_claude_web_routes_to_sessions_mode(tmp_data_home):
     assert ids == {"claude-web:conv-1"}
 
 
+# --- Chunk 4: research is records-shaped ----------------------------------
+
+
+def test_source_research_routes_to_records_mode(tmp_data_home):
+    """``source:research`` targets the records table ONLY. Before the
+    routing set learned about research it fell through to union mode,
+    where the sessions side (no origin filter for unknown sources)
+    returned EVERY session row — a leak, not a filter."""
+    store = Store()
+    store.migrate()
+    store.upsert(
+        [
+            Record(
+                stable_id="research:abc123",
+                source="research",
+                subject="Export formats survey",
+                body="report body",
+                tags=["research"],
+                created_at=datetime(2026, 7, 30, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 30, tzinfo=UTC),
+            )
+        ]
+    )
+    store.upsert_entities([_sess("cc-sess"), _obs("o1", "cc-sess", "chat")])
+    r = aggregator_query(dsl="source:research", _store=store)
+    assert r["ok"] is True
+    assert r["mode"] == "records"
+    ids = {rec["stable_id"] for rec in r["records"]}
+    assert ids == {"research:abc123"}
+    assert "cc-sess" not in ids
+
+
+def test_source_research_with_session_key_returns_notice(tmp_data_home):
+    """Session-only keys on the records-shaped research source mismatch."""
+    store = Store()
+    store.migrate()
+    r = aggregator_query(dsl="source:research session:x", _store=store)
+    assert r["ok"] is True
+    assert r["total"] == 0
+    assert "notice" in r
+
+
+# --- Chunk 7: sota-watch is records-shaped --------------------------------
+
+
+def test_source_sota_watch_routes_to_records_mode(tmp_data_home):
+    """``source:sota-watch`` targets the records table. If it fell through
+    to union mode the sessions side would leak every session row."""
+    store = Store()
+    store.migrate()
+    store.upsert(
+        [
+            Record(
+                stable_id="sota-watch:2026-07-31-tts",
+                source="sota-watch",
+                subject="TTS state of the art",
+                body="proposal body",
+                tags=["sota-watch"],
+                created_at=datetime(2026, 7, 31, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 31, tzinfo=UTC),
+            )
+        ]
+    )
+    store.upsert_entities([_sess("cc-sess"), _obs("o1", "cc-sess", "chat")])
+    r = aggregator_query(dsl="source:sota-watch", _store=store)
+    assert r["ok"] is True
+    assert r["mode"] == "records"
+    ids = {rec["stable_id"] for rec in r["records"]}
+    assert ids == {"sota-watch:2026-07-31-tts"}
+    assert "cc-sess" not in ids
+
+
+def test_source_sota_watch_with_session_key_returns_notice(tmp_data_home):
+    """Session-only keys on the records-shaped sota-watch source mismatch."""
+    store = Store()
+    store.migrate()
+    r = aggregator_query(dsl="source:sota-watch session:x", _store=store)
+    assert r["ok"] is True
+    assert r["total"] == 0
+    assert "notice" in r
+
+
 def test_cross_source_no_filters_unions(tmp_data_home):
     """No filters at all also unions — "show me everything" surface."""
     store = Store()
