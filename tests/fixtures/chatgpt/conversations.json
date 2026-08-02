@@ -1,0 +1,148 @@
+[
+  {
+    "conversation_id": "conv-uuid-1",
+    "id": "legacy-id-ignored",
+    "title": "Swallow airspeed",
+    "create_time": 1750000000.0,
+    "update_time": 1750003600.0,
+    "current_node": "node-th1",
+    "moderation_results": [],
+    "mapping": {
+      "root-1": {
+        "id": "root-1",
+        "message": null,
+        "parent": null,
+        "children": ["node-u1"]
+      },
+      "node-u1": {
+        "id": "node-u1",
+        "message": {
+          "id": "node-u1",
+          "author": {"role": "user", "name": null, "metadata": {}},
+          "create_time": 1750000010.0,
+          "content": {
+            "content_type": "text",
+            "parts": ["What is the airspeed velocity of an unladen swallow?"]
+          },
+          "status": "finished_successfully",
+          "metadata": {}
+        },
+        "parent": "root-1",
+        "children": ["node-a1", "node-a2"]
+      },
+      "node-a1": {
+        "id": "node-a1",
+        "message": {
+          "id": "node-a1",
+          "author": {"role": "assistant", "name": null, "metadata": {}},
+          "create_time": 1750000020.0,
+          "content": {
+            "content_type": "text",
+            "parts": ["African or European?"]
+          },
+          "status": "finished_successfully",
+          "metadata": {"model_slug": "gpt-4o"}
+        },
+        "parent": "node-u1",
+        "children": []
+      },
+      "node-a2": {
+        "id": "node-a2",
+        "message": {
+          "id": "node-a2",
+          "author": {"role": "assistant", "name": null, "metadata": {}},
+          "create_time": 1750000030.0,
+          "content": {
+            "content_type": "text",
+            "parts": ["About 11 m/s for a European swallow."]
+          },
+          "status": "finished_successfully",
+          "metadata": {"model_slug": "gpt-4o"}
+        },
+        "parent": "node-u1",
+        "children": ["node-t1"]
+      },
+      "node-t1": {
+        "id": "node-t1",
+        "message": {
+          "id": "node-t1",
+          "author": {"role": "tool", "name": "python", "metadata": {}},
+          "create_time": 1750000040.0,
+          "content": {
+            "content_type": "execution_output",
+            "parts": ["24"]
+          },
+          "status": "finished_successfully",
+          "metadata": {}
+        },
+        "parent": "node-a2",
+        "children": ["node-m1"]
+      },
+      "node-m1": {
+        "id": "node-m1",
+        "message": {
+          "id": "node-m1",
+          "author": {"role": "user", "name": null, "metadata": {}},
+          "create_time": null,
+          "content": {
+            "content_type": "multimodal_text",
+            "parts": [
+              {
+                "content_type": "image_asset_pointer",
+                "asset_pointer": "file-service://file-abc123",
+                "size_bytes": 1234,
+                "width": 100,
+                "height": 100
+              },
+              "Look at this image"
+            ]
+          },
+          "status": "finished_successfully",
+          "metadata": {}
+        },
+        "parent": "node-t1",
+        "children": ["node-e1"]
+      },
+      "node-e1": {
+        "id": "node-e1",
+        "message": {
+          "id": "node-e1",
+          "author": {"role": "assistant", "name": null, "metadata": {}},
+          "create_time": 1750000060.0,
+          "content": {
+            "content_type": "text",
+            "parts": [""]
+          },
+          "status": "finished_successfully",
+          "metadata": {}
+        },
+        "parent": "node-m1",
+        "children": ["node-th1"]
+      },
+      "node-th1": {
+        "id": "node-th1",
+        "message": {
+          "id": "node-th1",
+          "author": {"role": "assistant", "name": null, "metadata": {}},
+          "create_time": 1750000070.0,
+          "content": {
+            "content_type": "thoughts",
+            "thoughts": [
+              {"summary": "Considering swallows", "content": "hmm, laden vs unladen"}
+            ],
+            "source_analysis_msg_id": "x-1"
+          },
+          "status": "finished_successfully",
+          "metadata": {}
+        },
+        "parent": "node-e1",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv-uuid-2",
+    "title": "No mapping, id fallback, no update_time",
+    "create_time": 1750010000.0
+  }
+]
