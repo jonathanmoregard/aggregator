@@ -22,16 +22,33 @@ Security invariants (spec §Security):
 4. **Structured errors only.** DSL parse errors, FTS5 syntax errors, and any
    unexpected exception become ``{ok: false, reason, remediation}``.
 
-Routing: the AST decides which table to hit.
+Routing: two ontologies, one DSL surface.
 
-* ``source == 'sessions'`` (explicit) OR any of ``session:``, ``top:``,
-  ``agent:``, ``type:``, ``active:`` set → sessions/observations path.
-* ``source == 'github'`` OR default (no source hint AND no session keys) →
-  records path.
+* ``records`` + ``records_fts`` — row-per-unit-of-work sources (GitHub PRs +
+  issues; future: Gmail, Calendar). Filter keys: ``source:github``, ``tag:``,
+  ``state:``, ``check:``, ``mergeable:``, ``author:``.
+* ``sessions`` + ``observations`` + ``obs_fts`` — Claude Code conversation
+  streams (Langfuse-derived). Filter keys: ``source:sessions``, ``session:``,
+  ``top:``, ``agent:``, ``type:``, ``active:``.
 
-Text search: when both paths are candidates and no source is specified, hit
-sessions first (that's where most volume lives). Records are unhit unless the
-DSL explicitly asks for them.
+Route selection (see ``_wants_sessions`` / ``_route_mode``):
+
+* Explicit ``source:sessions|subagents|observations`` → sessions path.
+* Explicit ``source:github|records`` → records path. If the query ALSO
+  carries session-only keys the paths are incompatible — return empty +
+  a structured ``notice`` explaining the ontology mismatch (records don't
+  have session ids).
+* Session-only keys with no source → sessions path.
+* Records-only keys (``state``/``check``/``mergeable``) with a sessions
+  source → empty + notice (same mismatch pattern, other direction).
+* Records-only keys with no source → records path (parity with pre-v2).
+* No source hint AND no ontology-specific keys AND (``from``/``to``/``tag``/
+  ``text`` or nothing) → UNION mode: run both paths and merge results by
+  ``updated_at`` / ``last_ts``. This is the "what happened this week?"
+  cross-source surface.
+
+Text search: no automatic favouritism. UNION mode covers text-only queries
+by running FTS on both ``records_fts`` and ``obs_fts``.
 """
 from __future__ import annotations
 
@@ -160,12 +177,17 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
     }
 
 
-def _wants_sessions(ast: QueryAST) -> bool:
-    """True when the AST should be routed to sessions/observations tables."""
-    if ast.source in {"sessions", "subagents", "observations"}:
-        return True
-    if ast.source == "github" or ast.source == "records":
-        return False
+# Ontology labels for routing.
+_SESSIONS_SOURCES = {"sessions", "subagents", "observations"}
+_RECORDS_SOURCES = {"github", "records"}
+
+# Records-only extra keys (interpreted by the github Source in its extra dict).
+# When these show up on a sessions-scoped query the paths are incompatible.
+_RECORDS_ONLY_EXTRA_KEYS = {"state", "check", "mergeable"}
+
+
+def _has_sessions_keys(ast: QueryAST) -> bool:
+    """True if the AST carries any sessions-ontology key (top-level attr)."""
     return any(
         [
             ast.session_id,
@@ -176,6 +198,51 @@ def _wants_sessions(ast: QueryAST) -> bool:
             ast.active_to,
         ]
     )
+
+
+def _has_records_only_keys(ast: QueryAST) -> bool:
+    """True if the AST carries any records-only per-source extra key."""
+    return any(k in ast.extra for k in _RECORDS_ONLY_EXTRA_KEYS)
+
+
+def _route_mode(ast: QueryAST) -> str:
+    """Pick the target table(s).
+
+    Return one of:
+
+    * ``"records"`` — hit ``records`` only.
+    * ``"sessions"`` — hit ``sessions`` / ``observations`` only.
+    * ``"mismatch_sessions_on_records"`` — caller asked for records-shaped
+      source but passed session-only keys. Empty + notice.
+    * ``"mismatch_records_on_sessions"`` — caller asked for sessions-shaped
+      source but passed records-only keys. Empty + notice.
+    * ``"union"`` — no source hint AND no ontology-specific keys. Merge both.
+    """
+    if ast.source in _SESSIONS_SOURCES:
+        if _has_records_only_keys(ast):
+            return "mismatch_records_on_sessions"
+        return "sessions"
+    if ast.source in _RECORDS_SOURCES:
+        if _has_sessions_keys(ast):
+            return "mismatch_sessions_on_records"
+        return "records"
+    # No source hint: pick by which ontology's keys are present.
+    if _has_sessions_keys(ast):
+        return "sessions"
+    if _has_records_only_keys(ast):
+        return "records"
+    # Neither ontology's keys were used — cross-source query (date-only,
+    # text-only, tag-only, or completely empty). Hit both.
+    return "union"
+
+
+def _wants_sessions(ast: QueryAST) -> bool:
+    """Backwards-compat shim: True when the sessions path handles this AST.
+
+    Kept for existing call sites and tests; new code should use
+    ``_route_mode`` to distinguish the mismatch + union cases too.
+    """
+    return _route_mode(ast) == "sessions"
 
 
 def aggregator_query(
@@ -254,11 +321,48 @@ def aggregator_query(
     page_size = max(1, int(page_size))
     offset = _parse_page_token(page_token)
 
-    if _wants_sessions(ast):
+    mode = _route_mode(ast)
+    if mode == "sessions":
         return _query_sessions_path(
             store, ast, fields, page_size, offset, drilldown
         )
-    return _query_records_path(store, ast, fields, page_size, offset)
+    if mode == "records":
+        return _query_records_path(store, ast, fields, page_size, offset)
+    if mode == "mismatch_sessions_on_records":
+        return _mismatch_response(
+            mode="records",
+            notice=(
+                "Session-ontology keys (session:, top:, agent:, type:, "
+                "active:) do not apply to records-shaped sources like "
+                "github — records carry no session ids. Drop source:github "
+                "to run the query against the sessions table."
+            ),
+        )
+    if mode == "mismatch_records_on_sessions":
+        offending = sorted(
+            k for k in ast.extra if k in _RECORDS_ONLY_EXTRA_KEYS
+        )
+        return _mismatch_response(
+            mode="sessions",
+            notice=(
+                f"Records-only keys ({', '.join(offending)}:) do not apply "
+                "to sessions — those filters live on github PRs/issues. "
+                "Use source:github to run the query against the records table."
+            ),
+        )
+    # mode == "union"
+    return _query_union_path(store, ast, fields, page_size, offset)
+
+
+def _mismatch_response(mode: str, notice: str) -> dict[str, Any]:
+    """Return an empty, ontology-mismatch response with a structured notice."""
+    return {
+        "ok": True,
+        "mode": mode,
+        "records": [],
+        "total": 0,
+        "notice": notice,
+    }
 
 
 def _query_records_path(
@@ -387,6 +491,128 @@ def _query_sessions_path(
             "or with drilldown=True to fetch matching observation rows."
         )
     return result
+
+
+def _query_union_path(
+    store: Store,
+    ast: QueryAST,
+    fields: str,
+    page_size: int,
+    offset: int,
+) -> dict[str, Any]:
+    """UNION mode: no source hint, no ontology-specific keys.
+
+    Runs both the records path (github PRs/issues) and the sessions path
+    (Claude Code streams) and merges the results by recency. This is the
+    "what happened in July?" surface — the caller doesn't care which
+    ontology answers, they want the whole picture.
+
+    The two ontologies use different timestamps: records order by
+    ``updated_at`` (when the PR last changed); sessions order by
+    ``last_ts`` (when the session last had activity). We normalise to a
+    single ``sort_ts`` per item purely for merge ordering — the item's
+    own timestamps stay authoritative.
+
+    Pagination: fetch ``limit=offset+page_size+1`` from each side, merge,
+    then slice. This over-fetches on deep pages but keeps the surface
+    stateless (no cross-side page tokens). Typical inventories (thousands
+    per side, single-digit pages) tolerate this fine.
+
+    Records-side fetch skips FTS if the caller passed no text — parity
+    with ``store.query`` behaviour. Sessions side likewise.
+    """
+    over_fetch = offset + page_size + 1
+
+    try:
+        rec_rows = store.query(ast, limit=over_fetch, offset=0)
+        rec_total = store.count(ast)
+    except Exception as e:  # noqa: BLE001
+        log.exception("union: records-side query failed for ast=%r", ast)
+        return {
+            "ok": False,
+            "reason": f"query failed: {type(e).__name__}",
+            "remediation": (
+                "Simplify the query and try again. If this persists, call "
+                "aggregator_capabilities() to confirm the store is healthy."
+            ),
+        }
+    try:
+        sess_rows = store.query_sessions(ast, limit=over_fetch, offset=0)
+        sess_total = store.count_sessions(ast)
+    except Exception as e:  # noqa: BLE001
+        log.exception("union: sessions-side query failed for ast=%r", ast)
+        return {
+            "ok": False,
+            "reason": f"query failed: {type(e).__name__}",
+            "remediation": (
+                "Simplify the query and try again. If this persists, call "
+                "aggregator_capabilities() to confirm the store is healthy."
+            ),
+        }
+
+    # Merge: build (sort_ts, kind, obj) tuples and sort desc by sort_ts.
+    merged: list[tuple[datetime_like, str, Any]] = []
+    for r in rec_rows:
+        ts = r.updated_at or r.created_at
+        merged.append((ts, "record", r))
+    for s in sess_rows:
+        ts = s.last_ts or s.first_ts
+        merged.append((ts, "session", s))
+    merged.sort(key=_union_sort_key, reverse=True)
+
+    total = rec_total + sess_total
+    window = merged[offset : offset + page_size + 1]
+    has_more = len(window) > page_size
+    window = window[:page_size]
+
+    items: list[dict[str, Any]] = []
+    for _ts, kind, obj in window:
+        if kind == "record":
+            items.append(_record_to_item(_scrub_record(obj), fields))
+        else:
+            # Session-shaped card. Reuse the sessions-path helper for parity
+            # (subject = first user prompt, matching_observations count).
+            subject = _first_user_prompt(store, obj)
+            session_scoped = replace(
+                ast, top_session_id=obj.session_id, session_id=None,
+            )
+            match_count = store.count_observations(session_scoped)
+            items.append(
+                _session_to_item(obj, fields, subject, match_count, subject)
+            )
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "mode": "union",
+        "records": items,
+        "total": total,
+    }
+    if has_more:
+        result["next_page_token"] = str(offset + page_size)
+    if fields != "full":
+        result["notice"] = (
+            "Cross-source union (records + sessions). Content bodies "
+            "omitted (fields='summary'). Re-call with fields=full to "
+            "include bodies, or add source:github / source:sessions to "
+            "target a single ontology."
+        )
+    return result
+
+
+# Type alias for readability in the sort key below.
+datetime_like = object  # actually datetime | None, but keep the import list tight
+
+
+def _union_sort_key(item: tuple) -> tuple[int, Any]:
+    """Sort helper for union merge: put items with a real timestamp first
+    (so None-timestamped rows land at the bottom of a descending sort).
+    Returning ``(has_ts, ts)`` handles the None case without needing
+    ``ts.min`` fallbacks that would compare naive vs. aware datetimes.
+    """
+    ts = item[0]
+    if ts is None:
+        return (0, "")
+    return (1, ts.isoformat() if hasattr(ts, "isoformat") else ts)
 
 
 def _first_user_prompt(store: Store, s: SessionRow) -> str:

@@ -1,17 +1,38 @@
-"""SQLite + FTS5 store — Schema B (Langfuse-derived).
+"""SQLite + FTS5 store — Schema B (Langfuse-derived), two ontologies.
 
-Ontology: ``sessions`` (Langfuse "trace") + ``observations`` (Langfuse
-"observation") for Claude Code JSONL sources. Standalone ``records`` +
-``records_fts`` are retained for row-per-unit-of-work sources (GitHub PRs +
-issues) — different ontology; see ``sources/base.py`` docstring.
+The store holds two intentionally-distinct ontologies side by side:
+
+1. ``records`` + ``records_fts`` — **units-of-work** ontology (Gooen
+   stable-ID discipline; one row per PR / issue / eventually Gmail thread /
+   Calendar event). Fields: ``subject``, ``body``, ``tags``, ``created_at``,
+   ``updated_at``, per-source ``extra`` JSON blob. Query keys:
+   ``source:github``, ``state:``, ``check:``, ``mergeable:``, ``author:``,
+   ``tag:``. See ``sources/github.py``.
+
+2. ``sessions`` (Langfuse "trace") + ``observations`` (Langfuse
+   "observation") + ``obs_fts`` — **conversation-stream** ontology. One
+   session per JSONL, one observation per message. Fields: ``kind``,
+   ``root_session_id``, ``parent_session_id``, ``agent_type``,
+   ``first_ts``, ``last_ts``, tokens, tool metadata. Query keys:
+   ``source:sessions``, ``session:``, ``top:``, ``agent:``, ``type:``,
+   ``active:``. See ``sources/sessions.py``.
+
+The two schemas are NOT unified. A PR is not naturally a session; a session
+is not naturally a unit of work. Attempting to squeeze either into the
+other's shape loses meaningful structure (a session-shaped PR has no
+observation stream; a records-shaped session collapses turn-by-turn detail
+into an opaque body blob). ``aggregator/mcp.py::_route_mode`` implements
+transparent routing over the split so DSL callers don't have to know which
+table they're hitting; cross-ontology date/text queries fan out to both
+tables (UNION mode).
 
 Everything under a session root is an indexed equality on the denormalized
 ``observations.root_session_id`` — no recursion — the SOTA trick documented
-in the research report §2. Same trick lets ``sessions.root_session_id`` group
-top-level + subagent streams under one query.
+in the research report §2. Same trick lets ``sessions.root_session_id``
+group top-level + subagent streams under one query.
 
-SQLite is a **derived index**; JSONLs / GitHub API responses are the source of
-truth. Migration = full rebuild. Schema version bumps to 2 to signal the
+SQLite is a **derived index**; JSONLs / GitHub API responses are the source
+of truth. Migration = full rebuild. Schema version bumps to 2 to signal the
 break; ``Store.rebuild_all()`` drops every table (records + sessions +
 observations + FTS shadows) and re-runs DDL.
 
