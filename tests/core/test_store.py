@@ -292,6 +292,75 @@ def test_sessions_where_honours_source_kind_split(tmp_data_home):
     )
 
 
+def test_session_hitlist_honours_obs_type_with_fts(tmp_data_home):
+    """Live-model smoke MEDIUM (2026-08-02): the sessions hit list mapped
+    FTS text to sessions via root_session_id WITHOUT applying the
+    ``type:`` filter. ``type:tool_use suggest_doc_edit`` surfaced 161
+    session cards whose only match was a ``tool_result`` obs — every card
+    showed ``matching_observations=0`` while drilldown (correctly)
+    returned nothing. The hit list must honour the joint predicate.
+    """
+    from aggregator.core.dsl import parse
+
+    s = Store()
+    s.migrate()
+    s.upsert_entities(
+        [
+            _sess("root-joint"),
+            _obs(
+                "o-result", "root-joint", "output mentioning needleword",
+                obs_type="tool_result",
+            ),
+        ]
+    )
+    ast = parse("type:tool_use needleword")
+    assert s.query_sessions(ast) == [], (
+        "hit list must be empty when no obs matches BOTH type and text"
+    )
+    assert s.count_sessions(ast) == 0
+
+    ast_right_type = parse("type:tool_result needleword")
+    rows = s.query_sessions(ast_right_type)
+    assert {r.session_id for r in rows} == {"root-joint"}
+
+
+def test_session_hitlist_excludes_sibling_subagents_without_own_match(
+    tmp_data_home,
+):
+    """Live-model smoke MEDIUM (2026-08-02) part 2: an FTS hit in subagent
+    A surfaced A's card, the parent's card, AND sibling B's card (all rows
+    sharing root_session_id). Sibling cards with zero own matches are
+    noise. Semantics: parent card surfaces on any hit under its root
+    (session: aggregates); a subagent card surfaces only when its OWN
+    stream matches.
+    """
+    from aggregator.core.dsl import parse
+
+    s = Store()
+    s.migrate()
+    parent = "root-sib"
+    sub_a = f"{parent}:agentA"
+    sub_b = f"{parent}:agentB"
+    s.upsert_entities(
+        [
+            _sess(parent),
+            _sess(sub_a, kind="subagent", root=parent, parent=parent,
+                  agent_id="agentA"),
+            _sess(sub_b, kind="subagent", root=parent, parent=parent,
+                  agent_id="agentB"),
+            _obs("oa", sub_a, "agent A found needleword here", root=parent),
+            _obs("ob", sub_b, "agent B unrelated body", root=parent),
+        ]
+    )
+    ast = parse("needleword")
+    rows = s.query_sessions(ast)
+    ids = {r.session_id for r in rows}
+    assert ids == {parent, sub_a}, (
+        f"sibling without own match must not surface: got {ids}"
+    )
+    assert s.count_sessions(ast) == 2
+
+
 def test_rebuild_and_upsert_rolls_back_on_error(tmp_data_home):
     s = Store()
     s.migrate()

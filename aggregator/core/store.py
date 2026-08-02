@@ -820,15 +820,16 @@ class Store:
         c = self._c()
         if ast.text:
             try:
-                root_ids = self._fts_root_session_ids(ast.text)
+                root_ids, exact_ids = self._fts_hit_scope(
+                    ast.text, ast.obs_type
+                )
             except sqlite3.OperationalError as e:
                 log.warning("query_sessions FTS5 syntax %r: %s", ast.text, e)
                 return []
-            if not root_ids:
+            if not root_ids and not exact_ids:
                 return []
-            placeholders = ",".join("?" * len(root_ids))
-            where += f" AND root_session_id IN ({placeholders})"
-            params = [*params, *root_ids]
+            where += " AND " + self._fts_scope_clause(root_ids, exact_ids)
+            params = [*params, *sorted(root_ids), *sorted(exact_ids)]
         sql = f"SELECT * FROM sessions WHERE {where} ORDER BY last_ts DESC"
         if limit is not None or offset:
             sql += " LIMIT ? OFFSET ?"
@@ -856,14 +857,15 @@ class Store:
         c = self._c()
         if ast.text:
             try:
-                root_ids = self._fts_root_session_ids(ast.text)
+                root_ids, exact_ids = self._fts_hit_scope(
+                    ast.text, ast.obs_type
+                )
             except sqlite3.OperationalError:
                 return 0
-            if not root_ids:
+            if not root_ids and not exact_ids:
                 return 0
-            placeholders = ",".join("?" * len(root_ids))
-            where += f" AND root_session_id IN ({placeholders})"
-            params = [*params, *root_ids]
+            where += " AND " + self._fts_scope_clause(root_ids, exact_ids)
+            params = [*params, *sorted(root_ids), *sorted(exact_ids)]
         row = c.execute(
             f"SELECT COUNT(*) AS n FROM sessions WHERE {where}", params
         ).fetchone()
@@ -983,6 +985,60 @@ class Store:
             (text,),
         ).fetchall()
         return [r["root"] for r in rows if r["root"]]
+
+    @staticmethod
+    def _fts_scope_clause(root_ids: set[str], exact_ids: set[str]) -> str:
+        """SQL fragment pairing kinds with their FTS hit scope.
+
+        Top-level cards surface on any hit under their root; subagent
+        cards only on hits in their own stream. Caller appends params in
+        the same order: sorted(root_ids) then sorted(exact_ids). Empty
+        sets render as ``1=0`` (SQL disallows ``IN ()``).
+        """
+        root_part = (
+            "(kind = 'session' AND root_session_id IN ("
+            + ",".join("?" * len(root_ids)) + "))"
+            if root_ids
+            else "1=0"
+        )
+        exact_part = (
+            "(kind = 'subagent' AND session_id IN ("
+            + ",".join("?" * len(exact_ids)) + "))"
+            if exact_ids
+            else "1=0"
+        )
+        return f"({root_part} OR {exact_part})"
+
+    def _fts_hit_scope(
+        self, text: str, obs_type: str | None = None
+    ) -> tuple[set[str], set[str]]:
+        """FTS text (+ optional obs type) → ``(root_ids, exact_ids)``.
+
+        ``root_ids``  — distinct ``root_session_id`` of matching obs; used
+        to surface top-level session cards (a hit anywhere under the root
+        counts — ``session:`` aggregates subagents).
+        ``exact_ids`` — distinct ``session_id`` (composite for subagents);
+        used so a subagent card surfaces only when its OWN stream matches.
+
+        Live-model smoke MEDIUM (2026-08-02): the previous root-only
+        mapping ignored ``type:`` and surfaced sibling subagents with
+        zero own matches.
+        """
+        c = self._c()
+        sql = """
+            SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
+            FROM obs_fts f
+            JOIN observations o ON o.rowid = f.rowid
+            WHERE obs_fts MATCH ?
+        """
+        params: list = [text]
+        if obs_type:
+            sql += " AND o.type = ?"
+            params.append(obs_type)
+        rows = c.execute(sql, params).fetchall()
+        roots = {r["root"] for r in rows if r["root"]}
+        exacts = {r["sid"] for r in rows if r["sid"]}
+        return roots, exacts
 
     def _fts_obs_ids(self, text: str) -> list[str]:
         c = self._c()
