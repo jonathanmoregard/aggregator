@@ -298,6 +298,64 @@ def test_matching_observations_correct_for_subagents(tmp_data_home):
     )
 
 
+def test_matching_observations_top_session_includes_subagents(tmp_data_home):
+    """Round-1 BLOCKER: session:<root> under-counted when hits live in subagents.
+
+    Bug: for the top-level session card, ``matching_observations`` was
+    computed with ``top_session_id=s.session_id`` which maps to
+    ``observations.session_id = ?``. Subagent observations carry
+    ``session_id = "<parent>:<agentId>"``, so they never matched. A
+    ``session:<root>`` query that returns the top card would therefore show
+    ``matching_observations=0`` even when 5 subagent obs matched.
+
+    Fix: for ``kind='session'``, count with ``session_id=s.root_session_id``
+    (which routes to ``root_session_id = ?`` — includes subagents). For
+    ``kind='subagent'`` keep exact-session_id filter (that subagent only).
+    """
+    store = Store()
+    store.migrate()
+    root = "root-blocker"
+    sub_a = f"{root}:agentA"
+    sub_b = f"{root}:agentB"
+    store.upsert_entities(
+        [
+            _sess(root),
+            _sess(sub_a, kind="subagent", root=root, parent=root,
+                  agent_id="agentA"),
+            _sess(sub_b, kind="subagent", root=root, parent=root,
+                  agent_id="agentB"),
+            # One tool_use obs on the top-level stream.
+            _obs("obs-top-1", root, "top tool_use blocker_marker",
+                 obs_type="tool_use", root=root),
+            # Two tool_use obs on subagents; note session_id=sub*, root=root.
+            _obs("obs-a-1", sub_a, "sub A tool_use blocker_marker",
+                 obs_type="tool_use", root=root),
+            _obs("obs-b-1", sub_b, "sub B tool_use blocker_marker",
+                 obs_type="tool_use", root=root),
+        ]
+    )
+    # session:<root> should return the top card with matching_observations >= 3
+    # (top + both subagents), all matched by the FTS term.
+    r = aggregator_query(
+        dsl=f"session:{root} type:tool_use blocker_marker", _store=store,
+    )
+    assert r["ok"] is True
+    top_cards = [c for c in r["records"] if c["kind"] == "session"]
+    assert top_cards, f"expected a top-level card, got {r['records']}"
+    top = top_cards[0]
+    assert top["matching_observations"] >= 3, (
+        f"expected top card to count subagent obs (>=3), "
+        f"got {top['matching_observations']}"
+    )
+    # And a subagent card, when present, still counts only its own obs.
+    sub_cards = [c for c in r["records"] if c["kind"] == "subagent"]
+    for sc in sub_cards:
+        assert sc["matching_observations"] == 1, (
+            f"subagent card should count only its own obs, "
+            f"got {sc['matching_observations']} for {sc['stable_id']}"
+        )
+
+
 def test_top_synthesises_orphan_root_when_top_not_ingested(tmp_data_home):
     """B2 real-data repro: subagents present but top-level JSONL was live
     at ingest time so parent session_id row was never written. Users still

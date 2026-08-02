@@ -467,13 +467,16 @@ def _query_sessions_path(
     for s in page_sessions:
         # Per-session subject: first user observation's body (up to 280 chars).
         subject = _first_user_prompt(store, s)
-        # Match count within THIS session (not root-group) for the caller's
-        # query. B3 fix: use top_session_id (exact session_id match) not
-        # session_id (which maps to root_session_id and mis-counts subagents
-        # whose obs carry the parent's root, never the composite id).
-        session_scoped = replace(
-            ast, top_session_id=s.session_id, session_id=None,
-        )
+        # Match count within THIS session card, kind-aware:
+        # * kind='session' (top-level): count the whole root group, i.e.
+        #   ``root_session_id = s.root_session_id`` (== s.session_id for a
+        #   top row). This includes subagent obs, whose session_id is the
+        #   composite ``<parent>:<agentId>`` but whose root_session_id is
+        #   the parent. Round-1 BLOCKER fix — using top_session_id here
+        #   under-counted top cards whenever the hits lived in subagents.
+        # * kind='subagent': count only that subagent's own obs by exact
+        #   session_id match (top_session_id in the AST).
+        session_scoped = _count_scope_for(ast, s)
         match_count = store.count_observations(session_scoped)
         items.append(_session_to_item(s, fields, subject, match_count, subject))
     result = {
@@ -572,10 +575,9 @@ def _query_union_path(
         else:
             # Session-shaped card. Reuse the sessions-path helper for parity
             # (subject = first user prompt, matching_observations count).
+            # Kind-aware scope (see round-1 BLOCKER fix in the sessions path).
             subject = _first_user_prompt(store, obj)
-            session_scoped = replace(
-                ast, top_session_id=obj.session_id, session_id=None,
-            )
+            session_scoped = _count_scope_for(ast, obj)
             match_count = store.count_observations(session_scoped)
             items.append(
                 _session_to_item(obj, fields, subject, match_count, subject)
@@ -613,6 +615,28 @@ def _union_sort_key(item: tuple) -> tuple[int, Any]:
     if ts is None:
         return (0, "")
     return (1, ts.isoformat() if hasattr(ts, "isoformat") else ts)
+
+
+def _count_scope_for(ast: QueryAST, s: SessionRow) -> QueryAST:
+    """Return an AST scoped to count observations for a single session card.
+
+    Kind-aware to preserve two invariants (round-1 BLOCKER fix):
+
+    * ``kind='session'`` (top-level): scope by ``root_session_id`` so subagent
+      obs are included in the top card's ``matching_observations``. Uses
+      ``session_id=s.root_session_id`` (== ``s.session_id`` for a top row),
+      which ``_obs_where`` translates to ``root_session_id = ?``.
+    * ``kind='subagent'``: scope by exact ``session_id`` so a subagent card
+      counts only its own obs. Uses ``top_session_id=s.session_id``, which
+      ``_obs_where`` translates to ``session_id = ?``.
+
+    Text (FTS) and ``obs_type`` filters from the caller's original AST are
+    preserved so ``matching_observations`` reflects the query's filter set.
+    """
+    if s.kind == "subagent":
+        return replace(ast, top_session_id=s.session_id, session_id=None)
+    # kind == 'session' (top-level, or synthesised orphan-root).
+    return replace(ast, session_id=s.root_session_id, top_session_id=None)
 
 
 def _first_user_prompt(store: Store, s: SessionRow) -> str:
