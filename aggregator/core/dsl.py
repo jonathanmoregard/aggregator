@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from aggregator.sources.base import QueryAST
 
@@ -108,12 +108,21 @@ def _parse_date(val: str, label: str) -> datetime:
     return dt
 
 
+_BARE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def _parse_active_range(val: str) -> tuple[datetime | None, datetime | None]:
     """Parse ``active:LO..HI`` (either side optional).
 
     Examples: ``active:2026-07-30..2026-08-01``, ``active:..2026-07-30``,
     ``active:2026-07-30..``. Empty string returns (None, None) — degenerate
     but not an error.
+
+    Codex Phase 2 MEDIUM: a bare-date HI (``YYYY-MM-DD``) is treated as
+    the exclusive start of the NEXT day so the range is inclusive of
+    everything on day HI (documented semantics). A full ISO datetime is
+    honoured as-is. Callers rely on this at the store layer where the
+    comparison is ``first_ts < active_to``.
     """
     if ".." not in val:
         raise DSLError(
@@ -121,7 +130,13 @@ def _parse_active_range(val: str) -> tuple[datetime | None, datetime | None]:
         )
     lo_str, _, hi_str = val.partition("..")
     lo = _parse_date(lo_str, "active-from") if lo_str else None
-    hi = _parse_date(hi_str, "active-to") if hi_str else None
+    hi: datetime | None = None
+    if hi_str:
+        hi = _parse_date(hi_str, "active-to")
+        if _BARE_DATE_RE.match(hi_str):
+            # End-of-day inclusive: HI covers everything on that date without
+            # crossing midnight (store predicate is ``first_ts <= active_to``).
+            hi = hi + timedelta(days=1) - timedelta(microseconds=1)
     return lo, hi
 
 

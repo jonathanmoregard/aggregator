@@ -79,9 +79,11 @@ def test_parse_type_key():
 
 
 def test_parse_active_range_both_sides():
+    # Bare-date HI is end-of-day inclusive so the documented range covers
+    # everything on HI (Codex Phase 2 MEDIUM fix).
     ast = parse("active:2026-07-30..2026-08-01")
     assert ast.active_from == datetime(2026, 7, 30, tzinfo=UTC)
-    assert ast.active_to == datetime(2026, 8, 1, tzinfo=UTC)
+    assert ast.active_to == datetime(2026, 8, 1, 23, 59, 59, 999999, tzinfo=UTC)
 
 
 def test_parse_active_range_open_end():
@@ -93,7 +95,14 @@ def test_parse_active_range_open_end():
 def test_parse_active_range_open_start():
     ast = parse("active:..2026-08-01")
     assert ast.active_from is None
-    assert ast.active_to == datetime(2026, 8, 1, tzinfo=UTC)
+    assert ast.active_to == datetime(2026, 8, 1, 23, 59, 59, 999999, tzinfo=UTC)
+
+
+def test_parse_active_range_iso_hi_untouched():
+    """Full ISO datetime HI is honoured as-is; only bare dates shift to
+    end-of-day inclusive."""
+    ast = parse("active:..2026-08-01T15:00:00+00:00")
+    assert ast.active_to == datetime(2026, 8, 1, 15, tzinfo=UTC)
 
 
 def test_parse_active_range_bad_syntax_raises():
