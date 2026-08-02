@@ -74,10 +74,11 @@ def _scrub_record(r: Record) -> Record:
 
 
 def _record_to_item(r: Record, fields: str) -> dict[str, Any]:
-    content = (
-        wrap_record(r) if fields == "full"
-        else wrap_record(replace(r, body=""))
-    )
+    # M1: summary mode has no body, so don't wrap it — an empty
+    # <ExternalContent> is cosmetically misleading. Subject already shows
+    # in the caller's header line. Wrap only when we're actually returning
+    # untrusted body text (fields='full').
+    content = wrap_record(r) if fields == "full" else ""
     return {
         "stable_id": r.stable_id,
         "source": r.source,
@@ -96,19 +97,24 @@ def _session_to_item(
     body_preview: str,
 ) -> dict[str, Any]:
     """One session-level card. ``subject`` = first user prompt (first ~280 char),
-    ``matching_observations`` = how many observations match the query, and
-    ``content`` is a wrapped preview (empty in summary mode, first user prompt
-    in full mode).
+    ``matching_observations`` = how many observations match the query.
+
+    ``content`` (M1): empty in summary mode (no body to wrap, subject already
+    shown in the CLI header); wrapped first-user-prompt preview in full mode.
     """
-    fake_record_for_wrap = Record(
-        stable_id=s.session_id,
-        source="sessions" if s.kind == "session" else "subagents",
-        subject=subject,
-        body=body_preview if fields == "full" else "",
-    )
+    source = "sessions" if s.kind == "session" else "subagents"
+    if fields == "full":
+        content = wrap_record(
+            Record(
+                stable_id=s.session_id, source=source,
+                subject=subject, body=body_preview,
+            )
+        )
+    else:
+        content = ""
     return {
         "stable_id": s.session_id,
-        "source": "sessions" if s.kind == "session" else "subagents",
+        "source": source,
         "kind": s.kind,
         "root_session_id": s.root_session_id,
         "parent_session_id": s.parent_session_id,
@@ -119,19 +125,25 @@ def _session_to_item(
         "first_ts": s.first_ts.isoformat() if s.first_ts else None,
         "last_ts": s.last_ts.isoformat() if s.last_ts else None,
         "matching_observations": match_count,
-        "content": wrap_record(fake_record_for_wrap),
+        "content": content,
     }
 
 
 def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
-    body = o.body if fields == "full" else ""
-    body = scrub(body).text
-    fake_record_for_wrap = Record(
-        stable_id=o.obs_id,
-        source="observations",
-        subject=(o.body[:120] if o.body else o.type),
-        body=body,
-    )
+    # M1: summary drilldown mode surfaces metadata only; skip the wrap so we
+    # don't emit empty <ExternalContent> blocks. Full mode wraps the actual
+    # observation body (still scrubbed pre-return per spec §Security).
+    if fields == "full":
+        body = scrub(o.body or "").text
+        content = wrap_record(
+            Record(
+                stable_id=o.obs_id, source="observations",
+                subject=(o.body[:120] if o.body else o.type),
+                body=body,
+            )
+        )
+    else:
+        content = ""
     return {
         "obs_id": o.obs_id,
         "session_id": o.session_id,
@@ -144,7 +156,7 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
         "output_tokens": o.output_tokens,
         "tool_name": o.tool_name,
         "tool_use_id": o.tool_use_id,
-        "content": wrap_record(fake_record_for_wrap),
+        "content": content,
     }
 
 

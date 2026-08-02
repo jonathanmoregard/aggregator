@@ -370,6 +370,41 @@ def test_query_sessions_notice_when_summary(tmp_data_home):
     assert "notice" in result
 
 
+def test_summary_mode_omits_external_content_wrap(tmp_data_home):
+    """M1: summary mode returns hit list without bodies; wrapping the empty
+    body in <ExternalContent> is misleading (looks like real content is
+    present when it isn't). Wrap only in drilldown / fields=full.
+    """
+    store = Store()
+    _seed_sessions(store)
+    result = aggregator_query(
+        dsl="source:sessions", fields="summary", _store=store
+    )
+    for rec in result["records"]:
+        assert "<ExternalContent" not in rec["content"], (
+            f"summary mode should not wrap; got: {rec['content']!r}"
+        )
+    # Full mode must still wrap (parity with prior behaviour).
+    result_full = aggregator_query(
+        dsl="source:sessions", fields="full", _store=store
+    )
+    for rec in result_full["records"]:
+        assert "<ExternalContent" in rec["content"]
+
+
+def test_records_summary_omits_external_content_wrap(tmp_data_home):
+    """M1 records-path parity: same behaviour for github-shaped hits."""
+    store = Store()
+    _seed_records(store)
+    result = aggregator_query(
+        dsl="source:github", fields="summary", _store=store
+    )
+    for rec in result["records"]:
+        assert "<ExternalContent" not in rec["content"], (
+            f"summary mode should not wrap; got: {rec['content']!r}"
+        )
+
+
 def test_query_scrubs_records_secrets_on_return(tmp_data_home):
     """Pre-return scrub of Record path (parity with pre-v2 behaviour)."""
     store = Store()

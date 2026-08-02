@@ -39,14 +39,14 @@ def main() -> int:
     session_count = 0
     obs_count = 0
     batch: list = []
-    BATCH = 5000
+    batch_size = 5000
     for e in src.iter_entities(errors=errors):
         batch.append(e)
         if isinstance(e, SessionRow):
             session_count += 1
         elif isinstance(e, ObservationRow):
             obs_count += 1
-        if len(batch) >= BATCH:
+        if len(batch) >= batch_size:
             store.upsert_entities(batch)
             log.info(
                 "batch persisted: sessions_so_far=%d obs_so_far=%d",
