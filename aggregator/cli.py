@@ -245,6 +245,56 @@ def _cmd_ingest(
     return 0
 
 
+def _cmd_github_token_status(
+    args: argparse.Namespace,
+    store: Store,
+    sources: dict[str, Any],
+) -> int:
+    """Report which token the github ingest path would use + scopes.
+
+    Read-only, idempotent, no store writes. Consumes the same source
+    registry as ``ingest`` so tests can inject a stub without touching
+    the real gh CLI.
+    """
+    _ = store  # signature symmetry; deliberately unused
+    src = sources.get("github")
+    if src is None:
+        print(
+            "unknown source: github (registry has: "
+            f"{sorted(sources)})",
+            file=sys.stderr,
+        )
+        return 2
+    if not hasattr(src, "token_status"):
+        print(
+            "registered github source does not support token_status()",
+            file=sys.stderr,
+        )
+        return 2
+    status = src.token_status()
+    if args.json:
+        # Dataclasses aren't natively JSON-serialisable but their __dict__
+        # is a flat dict of primitives here, so this is safe.
+        print(json.dumps(status.__dict__, indent=2, default=str))
+        return 0
+    # Human-readable summary. Kept dense — one line per field, then the
+    # recommendation on its own row for quick eyeballing.
+    print(f"token source: {status.source}")
+    if status.scopes:
+        print(f"scopes:       {', '.join(status.scopes)}")
+    else:
+        print("scopes:       (none / unverified)")
+    print(f"write_capable: {status.write_capable}")
+    print(
+        f"override:     "
+        f"{'AGGREGATOR_ALLOW_WRITE_TOKEN=1' if status.override_active else 'unset'}"
+    )
+    if status.scope_error:
+        print(f"scope_error:  {status.scope_error}")
+    print(f"recommendation: {status.recommendation}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aggregator")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -279,6 +329,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="drop this source's rows and re-scan raw",
     )
 
+    tks = sub.add_parser(
+        "github-token-status",
+        help=(
+            "report which token the github ingest would use + its scopes "
+            "+ a read-only-token recommendation"
+        ),
+    )
+    tks.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON",
+    )
+
     return p
 
 
@@ -302,6 +365,8 @@ def main(
         # doing so would commit the DELETE before the transaction and
         # reintroduce the non-atomic gap this fix closes.
         return _cmd_ingest(args, store, sources)
+    if args.cmd == "github-token-status":
+        return _cmd_github_token_status(args, store, sources)
     return 2
 
 

@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 # Reserved seam: LLM wrapper for future ingest enrichment (see spec §Error
@@ -127,6 +128,172 @@ def _default_scope_fetcher() -> list[str]:
     raise ScopeFetchError("no X-Oauth-Scopes header in gh api response")
 
 
+def _default_gh_token_fetcher() -> str | None:
+    """Return the token ``gh`` would use for API calls (``gh auth token``).
+
+    Returns ``None`` on any failure — gh not installed, not logged in, or
+    otherwise unable to produce a token. Callers should treat ``None`` as
+    "no token available via gh CLI"; the caller decides whether the env
+    var provides one instead.
+
+    Kept separate from ``_default_scope_fetcher`` because the scope check
+    calls ``gh api`` which already inherits ``GH_TOKEN`` from env, whereas
+    this function is a diagnostic surface used only by
+    ``aggregator github-token-status`` (never by ingest).
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+    ) as e:
+        log.debug("gh auth token failed: %s", e)
+        return None
+    token = result.stdout.strip()
+    return token or None
+
+
+@dataclass
+class TokenStatus:
+    """Diagnostic snapshot of the token the ingest path would use.
+
+    Populated by ``token_status()``; consumed by the
+    ``aggregator github-token-status`` CLI subcommand. Pure data — no
+    references to live subprocess handles or connections — so it JSON-
+    serialises trivially and can be diffed between runs.
+
+    Fields:
+
+    * ``source`` — ``"env"`` (``GH_TOKEN`` was set and non-empty),
+      ``"gh-cli"`` (fell back to ``gh auth token``), or ``"none"``
+      (neither produced a token).
+    * ``scopes`` — parsed ``X-Oauth-Scopes`` header from ``gh api -i
+      /rate_limit``. Empty on scope-fetch failure (see ``scope_error``).
+    * ``write_capable`` — True when any scope in ``scopes`` is in
+      ``WRITE_SCOPES``.
+    * ``override_active`` — True when ``AGGREGATOR_ALLOW_WRITE_TOKEN=1``
+      is set — the operator has explicitly opted out of the read-only
+      contract.
+    * ``scope_error`` — string form of the fetcher exception when scope
+      fetch failed. ``None`` on success.
+    * ``recommendation`` — human-readable single-line-ish advice: what
+      the current state means and what to do about it. Consumed
+      verbatim by the CLI so callers get one authoritative message.
+    """
+
+    source: str
+    scopes: list[str]
+    write_capable: bool
+    override_active: bool
+    scope_error: str | None
+    recommendation: str
+
+
+def _recommendation_for(
+    source: str,
+    scopes: list[str],
+    write_capable: bool,
+    override_active: bool,
+    scope_error: str | None,
+) -> str:
+    """Compose the human-readable advice string for a TokenStatus.
+
+    Design goal: one line that says *why* and *what to do*. The CLI
+    prints this verbatim as the final line so operators don't have to
+    read the full status dump to know the next step.
+    """
+    if source == "none":
+        return (
+            "No token found. Either export GH_TOKEN=<readonly PAT> "
+            "(preferred) or run `gh auth login` and rerun ingest."
+        )
+    if scope_error is not None:
+        return (
+            f"Cannot verify token scopes ({scope_error}). Ingest will "
+            "fail-closed unless AGGREGATOR_ALLOW_WRITE_TOKEN=1 is set. "
+            "Fix: install gh, or set the override if you accept the risk."
+        )
+    offending = sorted(set(scopes) & WRITE_SCOPES)
+    if write_capable:
+        if override_active:
+            return (
+                f"Token has write scopes {offending}; ingest ALLOWED "
+                "because AGGREGATOR_ALLOW_WRITE_TOKEN=1 is set. "
+                "Recommended: unset the override and export "
+                "GH_TOKEN=<readonly PAT> instead."
+            )
+        return (
+            f"Token has write scopes {offending}. Either export "
+            "GH_TOKEN=<readonly PAT> (recommended) or set "
+            "AGGREGATOR_ALLOW_WRITE_TOKEN=1 to accept the risk."
+        )
+    return (
+        f"Token is read-only (scopes={scopes}, source={source}). "
+        "Ingest will proceed."
+    )
+
+
+def token_status(
+    _scope_fetcher: Callable[[], list[str]] = _default_scope_fetcher,
+    _gh_token_fetcher: Callable[[], str | None] = _default_gh_token_fetcher,
+) -> TokenStatus:
+    """Resolve which token the ingest path would use + its scopes.
+
+    Read-only diagnostic — no side effects, no writes, safe to call any
+    number of times. Wraps the scope fetcher in try/except so scope
+    lookup failure surfaces as ``scope_error`` on the return value
+    rather than raising (unlike ``_check_scopes`` which fails closed by
+    design in the ingest path).
+
+    Args:
+      _scope_fetcher: injectable seam; defaults to gh-CLI-backed. Tests
+        pass a lambda to bypass subprocess.
+      _gh_token_fetcher: injectable seam for ``gh auth token``. Only
+        consulted when ``GH_TOKEN`` is unset — env wins verbatim.
+
+    Returns:
+      ``TokenStatus`` snapshot; see the dataclass docstring.
+    """
+    env_token = os.environ.get("GH_TOKEN", "").strip()
+    override_active = os.environ.get("AGGREGATOR_ALLOW_WRITE_TOKEN") == "1"
+
+    if env_token:
+        source = "env"
+    else:
+        # Fall back to gh's stored credential. If that too is empty, source=none.
+        gh_token = _gh_token_fetcher()
+        source = "gh-cli" if gh_token else "none"
+
+    scopes: list[str] = []
+    scope_error: str | None = None
+    # Scope-fetching is worth attempting even for source=none because a
+    # future gh could produce scopes without producing a token (weird), and
+    # a lie of omission ("scopes: []") is worse than the underlying error.
+    try:
+        scopes = _scope_fetcher()
+    except Exception as e:  # noqa: BLE001 -- diagnostic; ANY failure is data
+        scope_error = str(e)
+    write_capable = _has_write_scope(scopes)
+
+    return TokenStatus(
+        source=source,
+        scopes=list(scopes),
+        write_capable=write_capable,
+        override_active=override_active,
+        scope_error=scope_error,
+        recommendation=_recommendation_for(
+            source, scopes, write_capable, override_active, scope_error,
+        ),
+    )
+
+
 def _default_api_fetcher(path: str) -> list[dict]:
     """Call `gh api <path> --paginate` and return the JSON-decoded list.
 
@@ -180,9 +347,24 @@ class GitHubSource:
         self,
         _scope_fetcher: Callable[[], list[str]] = _default_scope_fetcher,
         _api_fetcher: Callable[[str], list[dict]] = _default_api_fetcher,
+        _gh_token_fetcher: Callable[[], str | None] = _default_gh_token_fetcher,
     ):
         self._scope_fetcher = _scope_fetcher
         self._api_fetcher = _api_fetcher
+        self._gh_token_fetcher = _gh_token_fetcher
+
+    def token_status(self) -> TokenStatus:
+        """Return a ``TokenStatus`` snapshot for the token this instance
+        would use at ingest time.
+
+        Delegates to the module-level ``token_status()`` function so the
+        instance and standalone forms stay in lockstep (identical
+        recommendation text, same env-var precedence).
+        """
+        return token_status(
+            _scope_fetcher=self._scope_fetcher,
+            _gh_token_fetcher=self._gh_token_fetcher,
+        )
 
     def record_shape(self) -> dict[str, str]:
         """Return the DSL-facing field surface. Consumed by M2 help generator.
