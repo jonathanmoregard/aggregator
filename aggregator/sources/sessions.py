@@ -84,6 +84,29 @@ def _parse_iso(s: str | None) -> datetime | None:
     return dt
 
 
+_MAX_TOOL_INPUT_CHARS = 4096  # per obs row, keeps FTS index bounded
+
+
+def _tool_use_body(tool_name: Any, tool_input: Any) -> str:
+    """Serialise a tool_use block into a searchable body string.
+
+    Format: ``"<tool_name> <compact-json-input>"`` so FTS finds both the
+    tool name and any argument text (paths, queries, prompts). Input is
+    truncated to ``_MAX_TOOL_INPUT_CHARS`` chars to keep the FTS index
+    from blowing up on giant tool payloads (Write, Bash with big scripts).
+    """
+    name = tool_name if isinstance(tool_name, str) else ""
+    if tool_input is None:
+        return name
+    try:
+        payload = json.dumps(tool_input, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        payload = str(tool_input)
+    if len(payload) > _MAX_TOOL_INPUT_CHARS:
+        payload = payload[:_MAX_TOOL_INPUT_CHARS] + " …[truncated]"
+    return f"{name} {payload}".strip() if name else payload
+
+
 def _has_tool_result_block(content: Any) -> bool:
     if not isinstance(content, list):
         return False
@@ -132,6 +155,12 @@ def _extract_text_and_tools(content: Any) -> tuple[str, str | None, str | None]:
             tid = block.get("id")
             if isinstance(tid, str) and tool_use_id is None:
                 tool_use_id = tid
+            # B3 fix: fold tool name + input into body so FTS can find them
+            # (previously tool_use rows had empty body → `type:tool_use foo`
+            # queries never hit). Compact JSON keeps the text tokenisable
+            # without wrapping quotes bloating the index.
+            if not body_text:
+                body_text = _tool_use_body(n, block.get("input"))
         elif btype == "tool_result" and tool_use_id is None:
             tid = block.get("tool_use_id")
             if isinstance(tid, str):

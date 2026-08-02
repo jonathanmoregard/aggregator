@@ -351,8 +351,13 @@ def _query_sessions_path(
     for s in page_sessions:
         # Per-session subject: first user observation's body (up to 280 chars).
         subject = _first_user_prompt(store, s)
-        # Match count within this session for the caller's query.
-        session_scoped = replace(ast, top_session_id=None, session_id=s.session_id)
+        # Match count within THIS session (not root-group) for the caller's
+        # query. B3 fix: use top_session_id (exact session_id match) not
+        # session_id (which maps to root_session_id and mis-counts subagents
+        # whose obs carry the parent's root, never the composite id).
+        session_scoped = replace(
+            ast, top_session_id=s.session_id, session_id=None,
+        )
         match_count = store.count_observations(session_scoped)
         items.append(_session_to_item(s, fields, subject, match_count, subject))
     result = {

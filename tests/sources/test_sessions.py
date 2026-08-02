@@ -127,6 +127,49 @@ def test_observation_tool_result_type_and_body(fixtures_dir):
     assert o.tool_use_id == "tu-edit-1"
 
 
+def test_tool_use_only_message_serialises_name_and_input_into_body(tmp_path):
+    """B3 regression: tool_use blocks with NO preceding text block used to
+    produce empty body → FTS `type:tool_use foo` never hit anything in real
+    data. Parser must fold tool_name + input into body so FTS indexes it.
+    """
+    p = tmp_path / "sess-tool.jsonl"
+    p.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "sess-tool",
+                "uuid": "u-tool-1",
+                "cwd": "/x",
+                "timestamp": "2026-07-27T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-1",
+                            "name": "suggest_doc_edit",
+                            "input": {"docId": "abc", "edits": [{"note": "fix typo"}]},
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        )
+        + "\n"
+    )
+    old = time.time() - 24 * 60 * 60
+    os.utime(p, (old, old))
+    src = SessionsSource(projects_root=str(tmp_path))
+    _s, observations, _errs = _split_entities(src)
+    o = next(o for o in observations if o.obs_id == "u-tool-1")
+    assert o.type == "tool_use"
+    assert o.tool_name == "suggest_doc_edit"
+    # Body must contain the tool NAME plus its input payload so FTS finds it.
+    assert "suggest_doc_edit" in o.body
+    assert "abc" in o.body
+    assert "fix typo" in o.body
+
+
 def test_observation_denormalises_root_session_id(fixtures_dir):
     """Langfuse trick: root_session_id on every observation lets
     "everything under X" be an indexed equality."""

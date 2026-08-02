@@ -257,6 +257,47 @@ def test_top_returns_single_top_row_when_top_and_subagents_present(tmp_data_home
     assert r_agent["total"] == 1, r_agent
 
 
+def test_matching_observations_correct_for_subagents(tmp_data_home):
+    """B3 regression: session-level cards show real match counts even for
+    subagent hits.
+
+    Bug: ``matching_observations`` used ``session_id`` filter which routed
+    through ``root_session_id``. For subagents that filter never matched
+    because their obs carry the PARENT's root_session_id, not the composite
+    subagent id. Fix: filter observations by exact session_id (top:) and
+    keep the FTS text so counts reflect actual matches.
+    """
+    store = Store()
+    store.migrate()
+    parent = "parent-b3"
+    sub = f"{parent}:agentB3"
+    store.upsert_entities(
+        [
+            _sess(parent),
+            _sess(sub, kind="subagent", root=parent, parent=parent,
+                  agent_id="agentB3"),
+            # observation on the subagent — root_session_id = parent
+            _obs(
+                "obs-b3-1", sub, "please suggest_doc_edit for foo",
+                obs_type="tool_use", root=parent,
+            ),
+            _obs(
+                "obs-b3-2", sub, "unrelated body", obs_type="assistant",
+                root=parent,
+            ),
+        ]
+    )
+    r = aggregator_query(dsl="type:tool_use suggest_doc_edit", _store=store)
+    assert r["total"] >= 1
+    subagent_cards = [c for c in r["records"] if c["stable_id"] == sub]
+    assert subagent_cards, f"expected a card for subagent, got {r['records']}"
+    card = subagent_cards[0]
+    assert card["matching_observations"] == 1, (
+        f"expected matching_observations=1 for the tool_use hit, "
+        f"got {card['matching_observations']}"
+    )
+
+
 def test_top_synthesises_orphan_root_when_top_not_ingested(tmp_data_home):
     """B2 real-data repro: subagents present but top-level JSONL was live
     at ingest time so parent session_id row was never written. Users still
