@@ -14,3 +14,15 @@ One line per milestone landing green. Owner-facing status.
 - `5b4db7d..c25d14b` — **M2 dsl+scrub+store** — earlier logged.
 - `b273528` **M4 nix**, `e85ceb3` **M5 cli+raycast** — earlier logged.
 - **M6 close-out (advice-refine-test-loop)** — Phase 1 Opus (4 rounds, opus-4-7 fallback for fable-429), Phase 2 Codex/GPT-5.5 (2 rounds). Fixed: 3 BLOCKERs (ingest not persisted; claude_runner import still present; /search/issues shape mis-parsed as Pulls shape → repo collisions), 6 HIGHs (delimiter injection, scope fail-open, 500-row silent truncation, iter_records ignored since, rebuild non-atomic, transient-wipe with --rebuild), 8+ MEDIUMs (scrub regex fallbacks, ipv6 tighten, WAL+busy_timeout, GhApiError, UTC normalisation, upsert-no-commit closure, tz-safe compare, etc). Final: 148 pass / 1 skip, ruff clean, gitleaks clean. Both advisor phases returned SAFE TO SHIP.
+
+## 2026-08-02 (v2 real-data close-out)
+- `6a44155..6de2caa` — v2 Schema B migration (5 commits: schema, sessions v2 parser, dsl, mcp routing, one-shot reingest script)
+- `f34b1c7` — real-data smoke transcript: 3 BLOCKERs found by first live run (top: returns 0, FTS matches=0, spawn recovery 0/1170)
+- `c2e45b8` **B2 top:** synthesise orphan-root for sessions where only subagents ingested
+- `63a42c3` **B3 FTS** populate tool_use body + count matches per exact session
+- `972b214` **M1 empty wrap** drop <ExternalContent> in summary mode; also renamed BATCH→batch_size in reingest script
+- `f2aa2ba` **B1 spawn recovery** Task→Agent tool rename (2026 Claude Code change); prefer toolUseResult.agentId structured field, regex fallback. **0.0% → 90.3%** on live cache (remaining 10% = parent JSONL not on disk, honest limit).
+- `52d45f5` **M2 other-type** widened _KNOWN_TYPES to include attachment (99.8% of what was other), progress, plus 6 future-emitted types. Reclassified live cache. **21.4% → 0.00%**.
+- Ingest verify: 5678 sessions, 1170 subagents, 348168 observations, 3.1h wall.
+- Suite 191 pass, ruff clean.
+- Known remaining: matches=0 counter on FTS+type: hits (hits listed correctly, just count is wrong — advisor round should catch).
