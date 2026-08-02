@@ -217,7 +217,17 @@ in {
         Unit.Description = "Aggregator: github ingest timer";
         Timer = {
           OnCalendar = cfg.sources.github.interval;
+          # Codex Phase 2 MEDIUM: stagger against aggregator-sessions.
+          # Both timers default to `*:0/30` + OnBootSec=5min; without a
+          # delay they land in the same tick and both open a writer
+          # against the same cache.db. Sessions ingest is by far the
+          # heavier writer, so we jitter github by up to 3 min.
+          # busy_timeout=30s on the store side absorbs the residual
+          # overlap. This does NOT protect against a full sessions
+          # rebuild (--rebuild) which holds a savepoint for hours; for
+          # that case, disable this timer temporarily.
           OnBootSec = "5min";
+          RandomizedDelaySec = "3min";
           Persistent = true;
         };
         Install.WantedBy = [ "timers.target" ];
