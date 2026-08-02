@@ -26,3 +26,16 @@ One line per milestone landing green. Owner-facing status.
 - Ingest verify: 5678 sessions, 1170 subagents, 348168 observations, 3.1h wall.
 - Suite 191 pass, ruff clean.
 - Known remaining: matches=0 counter on FTS+type: hits (hits listed correctly, just count is wrong — advisor round should catch).
+
+## 2026-08-02 (autonomous continuation)
+- b69d3d0 nix v2 refresh — per-source toggles, GH_TOKEN via agenix file, OnBootSec catch-up, MCP auto-register option.
+- 04a3bb7 + cb39b01 github alignment — Part A: formalize records vs sessions ontology split (5 route outcomes incl. UNION); Part B: GH_TOKEN env precedence + aggregator github-token-status CLI diagnostic.
+- 7c7a6b0 HANDOVER v2 — fresh doc (no v1 existed for this repo), 10 sections anchored to code.
+- Advisor round on v2 diff (Opus): 1 BLOCKER + 2 HIGHs found:
+  - 0e3f3f7 BLOCKER: previously-known cosmetic FTS matches=0 was REAL — count_observations used session_id (composite for subagents), so session:root under-counted when hits lived in subagents. Fixed via kind-aware _count_scope_for(ast, s).
+  - 9ae6c3e HIGH-1: UNION pagination beyond first window unreachable — SQL LIMIT applied before FTS-id filter dropped real matches. Fixed by fetching full sides + Python-side merge (fine at v2 scale).
+  - d787167 HIGH-2: --rebuild silent-wipe threshold too permissive (refused only on 0 records). Ratio guard: refuse if new < 0.8 * existing AND existing > 100. --force + --yes overrides.
+  - 2862a0d MEDIUMs: sessions docstring resume-of-resume orphan cause; nix shell wrap token=$(cat FILE); export GH_TOKEN=quote token quote (set -e now catches cat failure); store synth-root docstring corrected.
+- Suite 225 pass, ruff clean.
+- Deferred: Phase 2 Codex advisor round + end-to-end live-model smoke (context ceiling).
+- Pending human: GitHub read-only PAT (see pending_for_human.md); MCP server registration verification post-restart.
