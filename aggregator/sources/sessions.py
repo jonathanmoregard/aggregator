@@ -82,13 +82,32 @@ LIVE_WINDOW_SECONDS = 5 * 60
 _AGENT_ID_TEXT_RE = re.compile(r"agentId:\s*([A-Za-z0-9_\-]{10,50})")
 
 
-# Line ``type`` values we still record (as observations of type ``system`` or
-# ``other``) but that carry no message.content. We keep them because the model
-# ``system`` events sometimes carry noteworthy state (permission-mode,
-# rate_limit_event). Nothing here is dropped; the ``type`` column preserves
-# provenance.
+# M2 fix (real-data-verified): raw JSONL ``type`` values seen in ~/.claude
+# beyond the message-carrying five. ``attachment`` alone accounted for 99.8%
+# of the previous ``other`` bucket (74253/74404 obs on live cache); adding it
+# + ``progress`` here collapses ``other`` to <0.1%. Additional known types
+# from research §5 (``queue-operation``, ``last-prompt``, ``hook``,
+# ``file-history-snapshot``, ``rate_limit_event``, ``permission-mode``) are
+# pre-listed so future emissions land in their own bucket instead of
+# ``other``. No CHECK constraint on ``observations.type`` — expanding the
+# enum is purely additive; no migration needed.
 _KNOWN_TYPES = frozenset(
-    {"user", "assistant", "tool_use", "tool_result", "system"}
+    {
+        "user",
+        "assistant",
+        "tool_use",
+        "tool_result",
+        "system",
+        # v2 M2 additions — preserve raw provenance so type: filters find them
+        "attachment",             # UserPromptSubmit hook results, file uploads (99.8% of legacy `other`)
+        "progress",               # in-flight tool progress markers
+        "queue-operation",        # cross-session prompt queue events
+        "last-prompt",            # tail-of-history bookmarks
+        "hook",                   # generic hook-fired events (defensive)
+        "file-history-snapshot",  # session-snapshot markers (research §5)
+        "rate_limit_event",       # api rate-limit signals
+        "permission-mode",        # permission-mode changes
+    }
 )
 
 
@@ -257,7 +276,12 @@ class SessionsSource:
             "git_branch": "str | None",
             "first_ts": "datetime (min message ts)",
             "last_ts": "datetime (max message ts)",
-            "obs_type": "'user'|'assistant'|'tool_use'|'tool_result'|'system'|'other'",
+            "obs_type": (
+                "'user'|'assistant'|'tool_use'|'tool_result'|'system'|"
+                "'attachment'|'progress'|'queue-operation'|'last-prompt'|"
+                "'hook'|'file-history-snapshot'|'rate_limit_event'|"
+                "'permission-mode'|'other'"
+            ),
         }
 
     # -- filesystem walk --------------------------------------------------
@@ -336,11 +360,16 @@ class SessionsSource:
         if not isinstance(parent_uuid, str):
             parent_uuid = None
         ts = _parse_iso(obj.get("timestamp"))
-        line_type = obj.get("type") or "other"
-        if not isinstance(line_type, str):
-            line_type = "other"
-        if line_type not in _KNOWN_TYPES:
-            line_type = "other"
+        # M2 fix: preserve the raw JSONL ``type`` verbatim when we recognise
+        # it. Previously any type outside the message-carrying five collapsed
+        # to ``other`` — hiding 74k+ attachment/progress/etc. rows behind a
+        # single opaque bucket. ``_KNOWN_TYPES`` is now an inclusive
+        # allowlist; unknown future types still fall through to ``other`` so
+        # a rename downstream doesn't blow up.
+        raw_type = obj.get("type") or "other"
+        if not isinstance(raw_type, str):
+            raw_type = "other"
+        line_type = raw_type if raw_type in _KNOWN_TYPES else "other"
         is_sidechain = bool(obj.get("isSidechain"))
         agent_id = obj.get("agentId") if isinstance(obj.get("agentId"), str) else None
         agent_type = obj.get("agentType") if isinstance(obj.get("agentType"), str) else None

@@ -311,6 +311,62 @@ def test_corrupt_line_skipped_not_aborted(tmp_path):
     assert len(observations) == 2
 
 
+def test_attachment_and_progress_types_preserved_not_bucketed_as_other(tmp_path):
+    """M2 fix: real Claude Code JSONLs emit ``type='attachment'`` (hook
+    results, file uploads) and ``type='progress'`` (in-flight markers). These
+    used to fold into ``other`` (74k+ rows on real cache, 99.8% of ``other``).
+    Parser must preserve them verbatim so ``type:attachment`` queries hit.
+    """
+    p = tmp_path / "sess-mixed.jsonl"
+    p.write_text(
+        json.dumps({
+            "type": "attachment",
+            "sessionId": "sess-mixed",
+            "uuid": "u-att-1",
+            "timestamp": "2026-07-28T10:00:01.000Z",
+            "cwd": "/x",
+            "attachment": {"type": "hook_success", "hookName": "UserPromptSubmit"},
+        })
+        + "\n"
+        + json.dumps({
+            "type": "progress",
+            "sessionId": "sess-mixed",
+            "uuid": "u-prog-1",
+            "timestamp": "2026-07-28T10:00:02.000Z",
+            "cwd": "/x",
+        })
+        + "\n"
+        + json.dumps({
+            "type": "queue-operation",
+            "sessionId": "sess-mixed",
+            "uuid": "u-queue-1",
+            "timestamp": "2026-07-28T10:00:03.000Z",
+            "cwd": "/x",
+            "operation": "enqueue",
+        })
+        + "\n"
+        + json.dumps({
+            "type": "user",
+            "sessionId": "sess-mixed",
+            "uuid": "u-anchor-1",
+            "timestamp": "2026-07-28T10:00:04.000Z",
+            "cwd": "/x",
+            "message": {"role": "user", "content": "hi"},
+        })
+        + "\n"
+    )
+    old = time.time() - 24 * 60 * 60
+    os.utime(p, (old, old))
+    src = SessionsSource(projects_root=str(tmp_path))
+    _s, observations, _errs = _split_entities(src)
+    by_id = {o.obs_id: o for o in observations}
+    assert by_id["u-att-1"].type == "attachment"
+    assert by_id["u-prog-1"].type == "progress"
+    assert by_id["u-queue-1"].type == "queue-operation"
+    # ``other`` reserved for truly unknown future types.
+    assert all(o.type != "other" for o in observations)
+
+
 def test_record_shape_documents_v2_fields():
     src = SessionsSource(projects_root="/tmp")
     shape = src.record_shape()
