@@ -39,3 +39,14 @@ One line per milestone landing green. Owner-facing status.
 - Suite 225 pass, ruff clean.
 - Deferred: Phase 2 Codex advisor round + end-to-end live-model smoke (context ceiling).
 - Pending human: GitHub read-only PAT (see pending_for_human.md); MCP server registration verification post-restart.
+
+## 2026-08-02 (Codex Phase 2 advisor on v2)
+- codex round on v2 diff (6a44155..HEAD, ~20 commits). Found 1 HIGH + 3 MEDIUM; all reproduced with RED tests before fix:
+  - eb5dcab HIGH: `Store.query()` records path applied SQL LIMIT/OFFSET before FTS intersect — same class as round-1 HIGH-1 union fix, but the records-only path was missed. `source:github needle` with `limit=3` returned `[] ` while `count()` reported 1. Fix mirrors union: fetch full ordered rows, Python-side intersect, Python-side slice. Bundled MEDIUMs: `_sessions_where`/`_obs_where` now honour `source:sessions|subagents` kind split (was returning identical rows for both); `busy_timeout` 5s→30s.
+  - 9001f6d MEDIUM: bare-date `active:D..D` excluded same-day sessions because HI parsed to midnight-start and store predicate is `first_ts <= active_to`. Fix: bare-date HI → end-of-day inclusive (23:59:59.999999). ISO datetime HI untouched.
+  - 8f36aca MEDIUM: two ingest timers colliding on `*:0/30` + `OnBootSec=5min`. `RandomizedDelaySec=3min` on github timer paired with busy_timeout bump.
+- 3 RED tests + 3 updated DSL tests + 1 new ISO-HI regression guard. Full suite 231 pass, ruff clean.
+- Deferred:
+  - Full sessions --rebuild savepoint spans minutes; concurrent github still fails. Documented — user disables github timer during rebuild.
+  - End-to-end live-model smoke still pending Claude Code restart.
+  - Aggregator Nix module → dellan config import still pending PR #156 merge + follow-up PR.
