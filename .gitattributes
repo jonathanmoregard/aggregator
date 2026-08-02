@@ -1,0 +1,8 @@
+# Belt-and-braces: cache/database artifacts must never enter the repo.
+# .gitignore excludes them; this marks any that sneak past as binary so
+# no diff/textconv machinery ever renders their content.
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.sqlite binary
+*.sqlite3 binary
