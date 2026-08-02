@@ -295,19 +295,26 @@ def token_status(
 
 
 def _default_api_fetcher(path: str) -> list[dict]:
-    """Call `gh api <path> --paginate` and return the JSON-decoded list.
+    """Call ``gh api <path> --paginate --jq '.items[]'`` and return the
+    JSON-decoded item list.
 
-    Codex Phase 2 MEDIUM #1: pre-fix, this returned ``[]`` on any subprocess
-    or JSON error, which silently degraded transient failures into "zero
-    adds" — the CLI printed ``errors=0`` even during rate-limit / outage
-    windows. Post-fix, any failure raises ``GhApiError``; ``iter_records``'
-    surrounding try/except catches it, appends to the shared ``errors``
-    sink, and — combined with the round-3 ``--rebuild`` refusal guard —
-    prevents an atomic wipe on transient failure.
+    Live-run bug (2026-08-02, first real ingest): plain
+    ``gh api --paginate /search/issues`` returns concatenated top-level
+    page objects (one per page), not a single JSON array. ``json.loads``
+    over the concatenated buffer fails with
+    ``Extra data: line 1 column N`` at the second page's start. Fix:
+    pass ``--jq '.items[]'`` so gh emits one item as JSON per line
+    across all pages; parse line-by-line (JSONL). Works for search
+    endpoints; for future non-search endpoints returning bare arrays,
+    ``--jq '.[]'`` would be the equivalent.
+
+    Codex Phase 2 MEDIUM #1 (still applies): any subprocess or parse
+    failure raises ``GhApiError``; ``iter_records`` surfaces it through
+    the shared errors sink instead of degrading silently to zero-adds.
     """
     try:
         result = subprocess.run(
-            ["gh", "api", "--paginate", path],
+            ["gh", "api", "--paginate", "--jq", ".items[]", path],
             check=True,
             capture_output=True,
             text=True,
@@ -321,16 +328,22 @@ def _default_api_fetcher(path: str) -> list[dict]:
     ) as e:
         log.warning("gh api %s failed: %s", path, e)
         raise GhApiError(f"gh api {path} failed: {e}") from e
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError as e:
-        log.warning("gh api %s returned non-JSON: %s", path, e)
-        raise GhApiError(f"gh api {path} returned non-JSON: {e}") from e
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return data.get("items", [])
-    return []
+    items: list[dict] = []
+    for lineno, line in enumerate(out.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as e:
+            log.warning(
+                "gh api %s line %d not JSON: %s", path, lineno, e
+            )
+            raise GhApiError(
+                f"gh api {path} returned non-JSON on line {lineno}: {e}"
+            ) from e
+        items.append(obj)
+    return items
 
 
 class GitHubSource:

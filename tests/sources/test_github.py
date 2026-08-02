@@ -293,6 +293,51 @@ def test_default_api_fetcher_raises_on_non_json():
         _default_api_fetcher("/search/issues?q=is:pr+author:@me")
 
 
+def test_default_api_fetcher_handles_multi_page_search_via_jsonl():
+    """Live-run regression: ``gh api --paginate /search/issues`` returned
+    concatenated top-level page objects, not a single JSON array. First
+    live GH ingest failed with
+    ``Extra data: line 1 column 506309 (char 506308)`` where the second
+    page's JSON glued onto the first.
+
+    Fix: invoke gh with ``--jq '.items[]'`` so each item is emitted as
+    one JSON object per line (JSONL) across all pages. The fetcher
+    parses line-by-line and returns the flat list.
+    """
+    items_jsonl = (
+        '{"id":1,"title":"first pr","html_url":"https://github.com/a/b/pull/1"}\n'
+        '{"id":2,"title":"second","html_url":"https://github.com/a/b/pull/2"}\n'
+        '{"id":3,"title":"third","html_url":"https://github.com/a/b/pull/3"}\n'
+    )
+    fake = subprocess.CompletedProcess(
+        args=["gh"], returncode=0, stdout=items_jsonl, stderr=""
+    )
+    with patch(
+        "aggregator.sources.github.subprocess.run", return_value=fake
+    ) as run:
+        result = _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+
+    assert len(result) == 3
+    assert [r["id"] for r in result] == [1, 2, 3]
+    # Command must use --jq to unwrap items — otherwise concatenated
+    # search-response objects reappear on multi-page results.
+    cmd = run.call_args[0][0]
+    assert "--jq" in cmd, f"fetcher must pass --jq to gh: got {cmd}"
+    assert ".items[]" in cmd, f"fetcher must extract .items[]: got {cmd}"
+
+
+def test_default_api_fetcher_jsonl_tolerates_empty_output():
+    """Empty result set from a search query — gh outputs zero lines."""
+    fake = subprocess.CompletedProcess(
+        args=["gh"], returncode=0, stdout="", stderr=""
+    )
+    with patch(
+        "aggregator.sources.github.subprocess.run", return_value=fake
+    ):
+        result = _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+    assert result == []
+
+
 def test_iter_records_records_all_four_endpoint_errors_when_fetcher_raises(
     monkeypatch,
 ):
