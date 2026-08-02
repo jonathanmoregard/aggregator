@@ -184,6 +184,114 @@ def test_store_probe_fts_public(tmp_data_home):
         s.probe_fts('"unterminated')
 
 
+# --- Codex Phase 2 findings (RED) -----------------------------------------
+
+
+def test_records_fts_reaches_deep_matches_beyond_first_page(tmp_data_home):
+    """Codex Phase 2 HIGH: direct records path applied LIMIT/OFFSET before
+    the FTS intersect, so a matching row beyond the first page window was
+    unreachable via ``query()`` even though ``count()`` reported it.
+
+    Repro: 5 non-matching newer records + 1 matching older record.
+    Query ``source:github needle`` with limit=3. Buggy behaviour returned
+    ``[]`` while count returned 1. Union path already had this fix; the
+    records-only path did not.
+    """
+    s = Store()
+    s.migrate()
+    non_matching = [
+        Record(
+            stable_id=f"github:acme/repo:{i}",
+            source="github",
+            subject=f"new {i}",
+            body="no match here",
+            tags=["acme/repo"],
+            updated_at=datetime(2026, 8, 1, 12 - i, tzinfo=UTC),
+        )
+        for i in range(5)
+    ]
+    old_match = Record(
+        stable_id="github:acme/repo:old",
+        source="github",
+        subject="old",
+        body="body with needle in it",
+        tags=["acme/repo"],
+        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    s.upsert([*non_matching, old_match])
+
+    ast = QueryAST(source="github", text="needle")
+    hits = s.query(ast, limit=3, offset=0)
+    total = s.count(ast)
+    assert total == 1
+    assert {r.stable_id for r in hits} == {"github:acme/repo:old"}, (
+        f"records LIMIT-before-FTS: got {[r.stable_id for r in hits]}"
+    )
+
+
+def test_active_bare_date_upper_bound_inclusive(tmp_data_home):
+    """Codex Phase 2 MEDIUM: ``active:D..D`` excluded sessions active on
+    day D because bare-date parses as midnight-start of D, and the upper
+    bound comparison ``first_ts <= active_to`` rejected sessions that
+    began later on the same day. Documented semantics: inclusive [LO, HI]
+    days. Fix: treat the bare-date HI as exclusive next-day.
+    """
+    from aggregator.core.dsl import parse
+
+    s = Store()
+    s.migrate()
+    s.upsert_entities(
+        [
+            _sess(
+                "feb1-session",
+                first_ts=datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+                last_ts=datetime(2026, 2, 1, 11, 0, tzinfo=UTC),
+            )
+        ]
+    )
+    ast = parse("active:2026-02-01..2026-02-01")
+    rows = s.query_sessions(ast)
+    assert {r.session_id for r in rows} == {"feb1-session"}, (
+        f"same-day active range excluded row: got {[r.session_id for r in rows]}"
+    )
+
+
+def test_sessions_where_honours_source_kind_split(tmp_data_home):
+    """Codex Phase 2 MEDIUM: ``_sessions_where`` ignored ``ast.source``, so
+    ``source:sessions`` and ``source:subagents`` returned identical rows
+    (top-level + subagents both). Sources advertise a kind bucket; the
+    filter must honour it.
+    """
+    from aggregator.core.dsl import parse
+
+    s = Store()
+    s.migrate()
+    s.upsert_entities(
+        [
+            _sess("root-src-kind"),
+            _sess(
+                "root-src-kind:agent1",
+                kind="subagent",
+                root="root-src-kind",
+                parent="root-src-kind",
+                agent_id="agent1",
+            ),
+        ]
+    )
+
+    ast_top = parse("source:sessions")
+    top_only = s.query_sessions(ast_top)
+    assert {r.session_id for r in top_only} == {"root-src-kind"}, (
+        f"source:sessions leaked subagent rows: {[r.session_id for r in top_only]}"
+    )
+
+    ast_sub = parse("source:subagents")
+    sub_only = s.query_sessions(ast_sub)
+    assert {r.session_id for r in sub_only} == {"root-src-kind:agent1"}, (
+        f"source:subagents leaked top rows: {[r.session_id for r in sub_only]}"
+    )
+
+
 def test_rebuild_and_upsert_rolls_back_on_error(tmp_data_home):
     s = Store()
     s.migrate()

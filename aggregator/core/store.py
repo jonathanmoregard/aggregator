@@ -217,12 +217,14 @@ class Store:
     """Thin wrapper around a per-process SQLite connection.
 
     Not thread-safe within a process — v1 assumes a single ingest thread
-    per process. Cross-process concurrency IS supported (Codex Phase 2
-    MEDIUM #2): two systemd user timers (sessions + github) fire on the
-    same ``*:0/30`` schedule and both open a Store against the same
-    ``cache.db``. ``_c()`` enables WAL journal mode + a 5s busy_timeout
-    so the second writer waits for the first to release its lock instead
-    of failing with ``database is locked``.
+    per process. Cross-process concurrency IS supported: two systemd user
+    timers (sessions + github) fire on ``*:0/30`` and both open a Store
+    against the same ``cache.db``. ``_c()`` enables WAL journal mode + a
+    30s busy_timeout (Codex Phase 2 bump from 5s) so the second writer
+    waits for the first to release its lock instead of failing with
+    ``database is locked``. The github timer also jitters by 3 min
+    (``RandomizedDelaySec`` in nix/aggregator.nix) to reduce collision
+    probability at the tick boundary.
     """
 
     def __init__(self, db_path: str | Path | None = None):
@@ -239,7 +241,15 @@ class Store:
             # Codex Phase 2 MEDIUM #2: concurrent-writer safety. See prior
             # revision docstring; WAL + busy_timeout + synchronous=NORMAL.
             self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
-            self._conn.execute("PRAGMA busy_timeout = 5000")
+            # Codex Phase 2 MEDIUM: bumped from 5s -> 30s. Steady-state
+            # ingests are seconds; 30s absorbs incidental collisions
+            # between the sessions and github timers without failing loud
+            # ``database is locked`` errors. The pathological case (full
+            # sessions rebuild holds a savepoint for minutes) is not fixed
+            # by any busy_timeout — sequence manually or set
+            # ``services.aggregator.sources.github.enable = false`` while
+            # rebuilding.
+            self._conn.execute("PRAGMA busy_timeout = 30000")
             self._conn.execute("PRAGMA synchronous = NORMAL")
         return self._conn
 
@@ -608,7 +618,31 @@ class Store:
             return []
         where, params = self._build_where(ast)
         c = self._c()
-        sql = f"SELECT * FROM records WHERE {where} ORDER BY updated_at DESC"
+        base_sql = f"SELECT * FROM records WHERE {where} ORDER BY updated_at DESC"
+        # Codex Phase 2 HIGH: when FTS text is present, we must intersect
+        # BEFORE pagination — SQL LIMIT applied ahead of the FTS filter
+        # drops legitimate matches beyond the first page and can return an
+        # empty page while ``count()`` reports hits. Fetch the full ordered
+        # side + Python-side FTS intersect + Python-side slice. Matches
+        # the union path's approach; safe at v2 scale (records table is
+        # bounded by GitHub search API pagination).
+        if ast.text:
+            try:
+                fts_ids = self._fts_ids(ast.text)
+            except sqlite3.OperationalError as e:
+                log.warning("FTS5 syntax error for query %r: %s", ast.text, e)
+                return []
+            try:
+                rows = list(c.execute(base_sql, params))
+            except sqlite3.OperationalError as e:
+                log.warning("store.query base SELECT failed for ast=%r: %s", ast, e)
+                return []
+            filtered = [row for row in rows if row["stable_id"] in fts_ids]
+            lo = int(offset)
+            hi = None if limit is None else lo + int(limit)
+            return [_row_to_record(row) for row in filtered[lo:hi]]
+
+        sql = base_sql
         if limit is not None or offset:
             sql += " LIMIT ? OFFSET ?"
             params = [*params, (-1 if limit is None else int(limit)), int(offset)]
@@ -617,15 +651,6 @@ class Store:
         except sqlite3.OperationalError as e:
             log.warning("store.query base SELECT failed for ast=%r: %s", ast, e)
             return []
-        if ast.text:
-            try:
-                fts_ids = self._fts_ids(ast.text)
-            except sqlite3.OperationalError as e:
-                log.warning("FTS5 syntax error for query %r: %s", ast.text, e)
-                return []
-            allowed_ids = {row["stable_id"] for row in rows}
-            keep = allowed_ids & fts_ids
-            rows = [row for row in rows if row["stable_id"] in keep]
         return [_row_to_record(row) for row in rows]
 
     def count(self, ast: QueryAST) -> int:
@@ -688,9 +713,21 @@ class Store:
         Precedence: ``top_session_id`` (exact ``session_id``) > ``session_id``
         (matches ``root_session_id`` — includes subagents) >
         ``agent_id`` filter.
+
+        Codex Phase 2 MEDIUM: honour ``ast.source`` kind split.
+        ``source:sessions`` filters to top-level rows (``kind='session'``);
+        ``source:subagents`` filters to subagent rows (``kind='subagent'``).
+        Both route through the sessions ontology upstream, but without the
+        kind filter they returned identical rows.
         """
         clauses = ["1=1"]
         params: list = []
+        if ast.source == "sessions":
+            clauses.append("kind = ?")
+            params.append("session")
+        elif ast.source == "subagents":
+            clauses.append("kind = ?")
+            params.append("subagent")
         if ast.top_session_id:
             clauses.append("session_id = ?")
             params.append(ast.top_session_id)
@@ -723,9 +760,19 @@ class Store:
         subagents). ``top_session_id`` matches the exact ``session_id`` (only
         the top-level stream). ``agent_id`` filters via the parent session
         row.
+
+        Codex Phase 2 MEDIUM: ``source:sessions`` / ``source:subagents``
+        restrict to observations owned by that kind (via the sessions
+        table). Kept in lockstep with ``_sessions_where``.
         """
         clauses = ["1=1"]
         params: list = []
+        if ast.source in ("sessions", "subagents"):
+            kind = "session" if ast.source == "sessions" else "subagent"
+            clauses.append(
+                "session_id IN (SELECT session_id FROM sessions WHERE kind = ?)"
+            )
+            params.append(kind)
         if ast.top_session_id:
             clauses.append("session_id = ?")
             params.append(ast.top_session_id)
