@@ -516,18 +516,22 @@ def _query_union_path(
     single ``sort_ts`` per item purely for merge ordering — the item's
     own timestamps stay authoritative.
 
-    Pagination: fetch ``limit=offset+page_size+1`` from each side, merge,
-    then slice. This over-fetches on deep pages but keeps the surface
-    stateless (no cross-side page tokens). Typical inventories (thousands
-    per side, single-digit pages) tolerate this fine.
+    Pagination (round-1 HIGH-1 fix): fetch ALL matches on both sides and
+    slice the merged list. Previous approach over-fetched
+    ``offset+page_size+1`` per side, which under-returned records-side
+    matches whenever FTS text was present: ``store.query`` applies its
+    SQL LIMIT before the Python-side FTS-id filter (records path), so
+    over-fetching the newest N rows can drop every actual match when the
+    matching rows sort deeper. Fetching all matches (``limit=None``)
+    sidesteps the ordering interaction and keeps the surface stateless.
+    Fine at v2 scale (records ~thousands, sessions ~thousands). Upgrade
+    to a proper cross-source cursor if either side crosses 10^5.
 
     Records-side fetch skips FTS if the caller passed no text — parity
     with ``store.query`` behaviour. Sessions side likewise.
     """
-    over_fetch = offset + page_size + 1
-
     try:
-        rec_rows = store.query(ast, limit=over_fetch, offset=0)
+        rec_rows = store.query(ast, limit=None, offset=0)
         rec_total = store.count(ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: records-side query failed for ast=%r", ast)
@@ -540,7 +544,7 @@ def _query_union_path(
             ),
         }
     try:
-        sess_rows = store.query_sessions(ast, limit=over_fetch, offset=0)
+        sess_rows = store.query_sessions(ast, limit=None, offset=0)
         sess_total = store.count_sessions(ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: sessions-side query failed for ast=%r", ast)

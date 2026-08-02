@@ -316,6 +316,132 @@ def test_cross_source_date_query_unions_records_and_sessions(tmp_data_home):
     assert r["total"] == 2
 
 
+def test_union_pagination_walks_all_items_without_loss(tmp_data_home):
+    """Round-1 HIGH-1: UNION deep-page reachability, no FTS.
+
+    50 records + 50 sessions on distinct dates. Walk every page with
+    page_size=10 and expect exactly 100 unique ids across all pages.
+    Baseline reachability regardless of the fetch strategy.
+    """
+    store = Store()
+    store.migrate()
+    # 50 records at descending dates in Jul 2026.
+    records = []
+    for i in range(50):
+        day = 1 + (i % 30)  # 1..30
+        records.append(
+            _rec(
+                f"github:acme/api:r{i:03d}",
+                subject=f"rec {i}",
+                body="body",
+                created=datetime(2026, 7, day, 8, 0, tzinfo=UTC),
+                updated=datetime(2026, 7, day, 8, 0, tzinfo=UTC),
+            )
+        )
+    store.upsert(records)
+    # 50 sessions active in Aug 2026 (mixed with records after sort).
+    sessions = []
+    for i in range(50):
+        day = 1 + (i % 30)
+        ts = datetime(2026, 8, day, 12, 0, tzinfo=UTC)
+        sessions.append(
+            _sess(
+                f"sess-u{i:03d}",
+                first_ts=ts,
+                last_ts=ts,
+            )
+        )
+    store.upsert_entities(sessions)
+
+    seen: set[str] = set()
+    page_token: str | None = None
+    pages = 0
+    while True:
+        pages += 1
+        assert pages < 50, "runaway pagination"
+        r = aggregator_query(
+            dsl="",
+            fields="summary",
+            page_size=10,
+            page_token=page_token,
+            _store=store,
+        )
+        assert r["ok"] is True
+        assert r["mode"] == "union"
+        for rec in r["records"]:
+            assert rec["stable_id"] not in seen, (
+                f"duplicate across pages: {rec['stable_id']}"
+            )
+            seen.add(rec["stable_id"])
+        page_token = r.get("next_page_token")
+        if page_token is None:
+            break
+    # All 100 items must be reachable via pagination.
+    assert len(seen) == 100, (
+        f"expected 100 unique ids across all pages, got {len(seen)}"
+    )
+    assert r["total"] == 100
+
+
+def test_union_pagination_records_fts_reaches_deep_matches(tmp_data_home):
+    """Round-1 HIGH-1: UNION with FTS text under-returns records-side matches.
+
+    Root cause: ``store.query`` applies ``LIMIT OFFSET`` in SQL BEFORE the
+    Python-side FTS-id filter (records path). When 50 records exist but only
+    the OLDEST 10 match the FTS text, over-fetching ``offset+page_size+1``
+    from the top of the ORDER BY updated_at DESC gives you the newest N
+    rows — none of which match the FTS term — so the FTS filter drops all
+    of them. The 10 matching (older) rows are unreachable via union.
+
+    Fix (option a in the round-1 note): fetch ALL matches per side (limit=
+    None), merge, then paginate over the merged list.
+    """
+    store = Store()
+    store.migrate()
+    # 40 newer records with body "boring" (won't match FTS "needle").
+    boring = [
+        _rec(
+            f"github:acme/api:b{i:03d}",
+            subject=f"boring {i}",
+            body="boring body",
+            created=datetime(2026, 8, 1 + (i % 28), 8, 0, tzinfo=UTC),
+            updated=datetime(2026, 8, 1 + (i % 28), 8, 0, tzinfo=UTC),
+        )
+        for i in range(40)
+    ]
+    # 10 older records with body "needle" (will match FTS).
+    needles = [
+        _rec(
+            f"github:acme/api:n{i:03d}",
+            subject=f"needle {i}",
+            body="needle content here",
+            created=datetime(2026, 7, 1 + i, 8, 0, tzinfo=UTC),
+            updated=datetime(2026, 7, 1 + i, 8, 0, tzinfo=UTC),
+        )
+        for i in range(10)
+    ]
+    store.upsert([*boring, *needles])
+    # Also a couple of sessions (unrelated to the needle text).
+    store.upsert_entities(
+        [
+            _sess("sess-x1", first_ts=datetime(2026, 8, 15, tzinfo=UTC),
+                  last_ts=datetime(2026, 8, 15, tzinfo=UTC)),
+        ]
+    )
+
+    r = aggregator_query(
+        dsl="needle", fields="summary", page_size=20, _store=store
+    )
+    assert r["ok"] is True
+    assert r["mode"] == "union"
+    needle_ids = {rec["stable_id"] for rec in r["records"]
+                  if rec["stable_id"].startswith("github:acme/api:n")}
+    assert len(needle_ids) == 10, (
+        f"expected all 10 needle records reachable in a single page, "
+        f"got {len(needle_ids)}; ids={sorted(needle_ids)}"
+    )
+
+
 def test_cross_source_no_filters_unions(tmp_data_home):
     """No filters at all also unions — "show me everything" surface."""
     store = Store()
