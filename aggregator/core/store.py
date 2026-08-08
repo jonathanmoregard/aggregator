@@ -237,17 +237,28 @@ class Store:
     probability at the tick boundary.
     """
 
-    def __init__(self, db_path: str | Path | None = None):
+    def __init__(self, db_path: str | Path | None = None, read_only: bool = False):
         self.db_path = Path(db_path) if db_path else _default_db_path()
+        self.read_only = read_only
         self._conn: sqlite3.Connection | None = None
 
     # -- connection lifecycle ---------------------------------------------
 
     def _c(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path)
+            if self.read_only:
+                # Codex MCP runs under a filesystem sandbox that can read the
+                # cache but cannot create SQLite WAL/SHM sidecars. immutable=1
+                # keeps recall truly read-only; writable ingest paths use the
+                # default Store() connection below.
+                uri = f"file:{self.db_path}?mode=ro&immutable=1"
+                self._conn = sqlite3.connect(uri, uri=True)
+            else:
+                self._conn = sqlite3.connect(self.db_path)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON;")
+            if self.read_only:
+                return self._conn
             # Codex Phase 2 MEDIUM #2: concurrent-writer safety. See prior
             # revision docstring; WAL + busy_timeout + synchronous=NORMAL.
             self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
@@ -268,6 +279,10 @@ class Store:
             self._conn.close()
             self._conn = None
 
+    def _ensure_writable(self) -> None:
+        if self.read_only:
+            raise RuntimeError("read-only Store cannot write")
+
     # -- schema -----------------------------------------------------------
 
     def migrate(self) -> None:
@@ -286,6 +301,7 @@ class Store:
         ``PRAGMA table_info`` probe (not user_version) so it only fires when
         the column is genuinely absent; fresh DBs get the column via DDL.
         """
+        self._ensure_writable()
         c = self._c()
         self._ensure_sessions_origin_column(c)
         for stmt in _DDL:
@@ -330,6 +346,7 @@ class Store:
         index; JSONLs / API responses are source of truth. Callers detecting
         a stale ``user_version`` invoke this before re-ingesting.
         """
+        self._ensure_writable()
         c = self._c()
         for stmt in _DROP_ALL:
             c.execute(stmt)
@@ -363,6 +380,7 @@ class Store:
         SAVEPOINT (COMMIT inside a savepoint releases it, which then breaks
         the surrounding RELEASE).
         """
+        self._ensure_writable()
         c = self._c()
         for e in entities:
             if isinstance(e, SessionRow):
@@ -459,6 +477,7 @@ class Store:
                 f"refusing to rebuild sessions: got {session_count} session "
                 f"rows, min_sessions={min_sessions}"
             )
+        self._ensure_writable()
         c = self._c()
         c.execute("SAVEPOINT rebuild_entities")
         try:
@@ -482,6 +501,7 @@ class Store:
         Idempotent per ``stable_id``: re-upsert of the same ID overwrites the
         row (INSERT ... ON CONFLICT DO UPDATE); a fresh ID inserts a new row.
         """
+        self._ensure_writable()
         c = self._c()
         for r in records:
             scrubbed_body = scrub(r.body).text
@@ -527,6 +547,7 @@ class Store:
 
     def rebuild(self, source: str) -> None:
         """Drop all Record-shaped rows for one source; caller re-ingests."""
+        self._ensure_writable()
         c = self._c()
         c.execute("DELETE FROM records WHERE source = ?", (source,))
         c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
@@ -550,6 +571,7 @@ class Store:
                 f"refusing to rebuild {source!r}: got {len(record_list)} "
                 f"records, min_records={min_records}"
             )
+        self._ensure_writable()
         c = self._c()
         c.execute("SAVEPOINT rebuild_and_upsert")
         try:

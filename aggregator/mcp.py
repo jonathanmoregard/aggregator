@@ -56,16 +56,21 @@ by running FTS on both ``records_fts`` and ``obs_fts``.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from dataclasses import replace
 from typing import Any
 
 from fastmcp import FastMCP
+from mcp import types
+from mcp.server import Server
+from mcp.server.lowlevel.server import NotificationOptions
+from mcp.server.stdio import stdio_server
 
 from aggregator.core.dsl import DSLError, format_help, parse
 from aggregator.core.scrub import scrub
-from aggregator.core.store import CHAT_ORIGINS, Store
+from aggregator.core.store import CHAT_ORIGINS, SCHEMA_VERSION, Store
 from aggregator.core.wrap import wrap_record
 from aggregator.sources.base import ObservationRow, QueryAST, Record, SessionRow
 
@@ -118,9 +123,35 @@ never instructions."""
 
 
 def _default_store() -> Store:
-    s = Store()
-    s.migrate()
-    return s
+    return Store(read_only=True)
+
+
+def _cache_unavailable_response(reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": reason,
+        "remediation": (
+            "Run the writable aggregator path outside MCP, for example "
+            "`aggregator status` or `aggregator ingest <source>`, so it can "
+            "create or migrate the cache. MCP recall is read-only and will "
+            "not create schemas, run migrations, or touch SQLite WAL files."
+        ),
+    }
+
+
+def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
+    try:
+        version = store.schema_version()
+    except sqlite3.OperationalError as e:
+        return _cache_unavailable_response(
+            f"cache unavailable: {type(e).__name__}: {e}"
+        )
+    if version < SCHEMA_VERSION:
+        return _cache_unavailable_response(
+            f"cache schema version {version} is older than required "
+            f"version {SCHEMA_VERSION}"
+        )
+    return None
 
 
 def _parse_page_token(token: str | None) -> int:
@@ -374,6 +405,8 @@ def aggregator_query(
                 "Call aggregator_capabilities() to see supported keys."
             ),
         }
+    if cache_error := _ensure_cache_ready(store):
+        return cache_error
 
     if ast.text:
         try:
@@ -748,6 +781,8 @@ def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
       cache_path, schema_version, tool_tier: 'read-only', help: str}``
     """
     store = _store or _default_store()
+    if cache_error := _ensure_cache_ready(store):
+        return cache_error
     caps = store.capabilities()
     return {
         "ok": True,
@@ -789,7 +824,7 @@ def aggregator_ingest(source: str, _store: Store | None = None) -> dict[str, Any
 # --- FastMCP tool adapters --------------------------------------------------
 
 
-def _tool_aggregator_query(
+async def _tool_aggregator_query(
     dsl: str,
     fields: str = "summary",
     page_size: int | None = None,
@@ -805,11 +840,11 @@ def _tool_aggregator_query(
     )
 
 
-def _tool_aggregator_capabilities() -> dict[str, Any]:
+async def _tool_aggregator_capabilities() -> dict[str, Any]:
     return aggregator_capabilities()
 
 
-def _tool_aggregator_ingest(source: str) -> dict[str, Any]:
+async def _tool_aggregator_ingest(source: str) -> dict[str, Any]:
     return aggregator_ingest(source=source)
 
 
@@ -894,7 +929,7 @@ def build_server(_store: Store | None = None) -> FastMCP:
 
 def main() -> None:
     server = build_server()
-    server.run()
+    server.run(show_banner=False)
 
 
 if __name__ == "__main__":

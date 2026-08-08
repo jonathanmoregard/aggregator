@@ -106,6 +106,13 @@ def test_capabilities_tool_tier_is_read_only(tmp_data_home):
     assert caps["tool_tier"] == "read-only"
 
 
+def test_capabilities_default_store_reports_missing_cache(tmp_data_home):
+    caps = aggregator_capabilities()
+    assert caps["ok"] is False
+    assert "cache unavailable" in caps["reason"]
+    assert "MCP recall is read-only" in caps["remediation"]
+
+
 def test_capabilities_cache_path_points_at_store_db(tmp_data_home):
     store = Store()
     _seed(store)

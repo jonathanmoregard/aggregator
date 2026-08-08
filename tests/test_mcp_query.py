@@ -17,6 +17,13 @@ from aggregator.mcp import aggregator_query
 from aggregator.sources.base import ObservationRow, Record, SessionRow
 
 
+def test_query_default_store_reports_missing_cache(tmp_data_home):
+    result = aggregator_query("travel")
+    assert result["ok"] is False
+    assert "cache unavailable" in result["reason"]
+    assert "MCP recall is read-only" in result["remediation"]
+
+
 def _rec(sid: str, subject: str, body: str, tags=()) -> Record:
     return Record(
         stable_id=sid,

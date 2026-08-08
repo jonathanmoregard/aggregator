@@ -466,6 +466,27 @@ def test_two_processes_concurrent_writes_succeed(tmp_data_home):
     assert not errs, f"concurrent writers hit errors: {errs}"
 
 
+def test_read_only_store_skips_wal_and_refuses_migration(tmp_path):
+    """MCP readers must not require WAL sidecar writes."""
+    import sqlite3
+
+    import pytest as _pytest
+
+    db_path = tmp_path / "cache.db"
+    con = sqlite3.connect(db_path)
+    con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    con.close()
+
+    store = Store(db_path, read_only=True)
+    journal = store._c().execute("PRAGMA journal_mode").fetchone()
+    assert journal[0].lower() != "wal"
+    assert not db_path.with_name("cache.db-wal").exists()
+    assert not db_path.with_name("cache.db-shm").exists()
+    with _pytest.raises(RuntimeError, match="read-only Store"):
+        store.migrate()
+    store.close()
+
+
 # --- v2 sessions + observations -------------------------------------------
 
 
