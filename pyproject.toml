@@ -20,6 +20,14 @@ dependencies = [
   # is the one failure mode this index cannot tolerate.
   "pypdf>=5.0",
   "python-docx>=1.1",
+  # v5 RAG / hybrid retrieval. `sqlite-vec` is the vector index; it ships as a
+  # loadable SQLite extension, and the store loads it BEST-EFFORT — see
+  # `Store._load_vector_extension`. Declaring it here does not make the vector
+  # arm mandatory: FTS5 recall keeps working when the extension is absent or
+  # ABI-mismatched, which is the whole point of the degrade path.
+  "sqlite-vec>=0.1.6",
+  "sentence-transformers>=3.0",
+  "numpy>=2.0",
 ]
 
 [project.scripts]
@@ -31,6 +39,9 @@ dev = [
   "pytest>=8",
   "pytest-cov>=5",
   "ruff>=0.6",
+]
+embed-gguf = [
+  "llama-cpp-python>=0.3",
 ]
 
 [build-system]
