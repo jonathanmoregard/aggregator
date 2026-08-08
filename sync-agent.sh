@@ -5,8 +5,19 @@
 
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
+# Normally the script lives in the repo it syncs and infers the path from its
+# own location. SYNC_REPO overrides that, so a repo can be synced without
+# planting this file inside it — required for public forks, where local
+# automation must not land in the tree or leak into an upstream PR (the
+# superpowers fork gitignores this script for exactly that reason, which is
+# also how it went missing and left its cron erroring on every run).
+REPO="${SYNC_REPO:-$(cd "$(dirname "$0")" && pwd)}"
 CLAUDE="$(command -v claude)"
+
+if [ ! -d "$REPO/.git" ]; then
+  echo "sync-agent: $REPO is not a git repository — aborting" >&2
+  exit 1
+fi
 
 cd "$REPO"
 
