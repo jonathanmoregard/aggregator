@@ -56,17 +56,12 @@ by running FTS on both ``records_fts`` and ``obs_fts``.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import sqlite3
 from dataclasses import replace
 from typing import Any
 
 from fastmcp import FastMCP
-from mcp import types
-from mcp.server import Server
-from mcp.server.lowlevel.server import NotificationOptions
-from mcp.server.stdio import stdio_server
 
 from aggregator.core.dsl import DSLError, format_help, parse
 from aggregator.core.scrub import scrub
