@@ -15,9 +15,12 @@ COVERAGE LIMIT: the Open API filters completed tasks out of every read
 endpoint. This module sees open tasks only; completions are inferred here
 (by disappearance, task 7) and corrected later from the CSV backup.
 
-Status vocabulary is TickTick's own, shared verbatim with
-``ticktick_csv.py`` so the two legs merge cleanly: ``0`` normal, ``2``
-completed, ``-1`` abandoned. There is no status ``1``.
+VOCABULARY: the status codes (``0`` normal, ``2`` completed, ``-1``
+abandoned — there is no ``1``) and the priority names are *imported* from
+``ticktick_csv.py`` rather than restated here. They live there because the
+backup export documents both in its own preamble, and a second hand-kept copy
+is exactly how the two legs would drift into writing different words for the
+same value once task 8 merges them by stable_id.
 """
 from __future__ import annotations
 
@@ -29,20 +32,17 @@ from urllib.error import URLError
 
 from aggregator.sources.base import Record, stable_id_for
 
+# One vocabulary, defined once, in the module whose file format documents it.
+# An inferred completion therefore writes the very code the CSV leg writes, and
+# a priority becomes the very word the CSV leg writes, so task 8 can merge API
+# and CSV records without translating between two dialects.
+from aggregator.sources.ticktick_csv import STATUS_COMPLETED, STATUS_OPEN, priority_name
+
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.ticktick.com/open/v1"
 SOURCE_NAME = "ticktick"
 DEFAULT_TIMEOUT = 30
-
-# TickTick priority values: 0 none, 1 low, 3 medium, 5 high.
-PRIORITY_NAMES = {0: "none", 1: "low", 3: "medium", 5: "high"}
-
-# Status codes, quoted from the backup export's own preamble. An inferred
-# completion uses "2" — the same code the CSV leg writes — so task 8 can merge
-# API and CSV records without translating between two vocabularies.
-STATUS_OPEN = "0"
-STATUS_COMPLETED = "2"
 
 
 class WriteAttemptError(RuntimeError):
@@ -122,11 +122,10 @@ def task_to_record(
         tags.append(project_name)
     tags.append("completed" if inferred else "open")
 
-    priority = task.get("priority", 0)
     extra: dict[str, object] = {
         "provenance": provenance,
         "status": STATUS_COMPLETED if inferred else STATUS_OPEN,
-        "priority": PRIORITY_NAMES.get(priority, str(priority or "")),
+        "priority": priority_name(task.get("priority")),
         "due_date": task.get("dueDate") or "",
         "start_date": task.get("startDate") or "",
         "repeat": task.get("repeatFlag") or "",

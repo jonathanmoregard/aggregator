@@ -7,7 +7,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from aggregator.sources import ticktick_api
+from aggregator.sources import ticktick_api, ticktick_csv
 
 TOKEN = "sup3r-s3cret-token"
 
@@ -201,6 +201,7 @@ def test_task_to_record_shape():
     assert set(rec.tags) >= {"work", "Work", "open"}
     assert rec.extra["provenance"] == "api"
     assert rec.extra["status"] == "0"
+    assert rec.extra["priority"] == "high"
     assert "completed_time_approx" not in rec.extra
 
 
@@ -246,8 +247,18 @@ def test_task_to_record_missing_fields_are_empty_not_none():
     assert rec.body == ""
     assert rec.extra["due_date"] == ""
     assert rec.extra["parent_id"] == ""
+    # Priority is the exception: absent means TickTick's own default level, 0.
+    assert rec.extra["priority"] == "none"
     assert rec.created_at is None
     assert rec.updated_at is None
+
+
+def test_task_to_record_priority_uses_the_shared_names():
+    """Names, not digits — and the same table the CSV leg maps through."""
+    assert ticktick_api.priority_name is ticktick_csv.priority_name
+    for level, name in ticktick_csv.PRIORITY_NAMES.items():
+        rec = ticktick_api.task_to_record({"id": "t1", "title": "x", "priority": level})
+        assert rec.extra["priority"] == name
 
 
 def test_task_to_record_normalises_timestamps_to_utc():

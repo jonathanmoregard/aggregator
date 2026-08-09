@@ -3,9 +3,13 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
+import pytest
+
+from aggregator.sources import ticktick_api
 from aggregator.sources.ticktick_csv import (
     HEADER_LINE_INDEX,
     MAX_PREAMBLE_ROWS,
+    STATUS_TAGS,
     is_ticktick_backup,
     parse_backup,
     row_to_record,
@@ -146,6 +150,7 @@ def test_row_to_record_open_task(tmp_path):
     assert rec.updated_at == rec.created_at
     assert rec.extra["provenance"] == "csv"
     assert rec.extra["status"] == "0"
+    assert rec.extra["priority"] == "medium"
     assert rec.extra["source_file"] == "TickTick.csv"
 
 
@@ -193,6 +198,63 @@ def test_status_wins_over_completed_time(tmp_path):
     assert "open" in rec.tags
     assert "completed" not in rec.tags
     assert rec.updated_at == datetime(2026, 8, 3, 17, 30, tzinfo=UTC)
+
+
+def test_api_status_codes_are_csv_status_codes():
+    """One vocabulary: every code the API leg writes must be one the CSV leg tags."""
+    assert STATUS_TAGS[ticktick_api.STATUS_OPEN] == "open"
+    assert STATUS_TAGS[ticktick_api.STATUS_COMPLETED] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("raw", "name"), [("0", "none"), ("1", "low"), ("3", "medium"), ("5", "high")]
+)
+def test_priority_digit_becomes_a_name(tmp_path, raw, name):
+    """The index holds the word a human would search for, not the export's digit."""
+    row = parse_backup(_backup(tmp_path, [_row(priority=raw)]))[0]
+    assert row_to_record(row, source_file="x.csv").extra["priority"] == name
+
+
+def test_blank_priority_is_ticktick_default_none(tmp_path):
+    """An absent level is TickTick's own default, 0 — the same default the API leg uses."""
+    row = parse_backup(_backup(tmp_path, [_row(priority="")]))[0]
+    assert row_to_record(row, source_file="x.csv").extra["priority"] == "none"
+
+
+def test_unknown_priority_is_kept_verbatim_and_warns(tmp_path, caplog):
+    """TickTick has no priority 2 or 4; an unlisted level must not read as 'none'."""
+    row = parse_backup(_backup(tmp_path, [_row(priority="2")]))[0]
+    with caplog.at_level(logging.WARNING, logger="aggregator.sources.ticktick_csv"):
+        rec = row_to_record(row, source_file="x.csv")
+    assert rec.extra["priority"] == "2"
+    assert "'2'" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("level", "name"), [(0, "none"), (1, "low"), (3, "medium"), (5, "high")]
+)
+def test_both_legs_write_the_same_priority_word(tmp_path, level, name):
+    """The bug this replaces: the CSV leg wrote "5" where the API leg wrote "high".
+
+    Task 8 merges the two legs by stable_id — asserted equal here — so a
+    divergent vocabulary would flip a task's priority depending on which leg
+    happened to write last, and a search for one would miss the other.
+    """
+    row = parse_backup(_backup(tmp_path, [_row(priority=str(level))]))[0]
+    csv_rec = row_to_record(row, source_file="x.csv")
+    api_rec = ticktick_api.task_to_record(
+        {"id": "abc123", "title": "Buy milk", "priority": level}
+    )
+    assert csv_rec.stable_id == api_rec.stable_id
+    assert csv_rec.extra["priority"] == api_rec.extra["priority"] == name
+
+
+def test_both_legs_keep_an_unknown_priority_the_same_way(tmp_path):
+    """Divergence must not sneak back in through the fallback path either."""
+    row = parse_backup(_backup(tmp_path, [_row(priority="4")]))[0]
+    csv_rec = row_to_record(row, source_file="x.csv")
+    api_rec = ticktick_api.task_to_record({"id": "abc123", "title": "Buy milk", "priority": 4})
+    assert csv_rec.extra["priority"] == api_rec.extra["priority"] == "4"
 
 
 def test_timestamps_normalised_to_utc(tmp_path):

@@ -14,6 +14,13 @@ is a single quoted value spanning four physical lines, so "six metadata lines"
 is only three csv rows, and the count varies with the export version. Scanning
 for the required columns is version-proof; counting rows silently yields zero
 records, which is indistinguishable from "no backup present".
+
+This module also owns TickTick's shared vocabulary — the status codes and the
+priority names — because the export documents both in its own preamble, so
+here they are grounded in evidence rather than in a guess. ``ticktick_api.py``
+imports them; the dependency only ever points that way (the CSV parser never
+needs the API client), so the two legs cannot drift into writing different
+words for the same value when task 8 merges them by stable_id.
 """
 from __future__ import annotations
 
@@ -49,7 +56,20 @@ REQUIRED_COLUMNS = frozenset({"Title", "taskId", "Status", "Created Time"})
 # There is no status 1. Anything unlisted is tagged 'open' *and warned about*
 # (session constraint 2026-08-08, "fail loudly") so a new vendor status code
 # cannot silently repeat the inverted-mapping bug this replaces.
-STATUS_TAGS = {"0": "open", "2": "completed", "-1": "abandoned"}
+#
+# ticktick_api.py imports STATUS_OPEN/STATUS_COMPLETED so an API-inferred
+# completion writes the same code the CSV leg writes.
+STATUS_OPEN = "0"
+STATUS_COMPLETED = "2"
+STATUS_ABANDONED = "-1"
+STATUS_TAGS = {
+    STATUS_OPEN: "open",
+    STATUS_COMPLETED: "completed",
+    STATUS_ABANDONED: "abandoned",
+}
+
+# TickTick priority levels: 0 none, 1 low, 3 medium, 5 high. There is no 2 or 4.
+PRIORITY_NAMES = {0: "none", 1: "low", 3: "medium", 5: "high"}
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -140,6 +160,29 @@ def _status_tag(status: str) -> str:
     return tag
 
 
+def priority_name(value: object) -> str:
+    """Map a TickTick priority to its name. Shared by both legs.
+
+    The CSV export writes ``"5"`` and the Open API writes ``5`` for the same
+    priority, but task 8 merges records from both legs by stable_id, so both
+    must land the same word in ``extra["priority"]`` — otherwise a task's
+    priority flips between ``"5"`` and ``"high"`` depending on which leg wrote
+    last, and a search for one misses records written by the other. Names win:
+    they are what a human types into the index.
+
+    Absent or blank means TickTick's own default level, 0 (none). An unlisted
+    level — there is no 2 or 4 — is indexed verbatim and warned about rather
+    than coerced to "none", so a new vendor level is visible instead of being
+    silently downgraded (session constraint 2026-08-08, "fail loudly").
+    """
+    text = "0" if value is None else (str(value).strip() or "0")
+    try:
+        return PRIORITY_NAMES[int(text)]
+    except (ValueError, KeyError):
+        log.warning("unexpected ticktick priority %r; indexing it verbatim", value)
+        return text
+
+
 def row_to_record(row: dict[str, str], source_file: str) -> Record:
     """Map one backup row to a Record.
 
@@ -167,7 +210,7 @@ def row_to_record(row: dict[str, str], source_file: str) -> Record:
         extra={
             "provenance": "csv",
             "status": status,
-            "priority": (row.get("Priority") or "").strip(),
+            "priority": priority_name(row.get("Priority")),
             "due_date": (row.get("Due Date") or "").strip(),
             "start_date": (row.get("Start Date") or "").strip(),
             "repeat": (row.get("Repeat") or "").strip(),
