@@ -40,6 +40,7 @@ from aggregator.mcp import (
 from aggregator.sources.base import ObservationRow, SessionRow
 from aggregator.sources.chatgpt import ChatGPTSource
 from aggregator.sources.claude_web import ClaudeWebSource
+from aggregator.sources.dropbox import DropboxSource
 from aggregator.sources.github import GitHubSource
 from aggregator.sources.research_reports import ResearchReportsSource
 from aggregator.sources.sessions import SessionsSource
@@ -97,6 +98,7 @@ def _default_sources() -> dict[str, Any]:
         "research": ResearchReportsSource(),
         "sota-watch": SotaWatchSource(),
         "substack": SubstackSource(),
+        "dropbox": DropboxSource(),
     }
 
 
@@ -444,7 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
         "source",
         help=(
             "source name: sessions | github | chatgpt | claude-web | "
-            "research | sota-watch | substack"
+            "research | sota-watch | substack | dropbox"
         ),
     )
     ing.add_argument("--since", help="ISO date to bound the ingest window")
