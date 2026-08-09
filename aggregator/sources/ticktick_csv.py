@@ -5,14 +5,21 @@ official Open API filters completed tasks out of every read endpoint, which
 is why no TickTick MCP server can back a history index on its own. See the
 design doc for the evidence.
 
-Backups are detected by structure, not filename — six metadata lines, then
-the header on line 7 — so an arbitrary CSV sitting in ~/Downloads is ignored
-rather than half-parsed into garbage records.
+Backups are detected by structure, not filename — a short metadata preamble,
+then a header row carrying TickTick's column names — so an arbitrary CSV
+sitting in ~/Downloads is ignored rather than half-parsed into garbage records.
+
+The header is *discovered*, never counted to. TickTick's third preamble field
+is a single quoted value spanning four physical lines, so "six metadata lines"
+is only three csv rows, and the count varies with the export version. Scanning
+for the required columns is version-proof; counting rows silently yields zero
+records, which is indistinguishable from "no backup present".
 """
 from __future__ import annotations
 
 import csv
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,13 +29,27 @@ log = logging.getLogger(__name__)
 
 SOURCE_NAME = "ticktick"
 
-# TickTick writes six metadata lines before the real header.
-HEADER_LINE_INDEX = 6
+# Where the header sits in a TickTick v7.2 export, counted in csv rows (not
+# physical lines: preamble row 2 is a quoted field spanning four lines).
+# Informational — fixtures use it; the parser discovers the header instead.
+HEADER_LINE_INDEX = 3
+
+# How far into a file we look for the header before giving up. Bounded so an
+# unrelated multi-megabyte CSV is not read end to end just to reject it.
+MAX_PREAMBLE_ROWS = 20
 
 # A file must have all of these on its header line to be treated as a backup.
 REQUIRED_COLUMNS = frozenset({"Title", "taskId", "Status", "Created Time"})
 
-STATUS_TAGS = {"0": "open", "1": "completed", "2": "archived"}
+# TickTick's own vocabulary, quoted verbatim from the export's preamble:
+#   Status:
+#   0 Normal
+#   -1 Abandoned
+#   2 Completed
+# There is no status 1. Anything unlisted is tagged 'open' *and warned about*
+# (session constraint 2026-08-08, "fail loudly") so a new vendor status code
+# cannot silently repeat the inverted-mapping bug this replaces.
+STATUS_TAGS = {"0": "open", "2": "completed", "-1": "abandoned"}
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -47,37 +68,53 @@ def _parse_dt(value: str | None) -> datetime | None:
             parsed = parse(text)
         except ValueError:
             continue
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        # Normalise to UTC: store.py compares and orders created_at/updated_at
+        # as ISO *text*, so a surviving foreign offset would sort wrongly.
+        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     log.warning("unparseable ticktick timestamp: %r", value)
+    return None
+
+
+def _find_header(reader: Iterator[list[str]]) -> list[str] | None:
+    """Advance ``reader`` past the preamble, returning the header row.
+
+    Leaves the reader positioned on the first data row. Returns None (reader
+    position unspecified) if no header turns up within MAX_PREAMBLE_ROWS.
+    """
+    for index, row in enumerate(reader):
+        if index >= MAX_PREAMBLE_ROWS:
+            return None
+        if REQUIRED_COLUMNS.issubset(row):
+            return row
     return None
 
 
 def _header_fields(path: Path) -> list[str] | None:
     """Return the backup's header fields, or None if this is not a backup."""
     try:
-        with path.open("r", encoding="utf-8", newline="") as fh:
-            reader = csv.reader(fh)
-            for index, row in enumerate(reader):
-                if index < HEADER_LINE_INDEX:
-                    continue
-                return row
+        with path.open("r", encoding="utf-8-sig", newline="") as fh:
+            return _find_header(csv.reader(fh))
     except (OSError, UnicodeDecodeError, csv.Error) as e:
         log.debug("not a readable csv: %s (%s)", path, e)
     return None
 
 
 def is_ticktick_backup(path: Path) -> bool:
-    fields = _header_fields(path)
-    return fields is not None and REQUIRED_COLUMNS.issubset(set(fields))
+    """True when a header carrying every REQUIRED_COLUMN is found in the preamble."""
+    return _header_fields(path) is not None
 
 
 def parse_backup(path: Path) -> list[dict[str, str]]:
-    """Return the backup's task rows. Rows without a taskId are dropped."""
-    with path.open("r", encoding="utf-8", newline="") as fh:
+    """Return the backup's task rows, or [] if the file has no TickTick header.
+
+    Rows are keyed by the discovered header, so extra vendor columns (v7.2 added
+    ``Kind`` and ``projectKind``) ride along instead of shifting every field.
+    Rows without a taskId are dropped. Unlike :func:`is_ticktick_backup` this
+    does not swallow read errors — gate on detection first.
+    """
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.reader(fh)
-        for _ in range(HEADER_LINE_INDEX):
-            next(reader, None)
-        header = next(reader, None)
+        header = _find_header(reader)
         if header is None:
             return []
         rows = [dict(zip(header, row, strict=False)) for row in reader if row]
@@ -94,8 +131,21 @@ def parse_backup(path: Path) -> list[dict[str, str]]:
     return kept
 
 
+def _status_tag(status: str) -> str:
+    """Map a raw ``Status`` value to its tag, warning on anything unrecognised."""
+    tag = STATUS_TAGS.get(status)
+    if tag is None:
+        log.warning("unexpected ticktick Status %r; tagging as 'open'", status)
+        return "open"
+    return tag
+
+
 def row_to_record(row: dict[str, str], source_file: str) -> Record:
-    """Map one backup row to a Record."""
+    """Map one backup row to a Record.
+
+    The status tag comes strictly from ``Status``, never from the presence of a
+    ``Completed Time`` — the real export has open rows carrying one.
+    """
     status = (row.get("Status") or "0").strip()
     created = _parse_dt(row.get("Created Time"))
     completed = _parse_dt(row.get("Completed Time"))
@@ -104,7 +154,7 @@ def row_to_record(row: dict[str, str], source_file: str) -> Record:
         value = (row.get(key) or "").strip()
         if value:
             tags.append(value)
-    tags.append(STATUS_TAGS.get(status, "open"))
+    tags.append(_status_tag(status))
 
     return Record(
         stable_id=stable_id_for(SOURCE_NAME, row["taskId"]),
