@@ -18,9 +18,17 @@ import fnmatch
 import logging
 import os
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
-from aggregator.core.textextract import SUPPORTED_EXTS
+from aggregator.core.textextract import (
+    PDF_EXTS,
+    SUPPORTED_EXTS,
+    ExtractionError,
+    extract_text,
+    first_markdown_heading,
+)
+from aggregator.sources.base import IngestResult, Record, stable_id_for
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +37,17 @@ DEFAULT_ROOT = "~/Dropbox"
 # Pruned unconditionally — never worth indexing, and node_modules alone is
 # ~10k files of the tree.
 SKIP_DIR_NAMES = {"node_modules", ".git", ".dropbox.cache"}
+
+# A 2 MB text file is not prose. The only files over this limit in the tree
+# today are two copies of a 5.4 MB Swedish wordlist.
+MAX_TEXT_BYTES = 2 * 1024 * 1024
+MAX_PDF_BYTES = 20 * 1024 * 1024
+MAX_BODY_CHARS = 200_000
+
+# Below this, a PDF is an image scan with no text layer. Skipped and counted,
+# not errored — we made a deliberate no-OCR choice, so this is an expected
+# outcome and must not page anyone.
+MIN_PDF_TEXT_CHARS = 50
 
 
 def _is_skipped_dir(name: str) -> bool:
@@ -92,3 +111,106 @@ class DropboxSource:
                 if _matches_exclude(rel, self.exclude):
                     continue
                 yield path
+
+    def record_shape(self) -> dict[str, str]:
+        """DSL-facing field surface (M2 help generator)."""
+        return {
+            "subject": "str (first markdown heading, or filename stem)",
+            "body": "str (extracted file text)",
+            "relpath": "str (path relative to the Dropbox root)",
+            "ext": "str (file extension, lowercased, with dot)",
+            "size_bytes": "int (file size on disk)",
+            "truncated": "bool (present only when the body was cut)",
+        }
+
+    def _size_limit(self, path: Path) -> int:
+        return MAX_PDF_BYTES if path.suffix.lower() in PDF_EXTS else MAX_TEXT_BYTES
+
+    def _to_record(self, path: Path, mtime: datetime, text: str, size: int) -> Record:
+        rel = path.relative_to(self.root).as_posix()
+        ext = path.suffix.lower()
+        truncated = len(text) > MAX_BODY_CHARS
+        body = text[:MAX_BODY_CHARS] if truncated else text
+        subject = (first_markdown_heading(text) if ext in {".md", ".markdown"} else None) or path.stem
+        top = PurePosixPath(rel).parts[0] if len(PurePosixPath(rel).parts) > 1 else None
+        extra: dict[str, object] = {
+            "relpath": rel,
+            "ext": ext,
+            "size_bytes": size,
+        }
+        if truncated:
+            extra["truncated"] = True
+        return Record(
+            stable_id=stable_id_for(self.name, rel),
+            source=self.name,
+            subject=subject,
+            body=body,
+            # created_at deliberately unset: filesystem birth time is not
+            # preserved across the Dropbox sync boundary, so it would be a
+            # confident-looking lie.
+            created_at=None,
+            updated_at=mtime,
+            tags=[t for t in (top, ext.lstrip(".")) if t],
+            extra=extra,
+        )
+
+    def iter_records(
+        self,
+        since: datetime | None,
+        errors: list[str] | None = None,
+    ) -> Iterator[Record]:
+        """Yield one Record per indexable Dropbox file.
+
+        ``since``: files with mtime <= since are skipped before extraction, so
+        an incremental run costs a stat per file rather than a parse.
+
+        Error policy: a file that cannot be parsed appends to ``errors`` and is
+        skipped — one corrupt PDF never aborts an ingest of 1600 files. An
+        image-only PDF is NOT an error (see MIN_PDF_TEXT_CHARS).
+        """
+        since_utc: datetime | None = None
+        if since is not None:
+            since_utc = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
+
+        for path in self._iter_candidate_paths():
+            try:
+                stat = path.stat()
+            except OSError as e:
+                log.warning("stat failed for %s: %s", path, e)
+                if errors is not None:
+                    errors.append(f"{path}: stat failed: {e}")
+                continue
+
+            mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+            if since_utc is not None and mtime <= since_utc:
+                continue
+            if stat.st_size > self._size_limit(path):
+                log.info("skipping oversized file %s (%d bytes)", path, stat.st_size)
+                continue
+
+            try:
+                text = extract_text(path)
+            except ExtractionError as e:
+                log.warning("extraction failed for %s: %s", path, e)
+                if errors is not None:
+                    errors.append(f"{path}: {e}")
+                continue
+            except OSError as e:
+                log.warning("read failed for %s: %s", path, e)
+                if errors is not None:
+                    errors.append(f"{path}: read failed: {e}")
+                continue
+
+            if path.suffix.lower() in PDF_EXTS and len(text.strip()) < MIN_PDF_TEXT_CHARS:
+                log.info("skipping image-only pdf %s", path)
+                continue
+            if not text.strip():
+                continue
+
+            yield self._to_record(path, mtime, text, stat.st_size)
+
+    def ingest(self, since: datetime | None) -> IngestResult:
+        """Count-only path for protocol compat; persistence is the CLI's job."""
+        errors: list[str] = []
+        added = sum(1 for _ in self.iter_records(since, errors=errors))
+        return IngestResult(added=added, updated=0, skipped=0, errors=errors)

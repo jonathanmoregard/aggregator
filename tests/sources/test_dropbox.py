@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from aggregator.sources.dropbox import DropboxSource
+import os
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from aggregator.sources.dropbox import MAX_BODY_CHARS, MAX_TEXT_BYTES, DropboxSource
 
 
 def _write(root, rel, content="body text"):
@@ -61,3 +66,91 @@ def test_root_read_from_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AGGREGATOR_DROPBOX_ROOT", str(tmp_path))
     src = DropboxSource()
     assert {p.name for p in src._iter_candidate_paths()} == {"ok.md"}
+
+
+def test_record_fields(tmp_path):
+    _write(tmp_path, "Blogg/post.md", "# My Title\n\nsome prose")
+    src = DropboxSource(root=tmp_path)
+    (rec,) = list(src.iter_records(None))
+    assert rec.stable_id == "dropbox:Blogg/post.md"
+    assert rec.source == "dropbox"
+    assert rec.subject == "My Title"
+    assert rec.body == "# My Title\n\nsome prose"
+    assert set(rec.tags) == {"Blogg", "md"}
+    assert rec.created_at is None
+    assert rec.updated_at is not None
+    assert rec.extra["relpath"] == "Blogg/post.md"
+    assert rec.extra["ext"] == ".md"
+    assert rec.extra["size_bytes"] > 0
+
+
+def test_subject_falls_back_to_filename_stem(tmp_path):
+    _write(tmp_path, "Recept/pannkakor.txt", "no heading here")
+    src = DropboxSource(root=tmp_path)
+    (rec,) = list(src.iter_records(None))
+    assert rec.subject == "pannkakor"
+
+
+def test_root_level_file_tags_have_extension_only(tmp_path):
+    _write(tmp_path, "loose.md", "x")
+    src = DropboxSource(root=tmp_path)
+    (rec,) = list(src.iter_records(None))
+    assert rec.tags == ["md"]
+
+
+def test_oversized_text_file_skipped(tmp_path):
+    _write(tmp_path, "wordlist.txt", "a" * (MAX_TEXT_BYTES + 1))
+    _write(tmp_path, "small.txt", "fine")
+    src = DropboxSource(root=tmp_path)
+    subjects = {r.subject for r in src.iter_records(None)}
+    assert subjects == {"small"}
+
+
+def test_body_truncated_with_flag(tmp_path):
+    _write(tmp_path, "long.txt", "b" * (MAX_BODY_CHARS + 500))
+    src = DropboxSource(root=tmp_path)
+    (rec,) = list(src.iter_records(None))
+    assert len(rec.body) == MAX_BODY_CHARS
+    assert rec.extra["truncated"] is True
+
+
+def test_since_filters_on_mtime(tmp_path):
+    old = _write(tmp_path, "old.md", "x")
+    new = _write(tmp_path, "new.md", "y")
+    stale = (datetime.now(UTC) - timedelta(days=30)).timestamp()
+    os.utime(old, (stale, stale))
+    since = datetime.now(UTC) - timedelta(days=1)
+    src = DropboxSource(root=tmp_path)
+    assert {r.subject for r in src.iter_records(since)} == {"new"}
+    assert new.exists()
+
+
+def test_corrupt_document_appends_error_and_continues(tmp_path):
+    (tmp_path / "broken.pdf").write_bytes(b"%PDF-1.4 truncated garbage")
+    _write(tmp_path, "good.md", "fine")
+    errors: list[str] = []
+    src = DropboxSource(root=tmp_path)
+    subjects = {r.subject for r in src.iter_records(None, errors=errors)}
+    assert subjects == {"good"}
+    assert len(errors) == 1
+    assert "broken.pdf" in errors[0]
+
+
+def test_image_only_pdf_skipped_without_error(tmp_path):
+    pypdf = pytest.importorskip("pypdf")
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with (tmp_path / "scan.pdf").open("wb") as fh:
+        writer.write(fh)
+    errors: list[str] = []
+    src = DropboxSource(root=tmp_path)
+    assert list(src.iter_records(None, errors=errors)) == []
+    assert errors == []
+
+
+def test_ingest_returns_counts(tmp_path):
+    _write(tmp_path, "a.md", "x")
+    _write(tmp_path, "b.md", "y")
+    result = DropboxSource(root=tmp_path).ingest(None)
+    assert result.added == 2
+    assert result.errors == []
