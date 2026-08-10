@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -31,14 +31,17 @@ def _no_network(monkeypatch):
     """No test in this file may reach the real TickTick API.
 
     The token is a write-scoped credential and the endpoint is the user's live
-    task list; a test that escaped the mock could mutate real data. Every test
-    that wants a response monkeypatches ``urlopen`` again, which wins over this.
+    task list; a test that escaped the mock could mutate real data. ``_open`` is
+    this module's single network seam, so patching it blocks only this module —
+    patching ``urllib.request.urlopen`` would have blocked the whole process for
+    the duration of every test in the file. Every test that wants a response
+    patches ``_open`` again, which wins over this.
     """
 
     def _forbidden(*args, **kwargs):
         raise AssertionError("test attempted a real network call")
 
-    monkeypatch.setattr(ticktick_api.request, "urlopen", _forbidden)
+    monkeypatch.setattr(ticktick_api, "_open", _forbidden)
 
 
 # --- the write guard ------------------------------------------------------
@@ -51,7 +54,7 @@ def test_request_refuses_non_get(method):
 
 
 def test_request_refuses_non_get_before_any_network_call():
-    """The guard is structural: the refusal happens before urlopen is reached.
+    """The guard is structural: the refusal happens before the network seam.
 
     The autouse ``_no_network`` fixture turns any real call into an
     AssertionError, so a WriteAttemptError here proves nothing was sent.
@@ -69,17 +72,68 @@ def test_request_refuses_plaintext_url():
 def test_get_sends_bearer_and_get_method(monkeypatch):
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None):
         seen["method"] = req.get_method()
         seen["auth"] = req.get_header("Authorization")
         seen["url"] = req.full_url
         return _FakeResponse({"ok": True})
 
-    monkeypatch.setattr(ticktick_api.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ticktick_api, "_open", fake_open)
     assert ticktick_api._request("GET", "https://x/y", token="tok") == {"ok": True}
     assert seen["method"] == "GET"
     assert seen["auth"] == "Bearer tok"
     assert seen["url"] == "https://x/y"
+
+
+# --- the token must not survive a redirect (review M1) --------------------
+
+
+def _captured_request(monkeypatch):
+    box = {}
+
+    def fake_open(req, timeout=None):
+        box["req"] = req
+        return _FakeResponse({"ok": True})
+
+    monkeypatch.setattr(ticktick_api, "_open", fake_open)
+    ticktick_api._request("GET", "https://api.ticktick.com/open/v1/project", token=TOKEN)
+    return box["req"]
+
+
+def test_authorization_is_an_unredirected_header(monkeypatch):
+    """urllib copies req.headers onto a redirect; unredirected_hdrs it never does."""
+    req = _captured_request(monkeypatch)
+    assert "Authorization" in req.unredirected_hdrs
+    assert not any(k.lower() == "authorization" for k in req.headers)
+
+
+def test_a_redirect_request_does_not_carry_the_bearer_token(monkeypatch):
+    """The measured defect: a 302 used to hand this write-scoped token to the target."""
+    req = _captured_request(monkeypatch)
+    redirected = ticktick_api._HttpsOnlyRedirectHandler().redirect_request(
+        req, None, 302, "Found", {}, "https://elsewhere.example/target"
+    )
+    assert not any(k.lower() == "authorization" for k in redirected.headers)
+    assert TOKEN not in json.dumps(dict(redirected.headers))
+
+
+def test_a_redirect_to_plaintext_is_refused():
+    """https -> http is a scheme downgrade urllib permits by default. We do not."""
+    handler = ticktick_api._HttpsOnlyRedirectHandler()
+    req = ticktick_api.request.Request("https://api.ticktick.com/open/v1/project")
+    with pytest.raises(URLError, match="non-https"):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1:8080/target")
+
+
+def test_the_module_opener_replaces_the_default_redirect_handler():
+    """A guarantee worth asserting structurally, not just on the happy path."""
+    handlers = ticktick_api._OPENER.handlers
+    assert any(isinstance(h, ticktick_api._HttpsOnlyRedirectHandler) for h in handlers)
+    assert all(
+        isinstance(h, ticktick_api._HttpsOnlyRedirectHandler)
+        for h in handlers
+        if isinstance(h, ticktick_api.request.HTTPRedirectHandler)
+    )
 
 
 # --- project walk ---------------------------------------------------------
@@ -101,6 +155,21 @@ def test_fetch_open_tasks_walks_projects(monkeypatch):
     assert {t["id"] for t in tasks} == {"t1", "t2"}
     assert {t["_projectName"] for t in tasks} == {"Work", "Home"}
     assert len(calls) == 3
+
+
+def test_fetch_open_tasks_url_encodes_the_project_id(monkeypatch):
+    """The id comes from TickTick, but interpolating it raw is a habit worth not having."""
+    calls = []
+
+    def fake_request(method, url, token, timeout=30):
+        calls.append(url)
+        if url.endswith("/project"):
+            return [{"id": "a b/c?d", "name": "Odd"}]
+        return {"tasks": []}
+
+    monkeypatch.setattr(ticktick_api, "_request", fake_request)
+    ticktick_api.fetch_open_tasks("tok")
+    assert calls[1] == f"{ticktick_api.BASE_URL}/project/a%20b%2Fc%3Fd/data"
 
 
 def test_fetch_open_tasks_one_bad_project_does_not_abort(monkeypatch):

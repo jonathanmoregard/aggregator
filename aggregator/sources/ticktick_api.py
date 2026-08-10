@@ -5,11 +5,19 @@ This is the repo's first direct HTTP call; the GitHub source shells out to
 GETs, it uses stdlib urllib.
 
 SECURITY: TickTick issues no read-only token — every token carries write
-scope. The compensating control is that ``_request`` refuses any method
-other than GET *before* it builds a request object, so no code path in this
-repo can mutate the user's tasks. It also refuses non-https URLs, so the
-bearer token cannot go out in cleartext. Both are tested in
-tests/sources/test_ticktick_api.py. The token is never logged.
+scope. Three compensating controls, all tested in
+tests/sources/test_ticktick_api.py:
+
+* ``_request`` refuses any method other than GET *before* it builds a request
+  object, so no code path in this repo can mutate the user's tasks.
+* It refuses a non-https URL, so the token is never sent in cleartext.
+* The token goes on as an *unredirected* header and the module's opener
+  refuses a non-https redirect target. urllib's default opener copies
+  ``req.headers`` onto a redirected request and permits an https->http
+  downgrade, so ``add_header`` alone would let a 30x walk this write-scoped
+  bearer token onto a plaintext host — measured, not theoretical.
+
+The token is never logged.
 
 COVERAGE LIMIT: the Open API filters completed tasks out of every read
 endpoint. This module sees open tasks only; completions are inferred here
@@ -29,6 +37,7 @@ import logging
 from datetime import UTC, datetime
 from urllib import request
 from urllib.error import URLError
+from urllib.parse import quote
 
 from aggregator.sources.base import Record, stable_id_for
 
@@ -49,6 +58,25 @@ class WriteAttemptError(RuntimeError):
     """Raised when any non-GET request is attempted. See module docstring."""
 
 
+class _HttpsOnlyRedirectHandler(request.HTTPRedirectHandler):
+    """Refuse a redirect that would leave https. See the SECURITY note."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802 - stdlib API
+        if not newurl.lower().startswith("https://"):
+            raise URLError(f"refusing a {code} redirect to a non-https url: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Module-private opener rather than install_opener(): this must not change the
+# redirect behaviour of every other urllib user in the process.
+_OPENER = request.build_opener(_HttpsOnlyRedirectHandler())
+
+
+def _open(req: request.Request, timeout: int):
+    """The module's single network seam. Tests patch this, not urllib's globals."""
+    return _OPENER.open(req, timeout=timeout)
+
+
 def _request(method: str, url: str, token: str, timeout: int = DEFAULT_TIMEOUT) -> object:
     """Perform one GET and return the decoded JSON body.
 
@@ -64,9 +92,12 @@ def _request(method: str, url: str, token: str, timeout: int = DEFAULT_TIMEOUT) 
     if not url.startswith("https://"):
         raise ValueError(f"refusing to send a bearer token to a non-https url: {url}")
     req = request.Request(url, method="GET")
-    req.add_header("Authorization", f"Bearer {token}")
+    # add_unredirected_header, not add_header: urllib copies req.headers onto a
+    # redirected request but never the unredirected ones, so a 30x cannot carry
+    # this write-scoped bearer token to another host.
+    req.add_unredirected_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/json")
-    with request.urlopen(req, timeout=timeout) as response:  # noqa: S310 - https enforced above
+    with _open(req, timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -88,7 +119,8 @@ def fetch_open_tasks(token: str, errors: list[str] | None = None) -> list[dict]:
         if not project_id:
             continue
         try:
-            data = _request("GET", f"{BASE_URL}/project/{project_id}/data", token)
+            url = f"{BASE_URL}/project/{quote(str(project_id), safe='')}/data"
+            data = _request("GET", url, token)
             if not isinstance(data, dict):
                 raise ValueError(f"unexpected payload: {type(data).__name__}")
         except (URLError, OSError, ValueError) as e:
