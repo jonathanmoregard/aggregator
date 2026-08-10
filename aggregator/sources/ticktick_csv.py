@@ -15,12 +15,17 @@ is only three csv rows, and the count varies with the export version. Scanning
 for the required columns is version-proof; counting rows silently yields zero
 records, which is indistinguishable from "no backup present".
 
-This module also owns TickTick's shared vocabulary — the status codes and the
-priority names — because the export documents both in its own preamble, so
-here they are grounded in evidence rather than in a guess. ``ticktick_api.py``
-imports them; the dependency only ever points that way (the CSV parser never
-needs the API client), so the two legs cannot drift into writing different
-words for the same value when task 8 merges them by stable_id.
+This module also owns TickTick's shared vocabulary — the status codes, the
+priority names, the status->tag mapping and the canonical date spelling —
+because the export documents them in its own preamble, so here they are
+grounded in evidence rather than in a guess. ``ticktick_api.py`` imports them;
+the dependency only ever points that way (the CSV parser never needs the API
+client), so the two legs cannot drift into writing different words for the same
+value when task 8 merges them by stable_id.
+
+The shared helpers take an optional ``logger`` so a warning about an API-sourced
+value is attributed to ``aggregator.sources.ticktick_api`` rather than sending
+an operator looking through the backup file for a value that never came from it.
 """
 from __future__ import annotations
 
@@ -71,8 +76,17 @@ STATUS_TAGS = {
 # TickTick priority levels: 0 none, 1 low, 3 medium, 5 high. There is no 2 or 4.
 PRIORITY_NAMES = {0: "none", 1: "low", 3: "medium", 5: "high"}
 
+# How every date *string* is spelled in the index, on both legs. Measured on the
+# real export: all 1129 non-empty ``Due Date`` values are `+0000` with no
+# milliseconds, so this is the export's own spelling, not an invention. The API
+# writes the same instant with a `.000` fraction; task 8 merges the two legs by
+# stable_id, so without one canonical form the same task's due_date would flip
+# spelling depending on which leg wrote last and an exact-match DSL filter would
+# miss half of them.
+DATE_TEXT_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 
-def _parse_dt(value: str | None) -> datetime | None:
+
+def _parse_dt(value: str | None, *, logger: logging.Logger | None = None) -> datetime | None:
     """Parse a TickTick timestamp, tolerating both ISO offsets and ``+0000``."""
     if not value:
         return None
@@ -91,8 +105,33 @@ def _parse_dt(value: str | None) -> datetime | None:
         # Normalise to UTC: store.py compares and orders created_at/updated_at
         # as ISO *text*, so a surviving foreign offset would sort wrongly.
         return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-    log.warning("unparseable ticktick timestamp: %r", value)
+    (logger or log).warning("unparseable ticktick timestamp: %r", value)
     return None
+
+
+def normalize_date_text(value: object, *, logger: logging.Logger | None = None) -> str:
+    """Canonicalise a TickTick date to :data:`DATE_TEXT_FORMAT`. Shared by both legs.
+
+    ``extra["due_date"]`` / ``extra["start_date"]`` are indexed as text, so the
+    two legs must spell the same instant identically — see DATE_TEXT_FORMAT.
+    The CSV export already writes this exact form, so this is a no-op on all
+    1129 dated rows of the real export; it is the API's `.000` fraction and any
+    future non-UTC offset that it actually converts.
+
+    Always returns a ``str``: a non-string payload value (TickTick could send an
+    epoch int) would otherwise land a JSON *number* in ``extra`` where the CSV
+    leg lands a string, and a DSL filter on the key would then miss it. An
+    unparseable value is kept verbatim and warned about rather than dropped.
+    """
+    if value is None:
+        return ""
+    text = (value if isinstance(value, str) else str(value)).strip()
+    if not text:
+        return ""
+    parsed = _parse_dt(text, logger=logger)
+    if parsed is None:
+        return text  # _parse_dt already warned
+    return parsed.strftime(DATE_TEXT_FORMAT)
 
 
 def _find_header(reader: Iterator[list[str]]) -> list[str] | None:
@@ -151,16 +190,21 @@ def parse_backup(path: Path) -> list[dict[str, str]]:
     return kept
 
 
-def _status_tag(status: str) -> str:
-    """Map a raw ``Status`` value to its tag, warning on anything unrecognised."""
+def status_tag(status: str, *, logger: logging.Logger | None = None) -> str:
+    """Map a raw ``Status`` value to its tag, warning on anything unrecognised.
+
+    Shared by both legs: the API leg reads the payload's own ``status`` and must
+    tag it with the same word the CSV leg would, or task 8's merge flips a task
+    between ``completed`` and ``open`` depending on which leg wrote last.
+    """
     tag = STATUS_TAGS.get(status)
     if tag is None:
-        log.warning("unexpected ticktick Status %r; tagging as 'open'", status)
+        (logger or log).warning("unexpected ticktick Status %r; tagging as 'open'", status)
         return "open"
     return tag
 
 
-def priority_name(value: object) -> str:
+def priority_name(value: object, *, logger: logging.Logger | None = None) -> str:
     """Map a TickTick priority to its name. Shared by both legs.
 
     The CSV export writes ``"5"`` and the Open API writes ``5`` for the same
@@ -179,7 +223,7 @@ def priority_name(value: object) -> str:
     try:
         return PRIORITY_NAMES[int(text)]
     except (ValueError, KeyError):
-        log.warning("unexpected ticktick priority %r; indexing it verbatim", value)
+        (logger or log).warning("unexpected ticktick priority %r; indexing it verbatim", value)
         return text
 
 
@@ -197,7 +241,7 @@ def row_to_record(row: dict[str, str], source_file: str) -> Record:
         value = (row.get(key) or "").strip()
         if value:
             tags.append(value)
-    tags.append(_status_tag(status))
+    tags.append(status_tag(status))
 
     return Record(
         stable_id=stable_id_for(SOURCE_NAME, row["taskId"]),
@@ -211,8 +255,9 @@ def row_to_record(row: dict[str, str], source_file: str) -> Record:
             "provenance": "csv",
             "status": status,
             "priority": priority_name(row.get("Priority")),
-            "due_date": (row.get("Due Date") or "").strip(),
-            "start_date": (row.get("Start Date") or "").strip(),
+            # Canonical spelling, identical on both legs — see DATE_TEXT_FORMAT.
+            "due_date": normalize_date_text(row.get("Due Date")),
+            "start_date": normalize_date_text(row.get("Start Date")),
             "repeat": (row.get("Repeat") or "").strip(),
             "parent_id": (row.get("parentId") or "").strip(),
             "source_file": source_file,
