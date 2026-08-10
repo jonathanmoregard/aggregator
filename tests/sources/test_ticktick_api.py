@@ -352,7 +352,15 @@ def test_fetch_open_tasks_never_leaks_the_token(monkeypatch, caplog):
 
 
 def test_fetch_open_tasks_notes_the_missing_inbox(monkeypatch, caplog):
-    """59 of 1302 tasks (5 of 238 open) live in an Inbox the listing never returns."""
+    """59 of 1302 tasks (5 of 238 open) live in an Inbox the listing never returns.
+
+    Deliberately **no** ``caplog.at_level``. Nothing under ``aggregator/`` calls
+    basicConfig/dictConfig/addHandler, so an operator running the CLI has an
+    unconfigured root logger, and ``logging.lastResort`` — level WARNING — is the
+    only thing that prints. This note was emitted at INFO and therefore produced
+    literally zero output; forcing the capture level to INFO made the test assert
+    the implementation back to itself instead of what an operator can see.
+    """
 
     def fake_request(method, url, token, timeout=30):
         if url.endswith("/project"):
@@ -360,9 +368,10 @@ def test_fetch_open_tasks_notes_the_missing_inbox(monkeypatch, caplog):
         return {"tasks": [_open_task(id="t1", projectId="p1")]}
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
-    with caplog.at_level(logging.INFO, logger=API_LOG):
-        ticktick_api.fetch_open_tasks("tok")
-    assert "Inbox" in caplog.text
+    ticktick_api.fetch_open_tasks("tok")
+    notes = [r for r in caplog.records if "Inbox" in r.getMessage()]
+    assert notes, "the Inbox coverage note is below the default level, so nobody sees it"
+    assert notes[0].levelno >= logging.lastResort.level
 
 
 def test_no_inbox_note_when_the_listing_does_contain_one(monkeypatch, caplog):
@@ -547,7 +556,7 @@ def test_task_to_record_inferred_completion_uses_status_2():
     assert "open" not in rec.tags
     assert "archived" not in rec.tags
     assert rec.extra["provenance"] == "api-inferred-complete"
-    assert rec.extra["completed_time_approx"] is True
+    assert rec.extra["completed_time_approx"] == "true"
     assert rec.updated_at == when
 
 
@@ -571,10 +580,21 @@ def test_task_to_record_extra_values_are_all_strings():
         full_task(dueDate=1785000000000, startDate=None, repeatFlag=7, parentId=42, projectId=9)
     )
     for key, value in rec.extra.items():
-        if key == "completed_time_approx":
-            continue
         assert isinstance(value, str), f"extra[{key!r}] is {type(value).__name__}"
     assert json.loads(json.dumps(rec.extra))["due_date"] == "1785000000000"
+
+
+def test_extra_values_are_all_strings_on_an_inferred_completion():
+    """No exemptions. ``completed_time_approx`` was a bool, so json.dumps wrote the
+    literal ``true`` and a DSL filter would have had to match that instead of text."""
+    rec = ticktick_api.task_to_record(
+        {"id": "t1", "title": "x"},
+        completed_at=datetime(2026, 8, 9, 12, 0, tzinfo=UTC),
+        provenance="api-inferred-complete",
+    )
+    for key, value in rec.extra.items():
+        assert isinstance(value, str), f"extra[{key!r}] is {type(value).__name__}"
+    assert json.loads(json.dumps(rec.extra))["completed_time_approx"] == "true"
 
 
 def test_task_to_record_untitled_falls_back_to_id():
@@ -782,6 +802,30 @@ def test_updated_at_prefers_completion_then_modification_then_creation():
         {**base, "modifiedTime": modified, "completedTime": completed, "status": 2}
     )
     assert with_done.updated_at == datetime(2026, 8, 9, tzinfo=UTC)
+
+
+def test_timestamp_fields_is_derived_not_a_second_copy():
+    """The tripwire and the record mapping must look under the same names."""
+    derived = (*ticktick_api.UPDATED_FIELDS, ticktick_api.CREATED_FIELD)
+    assert derived == ticktick_api.TIMESTAMP_FIELDS
+
+
+def test_correcting_the_field_names_moves_task_to_record_too(monkeypatch):
+    """The tripwire tells an operator to correct these constants. Measured before
+    the fix: doing exactly that silenced the warning and left every record
+    dateless, because ``task_to_record`` spelled the old names a second time —
+    which trades the loud failure back for the silent one."""
+    monkeypatch.setattr(ticktick_api, "CREATED_FIELD", "bornAt")
+    monkeypatch.setattr(ticktick_api, "UPDATED_FIELDS", ("touchedAt",))
+    task = {
+        "id": "t1",
+        "title": "x",
+        "bornAt": "2026-08-01T00:00:00+0000",
+        "touchedAt": "2026-08-05T00:00:00+0000",
+    }
+    rec = ticktick_api.task_to_record(task)
+    assert rec.created_at == datetime(2026, 8, 1, tzinfo=UTC)
+    assert rec.updated_at == datetime(2026, 8, 5, tzinfo=UTC)
 
 
 # --- token resolution -----------------------------------------------------

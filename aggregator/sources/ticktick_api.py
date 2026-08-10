@@ -30,9 +30,12 @@ COVERAGE LIMITS — two of them, both structural:
 2. ``GET /open/v1/project`` does not list the Inbox, so Inbox tasks are never
    fetched and can never "disappear" for task 7's completion inference either.
    Measured blast radius on the user's real export: 59 of 1302 tasks, 5 of the
-   238 currently open. ``fetch_open_tasks`` says so in the log when the listing
-   comes back without an Inbox, so a first real-token run reports a task count
-   that can be compared against the backup without the gap looking like a bug.
+   238 currently open. ``fetch_open_tasks`` *warns* when the listing comes back
+   without an Inbox — at WARNING specifically, because nothing under
+   ``aggregator/`` configures logging, so ``logging.lastResort`` (level WARNING)
+   is the only thing that prints and anything quieter reaches nobody. A first
+   real-token run therefore reports a task count that can be compared against
+   the backup without the gap looking like a bug.
 
 VOCABULARY: the status codes (``0`` normal, ``2`` completed, ``-1``
 abandoned — there is no ``1``), the status->tag mapping, the priority names and
@@ -73,8 +76,7 @@ BASE_URL = "https://api.ticktick.com/open/v1"
 SOURCE_NAME = "ticktick"
 DEFAULT_TIMEOUT = 30
 
-# Every field this module will accept a timestamp from, in the order it prefers
-# them for ``updated_at``.
+# The only place this module spells a timestamp field name.
 #
 # UNVERIFIED. TickTick's *documented* Task object is `id projectId title
 # isAllDay completedTime content desc dueDate items priority reminders
@@ -83,7 +85,18 @@ DEFAULT_TIMEOUT = 30
 # (every attempt to read the published docs was blocked, and there is no other
 # web access). So the names are not guessed at harder: ``_warn_no_timestamps``
 # makes the truth self-reporting on first contact with a real token instead.
-TIMESTAMP_FIELDS = ("completedTime", "modifiedTime", "createdTime")
+#
+# ``task_to_record`` reads these two constants and nothing else, which is the
+# point: the tripwire's message tells an operator to correct the names here, and
+# a second hand-kept copy inside ``task_to_record`` meant following that advice
+# silenced the warning while leaving every record dateless — trading the loud
+# failure back for the silent one.
+CREATED_FIELD = "createdTime"
+UPDATED_FIELDS = ("completedTime", "modifiedTime")  # ``updated_at`` preference order
+
+# Derived, not a third copy. Every field a date may come from, in preference
+# order; used by the tripwire and by the tests.
+TIMESTAMP_FIELDS = (*UPDATED_FIELDS, CREATED_FIELD)
 
 
 class WriteAttemptError(RuntimeError):
@@ -230,10 +243,16 @@ def _note_inbox_gap(project_names: list[str], task_count: int) -> None:
     known coverage limit that appended an error on every healthy poll would fire
     a CRITICAL desktop notification every time the timer runs, and an alert that
     always fires is an alert nobody reads.
+
+    WARNING, not INFO, and that is load-bearing. Nothing under ``aggregator/``
+    calls ``basicConfig``/``dictConfig``/``addHandler``, so the root logger has
+    no handlers and ``logging.lastResort`` — level WARNING — is what prints. At
+    INFO this line produced literally zero output, which is the same failure
+    shape as not logging it at all.
     """
     if any(name.strip().lower() == "inbox" for name in project_names):
         return
-    log.info(
+    log.warning(
         "ticktick api: walked %d project(s) for %d task(s); no Inbox in the listing, so "
         "Inbox tasks are out of scope for both this poll and task 7's completion inference "
         "(59 of 1302 tasks, 5 of 238 open, in the reference backup)",
@@ -251,10 +270,10 @@ def _warn_no_timestamps(tasks: list[dict], errors: list[str] | None) -> None:
     real one the CSV leg parsed. That is the "empty result looks like success"
     shape the fail-loudly constraint forbids.
 
-    ``TIMESTAMP_FIELDS`` is unverified against TickTick's published Task object
-    (see its comment). This is how that gets settled: the first run against a
-    real token either parses timestamps or names, in the errors list, exactly
-    which fields it looked under and found nothing.
+    The field names are unverified against TickTick's published Task object
+    (see the comment on ``CREATED_FIELD``). This is how that gets settled: the
+    first run against a real token either parses timestamps or names, in the
+    errors list, exactly which fields it looked under and found nothing.
     """
     if not tasks:
         return
@@ -271,7 +290,8 @@ def _warn_no_timestamps(tasks: list[dict], errors: list[str] | None) -> None:
         f"timestamp in any of {', '.join(TIMESTAMP_FIELDS)} — every API record would have a "
         "null created_at/updated_at, which is invisible in the index. These field names are "
         "unverified against TickTick's published Task object: dump a raw payload and correct "
-        "TIMESTAMP_FIELDS in aggregator/sources/ticktick_api.py",
+        "CREATED_FIELD / UPDATED_FIELDS in aggregator/sources/ticktick_api.py — those two are "
+        "the only copy, so correcting them fixes the records as well as this warning",
     )
 
 
@@ -284,11 +304,13 @@ def task_to_record(
     """Map one API task payload to a Record.
 
     ``completed_at`` is set only for inferred completions, and always alongside
-    ``provenance="api-inferred-complete"``. The status tag comes from the
-    payload's own ``status`` whenever it has one — never from the mere presence
-    of a completed timestamp, the rule the CSV leg follows — because an
-    inference that overrode a vendor field is the defect this repo already
-    shipped once.
+    ``provenance="api-inferred-complete"``. Absent that — i.e. on every task the
+    API actually served — the status tag comes from the payload's own ``status``
+    whenever it has one, never from the mere presence of a completed timestamp
+    (the rule the CSV leg follows), because an inference that overrode a vendor
+    field is the defect this repo already shipped once. An inferred completion
+    is the one case that does not consult the payload; see ``_payload_status``
+    for why that is safe.
 
     KNOWN MERGE DIVERGENCE: the CSV leg also tags with ``Folder Name``. The Open
     API's project object carries a ``groupId`` but no group name and there is no
@@ -305,13 +327,14 @@ def task_to_record(
         tags.append(project_name)
     tags.append(status_tag(status, logger=log))
 
-    extra: dict[str, object] = {
+    # Every value here is a str, with no exceptions — the annotation says so, so
+    # the next exception has to argue with a type-checker. extra is serialised
+    # with json.dumps, and a non-string would land a JSON number or literal where
+    # the CSV leg lands text, so an exact-match DSL filter would miss it.
+    extra: dict[str, str] = {
         "provenance": provenance,
         "status": status,
         "priority": priority_name(task.get("priority"), logger=log),
-        # Every value here is a str: extra is serialised with json.dumps, and an
-        # int would land a JSON number where the CSV leg lands a string, so an
-        # exact-match DSL filter on the key would miss it.
         "due_date": normalize_date_text(task.get("dueDate"), logger=log),
         "start_date": normalize_date_text(task.get("startDate"), logger=log),
         "repeat": _text(task.get("repeatFlag")),
@@ -319,10 +342,13 @@ def task_to_record(
         "project_id": _text(task.get("projectId")),
     }
     if inferred:
-        # Never let an approximate timestamp pass for a real one.
-        extra["completed_time_approx"] = True
+        # Never let an approximate timestamp pass for a real one. Spelled
+        # "true", not True: a bool serialises to the JSON literal `true`, so a
+        # filter would have to match that rather than the text every other value
+        # in extra uses.
+        extra["completed_time_approx"] = "true"
 
-    created = _parse_api_dt(task.get("createdTime"), field="createdTime")
+    created = _parse_api_dt(task.get(CREATED_FIELD), field=CREATED_FIELD)
     return Record(
         stable_id=stable_id_for(SOURCE_NAME, task_id),
         source=SOURCE_NAME,
@@ -330,14 +356,22 @@ def task_to_record(
         body=_task_body(task),
         tags=tags,
         created_at=created,
-        updated_at=(
-            completed_at
-            or _parse_api_dt(task.get("completedTime"), field="completedTime")
-            or _parse_api_dt(task.get("modifiedTime"), field="modifiedTime")
-            or created
-        ),
+        updated_at=completed_at or _first_dt(task, UPDATED_FIELDS) or created,
         extra=extra,
     )
+
+
+def _first_dt(task: dict, fields: tuple[str, ...]) -> datetime | None:
+    """The first parseable timestamp among ``fields``, in order, or None.
+
+    Driven off ``UPDATED_FIELDS`` rather than a hand-written ``a or b`` chain so
+    that the field names live in exactly one place — see ``CREATED_FIELD``.
+    """
+    for field in fields:
+        parsed = _parse_api_dt(task.get(field), field=field)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _task_id(task: dict) -> str:
@@ -413,9 +447,17 @@ def _task_body(task: dict) -> str:
 def _payload_status(task: dict, *, inferred: bool) -> str:
     """The status code to record: the payload's own, unless we inferred one.
 
-    Reading this was the whole point. The previous version derived status purely
-    from whether the *caller* passed ``completed_at``, so a payload that said
-    ``"status": 2`` was recorded as open — and task 8 lets the fresher API
+    ``inferred`` short-circuits: an inferred completion returns
+    ``STATUS_COMPLETED`` without reading the payload at all. That is not the
+    override this function exists to prevent — task 7 only infers a completion
+    for a task that *was* in the open batch and has since disappeared, so the
+    payload in hand is the stale open one and its ``status`` is ``0`` by
+    construction. Every task the API actually served takes the branch below and
+    is recorded as the payload says.
+
+    Reading the payload was the whole point. The previous version derived status
+    purely from whether the *caller* passed ``completed_at``, so a payload that
+    said ``"status": 2`` was recorded as open — and task 8 lets the fresher API
     observation beat the CSV row, so a task the backup correctly recorded as
     completed would be resurrected as open with the CSV evidence gone.
 
