@@ -138,26 +138,67 @@ BRANCH="$(git symbolic-ref --short HEAD)"
 
 PROMPT="There are uncommitted changes in $REPO. Group the changes into logical commits using your own judgment — related files should go together, unrelated changes should be separate commits. Use concise conventional commit messages (e.g. 'chore: sync ghostty config'). After all commits are done, push origin $BRANCH once. Do nothing else."
 
-if ! "$CLAUDE" \
-  --model claude-sonnet-4-6 \
-  --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git push:*) Bash(git log:*) Bash(git rm:*)" \
-  -p "$PROMPT"; then
-  notify_failure "claude exited non-zero — changes still uncommitted.
-Usual causes: usage limit reached, expired auth (claude /login), or API unreachable."
+# Capture the agent's output as well as tee it to the log. Claude Code prints
+# "You've hit your org's monthly usage limit" and "API Error: ..." to stdout
+# and still exits 0, so the exit code alone cannot tell an API failure apart
+# from a finished sync — aggregator logged three usage-limit runs and one
+# ConnectionRefused, every one of them reported as "worktree still dirty".
+# The text is kept only to explain a failure the checks below detect, never to
+# declare one, so a commit message containing "API Error" cannot fake a fail.
+claude_rc=0
+claude_out="$(
+  "$CLAUDE" \
+    --model claude-sonnet-4-6 \
+    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git push:*) Bash(git log:*) Bash(git rm:*)" \
+    -p "$PROMPT" 2>&1
+)" || claude_rc=$?
+printf '%s\n' "$claude_out"
+
+api_hint="$(printf '%s\n' "$claude_out" |
+  grep -iE 'usage limit|rate limit|API Error|Invalid API key|Credit balance|/login' |
+  head -3 || true)"
+if [ -n "$api_hint" ]; then
+  api_hint="
+Claude reported:
+$api_hint"
+fi
+
+if [ "$claude_rc" -ne 0 ]; then
+  notify_failure "claude exited $claude_rc — changes still uncommitted.
+Usual causes: usage limit reached, expired auth (claude /login), or API unreachable.$api_hint"
   exit 1
 fi
 
 # The agent is prompted to commit everything and push, but it is an agent —
 # it can stop early, or push can fail. Verify rather than assume, so a
 # half-done sync is not indistinguishable from a clean one.
-if [ -n "$(git status --porcelain)" ]; then
-  notify_failure "claude exited 0 but the worktree is still dirty — sync incomplete.
-$(git status --short | head -20)"
+#
+# Only *tracked* changes count as incomplete. The agent is deliberately given
+# judgment over what belongs in the repo, and it exercises it: aggregator's
+# sync succeeded and pushed on every run for days while being reported FAILED,
+# because one ephemeral `mission.md.bak-*` was left untracked. That is a
+# permanent red — nothing ever removes the file — so an untracked-only
+# leftover is logged, not escalated.
+tracked_dirty="$(git status --porcelain --untracked-files=no)"
+unpushed="$(git log --oneline "origin/$BRANCH..$BRANCH" 2>/dev/null || true)"
+
+if [ -n "$tracked_dirty" ]; then
+  notify_failure "claude exited 0 but tracked changes are still uncommitted — sync incomplete.
+$(printf '%s\n' "$tracked_dirty" | head -20)$api_hint"
   exit 1
 fi
 
-if [ -n "$(git log --oneline "origin/$BRANCH..$BRANCH" 2>/dev/null)" ]; then
+if [ -n "$unpushed" ]; then
   notify_failure "Commits were made but not pushed — origin/$BRANCH is behind.
-$(git log --oneline "origin/$BRANCH..$BRANCH" | head -10)"
+$(printf '%s\n' "$unpushed" | head -10)$api_hint"
   exit 1
+fi
+
+skipped="$(git ls-files --others --exclude-standard)"
+if [ -n "$skipped" ]; then
+  {
+    echo "sync-agent: synced $REPO; left $(printf '%s\n' "$skipped" | wc -l) file(s) untracked by agent judgment:"
+    printf '%s\n' "$skipped" | head -20 | sed 's/^/  ?? /' || true
+    echo "  (.gitignore them if this is recurring runtime state)"
+  } >&2
 fi
