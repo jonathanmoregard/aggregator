@@ -257,6 +257,54 @@ def test_both_legs_keep_an_unknown_priority_the_same_way(tmp_path):
     assert csv_rec.extra["priority"] == api_rec.extra["priority"] == "4"
 
 
+@pytest.mark.parametrize(
+    ("code", "tag"), [("0", "open"), ("2", "completed"), ("-1", "abandoned")]
+)
+def test_both_legs_write_the_same_status_word(tmp_path, code, tag):
+    """The API leg used to derive status from an inference and ignore the payload.
+
+    Task 8 lets the fresher API observation beat the CSV row, so a completed task
+    the backup had right came back as `open` with the CSV evidence discarded.
+    Same task id, same status code, same tag — asserted across both legs.
+    """
+    row = parse_backup(_backup(tmp_path, [_row(status=code)]))[0]
+    csv_rec = row_to_record(row, source_file="x.csv")
+    api_rec = ticktick_api.task_to_record(
+        {"id": "abc123", "title": "Buy milk", "status": int(code)}
+    )
+    assert csv_rec.stable_id == api_rec.stable_id
+    assert csv_rec.extra["status"] == api_rec.extra["status"] == code
+    assert tag in csv_rec.tags
+    assert tag in api_rec.tags
+
+
+def test_both_legs_spell_the_same_due_date_identically(tmp_path):
+    """The API writes `.000`, the export does not — same instant, two spellings.
+
+    ``extra`` is indexed as text, so an exact-match DSL filter on due_date would
+    have matched only whichever leg happened to write the record last.
+    """
+    row = parse_backup(_backup(tmp_path, [_row(due="2026-08-09T03:00:00+0000")]))[0]
+    csv_rec = row_to_record(row, source_file="x.csv")
+    api_rec = ticktick_api.task_to_record(
+        {"id": "abc123", "title": "Buy milk", "dueDate": "2026-08-09T03:00:00.000+0000"}
+    )
+    assert csv_rec.extra["due_date"] == api_rec.extra["due_date"] == "2026-08-09T03:00:00+0000"
+
+
+def test_csv_due_dates_keep_the_exports_own_spelling(tmp_path):
+    """Normalisation must be a no-op on the real export's format, not a rewrite.
+
+    Measured: all 1129 dated rows are `+0000` with no fraction. If canonicalising
+    changed them, every existing indexed due_date would silently stop matching.
+    """
+    raw = "2026-08-02T09:00:00+0000"
+    row = parse_backup(_backup(tmp_path, [_row(due=raw, start=raw)]))[0]
+    rec = row_to_record(row, source_file="x.csv")
+    assert rec.extra["due_date"] == raw
+    assert rec.extra["start_date"] == raw
+
+
 def test_timestamps_normalised_to_utc(tmp_path):
     """store.py compares ISO text, so a foreign offset must not survive."""
     row = parse_backup(_backup(tmp_path, [_row(created="2026-08-01T10:00:00+0200")]))[0]
