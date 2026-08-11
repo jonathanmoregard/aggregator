@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aggregator.core.store import EmptyRebuildRefusedError, Store
+from aggregator.imports.store_sink import count_writes
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
@@ -294,6 +295,16 @@ def _cmd_ingest(
         except Exception as e:  # noqa: BLE001 -- surface as CLI error, don't crash
             print(f"ingest {args.source} failed: {e}", file=sys.stderr)
             return 1
+        # Counts are probed BEFORE any write. Every write path here is an
+        # upsert (and --rebuild deletes first), so once the write has landed
+        # there is no way to tell an insert from an overwrite — which is how
+        # this summary came to print ``added=len(records) updated=0`` on
+        # every run, identical whether the run imported 313 new PRs or
+        # re-wrote the same 313 rows. Same helper the runner's sink uses, so
+        # the two surfaces cannot drift apart on what "added" means.
+        # On --rebuild the question is still "was this id already known?",
+        # answered against the pre-run store, not the emptied one.
+        counts = count_writes(store, "records", [r.stable_id for r in records])
         # Round-2 MEDIUM: when --rebuild is set, run the DELETE + upsert
         # atomically so a fault during upsert can't leave the store empty
         # for the source. Without --rebuild the plain upsert path is fine
@@ -353,14 +364,16 @@ def _cmd_ingest(
                 return 1
         else:
             store.upsert(records)
-        added = len(records)
+        added, updated, skipped = counts.added, counts.updated, counts.skipped
     else:
         result = src.ingest(since=since)
         added = result.added
+        updated = result.updated
+        skipped = result.skipped
         errors = list(result.errors)
     print(
-        f"ingest {args.source}: added={added} updated=0 skipped=0 "
-        f"errors={len(errors)}"
+        f"ingest {args.source}: added={added} updated={updated} "
+        f"skipped={skipped} errors={len(errors)}"
     )
     if errors:
         for e in errors[:5]:

@@ -19,6 +19,33 @@ from aggregator.imports.port import ImportItem, WriteCounts
 from aggregator.sources.base import ObservationRow, Record, SessionRow
 
 
+def count_writes(store: Store, table: str, ids: Sequence[str]) -> WriteCounts:
+    """Probe which of ``ids`` ``table`` already holds, ahead of the write.
+
+    MUST be called before the upsert. Afterwards every id is present and the
+    add/update distinction is gone for good — which is precisely how
+    ``cli.py`` ended up printing ``added=<batch size> updated=0`` on every
+    run, including runs that changed nothing.
+
+    Repeats within one batch address one row, so the first occurrence is the
+    add (or update) and any later one is an update.
+
+    Shared with ``cli.py`` deliberately: one definition of "added", so the
+    hand-run CLI summary and the runner's report can never disagree about
+    what happened.
+    """
+    existing = store.existing_ids(table, ids)
+    seen: set[str] = set()
+    added = updated = 0
+    for i in ids:
+        if i in seen or i in existing:
+            updated += 1
+        else:
+            added += 1
+        seen.add(i)
+    return WriteCounts(added=added, updated=updated)
+
+
 class StoreSink:
     """Write import items to a ``Store``, reporting what actually changed.
 
@@ -59,48 +86,32 @@ class StoreSink:
         return counts
 
     def _write_records(self, records: list[Record]) -> WriteCounts:
-        existing = self._store.existing_ids(
-            "records", [r.stable_id for r in records]
-        )
-        # De-duplicate within the batch too: two items with the same id in
+        # De-duplicates within the batch too: two items with the same id in
         # one batch are one add, not two.
-        seen: set[str] = set()
-        added = updated = 0
-        for r in records:
-            if r.stable_id in seen:
-                updated += 1
-                continue
-            seen.add(r.stable_id)
-            if r.stable_id in existing:
-                updated += 1
-            else:
-                added += 1
+        counts = count_writes(
+            self._store, "records", [r.stable_id for r in records]
+        )
         self._store.upsert(records)
-        return WriteCounts(added=added, updated=updated)
+        return counts
 
     def _write_entities(
         self,
         sessions: list[SessionRow],
         observations: list[ObservationRow],
     ) -> WriteCounts:
-        existing_sessions = self._store.existing_ids(
-            "sessions", [s.session_id for s in sessions]
+        # ``_unique`` first: a session row repeated inside one batch is one
+        # row and is counted once, unlike the records path where the repeat
+        # shows up as an overwrite.
+        counts = count_writes(
+            self._store, "sessions", _unique([s.session_id for s in sessions])
+        ) + count_writes(
+            self._store, "observations", _unique([o.obs_id for o in observations])
         )
-        existing_obs = self._store.existing_ids(
-            "observations", [o.obs_id for o in observations]
-        )
-        added = updated = 0
-        for sid in _unique([s.session_id for s in sessions]):
-            updated += 1 if sid in existing_sessions else 0
-            added += 0 if sid in existing_sessions else 1
-        for oid in _unique([o.obs_id for o in observations]):
-            updated += 1 if oid in existing_obs else 0
-            added += 0 if oid in existing_obs else 1
         # Sessions first: ``observations.session_id`` is a real FK, and an
         # adapter is allowed to yield an observation before its session row
         # (batch boundaries can split a stream anywhere).
         self._store.upsert_entities([*sessions, *observations])
-        return WriteCounts(added=added, updated=updated)
+        return counts
 
 
 def _unique(ids: list[str]) -> list[str]:
@@ -114,4 +125,4 @@ def _unique(ids: list[str]) -> list[str]:
     return out
 
 
-__all__ = ["StoreSink"]
+__all__ = ["StoreSink", "count_writes"]
