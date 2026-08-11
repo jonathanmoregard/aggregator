@@ -39,7 +39,7 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -166,6 +166,38 @@ def _confirm_force_on_stdin(prompt: str) -> bool:
     return answer == "y"
 
 
+class _UnbuildableSource:
+    """Stands in for a source whose constructor RAISED.
+
+    The mirror of ``imports/registry._UnbuildableAdapter``, for the
+    single-source path. Same reasoning: construction here is documented as
+    side-effect-free (env and path resolution only), which is exactly why an
+    environment-dependent raise is the plausible failure — and exactly why it
+    must cost only its own source.
+
+    It carries no ``iter_entities`` / ``iter_records`` / ``ingest``, so it can
+    never be mistaken for a working source and quietly ingest nothing; the
+    ingest path checks for it by type and reports the original error.
+    """
+
+    def __init__(self, name: str, error: BaseException) -> None:
+        self.name = name
+        self.error = error
+
+    def __str__(self) -> str:
+        return (
+            f"{self.name}: source could not be constructed: "
+            f"{type(self.error).__name__}: {self.error}"
+        )
+
+
+def _build_source(name: str, factory: Callable[[], Any]) -> Any:
+    try:
+        return factory()
+    except Exception as e:  # noqa: BLE001 -- isolation boundary, see the class
+        return _UnbuildableSource(name, e)
+
+
 def _default_sources() -> dict[str, Any]:
     """Real source registry. Kept in a function so tests can bypass with
     ``_sources={...}`` without importing the real sources' heavy deps
@@ -173,18 +205,28 @@ def _default_sources() -> dict[str, Any]:
 
     All constructors are side-effect-free (env/dir resolution only); no
     filesystem or network work happens until the chosen source's ingest
-    runs."""
-    return {
-        "sessions": SessionsSource(),
-        "github": GitHubSource(),
-        "chatgpt": ChatGPTSource(),
-        "claude-web": ClaudeWebSource(),
-        "research": ResearchReportsSource(),
-        "sota-watch": SotaWatchSource(),
-        "substack": SubstackSource(),
-        "dropbox": DropboxSource(),
-        "ticktick": TickTickSource(),
-    }
+    runs. A constructor that raises anyway yields an ``_UnbuildableSource``
+    under the same name instead of propagating — one broken source costs its
+    own ``ingest <name>`` and nothing else.
+
+    Called LAZILY, from the commands that need it (see ``main``). Built
+    eagerly before dispatch, as it was, a single raising constructor took down
+    ``query`` and ``status``, which consult no source at all, and ``ingest
+    --all``, which drives the adapter registry instead — and it did so
+    UPSTREAM of ``_UnbuildableAdapter``, so the run-all isolation never got to
+    contain anything."""
+    factories: list[tuple[str, Callable[[], Any]]] = [
+        ("sessions", SessionsSource),
+        ("github", GitHubSource),
+        ("chatgpt", ChatGPTSource),
+        ("claude-web", ClaudeWebSource),
+        ("research", ResearchReportsSource),
+        ("sota-watch", SotaWatchSource),
+        ("substack", SubstackSource),
+        ("dropbox", DropboxSource),
+        ("ticktick", TickTickSource),
+    ]
+    return {name: _build_source(name, factory) for name, factory in factories}
 
 
 def _cmd_query(args: argparse.Namespace, store: Store) -> int:
@@ -384,6 +426,11 @@ def _cmd_ingest(
         print(f"unknown source: {args.source}", file=sys.stderr)
         print(f"known sources: {sorted(sources)}", file=sys.stderr)
         return 2
+    if isinstance(src, _UnbuildableSource):
+        # 1 (hard failure), not 2 (usage error): the operator typed a real
+        # source name, and this machine's environment is why it cannot run.
+        print(f"ingest {src}", file=sys.stderr)
+        return 1
     try:
         since = _parse_since(args.since)
     except ValueError:
@@ -674,6 +721,9 @@ def _cmd_github_token_status(
             file=sys.stderr,
         )
         return 2
+    if isinstance(src, _UnbuildableSource):
+        print(f"github-token-status: {src}", file=sys.stderr)
+        return 1
     if not hasattr(src, "token_status"):
         print(
             "registered github source does not support token_status()",
@@ -810,7 +860,18 @@ def main(
     args = build_parser().parse_args(argv)
     store = _store or Store()
     store.migrate()
-    sources = _sources if _sources is not None else _default_sources()
+
+    def sources() -> dict[str, Any]:
+        """Build the source registry ON THE COMMAND THAT NEEDS IT.
+
+        Not before dispatch. ``query`` and ``status`` consult no source, and
+        ``ingest --all`` drives the ADAPTER registry (which has its own
+        construction isolation); building nine real sources for them meant a
+        single raising constructor aborted those commands with a bare
+        traceback, upstream of every guard downstream of it.
+        """
+        return _sources if _sources is not None else _default_sources()
+
     if args.cmd == "query":
         return _cmd_query(args, store)
     if args.cmd == "status":
@@ -839,9 +900,9 @@ def main(
         # ``args.rebuild`` is set. Do NOT call ``store.rebuild`` here —
         # doing so would commit the DELETE before the transaction and
         # reintroduce the non-atomic gap this fix closes.
-        return _cmd_ingest(args, store, sources)
+        return _cmd_ingest(args, store, sources())
     if args.cmd == "github-token-status":
-        return _cmd_github_token_status(args, store, sources)
+        return _cmd_github_token_status(args, store, sources())
     return 2
 
 
