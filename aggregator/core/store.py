@@ -580,6 +580,14 @@ class Store:
                     subject    = excluded.subject,
                     body       = excluded.body,
                     tags       = excluded.tags,
+                    -- Existing value first, so a creation time never moves
+                    -- once known — that is why created_at was left out of
+                    -- this SET list originally. Omitting it entirely went too
+                    -- far: a row first written dateless kept its NULL forever,
+                    -- including after ticktick's CREATED_FIELD is corrected,
+                    -- which breaks the tripwire's promise that fixing the
+                    -- field names also repairs the records it already wrote.
+                    created_at = COALESCE(records.created_at, excluded.created_at),
                     -- COALESCE, not a plain overwrite: a re-observation that
                     -- carries NO timestamp must not erase the one already
                     -- stored. ticktick is where this bites — a task payload
@@ -680,6 +688,14 @@ class Store:
                     subject    = excluded.subject,
                     body       = excluded.body,
                     tags       = excluded.tags,
+                    -- Existing value first, so a creation time never moves
+                    -- once known — that is why created_at was left out of
+                    -- this SET list originally. Omitting it entirely went too
+                    -- far: a row first written dateless kept its NULL forever,
+                    -- including after ticktick's CREATED_FIELD is corrected,
+                    -- which breaks the tripwire's promise that fixing the
+                    -- field names also repairs the records it already wrote.
+                    created_at = COALESCE(records.created_at, excluded.created_at),
                     -- COALESCE, not a plain overwrite: a re-observation that
                     -- carries NO timestamp must not erase the one already
                     -- stored. ticktick is where this bites — a task payload

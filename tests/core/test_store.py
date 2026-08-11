@@ -925,3 +925,34 @@ def test_a_dateless_reobservation_survives_the_rebuild_write_path_too(
 
     _, updated = _dates(s, "ticktick:t1")
     assert updated == REAL_TS.isoformat()
+
+
+def test_a_row_first_written_dateless_gains_a_created_at_later(tmp_data_home):
+    """Round-1 LOW: ``created_at`` was omitted from the ON CONFLICT SET list
+    entirely, so a row written before ticktick's CREATED_FIELD is corrected
+    kept its NULL forever — breaking the tripwire's own promise that
+    correcting the field names "fixes the records as well as this warning"."""
+    s = Store()
+    s.migrate()
+    s.upsert([_dated("ticktick:t1")])
+    assert _dates(s, "ticktick:t1") == (None, None)
+
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    created, _ = _dates(s, "ticktick:t1")
+    assert created == REAL_TS.isoformat()
+
+
+def test_a_known_created_at_never_moves(tmp_data_home):
+    """Why created_at was left out of the SET list in the first place, and the
+    half worth keeping: a creation time is minted once."""
+    s = Store()
+    s.migrate()
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    s.upsert(
+        [_dated("ticktick:t1", created=datetime(2020, 1, 1, tzinfo=UTC))]
+    )
+
+    created, _ = _dates(s, "ticktick:t1")
+    assert created == REAL_TS.isoformat()
