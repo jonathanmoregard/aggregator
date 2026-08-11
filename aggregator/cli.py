@@ -54,7 +54,7 @@ from aggregator.imports.port import ImportAdapter
 from aggregator.imports.registry import default_adapters
 from aggregator.imports.runner import NotifyHook, RunReport, run_imports
 from aggregator.imports.store_sink import StoreSink, count_writes
-from aggregator.imports.sync_bridge import accepts_errors_kwarg
+from aggregator.imports.sync_bridge import accepts_errors_kwarg, unwired_sink_note
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
@@ -359,10 +359,20 @@ def _iterate(
     on a run that then exits 0 because the retry succeeded.
 
     Same helper the run-all path uses (``sync_bridge.accepts_errors_kwarg``),
-    so the two surfaces cannot drift on which sources get an errors sink.
+    so the two surfaces cannot drift on which sources get an errors sink — and
+    the same note when the probe says no, so they cannot drift on whether that
+    degradation is reported either.
+
+    THE FALLBACK IS NOT FREE, and it used to be silent. Driving a source
+    without ``errors`` means every per-item failure it takes internally has
+    nowhere to land, so the run prints ``errors=0`` and exits 0 for a source
+    that may have skipped half its input. The source still runs — that is the
+    whole point of the fallback — but the run says the count cannot be
+    trusted for it.
     """
     if accepts_errors_kwarg(iter_fn):
         return iter_fn(since, errors=errors)
+    errors.append(unwired_sink_note(getattr(iter_fn, "__qualname__", str(iter_fn))))
     return iter_fn(since)
 
 

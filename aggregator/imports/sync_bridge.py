@@ -100,11 +100,45 @@ def accepts_errors_kwarg(fn: Callable[..., Any]) -> bool:
     iteration. Public, and imported by ``cli.py``, so both ingest surfaces
     decide this the same way — the CLI carried the try/except version until
     round 2, where a re-poll cost TickTick a whole poll's inferred completions.
+
+    A callable whose signature cannot be introspected at all (a builtin, a C
+    implementation) answers False, which widens the "old signature" branch to
+    cover "we could not tell". That is the safe direction only because BOTH
+    callers now report the fallback out loud — see :func:`unwired_sink_note`.
+    Returning False quietly, as this did, meant an unintrospectable callable
+    silently lost its error sink with nothing anywhere saying so.
     """
     try:
         return "errors" in inspect.signature(fn).parameters
     except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
         return False
+
+
+def unwired_sink_note(name: str) -> str:
+    """The message both ingest surfaces emit when the errors sink cannot be wired.
+
+    ONE spelling, in the module both surfaces already import
+    ``accepts_errors_kwarg`` from, for the same reason the probe itself lives
+    here: the CLI path and the run-all path must not drift on what this
+    degradation is called or on whether it is reported at all.
+
+    Reported rather than merely tolerated. The fallback keeps a source with an
+    older signature working, which is worth having — but it drives that source
+    with NO errors list, so every per-item failure it takes internally (an
+    unreadable file, a dropped row, a skipped task) has nowhere to land. The
+    run then prints ``errors=0`` and exits 0 while the source sheds data, which
+    is the same silent-success shape the sources' own error sinks exist to
+    prevent, one level up.
+    """
+    return (
+        f"{name}: this source's iterator does not accept an 'errors' argument "
+        f"(or its signature could not be read), so it was driven WITHOUT the "
+        f"run's error sink. It still ran and its items were ingested, but any "
+        f"file, row or item it skipped internally was dropped with nowhere to "
+        f"report it — this run's error count cannot be trusted for this "
+        f"source. Give its iterator an 'errors: list[str] | None = None' "
+        f"parameter"
+    )
 
 
 class SyncSourceAdapter:
@@ -150,6 +184,11 @@ class SyncSourceAdapter:
         def make_iterator() -> Iterable[ImportItem]:
             if accepts_errors_kwarg(self._iter_fn):
                 return self._iter_fn(self._since, errors=self._errors)
+            # The sink exists on this adapter and ``drain_errors`` is about to
+            # hand it to the runner, but this branch cannot wire it into the
+            # source. Say so THERE, in the list the runner reads, rather than
+            # letting the run report a clean sheet it has no way to vouch for.
+            self._errors.append(unwired_sink_note(self.name))
             return self._iter_fn(self._since)
 
         return aiter_in_thread(make_iterator, chunk_size=self._chunk_size)
@@ -185,4 +224,5 @@ __all__ = [
     "SyncSourceAdapter",
     "accepts_errors_kwarg",
     "aiter_in_thread",
+    "unwired_sink_note",
 ]

@@ -236,6 +236,28 @@ def test_source_without_an_errors_kwarg_still_adapts():
     adapter = SyncSourceAdapter(LegacyRecordSource())
     items = asyncio.run(_drain(adapter.get_data()))
     assert [r.stable_id for r in items] == ["t:legacy1"]
+
+
+def test_falling_back_to_an_old_signature_is_itself_reported():
+    """Round-5 inventory. The fallback silently un-wires ``self._errors``.
+
+    ``drain_errors`` is how a source's per-item failures reach the run report,
+    and this branch calls the source without the sink at all — so anything it
+    soft-skips internally has nowhere to land and the adapter reports a clean
+    run. Nothing logged that the fallback had fired, either.
+
+    Latent today (all nine registered sources declare ``errors``), so this is
+    a regression guard rather than a live loss.
+    """
+    adapter = SyncSourceAdapter(LegacyRecordSource())
+
+    asyncio.run(_drain(adapter.get_data()))
+
+    reported = adapter.drain_errors()
+    assert len(reported) == 1, "the un-wired sink was not reported at all"
+    assert "errors" in reported[0]
+    assert adapter.name in reported[0]
+    # Drained means drained, same as every other error this adapter carries.
     assert adapter.drain_errors() == []
 
 

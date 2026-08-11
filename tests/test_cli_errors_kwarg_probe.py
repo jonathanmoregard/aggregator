@@ -141,15 +141,21 @@ def test_a_genuine_typeerror_does_not_re_poll_on_the_entity_path(
 
 def test_an_old_signature_source_is_still_driven_once(tmp_path):
     """The fallback the ``except TypeError`` existed for has to keep working —
-    and has to run the source exactly once, not twice."""
+    and has to run the source exactly once, not twice.
+
+    Exit 3, not 0, since round 5: the source runs and its records land (that is
+    the point of the fallback), but it was driven with no errors sink, so the
+    run cannot vouch for its error count and says so. Ingestion working and the
+    run being clean are different claims.
+    """
     src = _OldStyleRecords()
     store = _store(tmp_path)
 
     rc = main(["ingest", "t"], _store=store, _sources={"t": src})
 
-    assert rc == 0
+    assert rc == 3
     assert src.calls == 1
-    assert store.count_by_source("t") == 1
+    assert store.count_by_source("t") == 1, "the fallback must still ingest"
 
 
 def test_an_old_signature_entity_source_is_still_driven_once(tmp_path):
@@ -157,8 +163,30 @@ def test_an_old_signature_entity_source_is_still_driven_once(tmp_path):
 
     rc = main(["ingest", "t"], _store=_store(tmp_path), _sources={"t": src})
 
-    assert rc == 0
+    assert rc == 3
     assert src.calls == 1
+
+
+def test_falling_back_to_an_old_signature_is_itself_reported(tmp_path, capsys):
+    """Round-5 inventory. The fallback silently un-wires the run's errors sink.
+
+    A source whose iterator takes no ``errors`` is driven without one, so every
+    per-item failure it hits internally — an unreadable file, a dropped row —
+    has nowhere to land. The run then reports ``errors=0`` and exits 0 while
+    the source is quietly shedding data, which is the exact shape the
+    fail-loudly constraint exists to stop, one level up from the sources.
+
+    Latent today (all nine registered sources declare ``errors``), so this is
+    a regression guard: the day someone adds a source without the parameter,
+    or renames it, the run says so instead of going quiet.
+    """
+    src = _OldStyleRecords()
+
+    rc = main(["ingest", "t"], _store=_store(tmp_path), _sources={"t": src})
+
+    assert src.calls == 1, "the source must still be driven, and exactly once"
+    assert rc == 3, "an un-wired errors sink was not reported at all"
+    assert "errors" in capsys.readouterr().err
 
 
 def test_the_errors_sink_still_reaches_a_modern_source(tmp_path, capsys):
