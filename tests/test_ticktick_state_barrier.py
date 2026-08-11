@@ -232,6 +232,57 @@ def test_a_state_write_that_fails_after_the_records_landed_is_reported(
     assert store.count_by_source("ticktick") == 2
 
 
+# -- round 3 W1: a pending commit must not outlive the poll that made it ---
+#
+# ``run_imports`` is public and takes adapter INSTANCES, so a long-lived caller
+# reuses one across runs. The pending advance was only ever cleared by
+# ``commit_after_write``; every early return in the poll left the PREVIOUS
+# poll's baseline armed, and the next successful write fired it — committing an
+# advance whose inferred completions nobody had written.
+
+
+def test_a_failed_poll_does_not_leave_the_previous_polls_commit_armed(
+    tmp_path, state_file, monkeypatch
+):
+    """THE round-3 finding. Poll 1 infers t2's completion and the write fails,
+    so the runner skips the barrier. Poll 2 dies on the API and the run
+    degrades to CSV-only. That run's write succeeds — and used to commit poll
+    1's baseline, consuming a completion no store ever received."""
+    source = _source(tmp_path, state_file)
+
+    list(source.iter_records(None, errors=[]))  # poll 1, then a failed write
+
+    def _dead_api(token, errors=None):
+        raise RuntimeError("ticktick 503")
+
+    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", _dead_api)
+    errors: list[str] = []
+    list(source.iter_records(None, errors=errors))  # poll 2: CSV-only
+    assert errors, "the failed poll is still reported"
+
+    source.commit_after_write()  # poll 2's rows landed, so the barrier fires
+
+    assert _baseline(state_file) == {"t1", "t2"}, (
+        "a run whose poll failed has no baseline to advance; t2's completion "
+        "must stay re-inferable"
+    )
+
+
+def test_a_pollless_run_does_not_leave_the_previous_polls_commit_armed(
+    tmp_path, state_file, monkeypatch
+):
+    """The other early return: the token went away, so there is no poll at
+    all. Same rule — nothing to commit."""
+    source = _source(tmp_path, state_file)
+    list(source.iter_records(None, errors=[]))  # poll 1, then a failed write
+
+    monkeypatch.setattr(source, "_token_arg", None)
+    list(source.iter_records(None, errors=[]))  # CSV-only, no credential
+    source.commit_after_write()
+
+    assert _baseline(state_file) == {"t1", "t2"}
+
+
 def test_the_barrier_is_a_no_op_for_sources_that_do_not_have_one(tmp_path):
     """Every other source is unaffected — the barrier is optional."""
 

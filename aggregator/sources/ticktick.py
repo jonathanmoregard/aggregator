@@ -289,6 +289,19 @@ class TickTickSource:
         return candidates
 
     def _api_candidates(self, errors: list[str] | None) -> dict[str, tuple[datetime, Record]]:
+        # DROP ANY PENDING COMMIT FIRST, before a single early return can skip
+        # past it. ``run_imports`` is public and a caller may hold one adapter
+        # across runs, so this instance can arrive here still carrying the
+        # baseline a PREVIOUS poll planned and no writer ever confirmed. Every
+        # return below this line then means "this poll planned no advance", and
+        # ``commit_after_write`` can only ever run the poll it belongs to.
+        #
+        # Without it: poll 1 infers a completion, the sink fails so the runner
+        # skips the barrier, poll 2 dies on a dead token and returns early, the
+        # CSV-only retry writes fine — and the barrier commits poll 1's
+        # baseline. The completion poll 1 inferred was never written by anyone
+        # and the Open API will never report it again.
+        self._pending_state_commit = None
         # INSIDE a try, deliberately. ``resolve_token`` raises
         # TokenUnavailableError (an OSError subclass) when the API leg is
         # configured but its secret cannot be read — an unreadable token file,
@@ -381,6 +394,11 @@ class TickTickSource:
         errors: list[str] | None = None,
     ) -> Iterator[Record]:
         """Yield one Record per task, newest observation winning per task id."""
+        # Poll start clears the pending advance too, not only ``_api_candidates``:
+        # the CSV leg runs first and can raise (an unreadable archive dir), which
+        # would leave the previous poll's commit armed on a reused instance with
+        # no poll of its own to answer for it.
+        self._pending_state_commit = None
         # ``--since`` parses to a naive datetime; backup mtimes are aware, and
         # comparing the two raises TypeError. Normalised once, here, so the
         # scan below can compare unconditionally.
