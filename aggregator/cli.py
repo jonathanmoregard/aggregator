@@ -46,6 +46,7 @@ from aggregator.sources.research_reports import ResearchReportsSource
 from aggregator.sources.sessions import SessionsSource
 from aggregator.sources.sota_watch import SotaWatchSource
 from aggregator.sources.substack import SubstackSource
+from aggregator.sources.ticktick import TickTickSource
 
 # Round-1 HIGH-2: partial-parse silent-wipe threshold.
 # When --rebuild would drop >20% of rows for a source that already holds
@@ -99,6 +100,7 @@ def _default_sources() -> dict[str, Any]:
         "sota-watch": SotaWatchSource(),
         "substack": SubstackSource(),
         "dropbox": DropboxSource(),
+        "ticktick": TickTickSource(),
     }
 
 
@@ -446,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
         "source",
         help=(
             "source name: sessions | github | chatgpt | claude-web | "
-            "research | sota-watch | substack | dropbox"
+            "research | sota-watch | substack | dropbox | ticktick"
         ),
     )
     ing.add_argument("--since", help="ISO date to bound the ingest window")

@@ -566,6 +566,38 @@ def test_source_sota_watch_with_session_key_returns_notice(tmp_data_home):
     assert "notice" in r
 
 
+# --- Task 8: ticktick is records-shaped -----------------------------------
+
+
+def test_source_ticktick_routes_to_records_mode(tmp_data_home):
+    """``source:ticktick`` targets the records table. Unlisted, it falls
+    through to union mode, whose sessions side has no origin filter for an
+    unknown source and would hand back every session row — the source becomes
+    ingestible and simultaneously unqueryable."""
+    store = Store()
+    store.migrate()
+    store.upsert(
+        [
+            Record(
+                stable_id="ticktick:abc123",
+                source="ticktick",
+                subject="Buy milk",
+                body="from the good shop",
+                tags=["errand", "open"],
+                created_at=datetime(2026, 8, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+        ]
+    )
+    store.upsert_entities([_sess("cc-sess"), _obs("o1", "cc-sess", "chat")])
+    r = aggregator_query(dsl="source:ticktick", _store=store)
+    assert r["ok"] is True
+    assert r["mode"] == "records"
+    ids = {rec["stable_id"] for rec in r["records"]}
+    assert ids == {"ticktick:abc123"}
+    assert "cc-sess" not in ids
+
+
 def test_cross_source_no_filters_unions(tmp_data_home):
     """No filters at all also unions — "show me everything" surface."""
     store = Store()

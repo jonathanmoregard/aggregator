@@ -265,8 +265,17 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
 # to union mode, whose sessions side has no origin filter for unknown
 # sources and would return every session row.
 # Chunk 7: ``sota-watch`` (self-generated SOTA proposals) same shape.
+# Task 8: ``ticktick`` (CSV backup + Open API poll, merged) same shape — one
+# record per task, no conversation stream anywhere in it.
 _SESSIONS_SOURCES = {"sessions", "subagents", "observations", *CHAT_ORIGINS}
-_RECORDS_SOURCES = {"github", "records", "research", "sota-watch", "substack"}
+_RECORDS_SOURCES = {
+    "github",
+    "records",
+    "research",
+    "sota-watch",
+    "substack",
+    "ticktick",
+}
 
 # Records-only extra keys (interpreted by the github Source in its extra dict).
 # When these show up on a sessions-scoped query the paths are incompatible.
