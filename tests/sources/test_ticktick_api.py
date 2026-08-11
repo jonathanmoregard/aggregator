@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -1045,3 +1046,319 @@ def test_resolve_token_unreadable_file_raises_a_distinguishable_error(tmp_path):
         ticktick_api.resolve_token(None, str(tmp_path / "missing"))
     assert issubclass(ticktick_api.TokenUnavailableError, OSError)
     assert not isinstance(excinfo.value, HTTPError)
+
+
+# --- the open-task state file ---------------------------------------------
+#
+# WHY IT EXISTS: the Open API serves open tasks only and has no endpoint that
+# reports a completion. A task in yesterday's batch that is missing from
+# today's has either been completed or deleted, and the API will never say
+# which. Written-down prior state is the only thing to diff against; without
+# it the task simply stops appearing and an "I finished that last week" search
+# comes back empty with nothing anywhere explaining why.
+
+
+def test_state_roundtrip(tmp_path):
+    path = tmp_path / "open_tasks.json"
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    ticktick_api.save_state(path, [{"id": "t1", "title": "A"}], now)
+    state = ticktick_api.load_state(path)
+    assert state["t1"]["task"]["title"] == "A"
+    assert state["t1"]["last_seen"] == now.isoformat()
+
+
+def test_load_missing_state_returns_empty(tmp_path):
+    """The first ever poll has no baseline; that is normal, not a failure."""
+    assert ticktick_api.load_state(tmp_path / "nope.json") == {}
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        pytest.param(lambda p: p.write_text("{not json", encoding="utf-8"), id="truncated"),
+        pytest.param(lambda p: p.write_text("[]", encoding="utf-8"), id="a-list-not-a-map"),
+        pytest.param(lambda p: p.write_text('"scalar"', encoding="utf-8"), id="a-bare-scalar"),
+        pytest.param(lambda p: p.write_bytes(b"\xff\xfe not utf-8"), id="undecodable"),
+        pytest.param(lambda p: p.mkdir(), id="not-even-a-file"),
+    ],
+)
+def test_load_corrupt_state_returns_empty_and_says_so(tmp_path, caplog, write):
+    """Unusable state costs one poll's inference and self-heals — but loudly.
+
+    It is a cache, not a database, so failing the whole ingest over it would be
+    worse than the gap. Silently returning ``{}`` would be worse still: that is
+    indistinguishable from a first poll, so a state file corrupted once would
+    keep losing every completion and never explain why. No ``caplog.at_level``
+    on purpose — nothing under ``aggregator/`` configures logging, so
+    ``logging.lastResort`` (WARNING) is all an operator ever sees.
+    """
+    path = tmp_path / "open_tasks.json"
+    write(path)
+    assert ticktick_api.load_state(path) == {}
+    notes = [r for r in caplog.records if "open_tasks.json" in r.getMessage()]
+    assert notes, "an unreadable state file was discarded without telling anyone"
+    assert notes[0].levelno >= logging.lastResort.level
+
+
+def test_save_state_creates_its_directory(tmp_path):
+    """The default path is three levels below $XDG_STATE_HOME, none of which exist.
+
+    On a fresh machine the very first save is the one that has to create them,
+    and a save that raises there would mean inference never starts working.
+    """
+    path = tmp_path / "state" / "aggregator" / "ticktick" / "open_tasks.json"
+    ticktick_api.save_state(path, [{"id": "t1"}], datetime(2026, 8, 8, tzinfo=UTC))
+    assert ticktick_api.load_state(path).keys() == {"t1"}
+
+
+def test_a_failed_save_leaves_the_previous_state_intact(tmp_path, monkeypatch):
+    """The write goes to a temp file and is renamed into place, never in situ.
+
+    A save interrupted partway through an in-place write leaves truncated JSON,
+    which costs the *next* poll its inference too — and by the poll after that
+    the baseline is fresh again, so every completion that happened in between is
+    gone for good. The rename is atomic, so the file is always either the old
+    poll or the new one.
+    """
+    path = tmp_path / "open_tasks.json"
+    first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    ticktick_api.save_state(path, [{"id": "t1", "title": "A"}], first)
+
+    real_write = Path.write_text
+
+    def fail_on_the_scratch_file(self, *args, **kwargs):
+        if self != path:
+            raise OSError("no space left on device")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_on_the_scratch_file)
+    with pytest.raises(OSError):
+        ticktick_api.save_state(path, [{"id": "t2", "title": "B"}], first)
+    assert ticktick_api.load_state(path)["t1"]["task"]["title"] == "A"
+
+
+def test_save_state_keys_by_the_modules_one_id_rule(tmp_path, caplog):
+    """Keys are minted by ``_task_id``, the same rule ``task_to_record`` uses.
+
+    Three things a hand-rolled ``if task.get("id")`` filter gets wrong, all of
+    them tested here: the legitimate id ``0`` is falsy and would be dropped
+    (the module already has a test refusing to lose it), a payload with no
+    ``id`` key at all raises KeyError from ``str(task["id"])`` and takes the
+    whole baseline down with it, and a padded id stored unstripped would never
+    match the stripped id the next poll mints — inventing a completion for a
+    task that never left.
+    """
+    path = tmp_path / "open_tasks.json"
+    ticktick_api.save_state(
+        path,
+        [
+            {"id": 0, "title": "falsy but real"},
+            {"id": "  t2  ", "title": "padded"},
+            {"id": None, "title": "null id"},
+            {"title": "no id key at all"},
+        ],
+        datetime(2026, 8, 8, tzinfo=UTC),
+    )
+    assert ticktick_api.load_state(path).keys() == {"0", "t2"}
+    dropped = [r for r in caplog.records if "2" in r.getMessage() and "state" in r.getMessage()]
+    assert dropped, "tasks were dropped from the baseline without telling anyone"
+    assert dropped[0].levelno >= logging.lastResort.level
+
+
+def test_disappeared_task_becomes_inferred_completion(tmp_path):
+    """Open last poll, absent this poll: the only completion signal there is.
+
+    The record is built entirely from the payload the state file kept — the API
+    will never serve this task again — which is what the stored ``task`` blob is
+    for. ``completed_time_approx`` is the string ``"true"``, not the bool: every
+    value in ``extra`` is text (``test_extra_values_are_all_strings_on_an_
+    inferred_completion``), because ``extra`` is json.dumps'd and a bool would
+    land the JSON literal ``true`` where a DSL filter expects a word.
+    """
+    path = tmp_path / "open_tasks.json"
+    first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    ticktick_api.save_state(
+        path,
+        [{"id": "t1", "title": "Gone", "_projectName": "Work"}, {"id": "t2", "title": "Stays"}],
+        first,
+    )
+    prev = ticktick_api.load_state(path)
+    records = ticktick_api.infer_completions(prev, current_ids={"t2"}, now=second)
+    assert [r.stable_id for r in records] == ["ticktick:t1"]
+    rec = records[0]
+    assert rec.subject == "Gone"
+    assert "Work" in rec.tags
+    assert rec.extra["provenance"] == "api-inferred-complete"
+    assert rec.extra["completed_time_approx"] == "true"
+    assert rec.extra["status"] == ticktick_csv.STATUS_COMPLETED
+    assert rec.updated_at == second
+    assert "completed" in rec.tags
+
+
+def test_no_inference_on_first_ever_poll():
+    """An empty baseline can complete nothing — including after a corrupt read.
+
+    ``load_state`` answers a missing or unreadable file with ``{}``, so this is
+    also the guarantee that a broken state file costs one poll's inference and
+    nothing else. Green from the moment ``infer_completions`` existed: it is a
+    regression guard on the direction of the diff, not a driver.
+    """
+    records = ticktick_api.infer_completions({}, current_ids={"t1"}, now=datetime.now(UTC))
+    assert records == []
+
+
+def test_a_poll_that_returned_nothing_at_all_is_reported(tmp_path, caplog):
+    """Every open task vanishing at once is an outage shape, not 238 completions.
+
+    ``fetch_open_tasks`` sinks a failed project into ``errors`` and carries on,
+    so a run where the project listing succeeded and every project then 500'd
+    comes back as an empty task list — indistinguishable, here, from the user
+    finishing everything. The records are still emitted (the next healthy poll
+    serves those tasks again with a fresher observation, and the merge reverts
+    them, so suppressing would cost a real last completion permanently) but the
+    operator is told, because a batch of approximate completions appearing in
+    the index with no explanation is the silent-failure shape this repo forbids.
+    """
+    previous = {
+        "t1": {"task": {"id": "t1", "title": "A"}, "last_seen": "2026-08-07T12:00:00+00:00"},
+        "t2": {"task": {"id": "t2", "title": "B"}, "last_seen": "2026-08-07T12:00:00+00:00"},
+    }
+    records = ticktick_api.infer_completions(
+        previous, current_ids=set(), now=datetime(2026, 8, 8, tzinfo=UTC)
+    )
+    assert [r.stable_id for r in records] == ["ticktick:t1", "ticktick:t2"]
+    notes = [r for r in caplog.records if "outage" in r.getMessage()]
+    assert notes, "a wholesale disappearance was recorded as completions in silence"
+    assert notes[0].levelno >= logging.lastResort.level
+
+
+def test_a_garbled_state_entry_does_not_cost_the_other_inferences(caplog):
+    """One unusable entry must not take the whole poll's inference with it.
+
+    The file parses as JSON, so ``load_state`` hands it over intact; it is the
+    entries that are wrong. ``entry.get`` on a string raises AttributeError and
+    an entry whose stored payload has no id raises ValueError out of
+    ``task_to_record`` — either one, uncaught, loses every other completion in
+    the batch. Same failure shape as the malformed ``tasks`` payload that used
+    to abort the whole project walk.
+    """
+    previous = {
+        "t1": "not an entry object at all",
+        "t2": {"task": {"title": "no id in the stored payload"}},
+        "t3": {"task": {"id": "t3", "title": "Gone"}, "last_seen": "2026-08-07T12:00:00+00:00"},
+    }
+    records = ticktick_api.infer_completions(
+        previous, current_ids={"t4"}, now=datetime(2026, 8, 8, tzinfo=UTC)
+    )
+    assert [r.stable_id for r in records] == ["ticktick:t3"]
+    notes = [r for r in caplog.records if "unusable" in r.getMessage()]
+    assert notes, "state entries were skipped without telling anyone"
+    assert notes[0].levelno >= logging.lastResort.level
+
+
+def test_default_state_path_respects_xdg(monkeypatch, tmp_path):
+    """State, not data or cache: it is regenerable but losing it loses history."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert (
+        ticktick_api.default_state_path()
+        == tmp_path / "aggregator" / "ticktick" / "open_tasks.json"
+    )
+
+
+@pytest.mark.parametrize("unset", ["absent", "empty"])
+def test_default_state_path_falls_back_to_the_xdg_default(monkeypatch, unset):
+    """Most desktops never export XDG_STATE_HOME, and systemd units export less.
+
+    An empty value is the same case: reading it literally yields a *relative*
+    path, so the baseline would land wherever the timer happened to be started
+    from and the next run — started elsewhere — would find no state and infer
+    nothing, forever.
+    """
+    if unset == "absent":
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    else:
+        monkeypatch.setenv("XDG_STATE_HOME", "")
+    path = ticktick_api.default_state_path()
+    assert path.is_absolute()
+    assert path == Path.home() / ".local" / "state" / "aggregator" / "ticktick" / "open_tasks.json"
+
+
+# --- the state store as a port --------------------------------------------
+
+
+class _InMemoryState:
+    """A state store that is not a file, written against the port only.
+
+    Its existence is the assertion: ``reconcile_open_tasks`` is typed against
+    ``OpenTaskState``, so a caller can hand it any object with ``load``/``save``
+    — this fake, or a future store — without the inference logic knowing.
+    """
+
+    def __init__(self, entries: dict | None = None):
+        self.entries = entries or {}
+        self.calls: list[str] = []
+
+    def load(self) -> dict[str, dict]:
+        self.calls.append("load")
+        return self.entries
+
+    def save(self, tasks, now) -> None:
+        self.calls.append("save")
+        self.entries = {
+            str(t["id"]): {"task": t, "last_seen": now.isoformat()} for t in tasks
+        }
+
+
+def test_reconcile_infers_against_the_previous_poll_then_records_this_one():
+    """Load, diff, save — in that order, which is the part worth pinning down.
+
+    Save-before-load overwrites the baseline with the current poll, so nothing
+    ever looks disappeared and inference is dead. It fails green: no error, no
+    warning, just an index that never gains another completion. Sequencing it
+    here means task 8 wires up one call instead of three it could order wrongly.
+    """
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    state = _InMemoryState(
+        {"t1": {"task": {"id": "t1", "title": "Gone"}, "last_seen": "2026-08-07T12:00:00+00:00"}}
+    )
+    records = ticktick_api.reconcile_open_tasks(state, [{"id": "t2", "title": "Stays"}], now)
+    assert [r.stable_id for r in records] == ["ticktick:t1"]
+    assert state.calls == ["load", "save"]
+    assert state.entries.keys() == {"t2"}
+
+
+def test_the_json_file_is_one_adapter_of_the_port(tmp_path):
+    """The shipped store: a JSON file, satisfying the port structurally.
+
+    Both it and the in-memory fake are accepted by the same ``isinstance``
+    check, which is what makes the protocol a seam rather than decoration.
+    """
+    state = ticktick_api.JsonFileState(tmp_path / "open_tasks.json")
+    assert isinstance(state, ticktick_api.OpenTaskState)
+    assert isinstance(_InMemoryState(), ticktick_api.OpenTaskState)
+
+    first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    assert ticktick_api.reconcile_open_tasks(state, [{"id": "t1"}, {"id": "t2"}], first) == []
+    (rec,) = ticktick_api.reconcile_open_tasks(state, [{"id": "t2"}], second)
+    assert rec.stable_id == "ticktick:t1"
+    assert rec.extra["provenance"] == "api-inferred-complete"
+    assert state.load().keys() == {"t2"}
+
+
+def test_reconcile_matches_ids_the_way_the_baseline_keys_them(tmp_path):
+    """One id rule on both sides of the diff, or every poll invents completions.
+
+    The baseline keys through ``_task_id`` (stripped, ``0`` kept). A caller
+    hand-rolling ``str(task["id"])`` for the current set spells a padded id
+    differently from its own stored key, so an unchanged task reads as
+    disappeared *every single poll* — and a task with no ``id`` key raises
+    KeyError and takes the whole poll down, where the baseline merely skips it.
+    """
+    state = ticktick_api.JsonFileState(tmp_path / "open_tasks.json")
+    first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    tasks = [{"id": "  t1  ", "title": "Padded"}, {"id": 0, "title": "Zero"}, {"title": "No id"}]
+    assert ticktick_api.reconcile_open_tasks(state, tasks, first) == []
+    assert ticktick_api.reconcile_open_tasks(state, tasks, second) == []

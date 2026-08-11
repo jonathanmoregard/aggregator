@@ -22,8 +22,10 @@ The token is never logged.
 COVERAGE LIMITS — two of them, both structural:
 
 1. The Open API filters completed tasks out of every read endpoint. This
-   module sees open tasks only; completions are inferred here (by
-   disappearance, task 7) and corrected later from the CSV backup. The
+   module sees open tasks only; completions are inferred here — by diffing each
+   poll against the previous one, which is what the open-task state file at the
+   bottom of this module exists to remember — and corrected later from the CSV
+   backup. The
    payload's own ``status`` is still read and trusted over that assumption, so
    if the endpoint ever does serve a completed task the record says so and a
    warning fires, instead of the task being silently resurrected as open.
@@ -51,7 +53,11 @@ import json
 import logging
 import os
 import time
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol, runtime_checkable
 from urllib import request
 from urllib.error import URLError
 from urllib.parse import quote
@@ -532,8 +538,6 @@ def _read_env_file(path: str) -> dict[str, str]:
     reads as an expired credential and sends the operator to re-authorize
     something that was never broken.
     """
-    from pathlib import Path
-
     try:
         raw = Path(path).read_text(encoding="utf-8")
     except OSError:
@@ -610,8 +614,6 @@ def resolve_token(
     if explicit:
         return explicit
     if token_file:
-        from pathlib import Path
-
         try:
             content = Path(token_file).read_text(encoding="utf-8").strip()
         except OSError as e:
@@ -631,3 +633,230 @@ def resolve_token(
         return None
     _reject_if_expired(values.get(EXPIRY_ENV_VAR), path)
     return shared
+
+
+# --- the open-task state file ----------------------------------------------
+#
+# WHY THIS EXISTS AT ALL. The Open API serves open tasks and nothing else, and
+# no endpoint of it reports a completion. So a task that was in the previous
+# poll and is missing from this one has either been completed or deleted, and
+# the API will never say which. Prior state written to disk is the only thing
+# there is to diff against: without it a finished task simply stops appearing,
+# the index loses it, and an "I did that last week" search comes back empty with
+# nothing anywhere explaining the gap. With it, the disappearance becomes an
+# explicit, flagged-as-approximate completion record that the CSV backup later
+# corrects with the real Completed Time.
+
+
+@runtime_checkable
+class OpenTaskState(Protocol):
+    """The port: wherever the previous poll's open-task set is kept.
+
+    A Protocol rather than a base class because structural typing is Python's
+    spelling of a port — the JSON file below satisfies it without importing or
+    inheriting anything, and so does a test double. Callers depend on this, not
+    on the file, so "where the baseline lives" stays one decision made in one
+    place.
+    """
+
+    def load(self) -> dict[str, dict]:
+        """The previous poll's tasks keyed by id, or {} when there is none."""
+        ...
+
+    def save(self, tasks: Iterable[dict], now: datetime) -> None:
+        """Replace the baseline with the tasks this poll returned."""
+        ...
+
+
+def default_state_path() -> Path:
+    """Where the baseline lives when the caller names no path.
+
+    ``$XDG_STATE_HOME``, defaulting to the spec's ``~/.local/state`` — state,
+    not data and not cache: it is regenerable, but regenerating it costs a
+    poll's completions, and unlike a cache nothing else can reconstruct them.
+
+    An unset *or empty* variable takes the default. Reading an empty one
+    literally yields a relative path, so the baseline would be written wherever
+    the timer happened to start and the next run, started elsewhere, would find
+    no state and infer nothing — forever, silently.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "aggregator" / "ticktick" / "open_tasks.json"
+
+
+def save_state(path: Path, tasks: Iterable[dict], now: datetime) -> None:
+    """Persist the current open-task set as the next poll's baseline, atomically.
+
+    Written to a scratch file in the same directory and renamed into place, so
+    an interrupted write cannot leave truncated JSON behind: the file is always
+    either the previous poll or this one. That matters more here than the usual
+    tidiness argument — a corrupt baseline costs the *next* poll its inference,
+    and the poll after that starts from a fresh baseline, so every completion
+    that happened in the gap is unrecoverable.
+
+    Keys come from ``_task_id`` — the module's single id rule, the one
+    ``task_to_record`` mints stable_ids with — so a baseline key is always
+    exactly the id the next poll will compare against. A task whose id is
+    unusable is skipped rather than allowed to abort the save, and is counted
+    out loud: a baseline that quietly lost entries would invent a completion
+    for every one of them on the very next poll.
+    """
+    payload: dict[str, dict] = {}
+    skipped = 0
+    for task in tasks:
+        try:
+            payload[_task_id(task)] = {"task": task, "last_seen": now.isoformat()}
+        except (ValueError, AttributeError):
+            skipped += 1
+    if skipped:
+        log.warning("ticktick state: skipped %d task(s) with no usable id", skipped)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scratch = path.with_name(path.name + ".tmp")
+    scratch.write_text(json.dumps(payload), encoding="utf-8")
+    scratch.replace(path)
+
+
+def load_state(path: Path) -> dict[str, dict]:
+    """Return the previous poll's open tasks, keyed by task id, or {}.
+
+    An absent file is the first-ever poll and is silent. Anything else — a
+    half-written file, a wrong shape, an unreadable path — costs one poll's
+    worth of inference and then self-heals, because this is a cache and failing
+    the whole ingest over it would be worse than the gap.
+
+    It does not self-heal *quietly*, though. An empty return is
+    indistinguishable from a first poll, so a file that stays corrupt would go
+    on losing every completion with nothing to notice. WARNING is deliberate:
+    nothing under ``aggregator/`` configures logging, so ``logging.lastResort``
+    is the only thing that prints and anything quieter reaches nobody.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        log.warning("ticktick state unreadable at %s (%s); starting fresh", path, e)
+        return {}
+    if not isinstance(data, dict):
+        log.warning(
+            "ticktick state at %s is a %s, not an id->task map; starting fresh",
+            path,
+            type(data).__name__,
+        )
+        return {}
+    return data
+
+
+def infer_completions(
+    previous: dict[str, dict],
+    current_ids: set[str],
+    now: datetime,
+) -> list[Record]:
+    """Records for the tasks that were open last poll and are absent now.
+
+    The Open API cannot report a completion, so disappearance is the only
+    signal available — and it is ambiguous: a task that was deleted looks
+    exactly like one that was finished. Recorded as completed anyway, because
+    the alternative is losing it from the index entirely, and never as a plain
+    fact: ``provenance`` says the completion was inferred and
+    ``completed_time_approx`` says the timestamp is the poll's, not TickTick's.
+    A later CSV backup overwrites both with the real Completed Time.
+
+    Sorted by id so a run's output is deterministic.
+    """
+    if previous and not current_ids:
+        # fetch_open_tasks sinks a failed project into ``errors`` and carries
+        # on, so "the listing worked and then every project 500'd" arrives here
+        # as an empty batch and looks exactly like finishing everything. The
+        # inference still runs — the next healthy poll serves those tasks again
+        # with a fresher observation and the merge reverts them, whereas
+        # suppressing would permanently lose a genuine last completion — but it
+        # does not run in silence.
+        log.warning(
+            "ticktick api: the poll returned no open tasks at all while %d were open last "
+            "time, so all %d are being recorded as inferred completions. If TickTick or the "
+            "network was down this is an outage, not %d completions; the next successful "
+            "poll re-observes them as open and corrects the index",
+            len(previous),
+            len(previous),
+            len(previous),
+        )
+    records = []
+    unusable = 0
+    for task_id, entry in sorted(previous.items()):
+        if task_id in current_ids:
+            continue
+        try:
+            task = entry.get("task") or {}
+            records.append(
+                task_to_record(task, completed_at=now, provenance="api-inferred-complete")
+            )
+        except (AttributeError, ValueError):
+            # A garbled entry — not an object, or a stored payload with no
+            # usable id. Skipped rather than allowed to abort the loop: one bad
+            # entry must not cost every other completion in the batch, the same
+            # rule the project walk follows for a malformed ``tasks`` payload.
+            unusable += 1
+    if unusable:
+        log.warning(
+            "ticktick state: %d unusable entr(ies) could not be turned into completions",
+            unusable,
+        )
+    return records
+
+
+def _open_task_ids(tasks: Iterable[dict]) -> set[str]:
+    """The ids of this poll's tasks, keyed exactly as the baseline keys them.
+
+    Both sides of the diff must spell an id the same way or an unchanged task
+    reads as disappeared on every poll: ``_task_id`` strips, so a stored key of
+    ``t1`` would never match a hand-rolled ``str(task["id"])`` of ``"  t1  "``.
+    Ids the baseline could not store are left out here too — ``save_state``
+    already counted and reported them.
+    """
+    ids = set()
+    for task in tasks:
+        try:
+            ids.add(_task_id(task))
+        except (ValueError, AttributeError):
+            continue
+    return ids
+
+
+@dataclass(frozen=True)
+class JsonFileState:
+    """The shipped adapter: the baseline as one JSON file on disk.
+
+    Deliberately thin — the reading and writing rules are the two module
+    functions above, which is also what the plan's own brief has task 8 call.
+    This is that behaviour wearing the port's shape, not a second
+    implementation of it.
+    """
+
+    path: Path
+
+    def load(self) -> dict[str, dict]:
+        return load_state(self.path)
+
+    def save(self, tasks: Iterable[dict], now: datetime) -> None:
+        save_state(self.path, tasks, now)
+
+
+def reconcile_open_tasks(
+    state: OpenTaskState, tasks: Iterable[dict], now: datetime
+) -> list[Record]:
+    """Diff this poll against the baseline, then make this poll the baseline.
+
+    The whole state protocol in one call, because the order is a trap: saving
+    before loading overwrites the baseline with the current poll, so nothing
+    ever looks disappeared and inference is silently dead — no error, no
+    warning, just an index that stops gaining completions.
+
+    Typed against :class:`OpenTaskState`, so nothing here knows or cares that
+    the baseline is a JSON file.
+    """
+    previous = state.load()
+    tasks = list(tasks)
+    records = infer_completions(previous, _open_task_ids(tasks), now)
+    state.save(tasks, now)
+    return records
