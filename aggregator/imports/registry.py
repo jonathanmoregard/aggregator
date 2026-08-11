@@ -21,6 +21,7 @@ filesystem walk, no network, no credential read happens until the runner pulls
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 
 from aggregator.imports.chatgpt import ChatGPTAdapter
@@ -35,24 +36,73 @@ from aggregator.imports.substack import SubstackAdapter
 from aggregator.imports.ticktick import TickTickAdapter
 
 
+class _UnbuildableAdapter:
+    """Stands in for a source whose adapter could not be CONSTRUCTED.
+
+    The runner's failure isolation begins at ``get_data``, so it protected
+    every source from every other source's acquisition failing — but not from
+    one of them failing to exist. Construction happens in one unprotected list
+    in this module, called from ``cli.main``, so a single constructor raising
+    (a path that resolved to a file, an env var read at ``__init__`` time)
+    killed the whole ``--all`` run before the runner ever saw it: no report, no
+    per-source errors, no exit 3, just a traceback. The timer then reports a
+    unit failure with nothing saying which of the nine sources was at fault or
+    that the other eight never ran.
+
+    Construction here is documented as side-effect-free (env and path
+    resolution only), which is exactly why an environment-dependent raise is
+    the plausible failure and exactly why it must not be fatal to the run.
+
+    Carrying the intended ``name`` matters: the report is keyed by it, so the
+    failure lands on the right source's line instead of appearing as a source
+    that silently vanished from the run.
+    """
+
+    def __init__(self, name: str, error: BaseException) -> None:
+        self.name = name
+        self._error = error
+
+    async def get_data(self):
+        """Re-raise the construction failure where the runner can contain it."""
+        raise RuntimeError(
+            f"{self.name}: adapter could not be constructed: "
+            f"{type(self._error).__name__}: {self._error}"
+        ) from self._error
+        yield  # pragma: no cover - unreachable; makes this an async generator
+
+
+def _build(name: str, factory: Callable[[], ImportAdapter]) -> ImportAdapter:
+    try:
+        return factory()
+    except Exception as e:  # noqa: BLE001 -- isolation boundary, see the class
+        return _UnbuildableAdapter(name, e)
+
+
 def default_adapters(since: datetime | None = None) -> list[ImportAdapter]:
     """Build one adapter per source, in a stable order.
 
     ``since`` is captured at construction because the port is a single-verb
     interface — per-source acquisition knobs belong to the adapter instance,
     not to ``get_data()``.
+
+    A constructor that raises yields an ``_UnbuildableAdapter`` under the same
+    name rather than propagating, so the run-all path keeps the property it
+    exists for: one broken source costs its own line in the report and nothing
+    else. The name is spelled here rather than read off the built adapter
+    because in the failing case there is no adapter to read it from.
     """
-    return [
-        SessionsAdapter(since=since),
-        GitHubAdapter(since=since),
-        ChatGPTAdapter(since=since),
-        ClaudeWebAdapter(since=since),
-        ResearchReportsAdapter(since=since),
-        SotaWatchAdapter(since=since),
-        SubstackAdapter(since=since),
-        DropboxAdapter(since=since),
-        TickTickAdapter(since=since),
+    factories: list[tuple[str, Callable[[], ImportAdapter]]] = [
+        ("sessions", lambda: SessionsAdapter(since=since)),
+        ("github", lambda: GitHubAdapter(since=since)),
+        ("chatgpt", lambda: ChatGPTAdapter(since=since)),
+        ("claude-web", lambda: ClaudeWebAdapter(since=since)),
+        ("research", lambda: ResearchReportsAdapter(since=since)),
+        ("sota-watch", lambda: SotaWatchAdapter(since=since)),
+        ("substack", lambda: SubstackAdapter(since=since)),
+        ("dropbox", lambda: DropboxAdapter(since=since)),
+        ("ticktick", lambda: TickTickAdapter(since=since)),
     ]
+    return [_build(name, factory) for name, factory in factories]
 
 
 __all__ = ["default_adapters"]
