@@ -5,6 +5,12 @@ Subcommands:
   ingest SOURCE   - trigger one source's ingest cycle (does the actual work;
                     the MCP ``aggregator_ingest`` tool only prints
                     instructions pointing here — this is the human-approve gate)
+  ingest --all    - run EVERY source through the unified import runner
+                    (``imports/runner.py``), one pass, one report. This is the
+                    command a single systemd timer runs: per-source failures
+                    are isolated, counts are real, and inputs that only a
+                    human refreshes get a staleness warning. Exit 3 when any
+                    source ended with errors.
   status          - print capabilities (sources, freshness, cache path)
 
 v2 (Schema B): sessions ingest routes through the entity path
@@ -25,13 +31,18 @@ Argparse (not click) per plan.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from aggregator.core.store import EmptyRebuildRefusedError, Store
-from aggregator.imports.store_sink import count_writes
+from aggregator.imports.port import ImportAdapter, SupportsInputFreshness
+from aggregator.imports.registry import default_adapters
+from aggregator.imports.runner import RunReport, run_imports
+from aggregator.imports.store_sink import StoreSink, count_writes
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
@@ -66,6 +77,17 @@ _RATIO_GUARD_KEEP_FRACTION = 0.8  # refuse if new < 0.8 * existing
 # timer that reads 0 as success lets the index rot unnoticed.
 EXIT_COMPLETED_WITH_ERRORS = 3
 
+# How old a manually-refreshed input may get before `ingest --all` nags.
+# Overridable with `--stale-after-days`.
+#
+# 14 days, chosen against the ritual it is nagging about: the export-archive
+# sources (chatgpt, claude-web, substack, and ticktick's CSV leg) are realistic
+# to refresh about monthly, so two weeks is half a cycle — late enough that a
+# freshly-run ritual is never nagged, early enough that the operator is told
+# before the gap is a month wide. Tighter and the warning fires on healthy
+# runs and gets tuned out, which is worse than not warning at all.
+DEFAULT_STALE_AFTER_DAYS = 14
+
 
 def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
     """True when the shrink from ``existing`` to ``new`` exceeds the guard.
@@ -77,6 +99,19 @@ def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
         existing_count > _RATIO_GUARD_MIN_EXISTING
         and new_count < _RATIO_GUARD_KEEP_FRACTION * existing_count
     )
+
+
+def _parse_since(raw: str | None) -> datetime | None:
+    """Parse ``--since`` into an aware UTC datetime. Raises ``ValueError``.
+
+    Naive input is stamped UTC because every timestamp downstream is aware and
+    comparing the two raises. Shared by both ingest paths so the single-source
+    and run-all windows cannot mean different things.
+    """
+    if not raw:
+        return None
+    since = datetime.fromisoformat(raw)
+    return since if since.tzinfo is not None else since.replace(tzinfo=UTC)
 
 
 def _confirm_force_on_stdin(prompt: str) -> bool:
@@ -274,15 +309,11 @@ def _cmd_ingest(
         print(f"unknown source: {args.source}", file=sys.stderr)
         print(f"known sources: {sorted(sources)}", file=sys.stderr)
         return 2
-    since: datetime | None = None
-    if args.since:
-        try:
-            since = datetime.fromisoformat(args.since)
-        except ValueError:
-            print(f"bad --since: {args.since}", file=sys.stderr)
-            return 2
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=UTC)
+    try:
+        since = _parse_since(args.since)
+    except ValueError:
+        print(f"bad --since: {args.since}", file=sys.stderr)
+        return 2
     # v2: entity-shaped sources (sessions) route through iter_entities +
     # upsert_entities. Record-shaped (github) fall through to iter_records +
     # upsert. Sources exposing only ingest() (old test stubs) use the
@@ -400,6 +431,143 @@ def _cmd_ingest(
     return 0
 
 
+def _ingest_usage_error(args: argparse.Namespace) -> str | None:
+    """Reject ingest invocations that cannot mean what they say. None = fine.
+
+    Every case here would otherwise SUCCEED while doing something other than
+    what was typed, which is the failure shape this repo keeps ruling out —
+    a run that looks like it worked is worse than one that stops.
+    """
+    if args.all_sources and args.source:
+        return (
+            f"ingest: --all takes no source name (got {args.source!r}); "
+            f"run either `aggregator ingest {args.source}` or "
+            f"`aggregator ingest --all`"
+        )
+    if not args.all_sources and not args.source:
+        return (
+            "ingest: name a source, or pass --all to run every source "
+            "through the unified runner"
+        )
+    if args.all_sources and args.rebuild:
+        # --rebuild drops a source's rows before re-scanning and is guarded
+        # per-source (ratio guard, empty-result guard, stdin confirmation).
+        # Across nine sources at once those guards would each need their own
+        # answer, and the entity rebuild replaces the WHOLE sessions +
+        # observations tables — it would wipe the chat-export origins. The
+        # runner path is upsert-only, which is idempotent per id anyway.
+        return (
+            "ingest: --rebuild is not supported with --all; rebuild one "
+            "source at a time (`aggregator ingest <name> --rebuild`)"
+        )
+    return None
+
+
+def _cmd_ingest_all(
+    args: argparse.Namespace,
+    store: Store,
+    adapters: Sequence[ImportAdapter],
+) -> int:
+    """Drive every adapter through the one runner and report what happened.
+
+    This is the command a single systemd timer runs. Everything it prints has
+    to be legible in a journal entry after the fact, because that is where the
+    operator will read it.
+
+    Per-source failure isolation is the runner's (``_run_one`` contains each
+    adapter's exception and keeps the others going); this function's job is to
+    turn the resulting report into a summary and an exit code.
+
+    ``since`` is already baked into each adapter at construction — the port is
+    a single-verb interface, so acquisition knobs live on the instance.
+    """
+    report = asyncio.run(run_imports(adapters, StoreSink(store)))
+    _print_run_report(report)
+    for warning in _staleness_warnings(
+        adapters, report, max_age_days=args.stale_after_days
+    ):
+        print(f"WARNING: {warning}", file=sys.stderr)
+    if report.errors:
+        for e in report.errors[:10]:
+            print(f"  error: {e}", file=sys.stderr)
+        # Same 3 as the single-source path, for the same reason: a run that
+        # completed but dropped files is not a success, and a timer that reads
+        # 0 as success lets the index rot unnoticed.
+        return EXIT_COMPLETED_WITH_ERRORS
+    return 0
+
+
+def _staleness_warnings(
+    adapters: Sequence[ImportAdapter],
+    report: RunReport,
+    *,
+    max_age_days: int,
+    now: datetime | None = None,
+) -> list[str]:
+    """One line per source whose hand-refreshed input has gone stale.
+
+    Only adapters implementing ``SupportsInputFreshness`` are considered — a
+    live API or a continuously-synced directory has no export ritual to
+    forget, and inventing an age for those would put a number in the report
+    nobody can act on and train the operator to ignore the warnings that
+    matter.
+
+    A missing input warns too, and is the more dangerous case: the source
+    imported nothing, every count is zero, and that is indistinguishable from
+    a healthy run with nothing new.
+
+    Deliberately NOT an error, so the exit code keeps meaning exactly one
+    thing ("this run failed or dropped data"). A stale zip is not a failure —
+    nothing broke, a human just has not exported lately — and it is fixed by a
+    different action than a crashed adapter. The age also rides along in
+    ``AdapterReport.input_newest_at``, so a notifier can weigh it separately.
+    """
+    moment = now or datetime.now(UTC)
+    warnings: list[str] = []
+    for adapter in adapters:
+        if not isinstance(adapter, SupportsInputFreshness):
+            continue
+        entry = report.adapters.get(adapter.name)
+        if entry is None:  # pragma: no cover - runner reports every adapter
+            continue
+        if entry.input_newest_at is None:
+            warnings.append(
+                f"{adapter.name}: no input found — this source imported "
+                f"nothing, which looks identical to having nothing new. Drop "
+                f"a fresh export where {adapter.name} looks for it."
+            )
+            continue
+        age_days = (moment - entry.input_newest_at).days
+        if age_days > max_age_days:
+            warnings.append(
+                f"{adapter.name}: input is {age_days} days stale "
+                f"(threshold {max_age_days}). Nothing on this machine "
+                f"refreshes it — export a new one, or raise "
+                f"--stale-after-days if that is the intended cadence."
+            )
+    return warnings
+
+
+def _print_run_report(report: RunReport) -> None:
+    """One line per source, then the run total.
+
+    Counts come from the sink, which probes the store BEFORE writing. The
+    single-source path used to print ``added=len(records) updated=0`` on every
+    run, so importing 313 new PRs and re-writing the same 313 rows produced
+    identical output; that is not repeated here.
+    """
+    print("ingest --all:")
+    for name, a in report.adapters.items():
+        print(
+            f"  {name}: added={a.added} updated={a.updated} "
+            f"skipped={a.skipped} errors={len(a.errors)}"
+        )
+    print(
+        f"  total: added={report.added} updated={report.updated} "
+        f"skipped={report.skipped} errors={len(report.errors)}"
+    )
+
+
 def _cmd_github_token_status(
     args: argparse.Namespace,
     store: Store,
@@ -475,15 +643,38 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="print capabilities / freshness")
     st.add_argument("--json", action="store_true")
 
-    ing = sub.add_parser("ingest", help="run one source's ingest cycle")
+    ing = sub.add_parser(
+        "ingest", help="run one source's ingest cycle, or --all of them"
+    )
     ing.add_argument(
         "source",
+        nargs="?",
         help=(
             "source name: sessions | github | chatgpt | claude-web | "
             "research | sota-watch | substack | dropbox | ticktick"
         ),
     )
+    ing.add_argument(
+        "--all",
+        dest="all_sources",
+        action="store_true",
+        help=(
+            "run every source through the unified runner instead of one "
+            "named source (one timer, one report; per-source failures are "
+            "isolated)"
+        ),
+    )
     ing.add_argument("--since", help="ISO date to bound the ingest window")
+    ing.add_argument(
+        "--stale-after-days",
+        type=int,
+        default=DEFAULT_STALE_AFTER_DAYS,
+        help=(
+            "with --all: warn when a manually-refreshed input (chat exports, "
+            "the TickTick CSV) is older than this many days "
+            f"(default: {DEFAULT_STALE_AFTER_DAYS})"
+        ),
+    )
     ing.add_argument(
         "--rebuild",
         action="store_true",
@@ -523,6 +714,7 @@ def main(
     argv: list[str] | None = None,
     _store: Store | None = None,
     _sources: dict[str, Any] | None = None,
+    _adapters: Sequence[ImportAdapter] | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     store = _store or Store()
@@ -533,6 +725,22 @@ def main(
     if args.cmd == "status":
         return _cmd_status(args, store)
     if args.cmd == "ingest":
+        usage_error = _ingest_usage_error(args)
+        if usage_error is not None:
+            print(usage_error, file=sys.stderr)
+            return 2
+        if args.all_sources:
+            try:
+                since = _parse_since(args.since)
+            except ValueError:
+                print(f"bad --since: {args.since}", file=sys.stderr)
+                return 2
+            adapters = (
+                _adapters
+                if _adapters is not None
+                else default_adapters(since=since)
+            )
+            return _cmd_ingest_all(args, store, adapters)
         # Round-2 MEDIUM: the atomic DELETE + upsert lives inside
         # ``_cmd_ingest`` via ``store.rebuild_and_upsert`` when
         # ``args.rebuild`` is set. Do NOT call ``store.rebuild`` here —
