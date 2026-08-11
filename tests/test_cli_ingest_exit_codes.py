@@ -174,6 +174,43 @@ def test_entities_run_with_errors_exits_three(tmp_data_home, capsys):
     assert "not JSON" in capsys.readouterr().err
 
 
+def test_a_real_dropped_session_file_exits_three(tmp_data_home, tmp_path, capsys):
+    """Round-5 HIGH 3, the whole chain, with the REAL source and a real drop.
+
+    The per-source tests prove the drop reaches ``errors`` and the fakes above
+    prove ``errors`` reaches exit 3. This joins them, because the failure this
+    branch keeps re-shipping is a fix that adds a log line and leaves the run
+    exiting 0 — which only an end-to-end run can catch.
+
+    A dangling symlink makes ``stat`` raise the same OSError a permission
+    change does, without leaving an unreadable directory for pytest to clean.
+    """
+    import os
+    import time
+
+    from aggregator.sources.sessions import SessionsSource
+
+    good = tmp_path / "sess-e2e.jsonl"
+    good.write_text(
+        '{"type":"user","sessionId":"sess-e2e","uuid":"e1",'
+        '"timestamp":"2026-07-26T10:00:01Z","cwd":"/x",'
+        '"message":{"role":"user","content":"hello"}}\n'
+    )
+    os.utime(good, (time.time() - 24 * 60 * 60,) * 2)
+    (tmp_path / "sess-dropped.jsonl").symlink_to(tmp_path / "no-such-target.jsonl")
+
+    store = Store()
+    store.migrate()
+    rc = cli.main(
+        ["ingest", "sessions"],
+        _store=store,
+        _sources={"sessions": SessionsSource(projects_root=str(tmp_path))},
+    )
+
+    assert rc == 3, "a whole JSONL was dropped and the run still reported success"
+    assert "sess-dropped.jsonl" in capsys.readouterr().err
+
+
 def test_unknown_source_still_exits_two(tmp_data_home):
     """Exit-code meanings for other failures are preserved, not renumbered."""
     store = Store()
