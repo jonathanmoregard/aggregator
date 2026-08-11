@@ -25,6 +25,11 @@ entity path (session-shaped; discovery scans the drops dir AND ~/Downloads);
 Injection seams:
 * ``_store`` — swap the SQLite backing for tests (default: XDG cache).
 * ``_sources`` — swap the source registry for tests.
+* ``_adapters`` — swap the import-port registry driving ``ingest --all``.
+* ``_notify`` — the run-report notifier. Fires on EVERY ``--all`` run, not
+  only failing ones: a run that imported nothing because the export archive
+  is a month old exits 0 and is otherwise indistinguishable from a healthy
+  no-op. Defaults to doing nothing.
 
 Argparse (not click) per plan.
 """
@@ -39,9 +44,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aggregator.core.store import EmptyRebuildRefusedError, Store
-from aggregator.imports.port import ImportAdapter, SupportsInputFreshness
+from aggregator.imports.port import ImportAdapter
 from aggregator.imports.registry import default_adapters
-from aggregator.imports.runner import RunReport, run_imports
+from aggregator.imports.runner import NotifyHook, RunReport, run_imports
 from aggregator.imports.store_sink import StoreSink, count_writes
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
@@ -538,10 +543,22 @@ def _ingest_usage_error(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _silent_notification(report: RunReport) -> None:
+    """The CLI's default notifier: do nothing.
+
+    The runner deliberately refuses to shell out to ``notify-send`` itself,
+    naming the CLI / systemd layer as where a real notifier belongs. This is
+    that seam standing empty: the desktop wiring is unit configuration, not
+    Python, and an interactive `aggregator ingest --all` should not pop a
+    desktop toast. Injected through ``main(_notify=...)``.
+    """
+
+
 def _cmd_ingest_all(
     args: argparse.Namespace,
     store: Store,
     adapters: Sequence[ImportAdapter],
+    notify: NotifyHook = _silent_notification,
 ) -> int:
     """Drive every adapter through the one runner and report what happened.
 
@@ -555,12 +572,23 @@ def _cmd_ingest_all(
 
     ``since`` is already baked into each adapter at construction — the port is
     a single-verb interface, so acquisition knobs live on the instance.
+
+    ``notify`` is the seam the desktop / systemd layer plugs a real notifier
+    into. It fires on every run, including clean ones, because a run that
+    imported nothing from a month-old export is clean and is still the thing
+    an operator needs told — see ``runner.run_imports``. Defaults to the
+    runner's no-op so library and test callers stay silent.
     """
-    report = asyncio.run(run_imports(adapters, StoreSink(store)))
+    report = asyncio.run(
+        run_imports(
+            adapters,
+            StoreSink(store),
+            notify=notify,
+            stale_after_days=args.stale_after_days,
+        )
+    )
     _print_run_report(report)
-    for warning in _staleness_warnings(
-        adapters, report, max_age_days=args.stale_after_days
-    ):
+    for warning in report.warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
     if report.errors:
         for e in report.errors[:10]:
@@ -572,57 +600,6 @@ def _cmd_ingest_all(
     return 0
 
 
-def _staleness_warnings(
-    adapters: Sequence[ImportAdapter],
-    report: RunReport,
-    *,
-    max_age_days: int,
-    now: datetime | None = None,
-) -> list[str]:
-    """One line per source whose hand-refreshed input has gone stale.
-
-    Only adapters implementing ``SupportsInputFreshness`` are considered — a
-    live API or a continuously-synced directory has no export ritual to
-    forget, and inventing an age for those would put a number in the report
-    nobody can act on and train the operator to ignore the warnings that
-    matter.
-
-    A missing input warns too, and is the more dangerous case: the source
-    imported nothing, every count is zero, and that is indistinguishable from
-    a healthy run with nothing new.
-
-    Deliberately NOT an error, so the exit code keeps meaning exactly one
-    thing ("this run failed or dropped data"). A stale zip is not a failure —
-    nothing broke, a human just has not exported lately — and it is fixed by a
-    different action than a crashed adapter. The age also rides along in
-    ``AdapterReport.input_newest_at``, so a notifier can weigh it separately.
-    """
-    moment = now or datetime.now(UTC)
-    warnings: list[str] = []
-    for adapter in adapters:
-        if not isinstance(adapter, SupportsInputFreshness):
-            continue
-        entry = report.adapters.get(adapter.name)
-        if entry is None:  # pragma: no cover - runner reports every adapter
-            continue
-        if entry.input_newest_at is None:
-            warnings.append(
-                f"{adapter.name}: no input found — this source imported "
-                f"nothing, which looks identical to having nothing new. Drop "
-                f"a fresh export where {adapter.name} looks for it."
-            )
-            continue
-        age_days = (moment - entry.input_newest_at).days
-        if age_days > max_age_days:
-            warnings.append(
-                f"{adapter.name}: input is {age_days} days stale "
-                f"(threshold {max_age_days}). Nothing on this machine "
-                f"refreshes it — export a new one, or raise "
-                f"--stale-after-days if that is the intended cadence."
-            )
-    return warnings
-
-
 def _print_run_report(report: RunReport) -> None:
     """One line per source, then the run total.
 
@@ -630,6 +607,12 @@ def _print_run_report(report: RunReport) -> None:
     single-source path used to print ``added=len(records) updated=0`` on every
     run, so importing 313 new PRs and re-writing the same 313 rows produced
     identical output; that is not repeated here.
+
+    ``warnings`` rides in the total because it is the only field that
+    distinguishes a healthy no-op from a run that imported nothing off a
+    month-old export. Both print ``added=0 ... errors=0``; only one of them
+    also prints ``warnings=1``, and that is what makes the difference legible
+    in a journal entry read after the fact.
     """
     print("ingest --all:")
     for name, a in report.adapters.items():
@@ -639,7 +622,8 @@ def _print_run_report(report: RunReport) -> None:
         )
     print(
         f"  total: added={report.added} updated={report.updated} "
-        f"skipped={report.skipped} errors={len(report.errors)}"
+        f"skipped={report.skipped} errors={len(report.errors)} "
+        f"warnings={len(report.warnings)}"
     )
 
 
@@ -790,6 +774,7 @@ def main(
     _store: Store | None = None,
     _sources: dict[str, Any] | None = None,
     _adapters: Sequence[ImportAdapter] | None = None,
+    _notify: NotifyHook | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     store = _store or Store()
@@ -815,7 +800,9 @@ def main(
                 if _adapters is not None
                 else default_adapters(since=since)
             )
-            return _cmd_ingest_all(args, store, adapters)
+            return _cmd_ingest_all(
+                args, store, adapters, _notify or _silent_notification
+            )
         # Round-2 MEDIUM: the atomic DELETE + upsert lives inside
         # ``_cmd_ingest`` via ``store.rebuild_and_upsert`` when
         # ``args.rebuild`` is set. Do NOT call ``store.rebuild`` here —

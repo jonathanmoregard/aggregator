@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from aggregator.imports.port import (
     ImportAdapter,
@@ -42,6 +42,13 @@ class AdapterReport:
     # exists to describe — the clean ones that imported nothing because the
     # input is stale.
     input_newest_at: datetime | None = None
+    # Whether the adapter implements ``SupportsInputFreshness`` at all.
+    # Without it, ``input_newest_at is None`` conflates two opposite things:
+    # "this source has no export ritual and never goes stale" (github reads a
+    # live API) and "the export archive is missing entirely", which is the
+    # loudest version of the problem — every count is zero and it looks
+    # exactly like a healthy no-op.
+    offers_input_freshness: bool = False
 
     @property
     def ok(self) -> bool:
@@ -56,6 +63,14 @@ class RunReport:
     # Faults belonging to the run itself rather than to any one adapter —
     # currently just a notification hook that blew up.
     run_errors: list[str] = field(default_factory=list)
+    # Non-fatal, operator-actionable notices: a hand-refreshed export that has
+    # gone stale, or one that is missing entirely. Deliberately NOT errors —
+    # nothing failed, a human just has not exported lately, and it is fixed by
+    # a different action than a crashed adapter — so these do not touch ``ok``
+    # and cannot change the exit code. They live ON the report rather than
+    # only on the caller's stderr because otherwise the notify hook, the one
+    # thing that can reach a human, cannot see them.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def added(self) -> int:
@@ -154,11 +169,57 @@ async def _run_one(
         except Exception as e:  # noqa: BLE001
             report.errors.append(f"drain_errors failed: {type(e).__name__}: {e}")
     if isinstance(adapter, SupportsInputFreshness):
+        report.offers_input_freshness = True
         try:
             report.input_newest_at = adapter.input_freshness()
         except Exception as e:  # noqa: BLE001
             report.errors.append(f"input_freshness failed: {type(e).__name__}: {e}")
     return report
+
+
+def staleness_warnings(
+    report: RunReport,
+    *,
+    max_age_days: int,
+    now: datetime | None = None,
+) -> list[str]:
+    """One line per source whose hand-refreshed input has gone stale.
+
+    Only adapters that offered ``input_freshness`` are considered — a live API
+    or a continuously-synced directory has no export ritual to forget, and
+    inventing an age for those would put a number in the report nobody can act
+    on and train the operator to ignore the warnings that matter.
+
+    A missing input warns too, and is the more dangerous case: the source
+    imported nothing, every count is zero, and that is indistinguishable from
+    a healthy run with nothing new.
+
+    Deliberately NOT errors, so the exit code keeps meaning exactly one thing
+    ("this run failed or dropped data"). A stale zip is not a failure —
+    nothing broke, a human just has not exported lately — and it is fixed by a
+    different action than a crashed adapter.
+    """
+    moment = now or datetime.now(UTC)
+    warnings: list[str] = []
+    for name, entry in report.adapters.items():
+        if not entry.offers_input_freshness:
+            continue
+        if entry.input_newest_at is None:
+            warnings.append(
+                f"{name}: no input found — this source imported "
+                f"nothing, which looks identical to having nothing new. Drop "
+                f"a fresh export where {name} looks for it."
+            )
+            continue
+        age_days = (moment - entry.input_newest_at).days
+        if age_days > max_age_days:
+            warnings.append(
+                f"{name}: input is {age_days} days stale "
+                f"(threshold {max_age_days}). Nothing on this machine "
+                f"refreshes it — export a new one, or raise "
+                f"--stale-after-days if that is the intended cadence."
+            )
+    return warnings
 
 
 async def run_imports(
@@ -167,6 +228,8 @@ async def run_imports(
     *,
     notify: NotifyHook = _no_notification,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    stale_after_days: int | None = None,
+    now: datetime | None = None,
 ) -> RunReport:
     """Drive every adapter concurrently and return the aggregated report.
 
@@ -180,6 +243,12 @@ async def run_imports(
     was gated on ``not report.ok``: on a clean run no notifier ever ran, so
     the value was unreachable by construction. The default hook is a no-op,
     so "fires on every run" costs a caller who wants nothing exactly nothing.
+
+    ``stale_after_days`` turns the collected freshness values into
+    ``report.warnings`` BEFORE ``notify`` fires, which is the whole point of
+    evaluating them here rather than in the caller: a warning the notifier
+    cannot see is stderr text on an exit-0 run, and no timer reads stderr.
+    ``None`` skips the evaluation (a caller with no staleness policy).
     """
     adapter_list: Sequence[ImportAdapter] = list(adapters)
     _refuse_duplicate_names(adapter_list)
@@ -187,6 +256,10 @@ async def run_imports(
         *(_run_one(a, sink, batch_size) for a in adapter_list)
     )
     report = RunReport(adapters={r.name: r for r in results})
+    if stale_after_days is not None:
+        report.warnings.extend(
+            staleness_warnings(report, max_age_days=stale_after_days, now=now)
+        )
     try:
         notify(report)
     except Exception as e:  # noqa: BLE001
@@ -214,4 +287,5 @@ __all__ = [
     "NotifyHook",
     "RunReport",
     "run_imports",
+    "staleness_warnings",
 ]

@@ -294,6 +294,148 @@ def test_a_source_without_a_freshness_signal_never_warns(tmp_path, capsys):
     assert "WARNING" not in capsys.readouterr().err
 
 
+# -- staleness has to reach something other than stderr --------------------
+#
+# Round-1 MEDIUM: the warnings were printed to stderr on an exit-0 run and
+# nothing else. `notify` fired only when `!ok`, so a 31-day-stale input that
+# imported 0 rows was indistinguishable from a healthy no-op to any timer.
+
+
+def test_a_clean_but_stale_run_still_reaches_the_notifier(tmp_path):
+    """THE finding. Nothing about this run is an error, and that is exactly
+    why it was invisible: no notifier ran, the exit code was 0, and every
+    count was 0 — the same shape as a healthy import with nothing new."""
+    store = _store(tmp_path)
+    seen = []
+
+    rc = main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[_ExportAdapter("substack", 31)],
+        _notify=seen.append,
+    )
+
+    assert rc == 0
+    assert len(seen) == 1, "the notifier must run on a clean run too"
+    report = seen[0]
+    assert report.ok is True
+    assert len(report.warnings) == 1
+    assert "31 days" in report.warnings[0]
+
+
+def test_a_healthy_no_op_carries_no_warnings(tmp_path):
+    """The other half of the same contract: the notifier must be able to tell
+    these two apart, so a fresh input has to produce an EMPTY warnings list,
+    not merely a differently-worded one."""
+    store = _store(tmp_path)
+    seen = []
+
+    main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[_ExportAdapter("substack", 2)],
+        _notify=seen.append,
+    )
+
+    assert seen[0].warnings == []
+
+
+def test_a_missing_export_reaches_the_notifier_too(tmp_path):
+    store = _store(tmp_path)
+    seen = []
+
+    main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[_ExportAdapter("chatgpt", None)],
+        _notify=seen.append,
+    )
+
+    assert len(seen[0].warnings) == 1
+    assert "no input" in seen[0].warnings[0].lower()
+
+
+def test_a_source_with_no_freshness_signal_produces_no_warning(tmp_path):
+    """github reads a live API; sessions reads a directory Claude Code appends
+    to. Neither has an export ritual to forget. A warning nobody can act on
+    trains the operator to ignore the one that matters."""
+    store = _store(tmp_path)
+    seen = []
+
+    main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[_FakeAdapter("github")],
+        _notify=seen.append,
+    )
+
+    assert seen[0].warnings == []
+
+
+def test_warnings_never_change_the_exit_code(tmp_path):
+    """Staleness is not a failure — nothing broke, a human just has not
+    exported lately — so ``errors`` keeps meaning exactly one thing."""
+    store = _store(tmp_path)
+
+    rc = main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[_ExportAdapter("substack", 400)],
+    )
+
+    assert rc == 0
+
+
+def test_the_printed_total_counts_the_warnings(tmp_path, capsys):
+    """The journal is where an operator reads this after the fact, and there
+    a stale no-op and a healthy no-op printed byte-identical totals."""
+    store = _store(tmp_path)
+
+    main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[_ExportAdapter("substack", 31), _FakeAdapter("github")],
+    )
+
+    out = capsys.readouterr().out
+    assert "total: added=0 updated=0 skipped=0 errors=0 warnings=1" in out
+
+
+def test_the_threshold_reaches_the_report_not_just_stderr(tmp_path):
+    store = _store(tmp_path)
+    seen = []
+
+    main(
+        ["ingest", "--all", "--stale-after-days", "60"],
+        _store=store,
+        _adapters=[_ExportAdapter("substack", 31)],
+        _notify=seen.append,
+    )
+
+    assert seen[0].warnings == []
+
+
+def test_a_notifier_that_blows_up_is_reported_on_an_otherwise_clean_run(
+    tmp_path, capsys
+):
+    """A notifier that cannot notify is a fault in its own right, and on a
+    clean run this is the only thing that says so."""
+    store = _store(tmp_path)
+
+    def explode(report):
+        raise FileNotFoundError("notify-send: not found")
+
+    rc = main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[_FakeAdapter("alpha", records=[_record("alpha")])],
+        _notify=explode,
+    )
+
+    assert rc == 3
+    assert "notify-send: not found" in capsys.readouterr().err
+
+
 # -- usage errors ----------------------------------------------------------
 
 
