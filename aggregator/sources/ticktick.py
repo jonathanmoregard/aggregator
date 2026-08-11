@@ -201,6 +201,11 @@ class TickTickSource:
             return
         target = self.archive_dir / path.name
         try:
+            self.archive_dir.mkdir(parents=True, exist_ok=True)
+            # 0700, and set explicitly rather than through mkdir's mode, which
+            # is umask-masked and does nothing at all to a directory an earlier
+            # run already created at 0755.
+            self.archive_dir.chmod(0o700)
             if target.exists() and target.stat().st_size > path.stat().st_size:
                 # Loud: an archive that quietly stopped updating looks exactly
                 # like one that is current.
@@ -214,10 +219,48 @@ class TickTickSource:
                     path.stat().st_size,
                 )
                 return
-            self.archive_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
+            self._copy_private(path, target)
         except OSError as e:
             log.warning("could not archive backup %s: %s", path, e)
+
+    @staticmethod
+    def _copy_private(path: Path, target: Path) -> None:
+        """Copy ``path`` to ``target`` at 0600, atomically, keeping its mtime.
+
+        ``shutil.copy2`` preserved the mode of the file in ~/Downloads, which
+        a browser writes at the default umask — typically 0644. This is the
+        user's entire task history, titles and notes included: the same data
+        class as ``open_tasks.json``, which is deliberately written 0600 for
+        exactly that reason. The two had opposite treatment.
+
+        Same shape as ``ticktick_api.save_state``: the mode is set on the
+        scratch fd BEFORE any bytes are written, so there is no window at
+        0644, and applied explicitly rather than through ``O_CREAT``'s mode
+        argument, which does nothing when a scratch file from an earlier run
+        already exists. The rename then makes the replacement atomic, so an
+        interrupted copy cannot leave a truncated archive — which, for the
+        only surviving copy of an unregenerable export, is the same failure
+        M5 is about.
+
+        The MTIME IS RESTORED from the source, and that is load-bearing rather
+        than tidiness: ``newest_backup_mtime`` reports the age of the newest
+        backup and the run-all path turns it into the staleness warning. A
+        copy stamped 'now' would make a two-year-old export read as fresh
+        forever, silently disabling the one signal that says nobody has
+        exported lately.
+        """
+        source_stat = path.stat()
+        scratch = target.with_name(target.name + ".tmp")
+        fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as out, path.open("rb") as source:
+                os.fchmod(out.fileno(), 0o600)
+                shutil.copyfileobj(source, out)
+            os.utime(scratch, (source_stat.st_atime, source_stat.st_mtime))
+        except BaseException:
+            scratch.unlink(missing_ok=True)
+            raise
+        os.replace(scratch, target)
 
     def _csv_candidates(
         self, since: datetime | None, errors: list[str] | None = None

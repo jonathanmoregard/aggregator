@@ -16,6 +16,10 @@ while ``open_tasks.json``, the same class of data, is deliberately written
 """
 from __future__ import annotations
 
+import os
+import stat
+from datetime import UTC, datetime
+
 import pytest
 
 from aggregator.sources import ticktick_api
@@ -115,6 +119,65 @@ def test_a_first_time_export_is_archived(tmp_path):
     list(_source(tmp_path).iter_records(None))
 
     assert len(parse_backup(tmp_path / "archive" / "TickTick.csv")) == 3
+
+
+# -- M6: the archived copy holds the same data class as open_tasks.json ---
+
+
+def test_the_archived_copy_is_not_world_readable(tmp_path):
+    """A downloaded file is typically 0644 and ``copy2`` preserves the mode.
+    This file is the user's whole task history — titles and notes, i.e. their
+    medical appointments and legal matters — and ``open_tasks.json`` is
+    deliberately written 0600 for exactly that reason. Same data class,
+    opposite treatment."""
+    _backup(tmp_path / "downloads" / "TickTick.csv", _rows(2), mode=0o644)
+
+    list(_source(tmp_path).iter_records(None))
+
+    mode = (tmp_path / "archive" / "TickTick.csv").stat().st_mode
+    assert stat.S_IMODE(mode) == 0o600
+
+
+def test_the_archive_directory_is_not_world_readable(tmp_path):
+    """The directory listing alone leaks the export dates."""
+    _backup(tmp_path / "downloads" / "TickTick.csv", _rows(2), mode=0o644)
+
+    list(_source(tmp_path).iter_records(None))
+
+    mode = (tmp_path / "archive").stat().st_mode
+    assert stat.S_IMODE(mode) == 0o700
+
+
+def test_the_archived_copy_keeps_the_exports_own_mtime(tmp_path):
+    """Tightening the mode must not cost the staleness signal.
+    ``newest_backup_mtime`` is what the run-all path turns into "your export is
+    31 days stale"; a copy stamped 'now' would make a two-year-old export read
+    as fresh forever."""
+    exported = _backup(tmp_path / "downloads" / "TickTick.csv", _rows(2))
+    old = datetime(2026, 6, 1, tzinfo=UTC).timestamp()
+    os.utime(exported, (old, old))
+
+    src = _source(tmp_path)
+    list(src.iter_records(None))
+    exported.unlink()  # the user clears ~/Downloads
+
+    archived = tmp_path / "archive" / "TickTick.csv"
+    assert int(archived.stat().st_mtime) == int(old)
+    assert _source(tmp_path).newest_backup_mtime() == datetime(
+        2026, 6, 1, tzinfo=UTC
+    )
+
+
+def test_an_already_tightened_archive_is_left_alone(tmp_path):
+    """Re-running must not widen anything back."""
+    _backup(tmp_path / "downloads" / "TickTick.csv", _rows(2), mode=0o644)
+    src = _source(tmp_path)
+    list(src.iter_records(None))
+    list(_source(tmp_path).iter_records(None))
+
+    archived = tmp_path / "archive" / "TickTick.csv"
+    assert stat.S_IMODE(archived.stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / "archive").stat().st_mode) == 0o700
 
 
 def test_refusing_to_archive_is_not_silent(tmp_path, caplog):
