@@ -240,6 +240,53 @@ def test_a_state_write_that_fails_after_the_records_landed_is_reported(
     assert store.count_by_source("ticktick") == 2
 
 
+# -- round 3 W3: a dropped baseline entry cannot exit 0 -------------------
+
+
+def test_a_dropped_baseline_entry_makes_the_run_exit_nonzero(tmp_path):
+    """THE round-3 finding. An entry ``infer_completions`` cannot turn into a
+    record is skipped — and then the barrier commits the advanced baseline,
+    which drops it for good. That used to be a log line on an exit-0 run, i.e.
+    permanent loss reported as success."""
+    state = tmp_path / "open_tasks.json"
+    state.write_text(
+        json.dumps(
+            {
+                "t1": {"task": {"id": "t1", "title": "open"}, "last_seen": "x"},
+                "t2": {"task": {"title": "no id"}, "last_seen": "x"},
+                "t3": "not an object at all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = Store(db_path=tmp_path / "cache.db")
+    store.migrate()
+
+    rc = cli.main(
+        ["ingest", "ticktick"],
+        _store=store,
+        _sources={"ticktick": _source(tmp_path, state)},
+    )
+
+    assert _baseline(state) == {"t1"}, "the commit did drop them"
+    assert rc == cli.EXIT_COMPLETED_WITH_ERRORS
+
+
+def test_the_dropped_entries_reach_the_run_report(tmp_path):
+    """Same on the run-all path, which is where the notifier reads from."""
+    state = tmp_path / "open_tasks.json"
+    state.write_text(
+        json.dumps({"t1": {"task": {"id": "t1"}}, "t2": "garbled"}),
+        encoding="utf-8",
+    )
+    adapter = TickTickAdapter(source=_source(tmp_path, state))
+
+    report = asyncio.run(run_imports([adapter], _CountingSink()))
+
+    assert report.ok is False
+    assert any("t2" in e for e in report.errors)
+
+
 # -- round 3 W2: "the stream ended" is not "the items were persisted" -----
 
 

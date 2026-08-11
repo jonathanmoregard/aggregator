@@ -381,7 +381,7 @@ class TickTickSource:
         # records have landed.
         state = ticktick_api.JsonFileState(self.state_file)
         inferred, commit = ticktick_api.plan_open_task_reconcile(
-            state, tasks, observed
+            state, tasks, observed, errors
         )
         self._pending_state_commit = commit
         for record in inferred:

@@ -797,6 +797,7 @@ def infer_completions(
     previous: dict[str, dict],
     current_ids: set[str],
     now: datetime,
+    errors: list[str] | None = None,
 ) -> list[Record]:
     """Records for the tasks that were open last poll and are absent now.
 
@@ -809,6 +810,13 @@ def infer_completions(
     A later CSV backup overwrites both with the real Completed Time.
 
     Sorted by id so a run's output is deterministic.
+
+    ``errors`` is the run's fault sink and an entry here means DATA WAS LOST.
+    An entry this cannot turn into a record is dropped — and then the write
+    barrier commits the advanced baseline, which is the act that makes the
+    disappearance unrepeatable, so that task's completion is gone for good.
+    A log line alone left that on an exit-0 run where every count looked
+    healthy; routed here it makes the run exit 3 and reach the notifier.
     """
     if previous and not current_ids:
         # fetch_open_tasks sinks a failed project into ``errors`` and carries
@@ -828,7 +836,7 @@ def infer_completions(
             len(previous),
         )
     records = []
-    unusable = 0
+    unusable: list[str] = []
     for task_id, entry in sorted(previous.items()):
         if task_id in current_ids:
             continue
@@ -842,11 +850,17 @@ def infer_completions(
             # usable id. Skipped rather than allowed to abort the loop: one bad
             # entry must not cost every other completion in the batch, the same
             # rule the project walk follows for a malformed ``tasks`` payload.
-            unusable += 1
+            unusable.append(task_id)
     if unusable:
-        log.warning(
-            "ticktick state: %d unusable entr(ies) could not be turned into completions",
-            unusable,
+        _note(
+            errors,
+            f"ticktick state: {len(unusable)} baseline entr(ies) could not be "
+            f"turned into completions and are being DROPPED "
+            f"({', '.join(unusable[:5])}"
+            f"{', ...' if len(unusable) > 5 else ''}). The advanced baseline no "
+            f"longer holds them, and the Open API serves open tasks only, so "
+            f"these completions cannot be re-derived. Check the open-task "
+            f"baseline for a truncated or hand-edited entry",
         )
     return records
 
@@ -889,7 +903,10 @@ class JsonFileState:
 
 
 def plan_open_task_reconcile(
-    state: OpenTaskState, tasks: Iterable[dict], now: datetime
+    state: OpenTaskState,
+    tasks: Iterable[dict],
+    now: datetime,
+    errors: list[str] | None = None,
 ) -> tuple[list[Record], Callable[[], None]]:
     """Diff this poll against the baseline; hand back the save as a callable.
 
@@ -910,10 +927,14 @@ def plan_open_task_reconcile(
     loading overwrites the baseline with the current poll and inference is
     silently dead — which is why this stays one function and not three calls
     at the call site.
+
+    ``errors`` is forwarded to :func:`infer_completions`, where an entry means
+    a completion is being dropped and the commit is about to make that
+    permanent. Pass the run's sink; a bare log line reaches nobody on a timer.
     """
     previous = state.load()
     tasks = list(tasks)
-    records = infer_completions(previous, _open_task_ids(tasks), now)
+    records = infer_completions(previous, _open_task_ids(tasks), now, errors)
 
     def commit() -> None:
         state.save(tasks, now)
@@ -922,7 +943,10 @@ def plan_open_task_reconcile(
 
 
 def reconcile_open_tasks(
-    state: OpenTaskState, tasks: Iterable[dict], now: datetime
+    state: OpenTaskState,
+    tasks: Iterable[dict],
+    now: datetime,
+    errors: list[str] | None = None,
 ) -> list[Record]:
     """Diff this poll against the baseline, then make this poll the baseline.
 
@@ -933,6 +957,6 @@ def reconcile_open_tasks(
     Typed against :class:`OpenTaskState`, so nothing here knows or cares that
     the baseline is a JSON file.
     """
-    records, commit = plan_open_task_reconcile(state, tasks, now)
+    records, commit = plan_open_task_reconcile(state, tasks, now, errors)
     commit()
     return records

@@ -1354,9 +1354,48 @@ def test_a_garbled_state_entry_does_not_cost_the_other_inferences(caplog):
         previous, current_ids={"t4"}, now=datetime(2026, 8, 8, tzinfo=UTC)
     )
     assert [r.stable_id for r in records] == ["ticktick:t3"]
-    notes = [r for r in caplog.records if "unusable" in r.getMessage()]
+    notes = [r for r in caplog.records if "DROPPED" in r.getMessage()]
     assert notes, "state entries were skipped without telling anyone"
     assert notes[0].levelno >= logging.lastResort.level
+
+
+def test_a_garbled_state_entry_reaches_the_runs_errors_sink():
+    """Round 3 W3. A skipped entry is not a curiosity: the commit that follows
+    drops it from the baseline, and the Open API serves open tasks only, so
+    that completion can never be re-derived. A log line alone left permanent
+    loss on an exit-0 run whose every count looked healthy."""
+    previous = {
+        "t1": "not an entry object at all",
+        "t2": {"task": {"title": "no id in the stored payload"}},
+    }
+    errors: list[str] = []
+
+    ticktick_api.infer_completions(
+        previous,
+        current_ids=set(),
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        errors=errors,
+    )
+
+    assert len(errors) == 1
+    assert "t1" in errors[0] and "t2" in errors[0]
+
+
+def test_the_reconcile_planner_forwards_the_errors_sink(tmp_path):
+    """The sink has to survive the hop the source actually makes — the source
+    calls the planner, never ``infer_completions`` directly."""
+    path = tmp_path / "open_tasks.json"
+    path.write_text('{"t1": "garbled"}', encoding="utf-8")
+    errors: list[str] = []
+
+    ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path),
+        [{"id": "t9", "title": "still open"}],
+        datetime(2026, 8, 8, tzinfo=UTC),
+        errors,
+    )
+
+    assert errors and "t1" in errors[0]
 
 
 def test_default_state_path_respects_xdg(monkeypatch, tmp_path):
