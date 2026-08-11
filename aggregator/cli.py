@@ -42,6 +42,7 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -820,25 +821,72 @@ def _desktop_notification(report: RunReport) -> None:
     which turns into exit 3. A notifier that cannot notify is a fault in its
     own right, and on an otherwise-clean run it is the only thing that says so.
     """
+    # BEFORE the "nothing worth saying" return, deliberately. A misconfigured
+    # notifier that is only checked when there is something to send stays
+    # latent until the first FAILING run — and that run's notify failure then
+    # reaches only the journal, which is the exact channel the notifier exists
+    # to replace. Checked on every run, the config fault surfaces on the next
+    # clean one, while the operator still has a working channel to hear it on.
+    argv = _notify_argv()
     text = _notification_text(report)
     if text is None:
         return
     urgency, summary, body = text
-    raw = os.environ.get(NOTIFY_COMMAND_ENV_VAR) or DEFAULT_NOTIFY_COMMAND
-    argv = shlex.split(raw)
-    if not argv:
-        raise ValueError(
-            f"${NOTIFY_COMMAND_ENV_VAR} is set but empty; unset it or name a "
-            f"program (default: {DEFAULT_NOTIFY_COMMAND})"
-        )
     # No shell=True: the value is operator configuration, split with shlex and
     # exec'd directly. Timeout because a hung notification daemon must not
     # wedge the timer's unit forever.
+    #
+    # ``--`` because summary and body are POSITIONAL and their content is not
+    # ours: a body line beginning with ``-`` is an option to notify-send's and
+    # dunstify's GOption parsers, and the notification is then lost to
+    # "option -x not recognized" rather than delivered. Safe today only by the
+    # accident that every line happens to be prefixed "<adapter name>: ", and
+    # adapter names are not validated against a leading dash.
     subprocess.run(
-        [*argv, "-u", urgency, "-a", "aggregator", summary, body],
+        [*argv, "-u", urgency, "-a", "aggregator", "--", summary, body],
         check=True,
         timeout=NOTIFY_TIMEOUT_SECONDS,
     )
+
+
+def _notify_argv() -> list[str]:
+    """The notify program and its arguments, or raise saying what is wrong.
+
+    Two config faults, both of which used to be quiet in the wrong direction.
+
+    A SET-BUT-BLANK value. ``AGGREGATOR_NOTIFY_COMMAND=`` is the shape a
+    systemd unit produces from ``Environment=AGGREGATOR_NOTIFY_COMMAND=``, and
+    it was falsy at both gates: it did not install the notifier and it fell
+    back to the default program. So an operator who had written the line
+    believed notifications were on and they were off, while a whitespace-only
+    value — the same intent, one keystroke different — raised loudly. Backwards:
+    a variable that is present is a statement of intent, and a blank one is a
+    broken statement, which is the loud case.
+
+    AN UNRESOLVABLE PROGRAM. ``notify-sned`` is not detectable at any point
+    except by trying, and the only run that used to try was a failing one.
+    Checked here, on every run.
+
+    Raising is the reporting channel: ``run_imports`` records a notify-hook
+    failure in ``run_errors``, so the run exits 3 and the summary says which
+    variable to fix.
+    """
+    raw = os.environ.get(NOTIFY_COMMAND_ENV_VAR)
+    argv = shlex.split(DEFAULT_NOTIFY_COMMAND if raw is None else raw)
+    if not argv:
+        raise ValueError(
+            f"${NOTIFY_COMMAND_ENV_VAR} is set but blank ({raw!r}), so no "
+            f"notifier could be installed; unset it to get the default "
+            f"({DEFAULT_NOTIFY_COMMAND}) or name a program"
+        )
+    if shutil.which(argv[0]) is None:
+        raise ValueError(
+            f"notify command {argv[0]!r} is not executable or not on PATH "
+            f"(from ${NOTIFY_COMMAND_ENV_VAR}"
+            f"{' — unset, so this is the default' if raw is None else ''}); "
+            f"no notification can be delivered until it is fixed"
+        )
+    return argv
 
 
 def _resolve_notify(
@@ -850,10 +898,17 @@ def _resolve_notify(
     var set on the developer's machine. Otherwise ``--notify`` or a set
     ``$AGGREGATOR_NOTIFY_COMMAND`` installs the real one — the env var alone is
     enough so a unit file can wire this up without changing anyone's argv.
+
+    PRESENCE, not truthiness. ``AGGREGATOR_NOTIFY_COMMAND=`` — what
+    ``Environment=AGGREGATOR_NOTIFY_COMMAND=`` in a unit file produces — is a
+    statement that the operator wants notifications, spelled wrong. Read as
+    falsy it installed nothing and said nothing, which is the one outcome an
+    operator who wrote that line cannot detect. Installed, ``_notify_argv``
+    refuses it out loud and the run exits 3.
     """
     if injected is not None:
         return injected
-    if getattr(args, "notify", False) or os.environ.get(NOTIFY_COMMAND_ENV_VAR):
+    if getattr(args, "notify", False) or NOTIFY_COMMAND_ENV_VAR in os.environ:
         return _desktop_notification
     return _silent_notification
 
