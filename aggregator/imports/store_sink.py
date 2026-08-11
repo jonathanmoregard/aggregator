@@ -78,6 +78,14 @@ class StoreSink:
                     f"unsupported import item: {type(item).__name__}"
                 )
 
+        # VALIDATE THE WHOLE BATCH BEFORE WRITING ANY OF IT. This used to sit
+        # inside the entity path, i.e. after the records had already landed —
+        # and the raise discards this method's return value, so the counts for
+        # the rows that DID land went with it. Rows in the store that no
+        # report ever counted is precisely the failure this file's counting
+        # exists to prevent.
+        self._refuse_orphan_observations(sessions, observations)
+
         counts = WriteCounts()
         if records:
             counts = counts + self._write_records(records)
@@ -111,8 +119,8 @@ class StoreSink:
         # ``observations.session_id`` is a real FK and ``PRAGMA foreign_keys``
         # is ON. This reordering is per-batch and cannot be anything else — the
         # sink sees one batch at a time and has no memory between calls. The
-        # contract on the adapter is therefore the stronger one, checked below.
-        self._refuse_orphan_observations(sessions, observations)
+        # contract on the adapter is therefore the stronger one, checked in
+        # ``write`` before anything at all is written.
         self._store.upsert_entities([*sessions, *observations])
         return counts
 
