@@ -91,13 +91,15 @@ async def aiter_in_thread(
             return
 
 
-def _accepts_errors_kwarg(fn: Callable[..., Any]) -> bool:
+def accepts_errors_kwarg(fn: Callable[..., Any]) -> bool:
     """True when ``fn`` takes an ``errors`` sink.
 
-    Signature inspection rather than ``cli.py``'s ``try/except TypeError``
-    around the call: that pattern also swallows a genuine TypeError raised
-    from inside the source, which would look like an old signature and
-    silently re-run the iteration.
+    Signature inspection rather than a ``try``/``except TypeError`` around the
+    call: that pattern also catches a genuine TypeError raised from inside the
+    source, which looks exactly like an old signature and silently re-runs the
+    iteration. Public, and imported by ``cli.py``, so both ingest surfaces
+    decide this the same way — the CLI carried the try/except version until
+    round 2, where a re-poll cost TickTick a whole poll's inferred completions.
     """
     try:
         return "errors" in inspect.signature(fn).parameters
@@ -146,7 +148,7 @@ class SyncSourceAdapter:
         self._errors = []
 
         def make_iterator() -> Iterable[ImportItem]:
-            if _accepts_errors_kwarg(self._iter_fn):
+            if accepts_errors_kwarg(self._iter_fn):
                 return self._iter_fn(self._since, errors=self._errors)
             return self._iter_fn(self._since)
 
@@ -167,5 +169,6 @@ class SyncSourceAdapter:
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "SyncSourceAdapter",
+    "accepts_errors_kwarg",
     "aiter_in_thread",
 ]

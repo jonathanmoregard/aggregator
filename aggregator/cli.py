@@ -48,6 +48,7 @@ from aggregator.imports.port import ImportAdapter
 from aggregator.imports.registry import default_adapters
 from aggregator.imports.runner import NotifyHook, RunReport, run_imports
 from aggregator.imports.store_sink import StoreSink, count_writes
+from aggregator.imports.sync_bridge import accepts_errors_kwarg
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
@@ -283,6 +284,38 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     return 0
 
 
+def _iterate(
+    iter_fn: Callable[..., Any],
+    since: datetime | None,
+    errors: list[str],
+) -> Any:
+    """Call a source's iterator, passing ``errors`` only if it takes one.
+
+    The signature is PROBED, never discovered by calling and catching. Both
+    ingest paths used to do this::
+
+        try:
+            records = list(src.iter_records(since, errors=errors))
+        except TypeError:
+            records = list(src.iter_records(since))
+
+    Argument binding raises TypeError at call time, so that handled the
+    old-signature case — and equally handled a genuine TypeError raised from
+    arbitrary depth inside the iteration, whereupon it silently ran the source
+    AGAIN. Iterating a source is not a read-only act: the TickTick poll's
+    ``reconcile_open_tasks`` advances the on-disk open-task baseline while it
+    runs, and the API only ever serves OPEN tasks, so the second pass sees no
+    disappearances and that poll's inferred completions are gone for good —
+    on a run that then exits 0 because the retry succeeded.
+
+    Same helper the run-all path uses (``sync_bridge.accepts_errors_kwarg``),
+    so the two surfaces cannot drift on which sources get an errors sink.
+    """
+    if accepts_errors_kwarg(iter_fn):
+        return iter_fn(since, errors=errors)
+    return iter_fn(since)
+
+
 def _cmd_ingest_entities(
     args: argparse.Namespace,
     store: Store,
@@ -299,10 +332,7 @@ def _cmd_ingest_entities(
     """
     errors: list[str] = []
     try:
-        try:
-            entities = list(src.iter_entities(since, errors=errors))
-        except TypeError:
-            entities = list(src.iter_entities(since))
+        entities = list(_iterate(src.iter_entities, since, errors))
     except Exception as e:  # noqa: BLE001
         print(f"ingest {args.source} failed: {e}", file=sys.stderr)
         return 1
@@ -453,13 +483,7 @@ def _cmd_ingest(
             # Round-3 HIGH/MEDIUM#3: plumb the errors sink into iter_records
             # so we can (a) refuse a wipe when every endpoint degrades to []
             # with errors present and (b) surface warnings post-ingest.
-            # Older iter_records signatures without an ``errors`` kwarg
-            # (e.g. the CLI persistence stub) are handled via TypeError
-            # fallback so we don't break narrow test doubles.
-            try:
-                records = list(src.iter_records(since, errors=errors))
-            except TypeError:
-                records = list(src.iter_records(since))
+            records = list(_iterate(src.iter_records, since, errors))
         except Exception as e:  # noqa: BLE001 -- surface as CLI error, don't crash
             print(f"ingest {args.source} failed: {e}", file=sys.stderr)
             return 1
