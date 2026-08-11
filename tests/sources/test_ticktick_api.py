@@ -1292,22 +1292,84 @@ def test_load_missing_state_returns_empty(tmp_path):
         pytest.param(lambda p: p.mkdir(), id="not-even-a-file"),
     ],
 )
-def test_load_corrupt_state_returns_empty_and_says_so(tmp_path, caplog, write):
-    """Unusable state costs one poll's inference and self-heals — but loudly.
+def test_load_corrupt_state_raises_rather_than_reading_as_empty(tmp_path, caplog, write):
+    """Round-5 HIGH 2. A baseline that exists and cannot be read is NOT ``{}``.
 
-    It is a cache, not a database, so failing the whole ingest over it would be
-    worse than the gap. Silently returning ``{}`` would be worse still: that is
-    indistinguishable from a first poll, so a state file corrupted once would
-    keep losing every completion and never explain why. No ``caplog.at_level``
-    on purpose — nothing under ``aggregator/`` configures logging, so
-    ``logging.lastResort`` (WARNING) is all an operator ever sees.
+    Returning ``{}`` made it indistinguishable from a first-ever poll, and the
+    caller's next act is to overwrite the baseline from that empty state — so
+    every pending completion in the unreadable file is destroyed, on a run that
+    exits 0. Losing the file is recoverable (one poll's inference); overwriting
+    it is not. It raises so the caller cannot mistake it for an empty baseline
+    and cannot commit over it.
     """
     path = tmp_path / "open_tasks.json"
     write(path)
-    assert ticktick_api.load_state(path) == {}
-    notes = [r for r in caplog.records if "open_tasks.json" in r.getMessage()]
-    assert notes, "an unreadable state file was discarded without telling anyone"
-    assert notes[0].levelno >= logging.lastResort.level
+    with pytest.raises(ticktick_api.StateUnreadableError) as caught:
+        ticktick_api.load_state(path)
+    assert "open_tasks.json" in str(caught.value)
+
+
+def test_the_planner_refuses_to_overwrite_a_baseline_it_could_not_read(tmp_path):
+    """Round-5 HIGH 2, end to end — the loss the raise exists to prevent.
+
+    A corrupt baseline read as ``{}`` inferred nothing (correct on its own) and
+    then let the commit replace the file with this poll's tasks. Everything the
+    unreadable file still held is gone at that point, and the Open API serves
+    open tasks only, so no later poll can re-derive it. The run said nothing and
+    exited 0.
+    """
+    path = tmp_path / "open_tasks.json"
+    path.write_text("{not json — a save interrupted mid-write", encoding="utf-8")
+    original = path.read_bytes()
+    errors: list[str] = []
+
+    records, commit = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path),
+        ticktick_api.OpenTaskPoll([{"id": "t9", "title": "open now"}], complete=True),
+        datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        errors,
+    )
+    commit()
+
+    assert records == []
+    assert path.read_bytes() == original, (
+        "the unreadable baseline was overwritten from an empty one — every "
+        "completion it still held is now unrecoverable"
+    )
+    assert len(errors) == 1
+    assert "open_tasks.json" in errors[0]
+
+
+def test_an_unreadable_baseline_is_loud_and_a_first_poll_is_not(tmp_path):
+    """The distinction the fix turns on, asserted as one pair.
+
+    "No baseline yet" is a legitimate, silent, every-first-run state. "A
+    baseline exists and cannot be read" is a fault that has to reach the run's
+    errors sink, because that is what makes the run exit 3 and notify — and a
+    timer is the only thing watching.
+    """
+    missing = tmp_path / "never-written.json"
+    first_run: list[str] = []
+    _, commit = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(missing),
+        ticktick_api.OpenTaskPoll([{"id": "t1"}], complete=True),
+        datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        first_run,
+    )
+    commit()
+    assert first_run == [], "a first-ever poll is normal and must stay quiet"
+    assert ticktick_api.load_state(missing).keys() == {"t1"}
+
+    broken = tmp_path / "open_tasks.json"
+    broken.write_text("[]", encoding="utf-8")
+    corrupt: list[str] = []
+    ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(broken),
+        ticktick_api.OpenTaskPoll([{"id": "t1"}], complete=True),
+        datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        corrupt,
+    )
+    assert len(corrupt) == 1
 
 
 def test_save_state_creates_its_directory(tmp_path):
@@ -1325,10 +1387,9 @@ def test_a_failed_save_leaves_the_previous_state_intact(tmp_path, monkeypatch):
     """The write goes to a temp file and is renamed into place, never in situ.
 
     A save interrupted partway through an in-place write leaves truncated JSON,
-    which costs the *next* poll its inference too — and by the poll after that
-    the baseline is fresh again, so every completion that happened in between is
-    gone for good. The rename is atomic, so the file is always either the old
-    poll or the new one.
+    which since round-5 HIGH 2 stops inference and the baseline advance dead
+    until a human clears it — every poll, not just the next one. The rename is
+    atomic, so the file is always either the old poll or the new one.
     """
     path = tmp_path / "open_tasks.json"
     first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
@@ -1438,12 +1499,13 @@ def test_disappeared_task_becomes_inferred_completion(tmp_path):
 
 
 def test_no_inference_on_first_ever_poll():
-    """An empty baseline can complete nothing — including after a corrupt read.
+    """An empty baseline can complete nothing.
 
-    ``load_state`` answers a missing or unreadable file with ``{}``, so this is
-    also the guarantee that a broken state file costs one poll's inference and
-    nothing else. Green from the moment ``infer_completions`` existed: it is a
-    regression guard on the direction of the diff, not a driver.
+    ``{}`` reaches here only from a path that resolves to nothing — the
+    first-ever poll. An unreadable baseline no longer arrives as ``{}`` at all
+    (round-5 HIGH 2); it raises before this is called. Green from the moment
+    ``infer_completions`` existed: a regression guard on the direction of the
+    diff, not a driver.
     """
     records = ticktick_api.infer_completions({}, current_ids={"t1"}, now=datetime.now(UTC))
     assert records == []

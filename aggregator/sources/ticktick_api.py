@@ -111,6 +111,16 @@ class WriteAttemptError(RuntimeError):
     """Raised when any non-GET request is attempted. See module docstring."""
 
 
+class StateUnreadableError(RuntimeError):
+    """The open-task baseline exists on disk and could not be read.
+
+    Its own type, and NOT an ``OSError``, so no ``except OSError`` anywhere in
+    the ingest path can quietly re-absorb it into "the filesystem hiccuped".
+    The one thing this must never become again is an empty baseline: see
+    :func:`load_state`.
+    """
+
+
 class TokenUnavailableError(OSError):
     """The API leg was configured but its secret could not be read.
 
@@ -811,7 +821,14 @@ class OpenTaskState(Protocol):
     """
 
     def load(self) -> dict[str, dict]:
-        """The previous poll's tasks keyed by id, or {} when there is none."""
+        """The previous poll's tasks keyed by id, or {} when there is none.
+
+        ``{}`` means "there is no baseline" and nothing else. An implementation
+        that HAS a baseline it cannot read must raise
+        :class:`StateUnreadableError` rather than answer ``{}`` — the caller
+        turns ``{}`` into "advance the baseline from scratch", which destroys
+        whatever the unreadable one still held.
+        """
         ...
 
     def save(self, tasks: Iterable[dict], now: datetime) -> None:
@@ -841,9 +858,10 @@ def save_state(path: Path, tasks: Iterable[dict], now: datetime) -> None:
     Written to a scratch file in the same directory and renamed into place, so
     an interrupted write cannot leave truncated JSON behind: the file is always
     either the previous poll or this one. That matters more here than the usual
-    tidiness argument — a corrupt baseline costs the *next* poll its inference,
-    and the poll after that starts from a fresh baseline, so every completion
-    that happened in the gap is unrecoverable.
+    tidiness argument — a corrupt baseline now stops inference and the baseline
+    advance dead until a human clears it (``load_state`` raises rather than
+    reading it as empty), so leaving truncated JSON behind costs every poll
+    until somebody notices, not just the next one.
 
     Keys come from ``_task_id`` — the module's single id rule, the one
     ``task_to_record`` mints stable_ids with — so a baseline key is always
@@ -879,34 +897,63 @@ def save_state(path: Path, tasks: Iterable[dict], now: datetime) -> None:
     scratch.replace(path)
 
 
+def _unreadable(path: Path, reason: str) -> StateUnreadableError:
+    """The one message an operator gets for a broken baseline. Says what to do.
+
+    Naming the recovery is the point: this is a permanent, every-run error
+    until a human acts, so an operator who cannot tell what action clears it
+    has been handed an alarm they can only learn to ignore.
+    """
+    return StateUnreadableError(
+        f"ticktick open-task baseline at {path} exists but cannot be read "
+        f"({reason}). REFUSING to treat it as an empty baseline: this poll's "
+        f"tasks would be written straight over it and every completion still "
+        f"pending in it would be unrecoverable, because the Open API serves "
+        f"open tasks only and can never report one again. Completion inference "
+        f"and the baseline advance are both skipped until this is resolved. "
+        f"Inspect the file; deleting it accepts the loss of whatever "
+        f"completions it still held and lets the next poll start a fresh "
+        f"baseline"
+    )
+
+
 def load_state(path: Path) -> dict[str, dict]:
-    """Return the previous poll's open tasks, keyed by task id, or {}.
+    """Return the previous poll's open tasks keyed by task id, {} for no file.
 
-    An absent file is the first-ever poll and is silent. Anything else — a
-    half-written file, a wrong shape, an unreadable path — costs one poll's
-    worth of inference and then self-heals, because this is a cache and failing
-    the whole ingest over it would be worse than the gap.
+    THE ABSENT FILE AND THE BROKEN FILE ARE OPPOSITE ANSWERS, and collapsing
+    them is the defect this signature exists to prevent. A path that resolves to
+    NOTHING is the first-ever poll: legitimate, silent, ``{}``. Anything that is
+    there and could not be turned into a baseline — a half-written file, a wrong
+    shape, undecodable bytes, a read this process is not permitted — RAISES.
 
-    It does not self-heal *quietly*, though. An empty return is
-    indistinguishable from a first poll, so a file that stays corrupt would go
-    on losing every completion with nothing to notice. WARNING is deliberate:
-    nothing under ``aggregator/`` configures logging, so ``logging.lastResort``
-    is the only thing that prints and anything quieter reaches nobody.
+    The line is drawn at "is anything there to lose", not at the exception's
+    name. ``NotADirectoryError`` joins ``FileNotFoundError`` on the quiet side
+    because an ancestor component being a plain file means no baseline exists at
+    that path or ever did, so starting fresh destroys nothing (and the save that
+    follows fails on its own, loudly). ``IsADirectoryError`` does not: something
+    is occupying the baseline path and this cannot say what.
+
+    It used to log a warning and return ``{}`` for both, which reads as "there
+    is no baseline". The caller's very next act is to write this poll as the new
+    baseline, so the unreadable file was replaced from an empty state and every
+    completion still pending in it was destroyed — on a run that exited 0 and
+    notified nobody. Losing the file costs one poll's inference and is
+    recoverable; overwriting it is not, and the Open API cannot re-serve a
+    completed task to make it good.
+
+    A log line was never going to be enough here. Nothing under ``aggregator/``
+    configures logging, and even at ``logging.lastResort``'s WARNING an
+    unattended timer run has nobody reading stderr. Raising is what puts this in
+    the run's ``errors``, which is what makes it exit 3 and notify.
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return {}
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
-        log.warning("ticktick state unreadable at %s (%s); starting fresh", path, e)
-        return {}
+        raise _unreadable(path, f"{type(e).__name__}: {e}") from e
     if not isinstance(data, dict):
-        log.warning(
-            "ticktick state at %s is a %s, not an id->task map; starting fresh",
-            path,
-            type(data).__name__,
-        )
-        return {}
+        raise _unreadable(path, f"it holds a {type(data).__name__}, not an id->task map")
     return data
 
 
@@ -1092,7 +1139,21 @@ def plan_open_task_reconcile(
         _note(errors, INCOMPLETE_POLL_NOTE)
         return [], lambda: None
 
-    previous = state.load()
+    try:
+        previous = state.load()
+    except StateUnreadableError as e:
+        # Caught HERE rather than left to propagate, and that placement is the
+        # whole fix. Propagating would take the CSV leg's 1302 backup rows out
+        # with it (``_api_candidates`` calls this planner outside its try), and
+        # swallowing it would put us back where we started. So: recorded in the
+        # run's sink, which is what makes the run exit 3 and notify, and handed
+        # back with a commit that DOES NOTHING — the baseline is not advanced,
+        # so the file survives for a human to look at. That is the asymmetry
+        # this turns on: losing the file costs one poll's inference and is
+        # recoverable, overwriting it is permanent.
+        _note(errors, str(e))
+        return [], lambda: None
+
     records = infer_completions(previous, _open_task_ids(tasks), now, errors)
 
     def commit() -> None:
