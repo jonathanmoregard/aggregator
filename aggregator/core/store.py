@@ -580,7 +580,17 @@ class Store:
                     subject    = excluded.subject,
                     body       = excluded.body,
                     tags       = excluded.tags,
-                    updated_at = excluded.updated_at,
+                    -- COALESCE, not a plain overwrite: a re-observation that
+                    -- carries NO timestamp must not erase the one already
+                    -- stored. ticktick is where this bites — a task payload
+                    -- with none of completedTime/modifiedTime/createdTime
+                    -- yields updated_at=None, and the merge lets the fresher
+                    -- API observation win, so a NULL landed on top of the real
+                    -- date the CSV leg parsed. The row then drops out of every
+                    -- date query while looking perfectly healthy, and only a
+                    -- WHOLE batch being dateless trips the API tripwire, so a
+                    -- partially-dated batch degrades in silence.
+                    updated_at = COALESCE(excluded.updated_at, records.updated_at),
                     extra      = excluded.extra
                 """,
                 (
@@ -670,7 +680,17 @@ class Store:
                     subject    = excluded.subject,
                     body       = excluded.body,
                     tags       = excluded.tags,
-                    updated_at = excluded.updated_at,
+                    -- COALESCE, not a plain overwrite: a re-observation that
+                    -- carries NO timestamp must not erase the one already
+                    -- stored. ticktick is where this bites — a task payload
+                    -- with none of completedTime/modifiedTime/createdTime
+                    -- yields updated_at=None, and the merge lets the fresher
+                    -- API observation win, so a NULL landed on top of the real
+                    -- date the CSV leg parsed. The row then drops out of every
+                    -- date query while looking perfectly healthy, and only a
+                    -- WHOLE batch being dateless trips the API tripwire, so a
+                    -- partially-dated batch degrades in silence.
+                    updated_at = COALESCE(excluded.updated_at, records.updated_at),
                     extra      = excluded.extra
                 """,
                 (

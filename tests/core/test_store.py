@@ -852,3 +852,76 @@ def test_existing_ids_rejects_a_table_not_on_the_allowlist(tmp_data_home):
     s.migrate()
     with pytest.raises(ValueError, match="unknown table"):
         s.existing_ids("records; DROP TABLE records", ["x"])
+
+
+# --- a re-observation must not erase a timestamp it does not carry --------
+#
+# Round-1 MEDIUM: ``ON CONFLICT ... updated_at = excluded.updated_at`` let a
+# record with no timestamp overwrite a real one. ticktick is where it bites: a
+# task payload carrying none of completedTime/modifiedTime/createdTime yields
+# ``updated_at=None``, and the merge lets the fresher API observation win, so
+# a NULL landed on the date the CSV leg had parsed. ``_warn_no_timestamps``
+# only fires when the WHOLE batch is dateless, so a partially-dated batch
+# degrades every date query it touches in complete silence.
+
+
+def _dated(sid: str, created=None, updated=None) -> Record:
+    return Record(
+        stable_id=sid,
+        source="ticktick",
+        subject="task",
+        body="body",
+        created_at=created,
+        updated_at=updated,
+    )
+
+
+def _dates(store: Store, sid: str) -> tuple[str | None, str | None]:
+    row = store._c().execute(
+        "SELECT created_at, updated_at FROM records WHERE stable_id = ?", (sid,)
+    ).fetchone()
+    return row["created_at"], row["updated_at"]
+
+
+REAL_TS = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+
+
+def test_a_dateless_reobservation_does_not_null_a_real_updated_at(tmp_data_home):
+    s = Store()
+    s.migrate()
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    s.upsert([_dated("ticktick:t1")])  # API leg won the merge, carrying nothing
+
+    _, updated = _dates(s, "ticktick:t1")
+    assert updated == REAL_TS.isoformat()
+
+
+def test_a_real_updated_at_still_overwrites_an_older_one(tmp_data_home):
+    """The guard must not freeze the column: a genuine newer observation is
+    the normal case and has to land."""
+    s = Store()
+    s.migrate()
+    newer = datetime(2026, 8, 1, tzinfo=UTC)
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=newer)])
+
+    _, updated = _dates(s, "ticktick:t1")
+    assert updated == newer.isoformat()
+
+
+def test_a_dateless_reobservation_survives_the_rebuild_write_path_too(
+    tmp_data_home,
+):
+    """``upsert`` and ``_do_write_records`` are two copies of the same SQL and
+    must not drift; the rebuild path deletes first, so this pins the INSERT
+    half rather than the conflict half."""
+    s = Store()
+    s.migrate()
+
+    s.rebuild_and_upsert("ticktick", [_dated("ticktick:t1", updated=REAL_TS)])
+    s.upsert([_dated("ticktick:t1")])
+
+    _, updated = _dates(s, "ticktick:t1")
+    assert updated == REAL_TS.isoformat()
