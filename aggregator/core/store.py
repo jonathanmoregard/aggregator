@@ -387,9 +387,35 @@ class Store:
         ``rebuild_and_upsert_entities`` can nest the writes under its
         SAVEPOINT (COMMIT inside a savepoint releases it, which then breaks
         the surrounding RELEASE).
+
+        A batch that raises part-way through is ROLLED BACK. sqlite3 opens an
+        implicit transaction before the first DML and holds it until someone
+        ends it; without this, the rows written before the raise sat pending
+        on the shared connection and the NEXT writer's COMMIT published them.
+        They land while every count that described them was discarded with the
+        exception — rows in the store that no report ever mentioned.
+
+        Only when this call owns the transaction. Under ``_commit=False`` the
+        caller holds a SAVEPOINT and does its own ``ROLLBACK TO SAVEPOINT``; a
+        connection-wide rollback here would destroy the savepoint it is about
+        to release.
         """
         self._ensure_writable()
         c = self._c()
+        try:
+            self._do_write_entities(c, entities)
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    @staticmethod
+    def _do_write_entities(
+        c: sqlite3.Connection, entities: Iterable[SessionEntity]
+    ) -> None:
+        """The entity write loop. Transaction handling belongs to the caller."""
         for e in entities:
             if isinstance(e, SessionRow):
                 c.execute(
@@ -461,8 +487,6 @@ class Store:
                 )
             else:
                 raise TypeError(f"unknown entity type: {type(e)!r}")
-        if _commit:
-            c.commit()
 
     def rebuild_and_upsert_entities(
         self,
@@ -563,67 +587,19 @@ class Store:
 
         Idempotent per ``stable_id``: re-upsert of the same ID overwrites the
         row (INSERT ... ON CONFLICT DO UPDATE); a fresh ID inserts a new row.
+
+        A batch that raises part-way through is ROLLED BACK, for the same
+        reason as ``upsert_entities`` — the rows written before the raise
+        would otherwise sit in the implicit transaction and be committed by
+        the next writer, uncounted by any report.
         """
         self._ensure_writable()
         c = self._c()
-        for r in records:
-            scrubbed_body = scrub(r.body).text
-            scrubbed_subject = scrub(r.subject).text
-            c.execute(
-                """
-                INSERT INTO records(
-                    stable_id, source, subject, body, tags,
-                    created_at, updated_at, extra
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(stable_id) DO UPDATE SET
-                    subject    = excluded.subject,
-                    body       = excluded.body,
-                    tags       = excluded.tags,
-                    -- Existing value first, so a creation time never moves
-                    -- once known — that is why created_at was left out of
-                    -- this SET list originally. Omitting it entirely went too
-                    -- far: a row first written dateless kept its NULL forever,
-                    -- including after ticktick's CREATED_FIELD is corrected,
-                    -- which breaks the tripwire's promise that fixing the
-                    -- field names also repairs the records it already wrote.
-                    created_at = COALESCE(records.created_at, excluded.created_at),
-                    -- COALESCE, not a plain overwrite: a re-observation that
-                    -- carries NO timestamp must not erase the one already
-                    -- stored. ticktick is where this bites — a task payload
-                    -- with none of completedTime/modifiedTime/createdTime
-                    -- yields updated_at=None, and the merge lets the fresher
-                    -- API observation win, so a NULL landed on top of the real
-                    -- date the CSV leg parsed. The row then drops out of every
-                    -- date query while looking perfectly healthy, and only a
-                    -- WHOLE batch being dateless trips the API tripwire, so a
-                    -- partially-dated batch degrades in silence.
-                    updated_at = COALESCE(excluded.updated_at, records.updated_at),
-                    extra      = excluded.extra
-                """,
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    json.dumps(r.tags),
-                    r.created_at.isoformat() if r.created_at else None,
-                    r.updated_at.isoformat() if r.updated_at else None,
-                    json.dumps(r.extra, default=str),
-                ),
-            )
-            c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
-            c.execute(
-                "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    " ".join(r.tags),
-                ),
-            )
+        try:
+            self._do_write_records(c, list(records))
+        except BaseException:
+            c.rollback()
+            raise
         c.commit()
 
     def rebuild(self, source: str) -> None:
