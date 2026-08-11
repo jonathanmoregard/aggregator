@@ -103,6 +103,24 @@ DEFAULT_STALE_AFTER_DAYS = 14
 # a 16% shrink, sailed through the guard, exited 0, and destroyed all 160.
 SESSIONS_REBUILD_ORIGINS = ("claude-code",)
 
+# Record-shaped sources whose ``--rebuild`` is refused, and why.
+#
+# --rebuild adds exactly one thing over a plain ingest: it DELETEs the rows a
+# re-scan did not produce. For a source whose stored rows are strictly a
+# superset of what any future scan can produce, that DELETE can only ever
+# destroy data — there is no state it can usefully correct.
+REBUILD_UNSUPPORTED_SOURCES: dict[str, str] = {
+    "ticktick": (
+        "its stored rows include api-inferred-complete tasks that nothing can "
+        "regenerate. The Open API serves OPEN tasks only and reports a "
+        "completion exactly once, as a disappearance between two polls, so a "
+        "completed task is never in a poll again; and the CSV backups that "
+        "would confirm it are a manual export whose only surviving copy is "
+        "the local archive. A rebuild that shrinks the source by under 20% "
+        "clears the shrink guard silently and takes those rows with it."
+    ),
+}
+
 
 def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
     """True when the shrink from ``existing`` to ``new`` exceeds the guard.
@@ -341,6 +359,14 @@ def _rebuild_refusal(name: str, src: Any) -> str | None:
             f"wholesale and this source's export archive is the only copy of "
             f"them. Re-run without --rebuild (ingest is an idempotent upsert "
             f"per session/observation id)."
+        )
+    reason = REBUILD_UNSUPPORTED_SOURCES.get(name)
+    if reason is not None:
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: "
+            f"{reason} Re-run without --rebuild (ingest is an idempotent "
+            f"upsert per stable_id, so a re-scan already overwrites every row "
+            f"it can produce)."
         )
     return None
 
