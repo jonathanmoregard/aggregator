@@ -258,6 +258,19 @@ class SessionsSource:
 
     name = "sessions"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild`` — why ``--rebuild`` is allowed here.
+
+        ``~/.claude/projects`` is written by Claude Code on this machine and
+        the scan reads it whole. The DELETE is additionally SCOPED to the
+        ``claude-code`` origin (``cli.SESSIONS_REBUILD_ORIGINS``), so the
+        vendor-export sessions sharing these tables are out of its reach.
+        """
+        return (
+            "~/.claude/projects, written by Claude Code on this machine; the "
+            "rebuild is scoped to the claude-code origin it can regenerate"
+        )
+
     def __init__(self, projects_root: str | None = None):
         self.projects_root = Path(
             projects_root or os.path.expanduser("~/.claude/projects")

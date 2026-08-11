@@ -60,7 +60,12 @@ from aggregator.mcp import (
 from aggregator.mcp import (
     aggregator_query as _mcp_query,
 )
-from aggregator.sources.base import ObservationRow, ReadsManualExport, SessionRow
+from aggregator.sources.base import (
+    ObservationRow,
+    ReadsManualExport,
+    SessionRow,
+    SupportsRebuild,
+)
 from aggregator.sources.chatgpt import ChatGPTSource
 from aggregator.sources.claude_web import ClaudeWebSource
 from aggregator.sources.dropbox import DropboxSource
@@ -454,6 +459,17 @@ def _cmd_ingest_entities(
 def _rebuild_refusal(name: str, src: Any) -> str | None:
     """Why ``--rebuild`` is refused for this source, or None if it is allowed.
 
+    REFUSAL IS THE DEFAULT. A source is allowed the destructive path only if it
+    declares ``sources.base.SupportsRebuild``; everything below that is a more
+    specific, better-worded refusal for a case we can name. Round 3: the checks
+    used to be the whole rule, so they only ever caught evidence AGAINST a
+    rebuild and a source that declared nothing at all — the normal state of a
+    source whose author never read this function — got the DELETE. Measured on
+    a fresh record-shaped source: 150 stored, 140 re-scanned, 10 last-copy rows
+    deleted, ``added=0 updated=140 skipped=0 errors=0``, exit 0. Forgetting a
+    declaration now costs a refusal an operator can read, which is recoverable;
+    the old default was not.
+
     CALLED BEFORE THE SOURCE IS ITERATED, and that ordering is the point.
     ``_cmd_ingest`` used to list the iterator first and only then decide
     whether the rebuild was permitted or whether a guard refused it — but
@@ -506,6 +522,22 @@ def _rebuild_refusal(name: str, src: Any) -> str | None:
             f"wholesale and only the sessions source can regenerate the origin "
             f"it is scoped to. Re-run without --rebuild (ingest is an "
             f"idempotent upsert per session/observation id)."
+        )
+    if not isinstance(src, SupportsRebuild):
+        # THE DEFAULT, and it is deliberately the last word rather than the
+        # first: the checks above produce a better message for a case we can
+        # name, and this catches everything else — including the case that
+        # matters most, a source nobody has thought about yet.
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: it does "
+            f"not declare that a re-scan reproduces everything the DELETE "
+            f"would remove. --rebuild DELETEs every row the re-scan did not "
+            f"produce, so a source whose stored rows outlive its current input "
+            f"silently destroys the difference. Re-run without --rebuild "
+            f"(ingest is an idempotent upsert, so a re-scan already overwrites "
+            f"every row it can produce). If this source really can regenerate "
+            f"its whole population, give it a rebuild_input() saying what keeps "
+            f"its input current (sources.base.SupportsRebuild)."
         )
     return None
 

@@ -29,6 +29,11 @@ def _store(tmp_path) -> Store:
 class _StatefulEntitySource:
     """An entity source whose iteration has a side effect it cannot undo."""
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
+
     def __init__(self, name: str) -> None:
         self.name = name
         self.iterated = 0
@@ -57,6 +62,11 @@ def name_to_origin(name: str) -> str:
 
 
 class _StatefulRecordSource:
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
+
     def __init__(self, name: str) -> None:
         self.name = name
         self.iterated = 0

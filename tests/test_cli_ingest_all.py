@@ -75,6 +75,11 @@ class _ExportAdapter(_FakeAdapter):
 class _RecordSource:
     """A single-source (non-adapter) stub for the `ingest <name>` path."""
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
+
     def __init__(self, name: str) -> None:
         self.name = name
 

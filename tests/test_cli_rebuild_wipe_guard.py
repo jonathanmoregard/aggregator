@@ -35,6 +35,11 @@ class _StubSource:
 
     name = "github"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
+
     def __init__(self, records: list[Record], errors: list[str] | None = None):
         self._records = list(records)
         self._errors = list(errors or [])

@@ -356,6 +356,15 @@ class GitHubSource:
 
     name = "github"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild`` — why ``--rebuild`` is allowed here.
+
+        A live API. Every PR and issue the store holds is still served by
+        ``gh api``, so a re-scan reproduces the whole population and a row it
+        drops really has gone from GitHub.
+        """
+        return "the GitHub API via `gh api`, which serves the whole history live"
+
     def __init__(
         self,
         _scope_fetcher: Callable[[], list[str]] = _default_scope_fetcher,

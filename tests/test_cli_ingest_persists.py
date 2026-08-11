@@ -27,6 +27,11 @@ class _StubRecordSource:
 
     name = "github"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
+
     def __init__(self, records: list[Record]):
         self._records = records
 
@@ -120,6 +125,11 @@ class _StubEntitySource:
     """Yields SessionRow + ObservationRow entities via iter_entities."""
 
     name = "sessions"
+
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
 
     def __init__(self, entities):
         self._entities = list(entities)

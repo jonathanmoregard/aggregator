@@ -76,6 +76,15 @@ class DropboxSource:
 
     name = "dropbox"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild`` — why ``--rebuild`` is allowed here.
+
+        The Dropbox client keeps this tree current continuously; the source
+        walks it live. A row the re-scan does not reproduce is a file that is
+        genuinely gone from the tree, which is what the DELETE should mean.
+        """
+        return "a local Dropbox tree the Dropbox client keeps synced continuously"
+
     def __init__(
         self,
         root: str | os.PathLike[str] | None = None,
