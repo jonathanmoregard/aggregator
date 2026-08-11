@@ -187,13 +187,20 @@ class OpenTaskPoll:
     and can therefore never contradict the inference. Only a manual CSV export
     could.
 
-    ``complete is False`` means "some of what is open was not observed", from
-    any cause: a project whose fetch failed, a project the listing gave with no
-    usable id, or task entries dropped for being the wrong shape. It does NOT
-    cover the Inbox, which ``GET /open/v1/project`` never lists at all — that
-    gap is permanent, known and reported separately by ``_note_inbox_gap``;
-    folding it in here would mean ``complete`` was False on every healthy poll
-    and inference would be dead forever.
+    ``complete is False`` means "some of what is open MAY not have been
+    observed", from any cause: an empty project listing, a project whose fetch
+    failed, a project the listing gave with no usable id, a project whose
+    payload carried no ``tasks`` key at all, or task entries dropped for being
+    the wrong shape. The bar is deliberately "may": the flag guards an
+    irreversible act, so anything this module cannot positively tell apart from
+    a missed task counts as one.
+
+    It does NOT cover the Inbox, which ``GET /open/v1/project`` never lists at
+    all — that gap is permanent, known and reported separately by
+    ``_note_inbox_gap``; folding it in here would mean ``complete`` was False on
+    every healthy poll and inference would be dead forever. Nor does a ``tasks``
+    key that is present and EMPTY, which is a project answering "nothing open
+    here" and is a complete view of it.
     """
 
     tasks: list[dict]
@@ -215,10 +222,41 @@ def _project_tasks(
     A dropped entry makes the poll INCOMPLETE, not merely noisy: the dropped
     task is open, it is now missing from the poll, and that is the exact input
     the completion inference misreads.
+
+    So does an ABSENT ``tasks`` key, which is the distinction this function
+    turns on. See below.
     """
     raw = data.get("tasks")
     if raw is None:
-        return [], True
+        # NOT "this project has nothing open". A project with nothing in it
+        # answers ``"tasks": []`` — a key that is PRESENT and empty, which falls
+        # through to the loop below and is a complete, understood view of that
+        # project. An ABSENT key is the payload declining to say anything about
+        # this project's tasks at all, and the causes are schema drift, a
+        # partial 200, pagination this client does not implement, and a project
+        # the token's scope will not fully serve. Nothing here can tell those
+        # apart from one another, and — the point — nothing here can tell any of
+        # them from a genuinely empty project either, because the one signal
+        # that would (an empty list) is exactly what is missing. Undecidable, so
+        # the answer has to be the safe one.
+        #
+        # Reported complete, this armed the precise input the completion
+        # inference misreads: every open task in the project is absent from the
+        # poll, gets recorded as finished, and the baseline advances past it.
+        # The Open API serves open tasks only and can therefore never contradict
+        # that; only a manual CSV export could.
+        _note(
+            errors,
+            f"{label}: the payload carried no 'tasks' key at all, so this "
+            f"project's open tasks were NOT observed. Treating the poll as "
+            f"incomplete rather than as a project with nothing open, which "
+            f"would infer a completion for every open task in it. An empty "
+            f"project answers with an empty 'tasks' LIST; if TickTick ever "
+            f"starts omitting the key for empty projects instead, this fires "
+            f"on every healthy poll and the check in _project_tasks is what "
+            f"has to change",
+        )
+        return [], False
     if not isinstance(raw, list):
         raise ValueError(f"unexpected tasks payload: {type(raw).__name__}")
     tasks = []
@@ -260,6 +298,29 @@ def poll_open_tasks(token: str, errors: list[str] | None = None) -> OpenTaskPoll
     tasks: list[dict] = []
     names: list[str] = []
     complete = True
+    if not projects:
+        # An empty listing is the purest form of the same defect: nothing was
+        # observed, so with ``complete`` True every task in the baseline reads
+        # as finished at once, the baseline advances past all of them, and the
+        # run exits 0. And it is not distinguishable from a token whose scope
+        # stopped covering the user's projects, which answers 200 with [] rather
+        # than 401.
+        #
+        # The cost of choosing incomplete: an account whose only tasks live in
+        # the Inbox — which ``GET /open/v1/project`` never lists (see the module
+        # docstring) — now reports this on every poll. It has nothing to infer
+        # either way, because a poll that walks no projects never puts anything
+        # in the baseline to diff against, so the choice costs that account
+        # noise and costs everyone else a permanent, uncontradictable data loss.
+        _note(
+            errors,
+            "ticktick api: /project returned an empty listing, so this poll "
+            "observed no projects and therefore no open tasks. Not treated as "
+            "a complete view: it is indistinguishable from a token whose scope "
+            "no longer covers them, and calling it complete would record every "
+            "task in the open-task baseline as completed in one go",
+        )
+        complete = False
     for project in projects:
         project_id = project.get("id") if isinstance(project, dict) else None
         if not project_id:
@@ -883,14 +944,20 @@ def infer_completions(
         # and genuinely empty. That is a real state and the inference runs —
         # but not in silence, because it is also what a TickTick-side outage
         # that answers 200-with-no-tasks would look like.
-        log.warning(
-            "ticktick api: the poll returned no open tasks at all while %d were open last "
-            "time, so all %d are being recorded as inferred completions. If TickTick or the "
-            "network was down this is an outage, not %d completions; the next successful "
-            "poll re-observes them as open and corrects the index",
-            len(previous),
-            len(previous),
-            len(previous),
+        #
+        # ``_note``, not ``log.warning``: the caller is about to commit the
+        # advanced baseline, which is what makes every one of these
+        # disappearances unrepeatable. A log line left the whole open-task list
+        # being written off as completed on a run that exited 0 and notified
+        # nobody — the same gap as the two cases above, in the one place where
+        # the blast radius is every task at once.
+        _note(
+            errors,
+            f"ticktick api: the poll returned no open tasks at all while "
+            f"{len(previous)} were open last time, so all {len(previous)} are being "
+            f"recorded as inferred completions. If TickTick or the network was down "
+            f"this is an outage, not {len(previous)} completions; the next successful "
+            f"poll re-observes them as open and corrects the index",
         )
     records = []
     unusable: list[str] = []

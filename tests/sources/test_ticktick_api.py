@@ -310,7 +310,11 @@ def test_poll_open_tasks_records_malformed_project_data(monkeypatch):
         ({"t1": {"id": "t1"}}, True),  # tasks as an object
         (["t1", "t2"], True),  # list of strings
         ("t1", True),  # a bare string
-        (None, False),  # explicitly null
+        # Explicitly null. Round-5 HIGH 1 moved this from (False) to (True):
+        # ``"tasks": null`` says no more about what is open in the project than
+        # omitting the key does, and a JSON null is not the empty LIST that a
+        # project with nothing open answers with.
+        (None, True),
         (12, True),  # a number
     ],
 )
@@ -340,6 +344,16 @@ def test_poll_open_tasks_survives_a_malformed_tasks_value(monkeypatch, bad_tasks
 
 
 def test_poll_open_tasks_tasks_key_missing_entirely(monkeypatch):
+    """Round-5 HIGH 1. A 200 with no ``tasks`` key is NOT "nothing is open here".
+
+    An empty project answers with ``"tasks": []`` — present and empty, a
+    complete and understood view. An ABSENT key is the payload declining to say
+    anything about this project's tasks at all: schema drift, a partial 200, or
+    a scope this token cannot read. None of those are distinguishable from one
+    another, and every one of them means the project's open tasks were not
+    observed, so the poll is incomplete and must say so.
+    """
+
     def fake_request(method, url, token, timeout=30):
         if url.endswith("/project"):
             return [{"id": "p1", "name": "Work"}]
@@ -349,8 +363,105 @@ def test_poll_open_tasks_tasks_key_missing_entirely(monkeypatch):
     errors: list[str] = []
     poll = ticktick_api.poll_open_tasks("tok", errors=errors)
     assert poll.tasks == []
+    assert poll.complete is False
+    assert len(errors) == 1
+    assert "tasks" in errors[0] and "p1" in errors[0]
+
+
+def test_a_tasks_key_that_is_present_and_empty_is_still_a_complete_view(monkeypatch):
+    """The other side of the same rule, and the one that keeps inference alive.
+
+    If an empty ``tasks`` list also cleared ``complete`` then a healthy account
+    with one empty project would infer nothing forever, which is the failure
+    the Inbox note is careful not to cause. Present-and-empty is an answer.
+    """
+
+    def fake_request(method, url, token, timeout=30):
+        if url.endswith("/project"):
+            return [{"id": "p1", "name": "Work"}, {"id": "p2", "name": "Home"}]
+        if url.endswith("/project/p1/data"):
+            return {"project": {"id": "p1"}, "tasks": []}
+        return {"tasks": [_open_task(id="t2", projectId="p2")]}
+
+    monkeypatch.setattr(ticktick_api, "_request", fake_request)
+    errors: list[str] = []
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert [t["id"] for t in poll.tasks] == ["t2"]
     assert poll.complete is True
     assert errors == []
+
+
+def test_a_project_with_no_tasks_key_does_not_bury_its_open_tasks(monkeypatch, tmp_path):
+    """Round-5 HIGH 1, end to end — the damage the flag exists to prevent.
+
+    p1 answers 200 with no ``tasks`` key while p2 serves real tasks. t1 was
+    open in p1 last poll. With ``complete`` wrongly True the planner runs the
+    inference over a view that never saw p1, records t1 as completed, and arms
+    the advanced baseline — and the Open API serves open tasks only, so no
+    later poll can ever disagree. Only a manual CSV export could.
+    """
+    path = tmp_path / "open_tasks.json"
+    first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    ticktick_api.save_state(path, [_open_task(id="t1", projectId="p1")], first)
+
+    def fake_request(method, url, token, timeout=30):
+        if url.endswith("/project"):
+            return [{"id": "p1", "name": "Work"}, {"id": "p2", "name": "Home"}]
+        if url.endswith("/project/p1/data"):
+            return {"project": {"id": "p1"}}  # 200, and no ``tasks`` key at all
+        return {"tasks": [_open_task(id="t2", projectId="p2")]}
+
+    monkeypatch.setattr(ticktick_api, "_request", fake_request)
+    errors: list[str] = []
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    records, commit = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path), poll, second, errors
+    )
+    commit()
+
+    assert records == [], "a project we never saw had its open tasks marked completed"
+    assert ticktick_api.load_state(path).keys() == {"t1"}, "the baseline was armed anyway"
+    assert errors
+
+
+def test_an_empty_project_listing_is_not_a_complete_view(monkeypatch):
+    """Round-5 HIGH 1. ``[]`` from ``/project`` is indistinguishable from a
+    token whose scope stopped covering them, so it cannot claim completeness.
+
+    Reported rather than inferred-over: with ``complete`` True this is the
+    purest form of the bug — zero tasks observed, every previously-open task
+    recorded as finished, baseline armed, exit 0. The cost of the choice is an
+    account whose only tasks live in the (never-listed) Inbox: it polls
+    nothing, so it has nothing to infer, and now says so out loud.
+    """
+    monkeypatch.setattr(
+        ticktick_api, "_request", lambda method, url, token, timeout=30: []
+    )
+    errors: list[str] = []
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert poll.tasks == []
+    assert poll.complete is False
+    assert len(errors) == 1
+
+
+def test_a_wholesale_disappearance_reaches_the_runs_errors_sink():
+    """Round-5 HIGH 1, sibling case. Every open task vanishing at once while the
+    poll calls itself complete is an outage shape, and the inference that
+    follows arms an irreversible baseline. A ``log.warning`` left that on an
+    exit-0 run, so it never reached the notifier."""
+    previous = {
+        "t1": {"task": {"id": "t1", "title": "A"}, "last_seen": "2026-08-07T12:00:00+00:00"},
+    }
+    errors: list[str] = []
+
+    records = ticktick_api.infer_completions(
+        previous, current_ids=set(), now=datetime(2026, 8, 8, tzinfo=UTC), errors=errors
+    )
+
+    assert [r.stable_id for r in records] == ["ticktick:t1"]
+    assert len(errors) == 1
+    assert "outage" in errors[0]
 
 
 def test_poll_open_tasks_skips_projects_without_id(monkeypatch):
@@ -1405,8 +1516,11 @@ def test_a_garbled_state_entry_reaches_the_runs_errors_sink():
         errors=errors,
     )
 
-    assert len(errors) == 1
-    assert "t1" in errors[0] and "t2" in errors[0]
+    # Two independent faults, both real: nothing at all came back this poll
+    # (round-5 HIGH 1) *and* neither baseline entry survived the conversion.
+    dropped = [e for e in errors if "DROPPED" in e]
+    assert len(dropped) == 1
+    assert "t1" in dropped[0] and "t2" in dropped[0]
 
 
 def test_the_reconcile_planner_forwards_the_errors_sink(tmp_path):
