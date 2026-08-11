@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from datetime import UTC, datetime
 from urllib import request
 from urllib.error import URLError
@@ -521,14 +523,84 @@ def _parse_api_dt(value: object, *, field: str = "timestamp", warn: bool = True)
     return None
 
 
-def resolve_token(token: str | None, token_file: str | None) -> str | None:
+def _read_env_file(path: str) -> dict[str, str]:
+    """Parse a ``KEY=VALUE`` env file, or return {} when there isn't one.
+
+    Deliberately mirrors ``~/.claude/todo/_envfile.py`` and the todo backend's
+    own reader — same comment handling, same quote stripping. A reader that
+    disagreed by one quote character would hand out a token that 401s, which
+    reads as an expired credential and sends the operator to re-authorize
+    something that was never broken.
+    """
+    from pathlib import Path
+
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+# The credential store shared with ``~/.claude/todo`` and router-agent's
+# add_task MCP. That backend owns the OAuth dance and writes each refreshed
+# access token back here, so this is where the live token is by definition;
+# a private copy would go stale the moment it refreshed.
+DEFAULT_ENV_FILE = os.path.expanduser("~/.config/todo/env")
+
+TOKEN_ENV_VAR = "TICKTICK_ACCESS_TOKEN"
+EXPIRY_ENV_VAR = "TICKTICK_TOKEN_EXPIRES_AT"
+
+# What a human must run to fix an expired token. This leg runs unattended from
+# a timer, so it cannot do the browser re-authorization itself.
+RELOGIN_COMMAND = "~/.claude/todo-add --login"
+
+
+def _reject_if_expired(expires_at: str | None, source: str) -> None:
+    """Raise when the accompanying expiry says the token is already dead.
+
+    Only advisory metadata: an absent or unparseable expiry is not an error,
+    because a token that still works must not be thrown away over a garbled
+    sidecar value. A *definitely* expired one is worth stopping for — otherwise
+    the failure surfaces as a 401 partway through the project walk, after the
+    run has already reported progress.
+    """
+    if not expires_at:
+        return
+    try:
+        deadline = int(expires_at)
+    except ValueError:
+        return
+    if deadline and deadline <= time.time():
+        raise TokenUnavailableError(
+            f"ticktick access token from {source} expired at "
+            f"{datetime.fromtimestamp(deadline, UTC).isoformat()}; "
+            f"re-authorize with `{RELOGIN_COMMAND}`"
+        )
+
+
+def resolve_token(
+    token: str | None, token_file: str | None, env_file: str | None = None
+) -> str | None:
     """Return the bearer token, or None when the API leg should be skipped.
 
+    Sources, in order: an explicit token, a token *file* (an agenix secret),
+    the process environment, then the shared ``~/.config/todo/env`` store that
+    the todo backend keeps current.
+
     An absent or empty token is a supported state, not an error: the source
-    falls back to CSV-only. That includes a present-but-empty secret file,
-    which is exactly how an agenix secret looks before the user has populated
-    it. An unreadable token FILE is different — the user asked for the API leg
-    and the secret is broken — so that raises :class:`TokenUnavailableError`.
+    falls back to CSV-only. An unreadable token FILE is different — the user
+    asked for the API leg and named a secret that is broken — so that raises
+    :class:`TokenUnavailableError`. An *empty* token file is neither: that is
+    exactly how the merged ``ticktick-api-token.age`` placeholder looks, and
+    short-circuiting on it would let the placeholder shadow a live credential
+    sitting in the shared store.
 
     A whitespace-only explicit token falls through to the file rather than
     shadowing it: treating it as "configured" silently skipped the API leg while
@@ -546,5 +618,16 @@ def resolve_token(token: str | None, token_file: str | None) -> str | None:
             raise TokenUnavailableError(
                 f"ticktick token file is unreadable: {token_file} ({e})"
             ) from e
-        return content or None
-    return None
+        if content:
+            return content
+    from_env = os.environ.get(TOKEN_ENV_VAR, "").strip()
+    if from_env:
+        _reject_if_expired(os.environ.get(EXPIRY_ENV_VAR), f"${TOKEN_ENV_VAR}")
+        return from_env
+    path = env_file or DEFAULT_ENV_FILE
+    values = _read_env_file(path)
+    shared = values.get(TOKEN_ENV_VAR, "").strip()
+    if not shared:
+        return None
+    _reject_if_expired(values.get(EXPIRY_ENV_VAR), path)
+    return shared

@@ -45,6 +45,23 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(ticktick_api, "_open", _forbidden)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_credentials(monkeypatch, tmp_path):
+    """No test in this file may read the developer's own TickTick token.
+
+    ``resolve_token`` falls back to the shared ``~/.config/todo/env`` store,
+    which on a developer machine holds a live write-scoped token. Without this,
+    "no token configured" tests would silently pass *because* a real token was
+    found, and the suite's result would depend on whose machine it ran on.
+    Tests that want an env file point ``DEFAULT_ENV_FILE`` at their own.
+    """
+    monkeypatch.setattr(
+        ticktick_api, "DEFAULT_ENV_FILE", str(tmp_path / "no-such-env")
+    )
+    monkeypatch.delenv("TICKTICK_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("TICKTICK_TOKEN_EXPIRES_AT", raising=False)
+
+
 def full_task(**over):
     """A plausible Open API Task object: every documented field, populated.
 
@@ -861,6 +878,155 @@ def test_resolve_token_empty_file_is_a_skip(tmp_path):
     token_file = tmp_path / "tok"
     token_file.write_text("\n", encoding="utf-8")
     assert ticktick_api.resolve_token(None, str(token_file)) is None
+
+
+# --- the shared ~/.config/todo/env credential store -------------------------
+#
+# The token is not this project's to own: ~/.claude/todo/backends/ticktick.py
+# already holds a TickTick OAuth client that writes a refreshed access token
+# back to ~/.config/todo/env, and router-agent's add_task MCP reads it from
+# there. A second copy in an agenix secret would go stale the moment that
+# backend refreshed, and the two would disagree with no way to tell which was
+# live. So this leg reads the same file instead of a private one.
+
+
+def _env_file(tmp_path, **pairs):
+    """Write a ``KEY=VALUE`` env file in the shared store's format."""
+    path = tmp_path / "env"
+    path.write_text(
+        "".join(f"{k}={v}\n" for k, v in pairs.items()), encoding="utf-8"
+    )
+    return str(path)
+
+
+def test_resolve_token_reads_the_shared_todo_env_file(tmp_path, monkeypatch):
+    """With nothing else configured, the shared store is the token's home."""
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN="from-shared-store"),
+    )
+    assert ticktick_api.resolve_token(None, None) == "from-shared-store"
+
+
+def test_resolve_token_strips_quotes_the_shared_store_may_carry(tmp_path, monkeypatch):
+    """The todo backend's own reader strips quotes, so this one must agree.
+
+    A token read as ``"abc"`` instead of ``abc`` produces a 401 that looks like
+    an expired credential, sending the operator to re-authorize a token that was
+    never broken.
+    """
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN='"quoted-token"  '),
+    )
+    assert ticktick_api.resolve_token(None, None) == "quoted-token"
+
+
+def test_resolve_token_ignores_comments_and_other_keys(tmp_path, monkeypatch):
+    path = tmp_path / "env"
+    path.write_text(
+        "# a comment\n"
+        "\n"
+        "TICKTICK_CLIENT_SECRET=not-the-token\n"
+        "TICKTICK_ACCESS_TOKEN=the-token\n"
+        "malformed-line-without-equals\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ticktick_api, "DEFAULT_ENV_FILE", str(path))
+    assert ticktick_api.resolve_token(None, None) == "the-token"
+
+
+def test_resolve_token_missing_shared_store_is_a_skip_not_an_error(tmp_path, monkeypatch):
+    """An absent shared store means "API leg not set up", which is supported."""
+    monkeypatch.setattr(
+        ticktick_api, "DEFAULT_ENV_FILE", str(tmp_path / "nope" / "env")
+    )
+    assert ticktick_api.resolve_token(None, None) is None
+
+
+def test_resolve_token_empty_agenix_file_falls_through_to_the_shared_store(
+    tmp_path, monkeypatch
+):
+    """The merged agenix placeholder must not shadow the real credential.
+
+    ``ticktick-api-token.age`` ships as a single newline, so before this the
+    empty read short-circuited to None and the API leg was skipped even with a
+    live token sitting in the shared store.
+    """
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN="from-shared-store"),
+    )
+    placeholder = tmp_path / "tok"
+    placeholder.write_text("\n", encoding="utf-8")
+    assert ticktick_api.resolve_token(None, str(placeholder)) == "from-shared-store"
+
+
+def test_resolve_token_prefers_the_environment_over_the_shared_store(
+    tmp_path, monkeypatch
+):
+    """A systemd unit passing the token in the environment wins over the file."""
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN="from-shared-store"),
+    )
+    monkeypatch.setenv("TICKTICK_ACCESS_TOKEN", "from-environment")
+    assert ticktick_api.resolve_token(None, None) == "from-environment"
+
+
+def test_resolve_token_expired_shared_token_raises_and_names_the_fix(
+    tmp_path, monkeypatch
+):
+    """An expired token must fail loudly, not 401 halfway through the walk.
+
+    This leg runs unattended from a timer and cannot do the browser
+    re-authorization the todo backend does, so the only useful thing it can do
+    is stop and say which command the human must run.
+    """
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(
+            tmp_path,
+            TICKTICK_ACCESS_TOKEN="stale",
+            TICKTICK_TOKEN_EXPIRES_AT="1000000000",  # 2001
+        ),
+    )
+    with pytest.raises(ticktick_api.TokenUnavailableError) as excinfo:
+        ticktick_api.resolve_token(None, None)
+    assert "todo-add --login" in str(excinfo.value)
+
+
+def test_resolve_token_unparseable_expiry_does_not_block_a_usable_token(
+    tmp_path, monkeypatch
+):
+    """Expiry is an optimization; a garbled one must not cost a working run."""
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(
+            tmp_path, TICKTICK_ACCESS_TOKEN="usable", TICKTICK_TOKEN_EXPIRES_AT="soon"
+        ),
+    )
+    assert ticktick_api.resolve_token(None, None) == "usable"
+
+
+def test_resolve_token_explicit_token_skips_the_expiry_check(tmp_path, monkeypatch):
+    """An explicitly passed token has no expiry metadata to check against."""
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(
+            tmp_path,
+            TICKTICK_ACCESS_TOKEN="stale",
+            TICKTICK_TOKEN_EXPIRES_AT="1000000000",
+        ),
+    )
+    assert ticktick_api.resolve_token("explicit", None) == "explicit"
 
 
 def test_resolve_token_unreadable_file_raises(tmp_path):
