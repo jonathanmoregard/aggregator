@@ -11,6 +11,8 @@ import contextlib
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from aggregator.core.store import SCHEMA_VERSION, Store
 from aggregator.sources.base import (
     ObservationRow,
@@ -827,3 +829,26 @@ def test_wal_files_land_in_db_dir(tmp_data_home):
     s.upsert_entities([_sess("sess-a"), _obs("o1", "sess-a", "hi")])
     db = Path(s.db_path)
     assert db.exists()
+
+
+def test_existing_ids_reports_which_primary_keys_are_already_stored(tmp_data_home):
+    """Batch existence probe. The import runner needs it to report REAL
+    added-vs-updated counts instead of ``added=len(items)``."""
+    s = Store()
+    s.migrate()
+    s.upsert([_rec("github:1", "github", "a", "b")])
+    s.upsert_entities([_sess("sess-a"), _obs("o1", "sess-a", "hi")])
+
+    assert s.existing_ids("records", ["github:1", "github:2"]) == {"github:1"}
+    assert s.existing_ids("sessions", ["sess-a", "sess-b"]) == {"sess-a"}
+    assert s.existing_ids("observations", ["o1", "o2"]) == {"o1"}
+    assert s.existing_ids("records", []) == set()
+
+
+def test_existing_ids_rejects_a_table_not_on_the_allowlist(tmp_data_home):
+    """Table name is interpolated into SQL, so it can only ever be one of
+    three literals — never caller-supplied text."""
+    s = Store()
+    s.migrate()
+    with pytest.raises(ValueError, match="unknown table"):
+        s.existing_ids("records; DROP TABLE records", ["x"])

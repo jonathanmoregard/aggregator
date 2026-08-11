@@ -76,6 +76,14 @@ SCHEMA_VERSION = 3
 # capabilities, and the MCP routing layer stay in lockstep.
 CHAT_ORIGINS = ("chatgpt", "claude-web")
 
+# Tables whose primary key ``existing_ids`` may probe, and that key's column.
+# Allowlist, not a hint: the table name is interpolated into SQL.
+_PK_BY_TABLE = {
+    "records": "stable_id",
+    "sessions": "session_id",
+    "observations": "obs_id",
+}
+
 
 class EmptyRebuildRefusedError(RuntimeError):
     """Raised by ``Store.rebuild_and_upsert`` when the incoming record list is
@@ -753,6 +761,41 @@ class Store:
                 "SELECT COUNT(*) AS n FROM records WHERE source = ?", (source,)
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    def existing_ids(self, table: str, ids: Iterable[str]) -> set[str]:
+        """Return the subset of ``ids`` already present in ``table``.
+
+        Read-only batch existence probe. Exists so an import sink can report
+        REAL added-vs-updated counts: both write paths are upserts, so after
+        the fact there is no way to tell a fresh row from an overwritten one,
+        and a summary that always says ``added=<batch size>`` is the bug
+        ``cli.py`` currently ships.
+
+        ``table`` is interpolated into the SQL (SQLite cannot parameterise an
+        identifier) and is therefore constrained to the three-entry allowlist
+        below — never caller-supplied text. The ids themselves are bound.
+        """
+        pk = _PK_BY_TABLE.get(table)
+        if pk is None:
+            raise ValueError(
+                f"unknown table {table!r}; expected one of {sorted(_PK_BY_TABLE)}"
+            )
+        id_list = list(ids)
+        if not id_list:
+            return set()
+        found: set[str] = set()
+        c = self._c()
+        # Chunked to stay under SQLITE_MAX_VARIABLE_NUMBER (999 on older
+        # builds) regardless of the caller's batch size.
+        for start in range(0, len(id_list), 500):
+            chunk = id_list[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = c.execute(
+                f"SELECT {pk} AS id FROM {table} WHERE {pk} IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            found.update(row["id"] for row in rows)
+        return found
 
     def probe_fts(self, text: str) -> None:
         """Run cheap MATCH probes to surface FTS5 syntax errors.
