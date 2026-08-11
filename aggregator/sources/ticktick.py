@@ -422,10 +422,16 @@ class TickTickSource:
         disappearance unrepeatable: the Open API serves OPEN tasks only, so the
         next poll cannot notice a completion it already advanced past.
 
-        Not calling it is safe and costs exactly one poll's inference — the
+        SKIPPING ONE CALL is safe and costs exactly one poll's inference: the
         next run diffs against the same baseline and infers the same
-        completions again. Calling it too early is the fault this exists to
-        prevent.
+        completions again. NEVER CALLING IT is a different thing and is not
+        safe — the baseline freezes, and a task created after the freeze was
+        never in it, so its later disappearance is invisible to every future
+        poll. That loss is permanent and unbounded, not one poll's worth. A
+        writing caller that holds this source must call this, or drive it
+        through ``run_imports`` / ``cli`` which do.
+
+        Calling it too EARLY is the fault this exists to prevent.
 
         Idempotent: the pending commit is cleared first, so a caller invoking
         it twice does not save twice, and a source whose poll found nothing

@@ -919,9 +919,12 @@ def plan_open_task_reconcile(
     recover it.
 
     So the caller gets the records and a ``commit`` it may only invoke once
-    those records have landed. Not calling it costs one poll's worth of
+    those records have landed. Skipping ONE commit costs one poll's worth of
     inference and nothing else: the next poll diffs against the same baseline
-    and infers the same completions again.
+    and infers the same completions again. Never committing at all is a
+    different and worse thing — the baseline freezes, a task created after the
+    freeze never enters it, and its later disappearance is therefore invisible
+    to every future poll. Do not read "safe to skip" as "optional".
 
     The load/diff/save ORDER remains the trap it always was — saving before
     loading overwrites the baseline with the current poll and inference is

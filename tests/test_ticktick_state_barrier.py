@@ -88,6 +88,14 @@ def _baseline(state_file) -> set[str]:
     return set(json.loads(state_file.read_text()))
 
 
+def _inferred(records) -> set[str]:
+    return {
+        r.stable_id
+        for r in records
+        if r.extra.get("provenance") == "api-inferred-complete"
+    }
+
+
 class _FailingStore(Store):
     """The sink/store failure the finding is about."""
 
@@ -238,6 +246,50 @@ def test_a_state_write_that_fails_after_the_records_landed_is_reported(
 
     assert rc == cli.EXIT_COMPLETED_WITH_ERRORS
     assert store.count_by_source("ticktick") == 2
+
+
+# -- round 3 W4: what "safe to skip" actually costs ------------------------
+
+
+def test_skipping_one_commit_costs_exactly_one_polls_inference(
+    tmp_path, state_file
+):
+    """Half of the docstring claim, and this half is true."""
+    source = _source(tmp_path, state_file)
+
+    first = _inferred(source.iter_records(None, errors=[]))  # no commit
+    second = _inferred(source.iter_records(None, errors=[]))
+
+    assert first == second == {"ticktick:t2"}
+
+
+def test_never_committing_loses_later_completions_permanently(
+    tmp_path, state_file, monkeypatch
+):
+    """The other half, which the docstring got wrong. A caller that NEVER
+    commits freezes the baseline; a task created after the freeze is never in
+    it, so its later disappearance is invisible to every future poll. That is
+    unbounded loss, not one poll's worth — the docstrings now say so."""
+    source = _source(tmp_path, state_file)
+
+    def _serve(*ids):
+        monkeypatch.setattr(
+            ticktick_api,
+            "fetch_open_tasks",
+            lambda token, errors=None: [{"id": i, "title": i} for i in ids],
+        )
+
+    _serve("t1", "t9")  # t9 is new, created after the frozen baseline
+    source.iter_records(None, errors=[])
+    _serve("t1")  # t9 completed
+    later = _inferred(source.iter_records(None, errors=[]))
+    later |= _inferred(source.iter_records(None, errors=[]))
+
+    assert "ticktick:t9" not in later, (
+        "if this ever passes, the barrier became optional and the docstrings "
+        "in port.py / ticktick.py / ticktick_api.py can drop the warning"
+    )
+    assert _baseline(state_file) == {"t1", "t2"}, "the baseline is frozen"
 
 
 # -- round 3 W3: a dropped baseline entry cannot exit 0 -------------------

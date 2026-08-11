@@ -150,6 +150,20 @@ class SupportsWriteBarrier(Protocol):
     Not a transaction and not a rollback — the sink's writes are already
     committed by then. It is the narrower guarantee that the adapter's own
     state cannot get ahead of them.
+
+    A WRITING CALLER MUST CALL IT. Skipping one call is cheap — the next run
+    re-derives the same advance — but a caller that never calls it freezes the
+    adapter's state, and for a source whose acquisition destroys its own
+    evidence that is unbounded loss, not one run's worth: TickTick's baseline
+    stops growing, so a task created after the freeze is never in it and its
+    later disappearance is invisible to every future poll. "Safe to skip" is
+    about one run, never about the contract.
+
+    The rules are asserted, not just described, in
+    ``tests/imports/test_write_barrier_contract.py``: every write path in this
+    repo is driven against a probe adapter that implements nothing but this
+    protocol, so a source that grows a barrier inherits the guarantees and a
+    regression in any call site fails there rather than in production.
     """
 
     def commit_after_write(self) -> None: ...
