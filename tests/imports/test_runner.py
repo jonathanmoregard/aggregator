@@ -331,6 +331,74 @@ def test_non_fatal_errors_are_drained_even_when_the_adapter_also_crashed():
     assert "/x/a.md: read failed" in errors
 
 
+# -- round 2 MEDIUM-3: isinstance gates on PRESENCE, not on shape ----------
+
+
+def test_a_drain_errors_that_returns_a_bare_string_is_not_shredded():
+    """THE finding. ``SupportsNonFatalErrors`` is ``runtime_checkable``, which
+    only checks that the method EXISTS — so an adapter returning ``str``
+    passes isinstance and ``errors.extend(a_string)`` appends one entry PER
+    CHARACTER, destroying the only operator-facing diagnostic the run has."""
+
+    class StringyErrors:
+        name = "stringy"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        def drain_errors(self):
+            return "ticktick token expired"
+
+    report = asyncio.run(run_imports([StringyErrors()], RecordingSink()))
+
+    errors = report.adapters["stringy"].errors
+    assert len(errors) == 1, f"the message was shredded into {len(errors)} pieces"
+    assert "ticktick token expired" in errors[0]
+    assert report.ok is False
+
+
+def test_a_drain_errors_that_returns_none_is_reported_as_a_fault():
+    """``None`` is the other shape that passes isinstance. Silently treating
+    it as "no errors" would hide whatever the adapter meant to report."""
+
+    class NoneErrors:
+        name = "nully"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        def drain_errors(self):
+            return None
+
+    report = asyncio.run(run_imports([NoneErrors()], RecordingSink()))
+
+    errors = report.adapters["nully"].errors
+    assert len(errors) == 1
+    assert "drain_errors" in errors[0]
+    assert "NoneType" in errors[0]
+
+
+def test_non_string_entries_survive_as_one_entry_each():
+    class OddEntries:
+        name = "odd"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        def drain_errors(self):
+            return [ValueError("bad row 7"), "b.md: read failed"]
+
+    report = asyncio.run(run_imports([OddEntries()], RecordingSink()))
+
+    errors = report.adapters["odd"].errors
+    assert len(errors) == 2
+    assert "bad row 7" in errors[0]
+    assert errors[1] == "b.md: read failed"
+
+
 def test_input_freshness_is_recorded_when_the_adapter_offers_it():
     """Sources differ on acquisition: a stale local export re-imports the same
     zip forever and looks like success. The runner records the input's age so a

@@ -165,7 +165,7 @@ async def _run_one(
     # dying must still surface all five.
     if isinstance(adapter, SupportsNonFatalErrors):
         try:
-            report.errors.extend(adapter.drain_errors())
+            report.errors.extend(_validated_errors(adapter.drain_errors()))
         except Exception as e:  # noqa: BLE001
             report.errors.append(f"drain_errors failed: {type(e).__name__}: {e}")
     if isinstance(adapter, SupportsInputFreshness):
@@ -175,6 +175,31 @@ async def _run_one(
         except Exception as e:  # noqa: BLE001
             report.errors.append(f"input_freshness failed: {type(e).__name__}: {e}")
     return report
+
+
+def _validated_errors(drained: object) -> list[str]:
+    """Check what ``drain_errors`` actually returned, at the boundary.
+
+    ``SupportsNonFatalErrors`` is ``runtime_checkable``, and that gates on
+    method PRESENCE only — the return annotation is not enforced anywhere. An
+    adapter returning a bare ``str`` therefore passed ``isinstance`` and then
+    ``report.errors.extend("ticktick token expired")`` appended one entry PER
+    CHARACTER: 22 entries reading 't', 'i', 'c', ... The count is what the CLI
+    prints and what the notifier's summary counts, and the message — the only
+    operator-facing diagnostic a non-fatal failure has — is destroyed.
+
+    A ``str`` is kept whole (the message is the valuable part) and labelled, so
+    the adapter bug is visible without costing the operator the diagnostic.
+    Non-str entries are rendered rather than dropped for the same reason.
+    Anything not iterable at all raises out of here into the caller's handler,
+    which already reports it as ``drain_errors failed: ...``.
+    """
+    if isinstance(drained, str):
+        return [
+            f"drain_errors returned a bare str, not list[str] (adapter "
+            f"contract); the message was: {drained}"
+        ]
+    return [e if isinstance(e, str) else f"{type(e).__name__}: {e}" for e in drained]
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
