@@ -88,6 +88,21 @@ EXIT_COMPLETED_WITH_ERRORS = 3
 # runs and gets tuned out, which is worse than not warning at all.
 DEFAULT_STALE_AFTER_DAYS = 14
 
+# Which ``sessions.origin`` populations `ingest sessions --rebuild` is allowed
+# to DELETE. Exactly the one the sessions source can regenerate: it scans
+# ~/.claude/projects and every row it emits carries the ``SessionRow.origin``
+# default, ``'claude-code'``.
+#
+# The sessions and observations tables also hold ``chatgpt`` and
+# ``claude-web`` rows, and those are NOT regenerable — their only source is a
+# vendor export archive a human downloads by hand, so once the drop is gone
+# the rows in this database are the last copy. Before this scope existed the
+# rebuild's DELETE was unqualified and took them too, and the >20% shrink
+# guard could not catch it: it compared the incoming claude-code count against
+# the WHOLE table, so a store of 840 claude-code + 160 claude-web rows read as
+# a 16% shrink, sailed through the guard, exited 0, and destroyed all 160.
+SESSIONS_REBUILD_ORIGINS = ("claude-code",)
+
 
 def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
     """True when the shrink from ``existing`` to ``new`` exceeds the guard.
@@ -212,9 +227,10 @@ def _cmd_ingest_entities(
     """v2 ingest path: source yields SessionRow + ObservationRow entities.
 
     ``--rebuild`` swaps sessions + observations atomically via
-    ``store.rebuild_and_upsert_entities``. Applies the same round-3 HIGH
-    silent-wipe guard as the Record path: refuse if the iterator yielded
-    zero session rows while errors surfaced.
+    ``store.rebuild_and_upsert_entities``, SCOPED to the origins the source
+    can regenerate (see ``SESSIONS_REBUILD_ORIGINS``). Applies the same
+    round-3 HIGH silent-wipe guard as the Record path: refuse if the iterator
+    yielded zero session rows while errors surfaced.
     """
     errors: list[str] = []
     try:
@@ -247,7 +263,10 @@ def _cmd_ingest_entities(
                 file=sys.stderr,
             )
             return 2
-        existing = store.count_by_source(args.source)
+        # Counted over the SAME origins the DELETE will reach. Counted over
+        # the whole table instead, the chat-export rows pad the denominator
+        # and hide a shrink the operator would otherwise be asked about.
+        existing = store.count_sessions_by_origin(SESSIONS_REBUILD_ORIGINS)
         if session_count == 0 and (errors or existing > 0):
             print(
                 f"ERROR: refusing to rebuild {args.source}: iterator yielded "
@@ -283,7 +302,11 @@ def _cmd_ingest_entities(
                     return 1
         min_sessions = 1 if existing > 0 else 0
         try:
-            store.rebuild_and_upsert_entities(entities, min_sessions=min_sessions)
+            store.rebuild_and_upsert_entities(
+                entities,
+                min_sessions=min_sessions,
+                origins=SESSIONS_REBUILD_ORIGINS,
+            )
         except EmptyRebuildRefusedError as e:
             print(f"ERROR: {e}; store left intact", file=sys.stderr)
             return 1
