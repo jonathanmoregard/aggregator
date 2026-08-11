@@ -108,6 +108,21 @@ class TickTickSource:
         # Overridable in tests to exercise both sides of the precedence rule.
         self._api_observed_at = datetime.now(UTC)
 
+    def manual_export_input(self) -> str:
+        """``sources.base.ReadsManualExport`` — what ``--rebuild`` is refused on.
+
+        The CSV leg. A human exports it out of the TickTick app into
+        ~/Downloads and nothing on this machine refreshes it; ``_archive`` keeps
+        the only surviving copy once ~/Downloads is cleared. (The API leg is
+        unrebuildable for a second, independent reason — see
+        ``cli.REBUILD_UNSUPPORTED_SOURCES``.)
+        """
+        return (
+            "a TickTick backup CSV a human exports from the app; nothing on "
+            "this machine refreshes it, and the local archive is its only "
+            "surviving copy once ~/Downloads is cleared"
+        )
+
     def record_shape(self) -> dict[str, str]:
         """DSL-facing field surface (M2 help generator).
 

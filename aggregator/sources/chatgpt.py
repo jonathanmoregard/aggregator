@@ -145,6 +145,14 @@ class ChatGPTSource:
         raw = drops_dir or os.environ.get("AGGREGATOR_DROPS_DIR") or DEFAULT_DROPS_DIR
         self.drops_dir = Path(raw).expanduser()
 
+    def manual_export_input(self) -> str:
+        """``sources.base.ReadsManualExport`` — what ``--rebuild`` is refused on."""
+        return (
+            "a ChatGPT data-export zip, requested from Settings and emailed as "
+            "a link that expires in 24h; nothing on this machine refreshes it, "
+            "so a conversation whose export is gone exists only in this store"
+        )
+
     def record_shape(self) -> dict[str, str]:
         return {
             "session_id": "str ('chatgpt:<conversation_id>')",

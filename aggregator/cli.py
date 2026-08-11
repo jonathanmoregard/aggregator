@@ -60,7 +60,7 @@ from aggregator.mcp import (
 from aggregator.mcp import (
     aggregator_query as _mcp_query,
 )
-from aggregator.sources.base import ObservationRow, SessionRow
+from aggregator.sources.base import ObservationRow, ReadsManualExport, SessionRow
 from aggregator.sources.chatgpt import ChatGPTSource
 from aggregator.sources.claude_web import ClaudeWebSource
 from aggregator.sources.dropbox import DropboxSource
@@ -125,12 +125,16 @@ NOTIFY_TIMEOUT_SECONDS = 10
 # a 16% shrink, sailed through the guard, exited 0, and destroyed all 160.
 SESSIONS_REBUILD_ORIGINS = ("claude-code",)
 
-# Record-shaped sources whose ``--rebuild`` is refused, and why.
+# Per-source ``--rebuild`` refusals whose reason NO PROPERTY CAPTURES.
 #
-# --rebuild adds exactly one thing over a plain ingest: it DELETEs the rows a
-# re-scan did not produce. For a source whose stored rows are strictly a
-# superset of what any future scan can produce, that DELETE can only ever
-# destroy data — there is no state it can usefully correct.
+# Not the general rule. The general rule is ``sources.base.ReadsManualExport``
+# — a source declares that its input is an archive a human downloads, and
+# ``_rebuild_refusal`` derives the refusal from that. This dict was the whole
+# mechanism until round 2, which is how ``substack`` (the same Settings →
+# Exports zip as chatgpt and claude-web) ended up with --rebuild allowed.
+#
+# What stays here is the reason that is specific to one source's ontology
+# rather than to how its input is acquired.
 REBUILD_UNSUPPORTED_SOURCES: dict[str, str] = {
     "ticktick": (
         "its stored rows include api-inferred-complete tasks that nothing can "
@@ -441,18 +445,6 @@ def _rebuild_refusal(name: str, src: Any) -> str | None:
     for this source, which is a different thing from a guard refusing a
     particular run's numbers.
     """
-    if hasattr(src, "iter_entities") and name != "sessions":
-        # `rebuild_and_upsert_entities` replaces sessions + observations for
-        # the origins it is scoped to. A chat-export source re-ingests via the
-        # idempotent per-id upsert instead; nothing about its rows needs a
-        # DELETE first.
-        return (
-            f"ERROR: --rebuild is not supported for source {name!r}: the "
-            f"entity rebuild path replaces the sessions/observations rows "
-            f"wholesale and this source's export archive is the only copy of "
-            f"them. Re-run without --rebuild (ingest is an idempotent upsert "
-            f"per session/observation id)."
-        )
     reason = REBUILD_UNSUPPORTED_SOURCES.get(name)
     if reason is not None:
         return (
@@ -460,6 +452,35 @@ def _rebuild_refusal(name: str, src: Any) -> str | None:
             f"{reason} Re-run without --rebuild (ingest is an idempotent "
             f"upsert per stable_id, so a re-scan already overwrites every row "
             f"it can produce)."
+        )
+    if isinstance(src, ReadsManualExport):
+        # THE RULE, and it is a property, not a list. Round 2: substack reads
+        # a Settings → Exports zip exactly like chatgpt and claude-web, and its
+        # --rebuild was allowed anyway — the refusal was decided by the
+        # hand-kept dict above plus the accident that the other two are
+        # entity-shaped. An old or partial archive then deleted last-copy rows
+        # under the ratio guard's slack, at exit 0 (measured: 150 stored, 140
+        # re-scanned, 10 gone, `added=0 updated=140 skipped=0 errors=0`).
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: its "
+            f"input is {src.manual_export_input()}. --rebuild DELETEs every "
+            f"row the re-scan did not reproduce, so an older or partial "
+            f"archive silently destroys the rest. Re-run without --rebuild "
+            f"(ingest is an idempotent upsert, so a re-scan already overwrites "
+            f"every row it can produce)."
+        )
+    if hasattr(src, "iter_entities") and name != "sessions":
+        # A second, shape-derived reason that outlives the property: the entity
+        # rebuild path replaces the sessions + observations rows wholesale for
+        # the origins it is scoped to, and only the sessions source can
+        # regenerate its origin. Kept for a future entity-shaped source whose
+        # input is NOT a manual export.
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: the "
+            f"entity rebuild path replaces the sessions/observations rows "
+            f"wholesale and only the sessions source can regenerate the origin "
+            f"it is scoped to. Re-run without --rebuild (ingest is an "
+            f"idempotent upsert per session/observation id)."
         )
     return None
 

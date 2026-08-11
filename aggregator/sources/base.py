@@ -179,6 +179,33 @@ class Source(Protocol):
         ...
 
 
+@runtime_checkable
+class ReadsManualExport(Protocol):
+    """A source whose input is an archive a HUMAN downloads, by hand.
+
+    The property that decides whether ``--rebuild`` can mean what it says.
+    ``--rebuild`` adds exactly one thing over a plain ingest: it DELETEs the
+    rows the re-scan did not reproduce. That is only ever safe when something
+    on this machine keeps the input current — a live API, a synced directory,
+    a tool that writes the files. When the input is a vendor export a person
+    downloads occasionally, the stored rows are a SUPERSET of what any scan can
+    produce (last month's export is gone from ~/Downloads), so the DELETE can
+    only destroy data.
+
+    Declared by the source itself, and checked structurally, so the rule is
+    derived rather than hand-kept. It was hand-kept until round 2, and
+    ``substack`` — the same Settings → Exports zip as ``chatgpt`` and
+    ``claude-web`` — was missing from the list: its ``--rebuild`` was allowed
+    and deleted last-copy rows at exit 0.
+
+    Returns a short human phrase naming the export and who refreshes it (i.e.
+    nobody), which goes into the refusal message. An operator who is only told
+    "not supported" reaches for ``--force``.
+    """
+
+    def manual_export_input(self) -> str: ...
+
+
 def stable_id_for(source: str, source_specific_id: str) -> str:
     """Mint a stable local ID. Enforces the "<source>:<id>" convention centrally
     so no source module hand-rolls the format inconsistently. See spec §Components
