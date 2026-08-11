@@ -18,6 +18,7 @@ from aggregator.imports.port import (
     ImportSink,
     SupportsInputFreshness,
     SupportsNonFatalErrors,
+    SupportsWriteBarrier,
 )
 
 # Items buffered before a sink write. Bounded so a 359k-observation source
@@ -135,12 +136,14 @@ async def _run_one(
         report.updated += counts.updated
         report.skipped += counts.skipped
 
+    wrote_everything = False
     try:
         async for item in adapter.get_data():
             batch.append(item)
             if len(batch) >= batch_size:
                 flush()
         flush()
+        wrote_everything = True
     except Exception as e:  # noqa: BLE001 -- isolation boundary, see below
         # PER-ADAPTER FAILURE ISOLATION. One source dying (expired token,
         # unreachable dir, locked DB) must not deny the other seven their
@@ -157,6 +160,21 @@ async def _run_one(
         except Exception as e2:  # noqa: BLE001
             report.errors.append(
                 f"flush after failure: {type(e2).__name__}: {e2}"
+            )
+
+    # The write barrier, and it is the ONE optional protocol that must not run
+    # after a failure: it exists so an adapter's own state cannot get ahead of
+    # the data it implies. A partial run leaves that state untouched and
+    # re-derives it next time. See ``SupportsWriteBarrier``.
+    if wrote_everything and isinstance(adapter, SupportsWriteBarrier):
+        try:
+            adapter.commit_after_write()
+        except Exception as e:  # noqa: BLE001
+            # The items ARE written, so this is not an ingest failure — but an
+            # adapter whose state never advances silently stops noticing what
+            # it exists to notice, and this is the only thing that says so.
+            report.errors.append(
+                f"commit_after_write failed: {type(e).__name__}: {e}"
             )
 
     # Optional protocols, checked structurally — an adapter opts in simply by

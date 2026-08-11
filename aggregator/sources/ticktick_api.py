@@ -53,7 +53,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -888,21 +888,51 @@ class JsonFileState:
         save_state(self.path, tasks, now)
 
 
+def plan_open_task_reconcile(
+    state: OpenTaskState, tasks: Iterable[dict], now: datetime
+) -> tuple[list[Record], Callable[[], None]]:
+    """Diff this poll against the baseline; hand back the save as a callable.
+
+    TWO-PHASE, and that is the point. The diff has to happen now — it needs
+    the poll — but advancing the baseline is a destructive act: it is what
+    makes a disappearance unrepeatable. The Open API serves OPEN tasks only,
+    so a completion is reported exactly once, as a gap between two polls; a
+    baseline advanced before the inferred records were WRITTEN turns any
+    later store or sink failure into permanent loss, with a re-run unable to
+    recover it.
+
+    So the caller gets the records and a ``commit`` it may only invoke once
+    those records have landed. Not calling it costs one poll's worth of
+    inference and nothing else: the next poll diffs against the same baseline
+    and infers the same completions again.
+
+    The load/diff/save ORDER remains the trap it always was — saving before
+    loading overwrites the baseline with the current poll and inference is
+    silently dead — which is why this stays one function and not three calls
+    at the call site.
+    """
+    previous = state.load()
+    tasks = list(tasks)
+    records = infer_completions(previous, _open_task_ids(tasks), now)
+
+    def commit() -> None:
+        state.save(tasks, now)
+
+    return records, commit
+
+
 def reconcile_open_tasks(
     state: OpenTaskState, tasks: Iterable[dict], now: datetime
 ) -> list[Record]:
     """Diff this poll against the baseline, then make this poll the baseline.
 
-    The whole state protocol in one call, because the order is a trap: saving
-    before loading overwrites the baseline with the current poll, so nothing
-    ever looks disappeared and inference is silently dead — no error, no
-    warning, just an index that stops gaining completions.
+    The single-phase form: commits immediately. Correct only for a caller that
+    has nothing to write, or that treats the diff as advisory — see
+    :func:`plan_open_task_reconcile`, which is what the source uses.
 
     Typed against :class:`OpenTaskState`, so nothing here knows or cares that
     the baseline is a JSON file.
     """
-    previous = state.load()
-    tasks = list(tasks)
-    records = infer_completions(previous, _open_task_ids(tasks), now)
-    state.save(tasks, now)
+    records, commit = plan_open_task_reconcile(state, tasks, now)
+    commit()
     return records

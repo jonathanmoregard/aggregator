@@ -184,12 +184,18 @@ def test_completion_inferred_across_two_polls(tmp_path, monkeypatch):
     """The Open API cannot report a completion, so disappearance is the signal.
 
     This only works if the poll is diffed against the baseline BEFORE the
-    baseline is overwritten with the poll — ``reconcile_open_tasks`` sequences
-    load -> diff -> save for exactly that reason.
+    baseline is overwritten with the poll — ``plan_open_task_reconcile``
+    sequences load -> diff -> save for exactly that reason.
+
+    ``commit_after_write`` stands in for the writing caller: since round 2 the
+    baseline is advanced by the CLI / runner AFTER the records land, not by
+    iteration, so a poll nobody stored is re-offered next time.
     """
     tasks = [{"id": "t1", "title": "Gone"}, {"id": "t2", "title": "Stays"}]
     monkeypatch.setattr(ticktick_api, "fetch_open_tasks", lambda token, errors=None: tasks)
-    list(_source(tmp_path, token="tok").iter_records(None))
+    first = _source(tmp_path, token="tok")
+    list(first.iter_records(None))
+    first.commit_after_write()
 
     tasks = [{"id": "t2", "title": "Stays"}]
     records = {r.stable_id: r for r in _source(tmp_path, token="tok").iter_records(None)}
@@ -407,11 +413,16 @@ def test_unusable_task_payload_is_recorded_and_skipped(tmp_path, monkeypatch):
 def test_unwritable_state_file_does_not_take_down_the_csv_leg(tmp_path, monkeypatch):
     """Same invariant as the token case, one step further into the API leg.
 
-    Persisting the baseline is the last thing the poll does, and it writes to
-    ``$XDG_STATE_HOME``. If that path is not a directory the write raises an
-    OSError from the middle of the merge — which is not a reason to lose the
+    Persisting the baseline writes to ``$XDG_STATE_HOME``. If that path is not
+    a directory the write raises an OSError — which is not a reason to lose the
     archive. The poll's own tasks are still emitted; only the next run's
-    completion inference is lost, and the error says so.
+    completion inference is lost, and the failure says so.
+
+    Round 2 moved WHEN this happens: the save is now the writing caller's
+    ``commit_after_write``, so it raises after the records have landed instead
+    of aborting the merge. The CLI turns that into an ``errors`` entry and exit
+    3; the runner into a report error. Either way it is loud, and — unlike
+    before — the poll's inferred completions were written first.
     """
     (tmp_path / "notadir").write_text("i am a file, not a directory", encoding="utf-8")
     _backup(tmp_path / "downloads" / "TickTick.csv", [_row()])
@@ -429,8 +440,9 @@ def test_unwritable_state_file_does_not_take_down_the_csv_leg(tmp_path, monkeypa
     )
     records = list(src.iter_records(None, errors=errors))
     assert [r.stable_id for r in records] == ["ticktick:abc123", "ticktick:api1"]
-    assert len(errors) == 1
-    assert "state" in errors[0]
+    assert errors == []
+    with pytest.raises(OSError, match="state could not be updated"):
+        src.commit_after_write()
 
 
 def test_backup_that_fails_to_parse_is_recorded_and_the_scan_continues(
@@ -472,6 +484,7 @@ def test_record_shape_documents_every_extra_key_both_legs_write(tmp_path, monkey
     )
     src = _source(tmp_path, token="tok")
     list(src.iter_records(None))
+    src.commit_after_write()  # the writing caller's barrier; see above
     # Second poll: t2 disappears, so an inferred completion (the third record
     # flavour, and the only one carrying completed_time_approx) shows up too.
     monkeypatch.setattr(ticktick_api, "fetch_open_tasks", lambda token, errors=None: [])

@@ -304,6 +304,30 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     return 0
 
 
+def _commit_after_write(src: Any, errors: list[str]) -> None:
+    """Let a source advance state that its records had to land first.
+
+    The single-source half of ``imports/port.SupportsWriteBarrier``; the
+    runner does the same after its final flush. Reached ONLY once the write
+    above returned — every failing path returns before here, which is the
+    whole guarantee. TickTick's open-task baseline is what needs it: advancing
+    it is what makes a completion unrepeatable, and it used to happen during
+    iteration, before a single row was written.
+
+    A failure is recorded, not raised. The records are already in the store,
+    so the ingest itself succeeded; but a baseline that never advances loses
+    every completion from here on, so it becomes an ``errors`` entry and the
+    run exits 3.
+    """
+    commit = getattr(src, "commit_after_write", None)
+    if commit is None:
+        return
+    try:
+        commit()
+    except Exception as e:  # noqa: BLE001 -- reported, never fatal to the write
+        errors.append(f"{type(e).__name__}: {e}")
+
+
 def _iterate(
     iter_fn: Callable[..., Any],
     since: datetime | None,
@@ -414,6 +438,7 @@ def _cmd_ingest_entities(
             return 1
     else:
         store.upsert_entities(entities)
+    _commit_after_write(src, errors)
 
     print(
         f"ingest {args.source}: sessions={session_count} "
@@ -593,6 +618,7 @@ def _cmd_ingest(
                 return 1
         else:
             store.upsert(records)
+        _commit_after_write(src, errors)
         added, updated, skipped = counts.added, counts.updated, counts.skipped
     else:
         result = src.ingest(since=since)

@@ -20,7 +20,7 @@ import csv
 import logging
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -107,6 +107,8 @@ class TickTickSource:
         )
         # Overridable in tests to exercise both sides of the precedence rule.
         self._api_observed_at = datetime.now(UTC)
+        # Set by a poll, run by ``commit_after_write``. See there.
+        self._pending_state_commit: Callable[[], None] | None = None
 
     def manual_export_input(self) -> str:
         """``sources.base.ReadsManualExport`` — what ``--rebuild`` is refused on.
@@ -273,23 +275,24 @@ class TickTickSource:
                 continue
             candidates[_merge_key(record)] = (observed, record)
 
-        # ``reconcile_open_tasks`` is the whole state protocol in one call:
-        # load the previous poll, diff, and only THEN make this poll the new
-        # baseline. Hand-rolling load/diff/save is a trap — saving before
+        # ``plan_open_task_reconcile`` is the whole state protocol in one call:
+        # load the previous poll, diff, and hand back the save as something to
+        # run LATER. Hand-rolling load/diff/save is a trap — saving before
         # loading means nothing ever looks disappeared and inference is
-        # silently dead, with no error and no warning. It persists internally,
-        # so there is no save_state call here.
+        # silently dead, with no error and no warning.
+        #
+        # TWO-PHASE, deliberately. Advancing the baseline is what makes a
+        # disappearance unrepeatable, and it used to happen here, mid-poll,
+        # before the first record had reached any sink: a store or sink failure
+        # after that point lost the completions this diff just inferred, with
+        # no way for a re-run to recover them. The save now waits for
+        # ``commit_after_write``, which the writing caller invokes once the
+        # records have landed.
         state = ticktick_api.JsonFileState(self.state_file)
-        try:
-            inferred = ticktick_api.reconcile_open_tasks(state, tasks, observed)
-        except OSError as e:
-            # Persisting the baseline is the one part of the poll that writes
-            # to disk. An unwritable state path costs the NEXT run its
-            # completion inference; it must not cost this one its archive, and
-            # it must not be silent, because a baseline that never updates
-            # loses every completion from here on.
-            _note(errors, f"ticktick state could not be updated at {self.state_file}: {e}")
-            return candidates
+        inferred, commit = ticktick_api.plan_open_task_reconcile(
+            state, tasks, observed
+        )
+        self._pending_state_commit = commit
         for record in inferred:
             candidates[_merge_key(record)] = (observed, record)
         return candidates
@@ -314,6 +317,38 @@ class TickTickSource:
 
         for task_id in sorted(merged):
             yield merged[task_id][1]
+
+    def commit_after_write(self) -> None:
+        """Persist the advanced open-task baseline. CALL ONLY AFTER WRITING.
+
+        Phase two of the poll. Everything the diff inferred has to be in the
+        store before this runs, because this is the act that makes the
+        disappearance unrepeatable: the Open API serves OPEN tasks only, so the
+        next poll cannot notice a completion it already advanced past.
+
+        Not calling it is safe and costs exactly one poll's inference — the
+        next run diffs against the same baseline and infers the same
+        completions again. Calling it too early is the fault this exists to
+        prevent.
+
+        Idempotent: the pending commit is cleared first, so a caller invoking
+        it twice does not save twice, and a source whose poll found nothing
+        (no token, API down, CSV-only run) does nothing here.
+
+        Raises ``OSError`` when the baseline cannot be written. Loud on
+        purpose: the records DID land, so the ingest itself succeeded, but a
+        baseline that never updates loses every completion from here on and
+        nothing else in the run would say so.
+        """
+        commit, self._pending_state_commit = self._pending_state_commit, None
+        if commit is None:
+            return
+        try:
+            commit()
+        except OSError as e:
+            raise OSError(
+                f"ticktick state could not be updated at {self.state_file}: {e}"
+            ) from e
 
     def newest_backup_mtime(self) -> datetime | None:
         """When the newest TickTick backup CSV was last written, or None.

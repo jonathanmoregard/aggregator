@@ -154,6 +154,20 @@ class SyncSourceAdapter:
 
         return aiter_in_thread(make_iterator, chunk_size=self._chunk_size)
 
+    def commit_after_write(self) -> None:
+        """Forward the runner's write barrier to the wrapped source.
+
+        Defined unconditionally, so ``SupportsWriteBarrier`` matches every
+        adapted source and the runner needs no special case; sources without
+        state to advance simply have nothing to forward it to. See
+        ``imports/port.SupportsWriteBarrier`` for why the barrier exists (a
+        source whose acquisition consumes its own evidence — TickTick's
+        open-task baseline — must not advance before the records land).
+        """
+        commit = getattr(self._source, "commit_after_write", None)
+        if commit is not None:
+            commit()
+
     def drain_errors(self) -> list[str]:
         """Hand the source's per-item failures to the runner, then forget them.
 

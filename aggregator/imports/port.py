@@ -122,6 +122,30 @@ class SupportsNonFatalErrors(Protocol):
 
 
 @runtime_checkable
+class SupportsWriteBarrier(Protocol):
+    """Optional: an adapter with state it may only advance once data landed.
+
+    Some acquisition is DESTRUCTIVE OF ITS OWN EVIDENCE. TickTick's Open API
+    serves open tasks only, so a completion appears exactly once — as a
+    disappearance between two polls — and the poll that notices it also
+    overwrites the baseline that made noticing possible. Advancing that
+    baseline before the inferred records are in the store turns any later sink
+    failure into permanent loss.
+
+    So the adapter keeps the advance pending and the runner calls this once
+    the stream has been written: after the final flush, and only when nothing
+    raised. A partial run leaves the state untouched and re-derives it next
+    time, which is why the barrier is not called on the failure path.
+
+    Not a transaction and not a rollback — the sink's writes are already
+    committed by then. It is the narrower guarantee that the adapter's own
+    state cannot get ahead of them.
+    """
+
+    def commit_after_write(self) -> None: ...
+
+
+@runtime_checkable
 class SupportsInputFreshness(Protocol):
     """Optional: when was the newest input this adapter reads last touched?
 
