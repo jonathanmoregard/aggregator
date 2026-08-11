@@ -128,6 +128,112 @@ def test_session_rows_are_written_before_their_observations(tmp_data_home):
     assert counts.added == 2
 
 
+# -- the reordering is per-batch, and the contract has to say so -----------
+#
+# Round-1 MEDIUM: the sink's own comment read "an adapter is allowed to yield
+# an observation before its session row (batch boundaries can split a stream
+# anywhere)". That is true inside one batch and exactly backwards about batch
+# boundaries: the runner flushes every 500 items and the sink has no memory
+# between calls, so an observation landing in an earlier batch than its session
+# hits the FK. Green in a small test, aborts the adapter on real volume.
+
+
+def test_an_observation_ahead_of_its_session_across_batches_is_refused(
+    tmp_data_home
+):
+    store = Store()
+    store.migrate()
+    sink = StoreSink(store)
+
+    with pytest.raises(ValueError) as excinfo:
+        sink.write([_obs("o1", "s1")])
+
+    message = str(excinfo.value)
+    assert "o1" in message, "must name the observation"
+    assert "s1" in message, "must name the session it wanted"
+    assert "before" in message.lower(), "must state the ordering rule"
+
+
+def test_the_refusal_replaces_a_bare_foreign_key_error(tmp_data_home):
+    """``FOREIGN KEY constraint failed`` names no row and no rule, so the
+    adapter author has nothing to act on."""
+    import sqlite3
+
+    store = Store()
+    store.migrate()
+
+    with pytest.raises(ValueError):
+        StoreSink(store).write([_obs("o1", "s1")])
+    # And the store is untouched, not half-written.
+    assert store.existing_ids("observations", ["o1"]) == set()
+    assert not isinstance(sqlite3.IntegrityError("x"), ValueError)
+
+
+def test_a_session_split_across_batches_is_legal(tmp_data_home):
+    """The legal direction: a session's observations may land in later batches
+    than the session row. That is what batch boundaries actually do to the
+    shipped sources' streams, and it must keep working."""
+    store = Store()
+    store.migrate()
+    sink = StoreSink(store)
+
+    first = sink.write([_sess("s1"), _obs("o1", "s1")])
+    second = sink.write([_obs("o2", "s1"), _obs("o3", "s1")])
+
+    assert (first.added, second.added) == (2, 2)
+    assert store.existing_ids("observations", ["o1", "o2", "o3"]) == {
+        "o1",
+        "o2",
+        "o3",
+    }
+
+
+def test_the_shipped_stream_shape_survives_a_batch_boundary(tmp_data_home):
+    """End to end through the runner at a batch size that splits every
+    session — the volume case the per-batch reordering hid."""
+    store = Store()
+    store.migrate()
+
+    class Sessions:
+        name = "sessions"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            for s in range(3):
+                yield _sess(f"s{s}")
+                for o in range(3):
+                    yield _obs(f"s{s}-o{o}", f"s{s}")
+
+    report = asyncio.run(run_imports([Sessions()], StoreSink(store), batch_size=2))
+
+    assert report.ok is True, report.errors
+    assert store.count_by_source("sessions") == 3
+    assert report.adapters["sessions"].added == 12
+
+
+def test_an_orphan_observation_is_isolated_to_its_own_adapter(tmp_data_home):
+    """It is still just an adapter error: the runner contains it and the other
+    sources complete."""
+    store = Store()
+    store.migrate()
+
+    class Orphan:
+        name = "orphan"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            yield _obs("o1", "never-yielded")
+
+    class Fine:
+        name = "fine"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            yield _rec("research:ok")
+
+    report = asyncio.run(run_imports([Orphan(), Fine()], StoreSink(store)))
+
+    assert report.failed_adapters == ["orphan"]
+    assert store.count_by_source("research") == 1
+
+
 def test_an_unknown_item_type_fails_loudly(tmp_data_home):
     store = Store()
     store.migrate()

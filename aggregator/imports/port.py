@@ -52,6 +52,15 @@ class ImportAdapter(Protocol):
     ``issubclass`` is not available for protocols carrying non-method
     members like ``name`` — that is a CPython restriction, not a design
     intent.
+
+    STREAM ORDER MATTERS for the entity shapes: yield a ``SessionRow`` BEFORE
+    any ``ObservationRow`` that names it. ``observations.session_id`` is a real
+    foreign key with ``PRAGMA foreign_keys`` ON, and the runner flushes the
+    stream to the sink in batches — the sink can reorder within one batch and
+    nowhere else, so an observation that precedes its session in the stream
+    lands in an earlier batch and aborts the adapter. Small tests never see it
+    (one batch, reordered, green); real volume always does. The sink refuses
+    such a batch with a message naming the offending pair.
     """
 
     name: str

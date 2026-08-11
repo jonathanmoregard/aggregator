@@ -107,11 +107,57 @@ class StoreSink:
         ) + count_writes(
             self._store, "observations", _unique([o.obs_id for o in observations])
         )
-        # Sessions first: ``observations.session_id`` is a real FK, and an
-        # adapter is allowed to yield an observation before its session row
-        # (batch boundaries can split a stream anywhere).
+        # Sessions before observations WITHIN THE BATCH, because
+        # ``observations.session_id`` is a real FK and ``PRAGMA foreign_keys``
+        # is ON. This reordering is per-batch and cannot be anything else — the
+        # sink sees one batch at a time and has no memory between calls. The
+        # contract on the adapter is therefore the stronger one, checked below.
+        self._refuse_orphan_observations(sessions, observations)
         self._store.upsert_entities([*sessions, *observations])
         return counts
+
+    def _refuse_orphan_observations(
+        self,
+        sessions: list[SessionRow],
+        observations: list[ObservationRow],
+    ) -> None:
+        """Reject observations whose session is neither in this batch nor stored.
+
+        THE ADAPTER CONTRACT: a session row must be yielded before any of its
+        observations, in stream order. This used to be documented as "an
+        adapter is allowed to yield an observation before its session row
+        (batch boundaries can split a stream anywhere)", which was true only
+        inside one batch and is precisely backwards about batch boundaries —
+        the runner flushes every 500 items, and an observation landing in an
+        earlier batch than its session hits the FK. That shape is invisible in
+        a small test (one batch, reordered, green) and aborts the adapter on
+        real volume.
+
+        Checked here rather than left to SQLite so the failure names what to
+        change. ``FOREIGN KEY constraint failed`` says nothing about which
+        observation, which session, or that an ordering rule exists at all.
+        """
+        if not observations:
+            return
+        in_batch = {s.session_id for s in sessions}
+        wanted = {o.session_id for o in observations if o.session_id not in in_batch}
+        if not wanted:
+            return
+        missing = wanted - self._store.existing_ids("sessions", sorted(wanted))
+        if not missing:
+            return
+        example = next(
+            o for o in observations if o.session_id in missing
+        )
+        raise ValueError(
+            f"observation {example.obs_id!r} references session "
+            f"{example.session_id!r}, which is neither in this batch nor "
+            f"already stored ({len(missing)} session id(s) affected). An "
+            f"adapter must yield a session row BEFORE any of its observations "
+            f"— the runner flushes the stream in batches and the sink can only "
+            f"reorder within one batch, so an observation that precedes its "
+            f"session in the stream hits the sessions foreign key."
+        )
 
 
 def _unique(ids: list[str]) -> list[str]:
