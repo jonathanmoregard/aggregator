@@ -268,3 +268,50 @@ def test_end_to_end_runner_over_the_real_store(tmp_data_home):
     assert report.adapters["bad"].added == 1
     assert report.ok is False
     assert report.failed_adapters == ["bad"]
+
+
+# -- round 3 L1: the two paths counted differently ------------------------
+
+
+def test_both_paths_satisfy_added_plus_updated_equals_items(tmp_data_home):
+    """The identity a caller reads the summary with. It held on the records
+    path and not on the entity path, which de-duplicated within a batch."""
+    store = Store()
+    store.migrate()
+    sink = StoreSink(store)
+
+    records = [_rec("research:a"), _rec("research:a"), _rec("research:b")]
+    entities = [_sess("s1"), _sess("s1"), _obs("o1", "s1")]
+
+    r = sink.write(records)
+    e = sink.write(entities)
+
+    assert r.added + r.updated == len(records)
+    assert e.added + e.updated == len(entities)
+    assert (r.skipped, e.skipped) == (0, 0)
+
+
+def test_entity_totals_do_not_move_with_batch_size(tmp_data_home, tmp_path):
+    """A repeat inside one batch used to be de-duplicated and a repeat across
+    a flush boundary could not be, so the SAME stream reported
+    added=2 updated=0 at batch_size=10 and added=2 updated=2 at 2. A number
+    that changes with an unrelated tuning knob is not a report."""
+    stream = [_sess("s1"), _obs("o1", "s1"), _sess("s1"), _obs("o1", "s1")]
+
+    class _Adapter:
+        name = "sessions"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            for item in stream:
+                yield item
+
+    totals = []
+    for size in (10, 2):
+        store = Store(db_path=tmp_path / f"batch{size}.db")
+        store.migrate()
+        report = asyncio.run(
+            run_imports([_Adapter()], StoreSink(store), batch_size=size)
+        )
+        totals.append((report.added, report.updated, report.skipped))
+
+    assert totals[0] == totals[1] == (2, 2, 0)

@@ -86,6 +86,25 @@ class StoreSink:
         # exists to prevent.
         self._refuse_orphan_observations(sessions, observations)
 
+        # ONE INVARIANT ACROSS BOTH PATHS: ``added + updated == len(items)``,
+        # and ``skipped`` is always 0 here. Neither path de-duplicates when
+        # counting, so a repeated id is one add and one update whether the
+        # repeat sits inside a batch or straddles a flush — i.e. the totals do
+        # not move when ``batch_size`` does.
+        #
+        # A MIXED BATCH IS NOT ATOMIC, and that is the one gap left. If the
+        # entity write raises after the record write committed, this method's
+        # return value goes with the exception and the landed records are
+        # counted by nobody. Each store call rolls its OWN batch back, so
+        # nothing is half-written, but the two are separate transactions.
+        # Unreachable today — ``SyncSourceAdapter`` binds one source to one of
+        # ``iter_entities`` / ``iter_records``, so no shipped adapter can emit
+        # both shapes, and the runner batches one adapter at a time — and the
+        # run is already reporting the exception, so it cannot look like
+        # success. An adapter that DOES mix shapes must not rely on the counts
+        # of a failing write; closing it properly needs one transaction
+        # spanning both store calls, which is a change to ``Store``'s surface,
+        # not to this file.
         counts = WriteCounts()
         if records:
             counts = counts + self._write_records(records)
@@ -107,13 +126,21 @@ class StoreSink:
         sessions: list[SessionRow],
         observations: list[ObservationRow],
     ) -> WriteCounts:
-        # ``_unique`` first: a session row repeated inside one batch is one
-        # row and is counted once, unlike the records path where the repeat
-        # shows up as an overwrite.
+        # COUNTED EXACTLY LIKE THE RECORDS PATH: every item is one add or one
+        # update, so ``added + updated == len(items)`` holds on both paths and
+        # a caller can read the two summaries the same way.
+        #
+        # This used to de-duplicate within the batch, which made the entity
+        # counts disagree with the record counts about a repeat AND made the
+        # run's totals depend on ``batch_size``: the same four-item stream
+        # reported added=2 updated=0 in one batch and added=2 updated=2 in two,
+        # because a repeat spanning a flush boundary was already stored by the
+        # time the second batch was counted and no dedupe could reach across.
+        # A number that changes with an unrelated tuning knob is not a report.
         counts = count_writes(
-            self._store, "sessions", _unique([s.session_id for s in sessions])
+            self._store, "sessions", [s.session_id for s in sessions]
         ) + count_writes(
-            self._store, "observations", _unique([o.obs_id for o in observations])
+            self._store, "observations", [o.obs_id for o in observations]
         )
         # Sessions before observations WITHIN THE BATCH, because
         # ``observations.session_id`` is a real FK and ``PRAGMA foreign_keys``
@@ -166,17 +193,6 @@ class StoreSink:
             f"reorder within one batch, so an observation that precedes its "
             f"session in the stream hits the sessions foreign key."
         )
-
-
-def _unique(ids: list[str]) -> list[str]:
-    """Order-preserving dedupe — repeats within one batch are one row."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for i in ids:
-        if i not in seen:
-            seen.add(i)
-            out.append(i)
-    return out
 
 
 __all__ = ["StoreSink", "count_writes"]
