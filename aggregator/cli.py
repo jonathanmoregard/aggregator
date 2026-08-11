@@ -246,23 +246,10 @@ def _cmd_ingest_entities(
     obs_count = sum(1 for e in entities if isinstance(e, ObservationRow))
 
     if args.rebuild:
-        # Chunk 4 guard: `rebuild_and_upsert_entities` atomically replaces
-        # the ENTIRE sessions + observations tables — it has no per-origin
-        # granularity. Running it for a chat-export source (chatgpt,
-        # claude-web) would silently wipe every claude-code session. Only
-        # the sessions source (which scans all claude-code JSONLs) may
-        # drive the whole-table rebuild; chat exports re-ingest via the
-        # idempotent upsert instead.
-        if args.source != "sessions":
-            print(
-                f"ERROR: --rebuild is not supported for source "
-                f"{args.source!r}: the entity rebuild path replaces the "
-                f"entire sessions/observations tables and would wipe other "
-                f"origins' rows. Re-run without --rebuild (ingest is an "
-                f"idempotent upsert per session/observation id).",
-                file=sys.stderr,
-            )
-            return 2
+        # Whether --rebuild is supported at all was settled by
+        # ``_rebuild_refusal`` BEFORE the iterator ran — see there for why the
+        # order matters.
+        #
         # Counted over the SAME origins the DELETE will reach. Counted over
         # the whole table instead, the chat-export rows pad the denominator
         # and hide a shrink the operator would otherwise be asked about.
@@ -324,6 +311,40 @@ def _cmd_ingest_entities(
     return 0
 
 
+def _rebuild_refusal(name: str, src: Any) -> str | None:
+    """Why ``--rebuild`` is refused for this source, or None if it is allowed.
+
+    CALLED BEFORE THE SOURCE IS ITERATED, and that ordering is the point.
+    ``_cmd_ingest`` used to list the iterator first and only then decide
+    whether the rebuild was permitted or whether a guard refused it — but
+    iterating a source is not a read-only act. The TickTick poll's
+    ``reconcile_open_tasks`` diffs against the previous open-task baseline and
+    then makes THIS poll the new baseline, on disk, during iteration. A run
+    that consumed that baseline and then exited without writing anything took
+    every completion it had just inferred with it: the API only ever serves
+    OPEN tasks, so a task that disappeared between two polls is reported
+    exactly once, and there is no second chance to notice. Deciding first
+    means a refused run never touches it.
+
+    Refusals are exit code 2 (usage error): the flag cannot mean what it says
+    for this source, which is a different thing from a guard refusing a
+    particular run's numbers.
+    """
+    if hasattr(src, "iter_entities") and name != "sessions":
+        # `rebuild_and_upsert_entities` replaces sessions + observations for
+        # the origins it is scoped to. A chat-export source re-ingests via the
+        # idempotent per-id upsert instead; nothing about its rows needs a
+        # DELETE first.
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: the "
+            f"entity rebuild path replaces the sessions/observations rows "
+            f"wholesale and this source's export archive is the only copy of "
+            f"them. Re-run without --rebuild (ingest is an idempotent upsert "
+            f"per session/observation id)."
+        )
+    return None
+
+
 def _cmd_ingest(
     args: argparse.Namespace, store: Store, sources: dict[str, Any]
 ) -> int:
@@ -337,6 +358,11 @@ def _cmd_ingest(
     except ValueError:
         print(f"bad --since: {args.since}", file=sys.stderr)
         return 2
+    if args.rebuild:
+        refusal = _rebuild_refusal(args.source, src)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 2
     # v2: entity-shaped sources (sessions) route through iter_entities +
     # upsert_entities. Record-shaped (github) fall through to iter_records +
     # upsert. Sources exposing only ingest() (old test stubs) use the
