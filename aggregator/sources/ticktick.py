@@ -173,7 +173,25 @@ class TickTickSource:
         return sorted(found.values(), key=lambda pair: pair[1])
 
     def _archive(self, path: Path) -> None:
-        """Copy a freshly-seen backup into the archive, best effort.
+        """Copy a successfully-parsed backup into the archive, best effort.
+
+        CALLED AFTER ``parse_backup`` RETURNS, never before. Detection and
+        parse are two separate reads and ~/Downloads is live, so a browser can
+        replace or truncate a file between them; archiving first meant a
+        download that sniffed like a backup and then failed to parse had
+        already overwritten the good copy — which is the ONLY copy, since the
+        export is manual and nothing regenerates completed-task history.
+
+        A same-named archive entry is only replaced by a file that is at least
+        as large. TickTick names every export the same thing, so a truncated
+        download lands exactly on top of the deep history, and a parse can
+        succeed on a truncated file: cut at a row boundary it simply yields
+        fewer rows, with nothing raised and nothing to notice. Bytes rather
+        than row count because the archived copy would otherwise have to be
+        re-parsed on every run to answer the question; a truncation is always
+        smaller, and a real export that shrinks (the user deleted a lot) is
+        still ingested in full — only the archive copy stays put, which is the
+        direction that cannot lose data.
 
         A failure here is logged, not raised: the rows have already been read,
         so losing the copy costs a future ``--rebuild`` its deep history but
@@ -181,9 +199,23 @@ class TickTickSource:
         """
         if path.parent == self.archive_dir:
             return
+        target = self.archive_dir / path.name
         try:
+            if target.exists() and target.stat().st_size > path.stat().st_size:
+                # Loud: an archive that quietly stopped updating looks exactly
+                # like one that is current.
+                log.warning(
+                    "not archiving %s: %s already holds a LARGER copy "
+                    "(%d bytes vs %d) and is the only surviving one — the "
+                    "download looks truncated. The run still ingested it.",
+                    path.name,
+                    target,
+                    target.stat().st_size,
+                    path.stat().st_size,
+                )
+                return
             self.archive_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, self.archive_dir / path.name)
+            shutil.copy2(path, target)
         except OSError as e:
             log.warning("could not archive backup %s: %s", path, e)
 
@@ -192,7 +224,6 @@ class TickTickSource:
     ) -> dict[str, tuple[datetime, Record]]:
         candidates: dict[str, tuple[datetime, Record]] = {}
         for path, mtime in self._backup_files(since):
-            self._archive(path)
             try:
                 rows = parse_backup(path)
             except (OSError, UnicodeDecodeError, csv.Error) as e:
@@ -203,6 +234,10 @@ class TickTickSource:
                 # every other source follows.
                 _note(errors, f"ticktick backup {path.name} could not be parsed: {e}")
                 continue
+            # AFTER the parse, deliberately — see ``_archive``. A file that
+            # sniffed like a backup and then failed to parse must not have
+            # already replaced the only surviving copy of the real one.
+            self._archive(path)
             for row in rows:
                 record = row_to_record(row, source_file=path.name)
                 task_id = _merge_key(record)
