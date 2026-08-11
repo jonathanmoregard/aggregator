@@ -124,6 +124,17 @@ class SupportsInputFreshness(Protocol):
     success. Returning the newest input timestamp lets a later task say
     "substack input is 31 days stale" instead. ``None`` means unknown.
 
+    RETURN AN AWARE DATETIME. A naive one satisfies the annotation and is
+    therefore not a type error, but every consumer compares it against
+    ``datetime.now(UTC)`` and subtracting a naive datetime from an aware one
+    raises TypeError — from the whole-run staleness pass, i.e. one adapter's
+    naive timestamp used to cost the run its report, every adapter's error
+    listing and its exit code. The runner now normalises a naive value to UTC
+    at the boundary rather than trusting this note, but "UTC" is a guess it
+    should not have to make: an adapter reading local files should stamp what
+    the filesystem actually means (``datetime.fromtimestamp(mtime, tz=UTC)``,
+    as the shipped ones do).
+
     Not built out yet — this is the seam so it can be, without reopening the
     port.
     """

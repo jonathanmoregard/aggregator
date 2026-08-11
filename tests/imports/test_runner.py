@@ -21,7 +21,12 @@ from datetime import UTC, datetime
 import pytest
 
 from aggregator.imports.port import ImportItem, WriteCounts
-from aggregator.imports.runner import RunReport, run_imports
+from aggregator.imports.runner import (
+    AdapterReport,
+    RunReport,
+    run_imports,
+    staleness_warnings,
+)
 from aggregator.sources.base import Record
 
 
@@ -348,6 +353,88 @@ def test_input_freshness_is_recorded_when_the_adapter_offers_it():
         2026, 7, 11, 9, 0, tzinfo=UTC
     )
     assert report.adapters["plain"].input_newest_at is None
+
+
+def test_a_naive_input_freshness_is_normalised_instead_of_exploding():
+    """Round-1 MEDIUM. A naive datetime satisfies ``datetime | None``, so an
+    adapter returning one is not a type error — it is a runtime one, raised
+    from the whole-run staleness pass, which runs once for every source after
+    they have all finished. One adapter's naive timestamp took down the report,
+    the error listing for every other source, and the exit code."""
+
+    class NaiveFreshness:
+        name = "substack"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            yield _rec("s1")
+
+        def input_freshness(self) -> datetime | None:
+            return datetime(2026, 7, 1, 9, 0)  # tzinfo is None
+
+    class Broken:
+        name = "github"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            raise RuntimeError("gh token expired")
+            yield  # pragma: no cover
+
+    report = asyncio.run(
+        run_imports(
+            [NaiveFreshness(), Broken()],
+            RecordingSink(),
+            stale_after_days=14,
+            now=datetime(2026, 8, 11, tzinfo=UTC),
+        )
+    )
+
+    assert report.adapters["substack"].input_newest_at == datetime(
+        2026, 7, 1, 9, 0, tzinfo=UTC
+    )
+    assert report.warnings == [
+        "substack: input is 40 days stale (threshold 14). Nothing on this "
+        "machine refreshes it — export a new one, or raise --stale-after-days "
+        "if that is the intended cadence."
+    ]
+    # The other adapter's failure survived, which is what was actually lost.
+    assert any("gh token expired" in e for e in report.errors)
+    assert report.ok is False
+
+
+def test_an_aware_input_freshness_is_left_alone():
+    class AwareFreshness:
+        name = "substack"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            yield _rec("s1")
+
+        def input_freshness(self) -> datetime | None:
+            return datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
+
+    report = asyncio.run(run_imports([AwareFreshness()], RecordingSink()))
+
+    assert report.adapters["substack"].input_newest_at == datetime(
+        2026, 7, 1, 9, 0, tzinfo=UTC
+    )
+
+
+def test_staleness_warnings_tolerates_a_naive_value_on_a_hand_built_report():
+    """The helper is public; a caller can assemble a report itself."""
+    report = RunReport(
+        adapters={
+            "substack": AdapterReport(
+                name="substack",
+                offers_input_freshness=True,
+                input_newest_at=datetime(2026, 7, 1, 9, 0),
+            )
+        }
+    )
+
+    warnings = staleness_warnings(
+        report, max_age_days=14, now=datetime(2026, 8, 11, tzinfo=UTC)
+    )
+
+    assert len(warnings) == 1
+    assert "40 days" in warnings[0]
 
 
 def test_a_failing_notify_hook_does_not_lose_the_report():

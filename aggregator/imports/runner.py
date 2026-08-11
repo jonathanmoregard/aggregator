@@ -171,10 +171,34 @@ async def _run_one(
     if isinstance(adapter, SupportsInputFreshness):
         report.offers_input_freshness = True
         try:
-            report.input_newest_at = adapter.input_freshness()
+            report.input_newest_at = _as_utc(adapter.input_freshness())
         except Exception as e:  # noqa: BLE001
             report.errors.append(f"input_freshness failed: {type(e).__name__}: {e}")
     return report
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Stamp a naive input timestamp as UTC. Normalisation, not a guess.
+
+    ``input_freshness`` is annotated ``datetime | None`` and a NAIVE datetime
+    satisfies that annotation, so an adapter returning one is not a type error
+    — it is a runtime error, and it lands nowhere near the adapter that caused
+    it. Every consumer does aware-datetime arithmetic against ``now(UTC)``,
+    and subtracting a naive datetime from an aware one raises TypeError. That
+    exception escaped the staleness pass, which runs once for the WHOLE run
+    after every adapter has finished: one source's naive timestamp took down
+    the run report, the error listing for all nine sources, and the exit-3
+    that tells the timer anything failed. Measured, not theoretical.
+
+    UTC because it is what every other timestamp in this codebase means and
+    what the whole comparison is against. The alternative — refusing the value
+    — would let one adapter's tz sloppiness cost the run its freshness signal,
+    which is the signal that exists to stop silent staleness in the first
+    place.
+    """
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
 
 
 def staleness_warnings(
@@ -199,19 +223,24 @@ def staleness_warnings(
     nothing broke, a human just has not exported lately — and it is fixed by a
     different action than a crashed adapter.
     """
-    moment = now or datetime.now(UTC)
+    moment = _as_utc(now) or datetime.now(UTC)
     warnings: list[str] = []
     for name, entry in report.adapters.items():
         if not entry.offers_input_freshness:
             continue
-        if entry.input_newest_at is None:
+        # ``_as_utc`` again, not only in ``_run_one``: this function is public
+        # and a caller can hand it a report it assembled itself. A TypeError
+        # here would escape the whole-run staleness pass and take the report,
+        # every adapter's error listing and the exit code with it.
+        newest = _as_utc(entry.input_newest_at)
+        if newest is None:
             warnings.append(
                 f"{name}: no input found — this source imported "
                 f"nothing, which looks identical to having nothing new. Drop "
                 f"a fresh export where {name} looks for it."
             )
             continue
-        age_days = (moment - entry.input_newest_at).days
+        age_days = (moment - newest).days
         if age_days > max_age_days:
             warnings.append(
                 f"{name}: input is {age_days} days stale "
