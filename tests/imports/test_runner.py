@@ -218,14 +218,62 @@ def test_notify_hook_fires_once_with_the_report_when_an_adapter_fails():
     assert seen[0].failed_adapters == ["boom"]
 
 
-def test_notify_hook_is_not_called_on_a_clean_run():
+def test_notify_hook_also_fires_on_a_clean_run_so_the_hook_can_decide():
+    """Round-1 MEDIUM. Gated on ``not report.ok``, the hook could never see a
+    run that completed cleanly — and a clean run that imported nothing because
+    the export archive is a month old is precisely what an operator needs told.
+    The runner cannot judge that; the notifier can, but only if it runs."""
     seen: list[RunReport] = []
-    asyncio.run(
+    report = asyncio.run(
         run_imports(
             [ListAdapter("alpha", [_rec("a1")])], RecordingSink(), notify=seen.append
         )
     )
-    assert seen == []
+    assert len(seen) == 1
+    assert seen[0] is report
+    assert seen[0].ok is True
+    assert seen[0].failed_adapters == []
+
+
+def test_a_clean_runs_input_freshness_is_reachable_by_the_notifier():
+    """``input_newest_at`` documents itself as something a notifier can weigh
+    separately. That was unreachable by construction: the only runs carrying an
+    interesting value are the clean ones, and no notifier ran on those."""
+
+    class StaleExport:
+        name = "substack"
+
+        async def get_data(self) -> AsyncIterator[ImportItem]:
+            return
+            yield  # pragma: no cover - an export with nothing new
+
+        def input_freshness(self) -> datetime | None:
+            return datetime(2026, 7, 1, tzinfo=UTC)
+
+    seen: list[RunReport] = []
+    asyncio.run(run_imports([StaleExport()], RecordingSink(), notify=seen.append))
+
+    assert len(seen) == 1
+    assert seen[0].ok is True
+    assert seen[0].adapters["substack"].input_newest_at == datetime(
+        2026, 7, 1, tzinfo=UTC
+    )
+
+
+def test_a_notify_hook_failing_on_a_clean_run_is_still_recorded():
+    """A notifier that cannot notify is a fault in its own right — and on an
+    otherwise-clean run this record is the only thing that says so."""
+
+    def explode(report: RunReport) -> None:
+        raise FileNotFoundError("notify-send: not found")
+
+    report = asyncio.run(
+        run_imports([ListAdapter("alpha", [_rec("a1")])], RecordingSink(), notify=explode)
+    )
+
+    assert report.failed_adapters == []
+    assert any("notify-send: not found" in e for e in report.errors)
+    assert report.ok is False
 
 
 def test_notify_defaults_to_a_no_op_so_library_code_stays_silent():

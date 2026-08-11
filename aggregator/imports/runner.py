@@ -36,6 +36,11 @@ class AdapterReport:
     errors: list[str] = field(default_factory=list)
     # Newest timestamp among the inputs this adapter read, when it can say
     # (``SupportsInputFreshness``). None = didn't offer / doesn't know.
+    #
+    # Read by the notify hook, which is why the hook now runs on every run:
+    # gated on failure, this field was unreachable on exactly the runs it
+    # exists to describe — the clean ones that imported nothing because the
+    # input is stale.
     input_newest_at: datetime | None = None
 
     @property
@@ -163,21 +168,33 @@ async def run_imports(
     notify: NotifyHook = _no_notification,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> RunReport:
-    """Drive every adapter concurrently and return the aggregated report."""
+    """Drive every adapter concurrently and return the aggregated report.
+
+    ``notify`` fires on EVERY run, not only failing ones, and the hook decides
+    what is worth telling a human. The runner has no way to know: a clean run
+    that imported nothing because the export archive is 31 days old is not an
+    error — nothing broke, a person just has not exported lately — yet it is
+    exactly what an operator needs told, and it is indistinguishable from a
+    healthy no-op in every other channel. ``AdapterReport.input_newest_at``
+    exists for a notifier to weigh, which it could not do while notification
+    was gated on ``not report.ok``: on a clean run no notifier ever ran, so
+    the value was unreachable by construction. The default hook is a no-op,
+    so "fires on every run" costs a caller who wants nothing exactly nothing.
+    """
     adapter_list: Sequence[ImportAdapter] = list(adapters)
     _refuse_duplicate_names(adapter_list)
     results = await asyncio.gather(
         *(_run_one(a, sink, batch_size) for a in adapter_list)
     )
     report = RunReport(adapters={r.name: r for r in results})
-    if not report.ok:
-        try:
-            notify(report)
-        except Exception as e:  # noqa: BLE001
-            # A missing notify-send must not cost us the report — the caller
-            # still has to be able to print WHICH adapter failed. Recorded,
-            # not swallowed.
-            report.run_errors.append(f"notify hook failed: {type(e).__name__}: {e}")
+    try:
+        notify(report)
+    except Exception as e:  # noqa: BLE001
+        # A missing notify-send must not cost us the report — the caller
+        # still has to be able to print WHICH adapter failed. Recorded,
+        # not swallowed: a notifier that cannot notify is itself a fault,
+        # and on an otherwise-clean run this is the only thing that says so.
+        report.run_errors.append(f"notify hook failed: {type(e).__name__}: {e}")
     return report
 
 
