@@ -29,7 +29,9 @@ Injection seams:
 * ``_notify`` — the run-report notifier. Fires on EVERY ``--all`` run, not
   only failing ones: a run that imported nothing because the export archive
   is a month old exits 0 and is otherwise indistinguishable from a healthy
-  no-op. Defaults to doing nothing.
+  no-op. Defaults to doing nothing INTERACTIVELY; ``--all --notify`` or
+  ``$AGGREGATOR_NOTIFY_COMMAND`` installs the real desktop notifier, which is
+  what an unattended timer run needs (stderr on an exit-0 run reaches nobody).
 
 Argparse (not click) per plan.
 """
@@ -38,6 +40,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import shlex
+import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -93,6 +98,17 @@ EXIT_COMPLETED_WITH_ERRORS = 3
 # before the gap is a month wide. Tighter and the warning fires on healthy
 # runs and gets tuned out, which is worse than not warning at all.
 DEFAULT_STALE_AFTER_DAYS = 14
+
+# How a run reaches a human when nobody is watching the terminal.
+#
+# ``--notify`` installs the real notifier; ``$AGGREGATOR_NOTIFY_COMMAND``
+# installs it too AND replaces the program, so a systemd unit can wire this up
+# through its ``Environment=`` without anyone editing an argv. The value is
+# shlex-split, so it may carry arguments ("dunstify --replace 42").
+NOTIFY_COMMAND_ENV_VAR = "AGGREGATOR_NOTIFY_COMMAND"
+DEFAULT_NOTIFY_COMMAND = "notify-send"
+# A hung notification daemon must not wedge the timer's unit.
+NOTIFY_TIMEOUT_SECONDS = 10
 
 # Which ``sessions.origin`` populations `ingest sessions --rebuild` is allowed
 # to DELETE. Exactly the one the sessions source can regenerate: it scans
@@ -644,6 +660,12 @@ def _ingest_usage_error(args: argparse.Namespace) -> str | None:
             "`aggregator ingest --all --stale-after-days "
             f"{args.stale_after_days}`"
         )
+    if args.notify and not args.all_sources:
+        return (
+            "ingest: --notify only applies to --all (the run report the "
+            "notifier describes is the runner's); drop it or run "
+            "`aggregator ingest --all --notify`"
+        )
     unused = [
         flag
         for flag, present in (("--force", args.force), ("--yes", args.yes))
@@ -661,12 +683,100 @@ def _ingest_usage_error(args: argparse.Namespace) -> str | None:
 def _silent_notification(report: RunReport) -> None:
     """The CLI's default notifier: do nothing.
 
-    The runner deliberately refuses to shell out to ``notify-send`` itself,
-    naming the CLI / systemd layer as where a real notifier belongs. This is
-    that seam standing empty: the desktop wiring is unit configuration, not
-    Python, and an interactive `aggregator ingest --all` should not pop a
-    desktop toast. Injected through ``main(_notify=...)``.
+    An interactive ``aggregator ingest --all`` prints its report to a terminal
+    somebody is already looking at, so it should not also pop a desktop toast.
+    An UNATTENDED run is the opposite case — see ``_desktop_notification`` and
+    ``--notify``.
     """
+
+
+def _notification_text(report: RunReport) -> tuple[str, str, str] | None:
+    """``(urgency, summary, body)`` for this run, or None to stay quiet.
+
+    The runner fires ``notify`` on every run and leaves it to the hook to
+    decide what is worth telling a human. Two things are:
+
+    * errors — CRITICAL, per the 2026-08-08 fail-loudly constraint.
+    * warnings with no errors — a hand-refreshed export has gone stale or is
+      missing. Nothing failed, so not critical, but this is precisely the run
+      that is invisible everywhere else: exit 0, every count 0, identical to a
+      healthy no-op.
+
+    A wholly clean run says nothing. A toast on every timer tick is how an
+    operator learns to dismiss them without reading, which would cost the two
+    cases above the only channel they have.
+    """
+    if report.errors:
+        return (
+            "critical",
+            f"aggregator ingest: {len(report.errors)} error(s)",
+            "\n".join([*report.errors[:5], *report.warnings[:3]]),
+        )
+    if report.warnings:
+        return (
+            "normal",
+            f"aggregator ingest: {len(report.warnings)} warning(s)",
+            "\n".join(report.warnings[:5]),
+        )
+    return None
+
+
+def _desktop_notification(report: RunReport) -> None:
+    """Tell a human, via ``notify-send`` (or ``$AGGREGATOR_NOTIFY_COMMAND``).
+
+    THE CLI IS WHERE THIS BELONGS. ``imports/runner.py`` refuses to shell out
+    and names this layer as the one that injects a real notifier — but until
+    round 2 nothing could: ``_notify`` is a Python-only seam, the console entry
+    point is ``aggregator.cli:main``, and no argv or env reached it. Every real
+    invocation therefore got ``_silent_notification``, so the round-1 "notify
+    fires on every run" fix moved the silence instead of removing it: on a
+    timer the warnings were stderr text on an exit-0 run, and nothing reads
+    that.
+
+    Still an injected callable — ``run_imports`` takes it as a parameter and
+    the default stays a no-op, so library and test callers shell out to
+    nothing. Only ``main`` installs this one, and only when asked.
+
+    A failure to notify propagates: the runner records it in ``run_errors``,
+    which turns into exit 3. A notifier that cannot notify is a fault in its
+    own right, and on an otherwise-clean run it is the only thing that says so.
+    """
+    text = _notification_text(report)
+    if text is None:
+        return
+    urgency, summary, body = text
+    raw = os.environ.get(NOTIFY_COMMAND_ENV_VAR) or DEFAULT_NOTIFY_COMMAND
+    argv = shlex.split(raw)
+    if not argv:
+        raise ValueError(
+            f"${NOTIFY_COMMAND_ENV_VAR} is set but empty; unset it or name a "
+            f"program (default: {DEFAULT_NOTIFY_COMMAND})"
+        )
+    # No shell=True: the value is operator configuration, split with shlex and
+    # exec'd directly. Timeout because a hung notification daemon must not
+    # wedge the timer's unit forever.
+    subprocess.run(
+        [*argv, "-u", urgency, "-a", "aggregator", summary, body],
+        check=True,
+        timeout=NOTIFY_TIMEOUT_SECONDS,
+    )
+
+
+def _resolve_notify(
+    args: argparse.Namespace, injected: NotifyHook | None
+) -> NotifyHook:
+    """Which notifier this invocation gets.
+
+    Injection wins, so a library or test caller is never surprised by an env
+    var set on the developer's machine. Otherwise ``--notify`` or a set
+    ``$AGGREGATOR_NOTIFY_COMMAND`` installs the real one — the env var alone is
+    enough so a unit file can wire this up without changing anyone's argv.
+    """
+    if injected is not None:
+        return injected
+    if getattr(args, "notify", False) or os.environ.get(NOTIFY_COMMAND_ENV_VAR):
+        return _desktop_notification
+    return _silent_notification
 
 
 def _cmd_ingest_all(
@@ -861,6 +971,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     ing.add_argument(
+        "--notify",
+        action="store_true",
+        help=(
+            "with --all: send a desktop notification when the run ends with "
+            "errors (CRITICAL) or staleness warnings (normal). For unattended "
+            f"runs; ${NOTIFY_COMMAND_ENV_VAR} overrides the program "
+            f"(default: {DEFAULT_NOTIFY_COMMAND}) and enables this on its own"
+        ),
+    )
+    ing.add_argument(
         "--rebuild",
         action="store_true",
         help="drop this source's rows and re-scan raw",
@@ -938,7 +1058,7 @@ def main(
                 else default_adapters(since=since)
             )
             return _cmd_ingest_all(
-                args, store, adapters, _notify or _silent_notification
+                args, store, adapters, _resolve_notify(args, _notify)
             )
         # Round-2 MEDIUM: the atomic DELETE + upsert lives inside
         # ``_cmd_ingest`` via ``store.rebuild_and_upsert`` when
