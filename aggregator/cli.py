@@ -611,6 +611,27 @@ def _ingest_usage_error(args: argparse.Namespace) -> str | None:
             "ingest: --rebuild is not supported with --all; rebuild one "
             "source at a time (`aggregator ingest <name> --rebuild`)"
         )
+    if args.rebuild and args.since:
+        # Round-2 HIGH-3. The two flags contradict each other on the one thing
+        # --rebuild adds over a plain ingest: the DELETE of every row the scan
+        # did not reproduce. --since narrows what the scan CAN reproduce, so
+        # the combination deletes the history outside the window — data the
+        # run never even looked at.
+        #
+        # Neither guard catches it. The ratio guard is bypassed outright below
+        # 100 existing rows (measured: 5 rows in, window covers 1, store ends
+        # at 1, exit 0), and above it a window covering >=80% of the store
+        # keeps the shrink under the threshold. Nothing prints a ``deleted=``
+        # count, so the summary of that run reads
+        # ``added=0 updated=1 skipped=0 errors=0``.
+        return (
+            f"ingest: --rebuild cannot be combined with --since "
+            f"({args.since!r}): --rebuild DELETEs every row the scan did not "
+            f"reproduce, and --since narrows the scan, so rows outside the "
+            f"window would be deleted without ever being read. Drop --since "
+            f"for a full re-scan, or drop --rebuild (a plain ingest is an "
+            f"idempotent upsert and deletes nothing)."
+        )
     # Flags that parse fine and then do nothing. Same rule as the cases above:
     # an invocation that succeeds while ignoring what was typed is worse than
     # one that stops, and these three are the ones where the operator's mental
