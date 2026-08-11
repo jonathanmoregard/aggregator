@@ -117,6 +117,28 @@ def test_parses_rows(tmp_path):
     assert rows[0]["Title"] == "Buy milk"
 
 
+def test_a_row_without_a_taskid_is_dropped_into_the_errors_sink(tmp_path):
+    """Same shape as the github source's dropped rows, and worse consequences.
+
+    The backup is the ONLY place completed-task history exists and nothing
+    regenerates it, so a row lost here is lost for good. A ``log.warning`` alone
+    left that on a run that exited 0 and notified nobody.
+    """
+    errors: list[str] = []
+    rows = parse_backup(
+        _backup(tmp_path, [_row(), _row(task_id="", title="Orphan")]), errors
+    )
+    assert [r["taskId"] for r in rows] == ["abc123"]
+    assert len(errors) == 1
+    assert "1 ticktick row(s) with no taskId" in errors[0]
+
+
+def test_a_clean_backup_adds_no_errors(tmp_path):
+    errors: list[str] = []
+    parse_backup(_backup(tmp_path, [_row()]), errors)
+    assert errors == []
+
+
 def test_bom_does_not_corrupt_first_column(tmp_path):
     """utf-8-sig: the BOM must not end up glued to a header or field name."""
     rows = parse_backup(_backup(tmp_path, [_row()], preamble=FLAT_PREAMBLE))

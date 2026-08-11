@@ -268,7 +268,7 @@ class TickTickSource:
         candidates: dict[str, tuple[datetime, Record]] = {}
         for path, mtime in self._backup_files(since):
             try:
-                rows = parse_backup(path)
+                rows = parse_backup(path, errors)
             except (OSError, UnicodeDecodeError, csv.Error) as e:
                 # Detection and parse are two separate reads, and ~/Downloads
                 # is live — a browser can replace or truncate a file between

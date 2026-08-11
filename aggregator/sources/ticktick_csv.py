@@ -163,13 +163,19 @@ def is_ticktick_backup(path: Path) -> bool:
     return _header_fields(path) is not None
 
 
-def parse_backup(path: Path) -> list[dict[str, str]]:
+def parse_backup(path: Path, errors: list[str] | None = None) -> list[dict[str, str]]:
     """Return the backup's task rows, or [] if the file has no TickTick header.
 
     Rows are keyed by the discovered header, so extra vendor columns (v7.2 added
     ``Kind`` and ``projectKind``) ride along instead of shifting every field.
     Rows without a taskId are dropped. Unlike :func:`is_ticktick_backup` this
     does not swallow read errors — gate on detection first.
+
+    A dropped row goes to ``errors``, not only to the log. The backup is the
+    ONLY source of completed-task history and nothing regenerates it, so a row
+    lost here is lost for good; a log line alone left that on an exit-0 run
+    that notified nobody, which is the same silent-loss shape the github source
+    shipped.
     """
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.reader(fh)
@@ -182,11 +188,14 @@ def parse_backup(path: Path) -> list[dict[str, str]]:
     # indistinguishable from a backup that had none (session constraint
     # 2026-08-08, "fail loudly").
     if len(kept) != len(rows):
-        log.warning(
-            "dropped %d ticktick row(s) without a taskId from %s",
-            len(rows) - len(kept),
-            path,
+        message = (
+            f"dropped {len(rows) - len(kept)} ticktick row(s) with no taskId from "
+            f"{path} — they are NOT in the index, and the backup is the only "
+            f"place completed-task history exists"
         )
+        log.warning("%s", message)
+        if errors is not None:
+            errors.append(message)
     return kept
 
 

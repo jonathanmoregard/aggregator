@@ -477,10 +477,10 @@ def test_backup_that_fails_to_parse_is_recorded_and_the_scan_continues(
     _backup(tmp_path / "archive" / "Older.csv", [_row(task_id="old1")])
     real_parse = ticktick.parse_backup
 
-    def flaky(path):
+    def flaky(path, errors=None):
         if path.name == "TickTick.csv":
             raise OSError("vanished mid-read")
-        return real_parse(path)
+        return real_parse(path, errors)
 
     monkeypatch.setattr(ticktick, "parse_backup", flaky)
     errors: list[str] = []

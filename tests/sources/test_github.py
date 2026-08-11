@@ -639,6 +639,72 @@ def test_iter_records_distinguishes_pr_from_issue_via_pull_request_marker(
     )
 
 
+# -- dropped rows are loud, not just logged --------------------------------
+#
+# This source runs unattended on a 30-minute systemd timer, so a `log.warning`
+# on a dropped row reached nobody: the run exited 0, notified nothing, and API
+# rows were missing from the index. That is live silent data loss, not a
+# hypothetical.
+
+
+def _orphan_rows(path: str) -> list[dict]:
+    """Rows with no repository_url and no parseable html_url — undrivable."""
+    if "is:pr" in path:
+        return [{"number": 42, "id": 9001, "title": "orphan pr", "state": "open"}]
+    return [{"number": 7, "id": 9002, "title": "orphan issue", "state": "open"}]
+
+
+def test_dropped_rows_reach_the_errors_sink(monkeypatch):
+    """The measured defect: four rows dropped, ``errors=0``, exit 0."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+    src = GitHubSource(
+        _scope_fetcher=lambda: ["public_repo"], _api_fetcher=_orphan_rows
+    )
+    result = src.ingest(since=None)
+    assert result.added == 0
+    assert len(result.errors) == 4, "one entry per endpoint that dropped rows"
+    assert all("DROPPED" in e for e in result.errors)
+
+
+def test_dropped_rows_do_not_abort_the_rest_of_the_endpoint(monkeypatch):
+    """Per-item faults are collected, not fatal (spec §Error handling)."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+    good = _search_pr_row(
+        repository_url="https://api.github.com/repos/acme/api", number=1
+    )
+
+    def fetcher(path: str) -> list[dict]:
+        if "is:pr+author" in path:
+            return [{"number": 42, "id": 9001, "title": "orphan"}, good]
+        return []
+
+    src = GitHubSource(_scope_fetcher=lambda: ["public_repo"], _api_fetcher=fetcher)
+    errors: list[str] = []
+    records = list(src.iter_records(since=None, errors=errors))
+    assert [r.stable_id for r in records] == ["github:acme/api:1"]
+    assert len(errors) == 1
+    assert "42" in errors[0]
+
+
+def test_a_flood_of_dropped_rows_is_one_error_naming_five(monkeypatch):
+    """A wholesale schema change must not write one error per row into a
+    desktop notification; the count is what matters, plus enough identifiers
+    to go looking with."""
+    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
+
+    def fetcher(path: str) -> list[dict]:
+        if "is:pr+author" in path:
+            return [{"number": n, "id": n} for n in range(50)]
+        return []
+
+    src = GitHubSource(_scope_fetcher=lambda: ["public_repo"], _api_fetcher=fetcher)
+    errors: list[str] = []
+    list(src.iter_records(since=None, errors=errors))
+    assert len(errors) == 1
+    assert "DROPPED 50 row(s)" in errors[0]
+    assert errors[0].endswith(", ...")
+
+
 def test_iter_records_omits_updated_filter_when_since_is_none(monkeypatch):
     """No ``since`` = no filter; behaviour unchanged from the pre-fix path."""
     monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
