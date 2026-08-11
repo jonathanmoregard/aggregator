@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -1194,17 +1195,48 @@ def test_a_failed_save_leaves_the_previous_state_intact(tmp_path, monkeypatch):
     first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
     ticktick_api.save_state(path, [{"id": "t1", "title": "A"}], first)
 
-    real_write = Path.write_text
+    def out_of_space(*args, **kwargs):
+        raise OSError("no space left on device")
 
-    def fail_on_the_scratch_file(self, *args, **kwargs):
-        if self != path:
-            raise OSError("no space left on device")
-        return real_write(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "write_text", fail_on_the_scratch_file)
+    # The scratch file's write leg, whatever it is spelled as — the point is
+    # that a failure there never reaches the rename.
+    monkeypatch.setattr(ticktick_api.os, "fdopen", out_of_space)
     with pytest.raises(OSError):
         ticktick_api.save_state(path, [{"id": "t2", "title": "B"}], first)
     assert ticktick_api.load_state(path)["t1"]["task"]["title"] == "A"
+
+
+def test_save_state_is_not_world_readable(tmp_path):
+    """Round-1 LOW. The baseline holds whole task payloads — titles and notes,
+    i.e. medical appointments, legal matters, everything a person puts in a
+    task manager. No token, so not a credential, but a cache file has no
+    business publishing somebody's to-do list at the default umask."""
+    path = tmp_path / "open_tasks.json"
+
+    ticktick_api.save_state(
+        path,
+        [{"id": "t1", "title": "Therapy appointment", "content": "notes"}],
+        datetime(2026, 8, 8, tzinfo=UTC),
+    )
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode & 0o077 == 0, f"group/other can read the task list: {oct(mode)}"
+    assert ticktick_api.load_state(path).keys() == {"t1"}
+
+
+def test_a_leftover_scratch_file_does_not_keep_a_looser_mode(tmp_path):
+    """O_CREAT's mode argument is ignored when the file already exists, and a
+    scratch file survives any interrupted save."""
+    path = tmp_path / "open_tasks.json"
+    scratch = path.with_name(path.name + ".tmp")
+    scratch.write_text("{}", encoding="utf-8")
+    scratch.chmod(0o666)
+
+    ticktick_api.save_state(
+        path, [{"id": "t1"}], datetime(2026, 8, 8, tzinfo=UTC)
+    )
+
+    assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
 
 
 def test_save_state_keys_by_the_modules_one_id_rule(tmp_path, caplog):

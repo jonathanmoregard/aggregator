@@ -734,6 +734,15 @@ def save_state(path: Path, tasks: Iterable[dict], now: datetime) -> None:
     unusable is skipped rather than allowed to abort the save, and is counted
     out loud: a baseline that quietly lost entries would invent a completion
     for every one of them on the very next poll.
+
+    Written 0600, not at the default umask. This file holds whole task
+    payloads — titles and notes, i.e. the user's medical appointments, legal
+    matters and everything else they put in a task manager. No token, so it is
+    not a credential, but a world-readable copy of somebody's to-do list is not
+    something a cache file should create on their behalf. The mode is set on
+    the scratch fd BEFORE any bytes are written, so there is no window at 0644,
+    and applied explicitly rather than relying on O_CREAT's mode argument,
+    which does nothing when a scratch file from an earlier run already exists.
     """
     payload: dict[str, dict] = {}
     skipped = 0
@@ -746,7 +755,10 @@ def save_state(path: Path, tasks: Iterable[dict], now: datetime) -> None:
         log.warning("ticktick state: skipped %d task(s) with no usable id", skipped)
     path.parent.mkdir(parents=True, exist_ok=True)
     scratch = path.with_name(path.name + ".tmp")
-    scratch.write_text(json.dumps(payload), encoding="utf-8")
+    fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(json.dumps(payload))
     scratch.replace(path)
 
 
