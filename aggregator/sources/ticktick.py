@@ -210,7 +210,29 @@ class TickTickSource:
             _note(errors, f"ticktick token unavailable: {e}")
             return {}
         if not token:
-            log.info("no ticktick token configured; running CSV-only")
+            # WARNING, not INFO, and that is load-bearing for the same reason
+            # it is in ``ticktick_api._note_inbox_gap``: nothing under
+            # ``aggregator/`` configures logging, so ``logging.lastResort``
+            # (level WARNING) is the only thing that prints and anything
+            # quieter reaches nobody. At INFO this line produced literally no
+            # output, so an operator who believed the API leg was configured
+            # got a CSV-only run and no way at all to notice.
+            #
+            # Not an ``errors`` entry: running without the API leg is a
+            # supported configuration (the CSV backup carries all the history)
+            # and an error here would fire a CRITICAL notification on every
+            # timer tick for a user who simply never wanted it. A credential
+            # that is CONFIGURED and broken is the loud case, and
+            # ``resolve_token`` raises for it above.
+            log.warning(
+                "no ticktick token configured (checked the explicit token, "
+                "$%s / $%s, $%s, and %s); running CSV-only, so completed-task "
+                "history will be as old as the newest backup export",
+                TOKEN_ENV_VAR,
+                TOKEN_FILE_ENV_VAR,
+                ticktick_api.TOKEN_ENV_VAR,
+                ticktick_api.DEFAULT_ENV_FILE,
+            )
             return {}
 
         observed = self._api_observed_at

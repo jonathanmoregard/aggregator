@@ -1048,6 +1048,76 @@ def test_resolve_token_unreadable_file_raises_a_distinguishable_error(tmp_path):
     assert not isinstance(excinfo.value, HTTPError)
 
 
+# --- present-but-empty is a broken credential, not an absent one ----------
+#
+# Round-1 MEDIUM: an EMPTY ``TICKTICK_ACCESS_TOKEN`` in the shared store was
+# indistinguishable from never having configured the API leg. That is exactly
+# what a failed OAuth refresh leaves behind — the todo backend rewrites the
+# file on every refresh, so a refresh that produced nothing writes the key with
+# no value — and it silently disabled the poll on an exit-0 run.
+
+
+def test_an_empty_token_in_the_shared_store_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN=""),
+    )
+    with pytest.raises(ticktick_api.TokenUnavailableError) as excinfo:
+        ticktick_api.resolve_token(None, None)
+    message = str(excinfo.value)
+    assert "empty" in message
+    assert ticktick_api.RELOGIN_COMMAND in message, "must name the human's fix"
+
+
+def test_a_whitespace_only_token_in_the_shared_store_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN='"   "'),
+    )
+    with pytest.raises(ticktick_api.TokenUnavailableError):
+        ticktick_api.resolve_token(None, None)
+
+
+def test_an_empty_token_in_the_environment_raises(tmp_path, monkeypatch):
+    """Same shape from the other direction: a unit file whose EnvironmentFile
+    failed to load exports the name with no value."""
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN="a-live-token"),
+    )
+    monkeypatch.setenv("TICKTICK_ACCESS_TOKEN", "")
+    with pytest.raises(ticktick_api.TokenUnavailableError):
+        ticktick_api.resolve_token(None, None)
+
+
+def test_an_absent_key_in_the_shared_store_is_still_a_plain_skip(
+    tmp_path, monkeypatch
+):
+    """The distinction the fix rests on. A machine that never configured the
+    API leg is not broken and must not be reported as broken."""
+    monkeypatch.setattr(
+        ticktick_api, "DEFAULT_ENV_FILE", _env_file(tmp_path, SOMETHING_ELSE="x")
+    )
+    assert ticktick_api.resolve_token(None, None) is None
+
+
+def test_an_empty_token_file_is_still_a_skip_not_a_failure(tmp_path, monkeypatch):
+    """The deliberate asymmetry: an empty FILE is exactly how the merged
+    ``ticktick-api-token.age`` placeholder looks, so treating it as broken
+    would let the placeholder shadow a live credential in the shared store."""
+    placeholder = tmp_path / "placeholder"
+    placeholder.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        ticktick_api,
+        "DEFAULT_ENV_FILE",
+        _env_file(tmp_path, TICKTICK_ACCESS_TOKEN="from-shared-store"),
+    )
+    assert ticktick_api.resolve_token(None, str(placeholder)) == "from-shared-store"
+
+
 # --- the open-task state file ---------------------------------------------
 #
 # WHY IT EXISTS: the Open API serves open tasks only and has no endpoint that

@@ -12,6 +12,7 @@ whole archive for a credential the user may never have configured.
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -330,6 +331,52 @@ def test_expired_shared_token_degrades_to_csv_only(tmp_path, monkeypatch):
     assert [r.stable_id for r in records] == ["ticktick:abc123"]
     assert len(errors) == 1
     assert ticktick_api.RELOGIN_COMMAND in errors[0]
+
+
+def test_an_empty_shared_token_is_a_loud_error_not_a_silent_csv_only_run(
+    tmp_path, monkeypatch
+):
+    """Round-1 MEDIUM. A failed OAuth refresh leaves the key present with no
+    value, and that read as "the API leg was never configured" — reported at a
+    log level nothing prints, on a run that still exited 0. The poll silently
+    disabled itself and completed-task inference stopped, permanently."""
+    env_file = tmp_path / "env"
+    env_file.write_text("TICKTICK_ACCESS_TOKEN=\n", encoding="utf-8")
+    monkeypatch.setattr(ticktick_api, "DEFAULT_ENV_FILE", str(env_file))
+    _backup(tmp_path / "downloads" / "TickTick.csv", [_row()])
+    errors: list[str] = []
+
+    records = list(_source(tmp_path).iter_records(None, errors=errors))
+
+    # Still CSV-only rather than a dead ingest — the load-bearing invariant.
+    assert [r.stable_id for r in records] == ["ticktick:abc123"]
+    assert len(errors) == 1
+    assert "empty" in errors[0]
+    assert ticktick_api.RELOGIN_COMMAND in errors[0]
+
+
+def test_a_genuinely_unconfigured_api_leg_is_not_an_error_but_is_audible(
+    tmp_path, monkeypatch, caplog
+):
+    """The other side of that distinction. Never configuring the API leg is a
+    supported setup, so it must not fire a CRITICAL notification every tick —
+    but it was logged at INFO, and nothing under ``aggregator/`` configures
+    logging, so ``logging.lastResort`` (WARNING) meant it reached nobody."""
+    env_file = tmp_path / "env"
+    env_file.write_text("# no token here\n", encoding="utf-8")
+    monkeypatch.setattr(ticktick_api, "DEFAULT_ENV_FILE", str(env_file))
+    _backup(tmp_path / "downloads" / "TickTick.csv", [_row()])
+    errors: list[str] = []
+
+    with caplog.at_level(logging.WARNING, logger="aggregator.sources.ticktick"):
+        records = list(_source(tmp_path).iter_records(None, errors=errors))
+
+    assert [r.stable_id for r in records] == ["ticktick:abc123"]
+    assert errors == []
+    assert any(
+        "CSV-only" in r.getMessage() and r.levelno >= logging.WARNING
+        for r in caplog.records
+    ), f"the CSV-only degradation must print, got {caplog.records!r}"
 
 
 def test_unusable_task_payload_is_recorded_and_skipped(tmp_path, monkeypatch):

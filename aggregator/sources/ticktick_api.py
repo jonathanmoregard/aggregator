@@ -589,6 +589,24 @@ def _reject_if_expired(expires_at: str | None, source: str) -> None:
         )
 
 
+def _reject_if_blank(value: str, source: str) -> None:
+    """Raise when a token source exists but holds nothing.
+
+    "The key is not there" and "the key is there and empty" are opposite
+    diagnoses with opposite fixes, and collapsing them into ``None`` made a
+    broken OAuth refresh look exactly like a machine that never configured the
+    API leg. Only the second one is a fault, and only a human can clear it.
+    """
+    if value.strip():
+        return
+    raise TokenUnavailableError(
+        f"ticktick access token from {source} is set but empty — the API leg "
+        f"is configured and its credential is gone (this is what a failed "
+        f"OAuth refresh leaves behind). Re-authorize with "
+        f"`{RELOGIN_COMMAND}`, or unset it if the API leg is not wanted."
+    )
+
+
 def resolve_token(
     token: str | None, token_file: str | None, env_file: str | None = None
 ) -> str | None:
@@ -609,6 +627,20 @@ def resolve_token(
     A whitespace-only explicit token falls through to the file rather than
     shadowing it: treating it as "configured" silently skipped the API leg while
     a perfectly good token file sat right there.
+
+    A ``TICKTICK_ACCESS_TOKEN`` that is PRESENT BUT EMPTY — in the process
+    environment or in the shared store — is a broken credential, not an absent
+    one, and raises. That is precisely what a failed OAuth refresh leaves
+    behind: the todo backend rewrites ``~/.config/todo/env`` on every refresh,
+    so a refresh that produced nothing writes the key with no value. Returning
+    None for it made a dead API leg identical to a machine that never
+    configured one — reported, if at all, at a log level nothing prints — so
+    the leg silently disabled itself and the run still exited 0.
+
+    The token FILE keeps the opposite rule and that asymmetry is deliberate:
+    an empty file is exactly how the merged ``ticktick-api-token.age``
+    placeholder looks, so treating it as broken would let the placeholder
+    shadow a live credential in the shared store.
     """
     explicit = (token or "").strip()
     if explicit:
@@ -622,17 +654,19 @@ def resolve_token(
             ) from e
         if content:
             return content
-    from_env = os.environ.get(TOKEN_ENV_VAR, "").strip()
-    if from_env:
+    raw_env = os.environ.get(TOKEN_ENV_VAR)
+    if raw_env is not None:
+        _reject_if_blank(raw_env, f"${TOKEN_ENV_VAR}")
         _reject_if_expired(os.environ.get(EXPIRY_ENV_VAR), f"${TOKEN_ENV_VAR}")
-        return from_env
+        return raw_env.strip()
     path = env_file or DEFAULT_ENV_FILE
     values = _read_env_file(path)
-    shared = values.get(TOKEN_ENV_VAR, "").strip()
-    if not shared:
+    if TOKEN_ENV_VAR not in values:
         return None
+    shared = values[TOKEN_ENV_VAR]
+    _reject_if_blank(shared, f"{TOKEN_ENV_VAR} in {path}")
     _reject_if_expired(values.get(EXPIRY_ENV_VAR), path)
-    return shared
+    return shared.strip()
 
 
 # --- the open-task state file ----------------------------------------------
