@@ -4,12 +4,12 @@ Personal "everything about me, currently, one prompt" aggregator. Caches Claude 
 
 ## Status
 
-v1: two sources (Claude Code sessions, GitHub PRs + issues via `gh api /search/issues`), SQLite+FTS5 store with WAL-mode concurrent-writer safety, four surfaces:
+v1: nine registered sources (see [Sources](#sources) below), SQLite+FTS5 store with WAL-mode concurrent-writer safety, four surfaces:
 
 - **FastMCP** (`aggregator-mcp`) — three read-only tools: `aggregator_query`, `aggregator_capabilities`, `aggregator_ingest` (a human-approve gate that only prints the CLI command).
 - **CLI** (`aggregator`) — `query`, `ingest SOURCE [--since ISO] [--rebuild]`, `status`.
 - **Raycast** — scripts in `scripts/raycast/` wrap the CLI for one-shot triage.
-- **Nix module** (`nix/aggregator.nix`) — home-manager module with systemd user timers on `*:0/30` for both sources.
+- **Nix module** (`nix/aggregator.nix`) — home-manager module with systemd user timers on `*:0/30`, currently for `sessions` and `github` only. Note that this module is not what runs in production: `nixos-config` ships a standalone duplicate (`modules/nixos/aggregator-github-timer.nix`) because this repo is local-only and cannot be a flake input on a CI runner. Every other source is hand-run today.
 
 Design docs: `docs/superpowers/plans/2026-08-01-aggregator-plan.md` (chunked build plan) and `docs/superpowers/specs/2026-08-01-aggregator-design.md` (design spec).
 
