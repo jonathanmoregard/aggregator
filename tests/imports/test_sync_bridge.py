@@ -81,6 +81,45 @@ def test_exception_from_the_sync_iterator_propagates():
         asyncio.run(_drain(aiter_in_thread(produce, chunk_size=1)))
 
 
+def test_items_pulled_before_a_mid_chunk_crash_still_reach_the_consumer():
+    """Round-1 LOW. ``_next_chunk`` raised from inside the pull loop, throwing
+    away everything it had already collected — up to 255 items at the default
+    chunk size. "Partial ingest beats total loss" is the policy everywhere else
+    in this pipeline and did not hold here."""
+    seen: list[int] = []
+
+    def produce() -> Iterator[int]:
+        yield from range(7)
+        raise OSError("disk gone")
+
+    async def drive() -> None:
+        async for item in aiter_in_thread(produce, chunk_size=256):
+            seen.append(item)
+
+    with pytest.raises(OSError, match="disk gone"):
+        asyncio.run(drive())
+
+    assert seen == list(range(7))
+
+
+def test_a_crash_on_a_later_chunk_keeps_the_earlier_ones_and_its_own_partial():
+    seen: list[int] = []
+
+    def produce() -> Iterator[int]:
+        yield from range(5)
+        raise RuntimeError("upstream 500")
+
+    async def drive() -> None:
+        async for item in aiter_in_thread(produce, chunk_size=2):
+            seen.append(item)
+
+    with pytest.raises(RuntimeError, match="upstream 500"):
+        asyncio.run(drive())
+
+    # 0,1 | 2,3 | 4 then the raise — the partial final chunk is not lost.
+    assert seen == [0, 1, 2, 3, 4]
+
+
 class FakeRecordSource:
     """Shaped like research/sota-watch: iter_records(since, errors=...)."""
 

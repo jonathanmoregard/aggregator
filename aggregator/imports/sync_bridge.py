@@ -34,15 +34,32 @@ T = TypeVar("T")
 DEFAULT_CHUNK_SIZE = 256
 
 
-def _next_chunk(iterator: Iterator[T], size: int) -> list[T]:
-    """Pull up to ``size`` items. Runs in the worker thread."""
+def _next_chunk(
+    iterator: Iterator[T], size: int
+) -> tuple[list[T], Exception | None]:
+    """Pull up to ``size`` items. Runs in the worker thread.
+
+    Returns whatever was pulled ALONGSIDE the failure, rather than letting the
+    failure discard it. A source that dies part-way through a chunk had already
+    produced up to ``size - 1`` items, and raising from here threw every one of
+    them away before the consumer saw them — the runner's "whatever arrived
+    before the crash still gets written" only ever applied to whole chunks that
+    had already crossed the thread boundary. At the default chunk size that is
+    up to 255 items lost per crash.
+
+    ``Exception``, not ``BaseException``: CancelledError and KeyboardInterrupt
+    mean the whole run is being torn down and must keep propagating, the same
+    rule the runner's isolation boundary follows.
+    """
     chunk: list[T] = []
     for _ in range(size):
         try:
             chunk.append(next(iterator))
         except StopIteration:
             break
-    return chunk
+        except Exception as e:  # noqa: BLE001 -- handed back, never swallowed
+            return chunk, e
+    return chunk, None
 
 
 async def aiter_in_thread(
@@ -57,14 +74,21 @@ async def aiter_in_thread(
     the loop. Exceptions raised by the sync side propagate to the caller
     unchanged — the runner turns them into a per-adapter error, and nothing
     is silently dropped.
+
+    Items pulled BEFORE the failure are yielded first, then the exception is
+    re-raised. Partial ingest beats total loss is the policy everywhere else in
+    this pipeline, and it did not hold here: a raise mid-chunk discarded up to
+    ``chunk_size - 1`` items the source had already produced.
     """
     iterator = await asyncio.to_thread(lambda: iter(make_iterator()))
     while True:
-        chunk = await asyncio.to_thread(_next_chunk, iterator, chunk_size)
-        if not chunk:
-            return
+        chunk, error = await asyncio.to_thread(_next_chunk, iterator, chunk_size)
         for item in chunk:
             yield item
+        if error is not None:
+            raise error
+        if not chunk:
+            return
 
 
 def _accepts_errors_kwarg(fn: Callable[..., Any]) -> bool:
