@@ -540,6 +540,29 @@ def _ingest_usage_error(args: argparse.Namespace) -> str | None:
             "ingest: --rebuild is not supported with --all; rebuild one "
             "source at a time (`aggregator ingest <name> --rebuild`)"
         )
+    # Flags that parse fine and then do nothing. Same rule as the cases above:
+    # an invocation that succeeds while ignoring what was typed is worse than
+    # one that stops, and these three are the ones where the operator's mental
+    # model is furthest from what happened — somebody passing --force believes
+    # they have authorised a destructive run.
+    if args.stale_after_days is not None and not args.all_sources:
+        return (
+            "ingest: --stale-after-days only applies to --all (the input "
+            "staleness check runs over the whole registry); drop it or run "
+            "`aggregator ingest --all --stale-after-days "
+            f"{args.stale_after_days}`"
+        )
+    unused = [
+        flag
+        for flag, present in (("--force", args.force), ("--yes", args.yes))
+        if present
+    ]
+    if unused and not args.rebuild:
+        return (
+            f"ingest: {' and '.join(unused)} only applies to --rebuild (it "
+            f"overrides the >20% row-drop guard, and nothing is dropped "
+            f"without --rebuild); drop it or add --rebuild"
+        )
     return None
 
 
@@ -584,7 +607,11 @@ def _cmd_ingest_all(
             adapters,
             StoreSink(store),
             notify=notify,
-            stale_after_days=args.stale_after_days,
+            stale_after_days=(
+                args.stale_after_days
+                if args.stale_after_days is not None
+                else DEFAULT_STALE_AFTER_DAYS
+            ),
         )
     )
     _print_run_report(report)
@@ -727,7 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
     ing.add_argument(
         "--stale-after-days",
         type=int,
-        default=DEFAULT_STALE_AFTER_DAYS,
+        # No argparse default: `None` is how "the operator did not type this"
+        # is told apart from "they typed the default", which is what lets the
+        # usage check reject it on a run where it cannot do anything.
+        # ``_cmd_ingest_all`` applies DEFAULT_STALE_AFTER_DAYS.
+        default=None,
         help=(
             "with --all: warn when a manually-refreshed input (chat exports, "
             "the TickTick CSV) is older than this many days "

@@ -13,6 +13,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from aggregator.cli import DEFAULT_STALE_AFTER_DAYS, main
 from aggregator.core.store import Store
 from aggregator.imports.port import ImportItem
@@ -68,6 +70,16 @@ class _ExportAdapter(_FakeAdapter):
 
     def input_freshness(self) -> datetime | None:
         return self._freshness
+
+
+class _RecordSource:
+    """A single-source (non-adapter) stub for the `ingest <name>` path."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def iter_records(self, since, errors=None):
+        yield _record(self.name)
 
 
 def _record(source: str, n: int = 1) -> Record:
@@ -464,6 +476,67 @@ def test_neither_a_source_nor_all_is_a_usage_error(tmp_path, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "--all" in err
+
+
+def test_stale_after_days_without_all_is_a_usage_error(tmp_path, capsys):
+    """Round-1 LOW: it parsed on every ingest invocation and did nothing
+    without --all. An operator who typed a threshold believes they changed
+    when the run nags them."""
+    store = _store(tmp_path)
+
+    rc = main(
+        ["ingest", "alpha", "--stale-after-days", "60"],
+        _store=store,
+        _sources={"alpha": _RecordSource("alpha")},
+    )
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--stale-after-days" in err
+    assert "--all" in err
+    assert store.count_by_source("alpha") == 0
+
+
+@pytest.mark.parametrize("flag", ["--force", "--yes"])
+def test_force_and_yes_without_rebuild_are_usage_errors(tmp_path, capsys, flag):
+    """Somebody passing --force believes they have authorised a destructive
+    run. Accepting it silently on a run that destroys nothing is the widest
+    gap between what was typed and what happened."""
+    store = _store(tmp_path)
+
+    rc = main(
+        ["ingest", "alpha", flag],
+        _store=store,
+        _sources={"alpha": _RecordSource("alpha")},
+    )
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert flag in err
+    assert "--rebuild" in err
+    assert store.count_by_source("alpha") == 0
+
+
+def test_the_flags_are_accepted_where_they_do_something(tmp_path):
+    """The other half: they must still work on the runs they apply to."""
+    store = _store(tmp_path)
+
+    assert (
+        main(
+            ["ingest", "--all", "--stale-after-days", "60"],
+            _store=store,
+            _adapters=[_ExportAdapter("substack", 31)],
+        )
+        == 0
+    )
+    assert (
+        main(
+            ["ingest", "alpha", "--rebuild", "--force", "--yes"],
+            _store=store,
+            _sources={"alpha": _RecordSource("alpha")},
+        )
+        == 0
+    )
 
 
 def test_rebuild_is_refused_with_all(tmp_path, capsys):
