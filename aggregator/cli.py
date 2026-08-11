@@ -57,6 +57,15 @@ from aggregator.sources.ticktick import TickTickSource
 _RATIO_GUARD_MIN_EXISTING = 100
 _RATIO_GUARD_KEEP_FRACTION = 0.8  # refuse if new < 0.8 * existing
 
+# Exit codes. 0 clean; 1 hard failure; 2 usage error (unknown source, bad
+# --since, unknown subcommand) — both pre-existing and deliberately not
+# renumbered. 3 is the new one: the run completed but ended with a non-empty
+# errors list. Distinct from 2 so the systemd wrapper can tell a typo'd
+# source name from a run that dropped three PDFs; distinct from 0 because
+# `tasks/session-constraints.md` requires a failed ingest to be loud, and a
+# timer that reads 0 as success lets the index rot unnoticed.
+EXIT_COMPLETED_WITH_ERRORS = 3
+
 
 def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
     """True when the shrink from ``existing`` to ``new`` exceeds the guard.
@@ -253,6 +262,7 @@ def _cmd_ingest_entities(
     if errors:
         for e in errors[:5]:
             print(f"  error: {e}", file=sys.stderr)
+        return EXIT_COMPLETED_WITH_ERRORS
     return 0
 
 
@@ -378,6 +388,15 @@ def _cmd_ingest(
     if errors:
         for e in errors[:5]:
             print(f"  error: {e}", file=sys.stderr)
+        # 3, not 0: a run that completed but dropped files is not a success,
+        # and a partially-successful run is not a successful run — some
+        # records landing does not make the missing ones acceptable. A timer
+        # reporting success while the index rots is indistinguishable from
+        # one with nothing to do. 3 rather than 2 because 2 is this file's
+        # usage-error code and the systemd wrapper must tell them apart:
+        # "you typed a bad source name" and "the run dropped three PDFs"
+        # need different notification text and different human responses.
+        return EXIT_COMPLETED_WITH_ERRORS
     return 0
 
 
