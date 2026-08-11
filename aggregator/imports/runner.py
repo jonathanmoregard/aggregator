@@ -166,7 +166,17 @@ async def _run_one(
     # after a failure: it exists so an adapter's own state cannot get ahead of
     # the data it implies. A partial run leaves that state untouched and
     # re-derives it next time. See ``SupportsWriteBarrier``.
-    if wrote_everything and isinstance(adapter, SupportsWriteBarrier):
+    #
+    # ``report.skipped`` is half the condition, not decoration. "The stream
+    # ended without raising" is NOT "the items were persisted": ``skipped`` is
+    # the sink saying it declined to write, which ``WriteCounts`` explicitly
+    # anticipates for a filtering or dry-run sink. Firing the barrier then
+    # advances a baseline for records that reached no store at all — and for
+    # TickTick that is permanent, because the Open API reports a completion
+    # exactly once. Declining to fire costs one poll's inference; firing costs
+    # the inference forever. The asymmetry decides it.
+    persisted_everything = wrote_everything and report.skipped == 0
+    if persisted_everything and isinstance(adapter, SupportsWriteBarrier):
         try:
             adapter.commit_after_write()
         except Exception as e:  # noqa: BLE001

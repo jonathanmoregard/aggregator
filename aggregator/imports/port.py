@@ -75,6 +75,9 @@ class WriteCounts:
     ``added`` — the item's primary key was not in the store before.
     ``updated`` — it was, and the row was overwritten.
     ``skipped`` — the sink declined to write it (unknown shape, filtered).
+    Load-bearing beyond the summary: a nonzero ``skipped`` withholds the
+    ``SupportsWriteBarrier`` call, because an adapter must not advance state
+    that implies rows the sink says it did not write.
 
     These have to come back FROM the write. ``cli.py`` reports
     ``added=len(records) updated=0`` for every run, so its summary is the
@@ -133,9 +136,16 @@ class SupportsWriteBarrier(Protocol):
     failure into permanent loss.
 
     So the adapter keeps the advance pending and the runner calls this once
-    the stream has been written: after the final flush, and only when nothing
-    raised. A partial run leaves the state untouched and re-derives it next
-    time, which is why the barrier is not called on the failure path.
+    the stream has been PERSISTED: after the final flush, only when nothing
+    raised, and only when the sink reported nothing skipped. A partial run
+    leaves the state untouched and re-derives it next time, which is why the
+    barrier is not called on the failure path.
+
+    "Nothing skipped" is not belt-and-braces. ``WriteCounts.skipped`` is the
+    sink saying it declined to write — a dry-run or filtering sink, which the
+    field exists for — and that stream also ends cleanly. Gating on the stream
+    alone let such a sink advance a baseline for records no store ever
+    received.
 
     Not a transaction and not a rollback — the sink's writes are already
     committed by then. It is the narrower guarantee that the adapter's own

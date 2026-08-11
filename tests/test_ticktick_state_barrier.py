@@ -109,6 +109,14 @@ class _CountingSink:
         return WriteCounts(added=len(items))
 
 
+class _DryRunSink:
+    """A sink that declines to write and says so. Not hypothetical — this is
+    the case ``WriteCounts.skipped`` is documented to exist for."""
+
+    def write(self, items) -> WriteCounts:
+        return WriteCounts(skipped=len(items))
+
+
 # -- the finding ----------------------------------------------------------
 
 
@@ -230,6 +238,43 @@ def test_a_state_write_that_fails_after_the_records_landed_is_reported(
 
     assert rc == cli.EXIT_COMPLETED_WITH_ERRORS
     assert store.count_by_source("ticktick") == 2
+
+
+# -- round 3 W2: "the stream ended" is not "the items were persisted" -----
+
+
+def test_a_sink_that_persisted_nothing_does_not_advance_the_baseline(
+    tmp_path, state_file
+):
+    """THE round-3 finding. The runner fired the barrier on 'the stream ended
+    without raising'. A sink that declines to write ends the stream just as
+    cleanly and stores nothing — so the baseline advanced past a completion
+    that reached no store at all, on a run that exited 0."""
+    adapter = TickTickAdapter(source=_source(tmp_path, state_file))
+
+    report = asyncio.run(run_imports([adapter], _DryRunSink()))
+
+    assert report.ok is True, "declining to write is not a failure"
+    assert (report.added, report.updated, report.skipped) == (0, 0, 2)
+    assert _baseline(state_file) == {"t1", "t2"}, (
+        "nothing was persisted, so t2's completion must stay re-inferable"
+    )
+
+
+def test_a_partly_skipped_batch_does_not_advance_the_baseline_either(
+    tmp_path, state_file
+):
+    """Half-written is not written. The skipped item may be the completion."""
+
+    class _HalfSink:
+        def write(self, items) -> WriteCounts:
+            return WriteCounts(added=len(items) - 1, skipped=1)
+
+    adapter = TickTickAdapter(source=_source(tmp_path, state_file))
+
+    asyncio.run(run_imports([adapter], _HalfSink()))
+
+    assert _baseline(state_file) == {"t1", "t2"}
 
 
 # -- round 3 W1: a pending commit must not outlive the poll that made it ---
