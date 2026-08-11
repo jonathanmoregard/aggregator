@@ -10,6 +10,7 @@ from aggregator.sources.ticktick_csv import (
     HEADER_LINE_INDEX,
     MAX_PREAMBLE_ROWS,
     STATUS_TAGS,
+    UNKNOWN_STATUS_TAG,
     is_ticktick_backup,
     parse_backup,
     row_to_record,
@@ -202,13 +203,39 @@ def test_status_minus_one_is_abandoned(tmp_path):
     assert "open" not in tags
 
 
-def test_unknown_status_defaults_open_and_warns(tmp_path, caplog):
-    """A status TickTick has never emitted (e.g. 1) is loud, not silently coerced."""
+def test_unknown_status_is_never_guessed_at_as_open(tmp_path, caplog):
+    """A status TickTick has never emitted (e.g. 1) is loud, not silently coerced.
+
+    "There is no status 1" was measured against one export in 2026 — an
+    observation about the vendor's current behaviour, not a guarantee. Coercing
+    drift to ``open`` misclassified the task on an exit-0 run: a search for open
+    work would return something TickTick considers finished, with nothing
+    anywhere saying the index had guessed.
+    """
     row = parse_backup(_backup(tmp_path, [_row(status="1")]))[0]
+    errors: list[str] = []
     with caplog.at_level(logging.WARNING, logger="aggregator.sources.ticktick_csv"):
-        rec = row_to_record(row, source_file="x.csv")
-    assert "open" in rec.tags
+        rec = row_to_record(row, source_file="x.csv", errors=errors)
+    assert "open" not in rec.tags
+    assert UNKNOWN_STATUS_TAG in rec.tags
+    # Emitted, not dropped: nothing regenerates the backup, so losing the row
+    # would be permanent and strictly worse than an honestly-labelled unknown.
+    assert rec.stable_id == "ticktick:abc123"
+    # The raw code rides along verbatim, so the drifted rows stay findable.
+    assert rec.extra["status"] == "1"
     assert "'1'" in caplog.text
+    assert len(errors) == 1
+    assert "'1'" in errors[0]
+
+
+def test_a_recognised_status_adds_no_error(tmp_path):
+    """Only DRIFT is loud. Every real row must stay silent, or the alert that
+    fires on every healthy run is an alert nobody reads."""
+    errors: list[str] = []
+    for status in STATUS_TAGS:
+        row = parse_backup(_backup(tmp_path, [_row(status=status)]))[0]
+        row_to_record(row, source_file="x.csv", errors=errors)
+    assert errors == []
 
 
 def test_status_wins_over_completed_time(tmp_path):

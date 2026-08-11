@@ -137,7 +137,10 @@ class TickTickSource:
             "subject": "str (task title)",
             "body": "str (task content/notes, plus checklist items on the API leg)",
             "provenance": "str (csv | api | api-inferred-complete)",
-            "status": "str (0 open, 2 completed, -1 abandoned; there is no 1)",
+            # Verbatim, always: an unrecognised code is indexed as it arrived
+            # and tagged 'status-unrecognised' rather than guessed at as open.
+            # "There is no 1" is measured against one 2026 export, not promised.
+            "status": "str (0 open, 2 completed, -1 abandoned; anything else is drift)",
             "priority": "str (none | low | medium | high)",
             "due_date": "str (ISO 8601 +0000, may be empty)",
             "start_date": "str (ISO 8601 +0000, may be empty)",
@@ -282,7 +285,7 @@ class TickTickSource:
             # already replaced the only surviving copy of the real one.
             self._archive(path)
             for row in rows:
-                record = row_to_record(row, source_file=path.name)
+                record = row_to_record(row, source_file=path.name, errors=errors)
                 task_id = _merge_key(record)
                 if task_id not in candidates or candidates[task_id][0] <= mtime:
                     candidates[task_id] = (mtime, record)
@@ -356,7 +359,7 @@ class TickTickSource:
         candidates: dict[str, tuple[datetime, Record]] = {}
         for task in poll.tasks:
             try:
-                record = ticktick_api.task_to_record(task)
+                record = ticktick_api.task_to_record(task, errors=errors)
             except (ValueError, AttributeError) as e:
                 # A payload with no usable id, or one that is not an object at
                 # all. Skipped rather than allowed to abort the loop: one

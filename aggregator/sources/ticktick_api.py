@@ -359,6 +359,7 @@ def task_to_record(
     *,
     completed_at: datetime | None = None,
     provenance: str = "api",
+    errors: list[str] | None = None,
 ) -> Record:
     """Map one API task payload to a Record.
 
@@ -376,6 +377,10 @@ def task_to_record(
     documented endpoint to resolve one, so an API record cannot reproduce that
     tag. Task 8 should union tags across the two legs rather than let the API
     record's tag list replace the CSV record's.
+
+    ``errors`` is the run's fault sink, forwarded to ``status_tag`` so a status
+    code neither leg recognises makes the run exit non-zero rather than being
+    quietly filed as open.
     """
     task_id = _task_id(task)  # first, so an unusable payload fails before it warns
     inferred = completed_at is not None
@@ -384,7 +389,7 @@ def task_to_record(
     project_name = _text(task.get("_projectName")).strip()
     if project_name:
         tags.append(project_name)
-    tags.append(status_tag(status, logger=log))
+    tags.append(status_tag(status, logger=log, errors=errors))
 
     # Every value here is a str, with no exceptions — the annotation says so, so
     # the next exception has to argue with a type-checker. extra is serialised

@@ -73,6 +73,15 @@ STATUS_TAGS = {
     STATUS_ABANDONED: "abandoned",
 }
 
+# What a task carrying a status this module has never seen is tagged with.
+#
+# Not ``open``. "There is no status 1" is an observation measured against one
+# export in 2026, not a promise from TickTick; coercing a future code to
+# ``open`` would misclassify the task on an exit-0 run, and a search for open
+# work would return something the vendor considers finished. This tag claims
+# nothing, and doubles as the query that finds every drifted row at once.
+UNKNOWN_STATUS_TAG = "status-unrecognised"
+
 # TickTick priority levels: 0 none, 1 low, 3 medium, 5 high. There is no 2 or 4.
 PRIORITY_NAMES = {0: "none", 1: "low", 3: "medium", 5: "high"}
 
@@ -199,18 +208,47 @@ def parse_backup(path: Path, errors: list[str] | None = None) -> list[dict[str, 
     return kept
 
 
-def status_tag(status: str, *, logger: logging.Logger | None = None) -> str:
-    """Map a raw ``Status`` value to its tag, warning on anything unrecognised.
+def status_tag(
+    status: str,
+    *,
+    logger: logging.Logger | None = None,
+    errors: list[str] | None = None,
+) -> str:
+    """Map a raw ``Status`` value to its tag, reporting anything unrecognised.
 
     Shared by both legs: the API leg reads the payload's own ``status`` and must
     tag it with the same word the CSV leg would, or task 8's merge flips a task
     between ``completed`` and ``open`` depending on which leg wrote last.
+
+    An unrecognised code is tagged :data:`UNKNOWN_STATUS_TAG` and routed to
+    ``errors``, NOT coerced to ``open``. "There is no status 1" was measured
+    against one export in 2026 — an observation about a vendor's current
+    behaviour, not a guarantee about its future one. Coercing drift to ``open``
+    misclassified the task on a run that exited 0: a task TickTick considers
+    finished would come back from a search for open work, and nothing anywhere
+    would say the index had guessed.
+
+    The row is still EMITTED, deliberately. Dropping it would lose the task
+    from an index whose entire job is to remember it, and on the CSV leg
+    nothing regenerates the backup, so the loss would be permanent — a strictly
+    worse failure than an honestly-labelled unknown. ``extra["status"]`` keeps
+    the raw code verbatim, so the drifted rows are findable by exact match once
+    an operator knows what the new code means.
     """
     tag = STATUS_TAGS.get(status)
-    if tag is None:
-        (logger or log).warning("unexpected ticktick Status %r; tagging as 'open'", status)
-        return "open"
-    return tag
+    if tag is not None:
+        return tag
+    message = (
+        f"unrecognised ticktick Status {status!r}: not one of "
+        f"{sorted(STATUS_TAGS)} — TickTick's vocabulary has drifted, so this "
+        f"task is tagged {UNKNOWN_STATUS_TAG!r} rather than guessed at. Its "
+        f"real state is unknown to the index until STATUS_TAGS in "
+        f"aggregator/sources/ticktick_csv.py learns the new code"
+    )
+    (logger or log).warning("%s", message)
+    if errors is not None:
+        errors.append(message)
+    return UNKNOWN_STATUS_TAG
 
 
 def priority_name(value: object, *, logger: logging.Logger | None = None) -> str:
@@ -236,11 +274,17 @@ def priority_name(value: object, *, logger: logging.Logger | None = None) -> str
         return text
 
 
-def row_to_record(row: dict[str, str], source_file: str) -> Record:
+def row_to_record(
+    row: dict[str, str], source_file: str, errors: list[str] | None = None
+) -> Record:
     """Map one backup row to a Record.
 
     The status tag comes strictly from ``Status``, never from the presence of a
     ``Completed Time`` — the real export has open rows carrying one.
+
+    ``errors`` is the run's fault sink, forwarded to :func:`status_tag` so a
+    status code this module does not recognise makes the run exit non-zero
+    instead of being quietly filed as open.
     """
     status = (row.get("Status") or "0").strip()
     created = _parse_dt(row.get("Created Time"))
@@ -250,7 +294,7 @@ def row_to_record(row: dict[str, str], source_file: str) -> Record:
         value = (row.get(key) or "").strip()
         if value:
             tags.append(value)
-    tags.append(status_tag(status))
+    tags.append(status_tag(status, errors=errors))
 
     return Record(
         stable_id=stable_id_for(SOURCE_NAME, row["taskId"]),

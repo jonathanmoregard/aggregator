@@ -636,6 +636,30 @@ def _dead_p2():
     raise HTTPError(f"{ticktick_api.BASE_URL}/project/p2/data", 500, "boom", {}, None)
 
 
+def test_vocabulary_drift_in_a_backup_reaches_the_runs_errors_sink(tmp_path):
+    """An unrecognised status must not ride out on an exit-0 run.
+
+    End to end, because the sink only matters if it survives the hop from
+    ``status_tag`` through ``row_to_record`` to the run report the CLI turns
+    into an exit code and a notification.
+    """
+    _backup(tmp_path / "downloads" / "TickTick.csv", [_row(status="1")])
+    errors: list[str] = []
+    (rec,) = list(_source(tmp_path).iter_records(None, errors=errors))
+    assert "open" not in rec.tags
+    assert rec.extra["status"] == "1"
+    assert len(errors) == 1
+    assert "'1'" in errors[0]
+
+
+def test_a_normal_backup_leaves_the_errors_sink_empty(tmp_path):
+    """The other half: an alert that fires on every healthy run is not an alert."""
+    _backup(tmp_path / "downloads" / "TickTick.csv", [_row(), _row(task_id="t2", status="2")])
+    errors: list[str] = []
+    assert len(list(_source(tmp_path).iter_records(None, errors=errors))) == 2
+    assert errors == []
+
+
 def test_a_blip_on_one_project_does_not_complete_that_projects_tasks(
     tmp_path, monkeypatch
 ):

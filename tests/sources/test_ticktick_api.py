@@ -565,13 +565,21 @@ def test_task_to_record_absent_status_is_open():
     assert "open" in rec.tags
 
 
-def test_task_to_record_unknown_status_is_verbatim_and_warns(caplog):
-    """TickTick has no status 1. A new vendor code must be visible, not coerced."""
+def test_task_to_record_unknown_status_is_verbatim_and_reported(caplog):
+    """TickTick has no status 1. A new vendor code must be visible, not coerced.
+
+    Same rule and the same shared function as the CSV leg, which is the point:
+    a code the API starts serving and a code the export starts writing must not
+    land two different tags on one stable_id.
+    """
+    errors: list[str] = []
     with caplog.at_level(logging.WARNING, logger=API_LOG):
-        rec = ticktick_api.task_to_record(full_task(status=1))
+        rec = ticktick_api.task_to_record(full_task(status=1), errors=errors)
     assert rec.extra["status"] == "1"
-    assert "open" in rec.tags
+    assert "open" not in rec.tags
+    assert ticktick_csv.UNKNOWN_STATUS_TAG in rec.tags
     assert "'1'" in caplog.text
+    assert len(errors) == 1
 
 
 def test_task_to_record_uses_the_payloads_completed_time():
