@@ -425,6 +425,45 @@ def test_a_project_with_no_tasks_key_does_not_bury_its_open_tasks(monkeypatch, t
     assert errors
 
 
+@pytest.mark.parametrize(
+    ("extra", "expect_complete"),
+    [
+        ({"nextPageToken": "abc"}, False),
+        ({"hasMore": True}, False),
+        ({"next_cursor": "xyz"}, False),
+        # The endpoint explicitly saying "this is the whole list" is the
+        # opposite of a fault, and benign metadata must not kill inference.
+        ({"hasMore": False}, True),
+        ({"total": 1, "limit": 50, "page": 1}, True),
+        ({}, True),
+    ],
+)
+def test_a_paged_project_payload_is_not_a_complete_view(monkeypatch, extra, expect_complete):
+    """Round-5 HIGH 1, the channel the absent-key check cannot see.
+
+    A paged payload has the key, has a list, and every entry is well formed —
+    it is simply only the first page, and a truncated list is indistinguishable
+    from a short one. If TickTick ever pages this endpoint, the unseen open
+    tasks get inferred completed exactly as an unread project's would.
+
+    A tripwire, not a verified fix: the endpoint's real shape could not be
+    confirmed offline, so this makes the truth self-report on first contact
+    with a real token rather than guessing at a cursor to follow.
+    """
+
+    def fake_request(method, url, token, timeout=30):
+        if url.endswith("/project"):
+            return [{"id": "p1", "name": "Work"}]
+        return {"tasks": [_open_task(id="t1", projectId="p1")], **extra}
+
+    monkeypatch.setattr(ticktick_api, "_request", fake_request)
+    errors: list[str] = []
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert [t["id"] for t in poll.tasks] == ["t1"], "the observed page is still kept"
+    assert poll.complete is expect_complete
+    assert bool(errors) is not expect_complete
+
+
 def test_an_empty_project_listing_is_not_a_complete_view(monkeypatch):
     """Round-5 HIGH 1. ``[]`` from ``/project`` is indistinguishable from a
     token whose scope stopped covering them, so it cannot claim completeness.

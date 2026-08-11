@@ -217,6 +217,36 @@ class OpenTaskPoll:
     complete: bool
 
 
+# Payload keys that would mean "there is more where this came from".
+#
+# UNVERIFIED, and a tripwire rather than a guess acted upon. TickTick's
+# ``/project/{id}/data`` is documented as a single ``{project, tasks, columns}``
+# object with no cursor, but that could not be confirmed — every attempt to read
+# the published docs was blocked and there is no other web access — and this is
+# the same situation as ``CREATED_FIELD``, handled the same way: make the truth
+# self-reporting on first contact with a real token instead of guessing harder.
+#
+# Deliberately a SHORT list of unambiguous "there is more" names. ``total``,
+# ``page``, ``limit`` and ``offset`` are omitted on purpose: benign metadata
+# under any of those names would clear ``complete`` on every healthy poll and
+# kill completion inference outright, which is the failure mode the Inbox note
+# is careful to avoid.
+_PAGING_KEYS = frozenset({"nextpagetoken", "nextcursor", "hasmore", "nextpage"})
+
+
+def _paging_signals(data: dict) -> list[str]:
+    """The truthy pagination-cursor keys in a project payload, if any.
+
+    Truthy only: a ``"hasMore": false`` is the endpoint explicitly saying this
+    IS the whole list, which is the opposite of a fault.
+    """
+    return sorted(
+        str(key)
+        for key, value in data.items()
+        if str(key).lower().replace("_", "") in _PAGING_KEYS and value
+    )
+
+
 def _project_tasks(
     data: dict, project_name: str, errors: list[str] | None, label: str
 ) -> tuple[list[dict], bool]:
@@ -275,10 +305,28 @@ def _project_tasks(
             continue
         entry["_projectName"] = project_name
         tasks.append(entry)
+    complete = True
     if len(tasks) != len(raw):
         _note(errors, f"{label}: skipped {len(raw) - len(tasks)} non-object task entr(ies)")
-        return tasks, False
-    return tasks, True
+        complete = False
+    cursors = _paging_signals(data)
+    if cursors:
+        # A PAGED payload is the one way this project's task list can be short
+        # without anything above noticing: the key is present, the value is a
+        # list, every entry is a well-formed object, and it is still only the
+        # first page. That is HIGH 1's exact damage — unseen open tasks inferred
+        # completed — arriving through a channel the absent-key check cannot
+        # see, because a truncated list is indistinguishable from a short one.
+        _note(
+            errors,
+            f"{label}: the payload carries {', '.join(cursors)}, which means "
+            f"this client is reading only the FIRST PAGE of the project's "
+            f"tasks and the rest were not observed. Treating the poll as "
+            f"incomplete; completion inference stays off until "
+            f"_project_tasks learns to follow the cursor",
+        )
+        complete = False
+    return tasks, complete
 
 
 def poll_open_tasks(token: str, errors: list[str] | None = None) -> OpenTaskPoll:
