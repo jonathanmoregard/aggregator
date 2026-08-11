@@ -322,6 +322,79 @@ def test_corrupt_line_skipped_not_aborted(tmp_path):
     assert len(observations) == 2
 
 
+def test_a_corrupt_line_is_reported_exactly_once(tmp_path):
+    """Both passes read every top-level file, so a line-level fault used to be
+    appended to the same sink twice. The CLI prints ``errors[:5]``, so a file
+    with three bad lines could crowd every other fault in the run out of the
+    only view an operator gets."""
+    p = tmp_path / "sess-dup.jsonl"
+    p.write_text(
+        '{"type":"user","sessionId":"sess-dup","uuid":"d1","timestamp":"2026-07-26T10:00:01Z",'
+        '"cwd":"/x","message":{"role":"user","content":"ok"}}\n'
+        "garbage that is not json\n"
+    )
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+    _s, _o, errors = _split_entities(SessionsSource(projects_root=str(tmp_path)))
+    assert len([e for e in errors if "corrupt" in e]) == 1
+
+
+def test_an_unstattable_file_reaches_the_errors_sink(tmp_path):
+    """Round-5 HIGH 3. A whole JSONL dropped by a failed ``stat`` was invisible.
+
+    ``_iter_jsonl_files`` consults mtime for the live-file window and answered
+    any OSError with a bare ``continue`` — no error, no log. Sessions is the
+    largest source in the index (~5,678 sessions / ~359k observations), so a
+    permission change on one project directory, or a dangling symlink left by a
+    moved project, silently shrinks the index on a run that reports success.
+
+    A dangling symlink is used because it raises the same OSError as the
+    permission case without leaving an unreadable directory behind for pytest
+    to trip over during cleanup.
+    """
+    good = tmp_path / "sess-good.jsonl"
+    good.write_text(
+        '{"type":"user","sessionId":"sess-good","uuid":"g1","timestamp":"2026-07-26T10:00:01Z",'
+        '"cwd":"/x","message":{"role":"user","content":"ok"}}\n'
+    )
+    os.utime(good, (time.time() - 24 * 60 * 60,) * 2)
+    (tmp_path / "sess-gone.jsonl").symlink_to(tmp_path / "no-such-target.jsonl")
+
+    sessions, _obs, errors = _split_entities(SessionsSource(projects_root=str(tmp_path)))
+
+    # Per-item, not fatal: the readable file still lands. That is by design.
+    assert [s.session_id for s in sessions] == ["sess-good"]
+    assert len(errors) == 1
+    assert "sess-gone.jsonl" in errors[0]
+
+
+def test_a_non_dict_jsonl_line_reaches_the_errors_sink(tmp_path):
+    """Round-5 HIGH 3. A JSONL line that parses but is not an object was
+    skipped with NO LOG AT ALL — the quietest drop in the largest source.
+
+    It is exactly what a truncated-then-appended file or a writer bug leaves
+    behind, and it is indistinguishable from a session that simply had fewer
+    observations. Per-item, so the surrounding good lines still land.
+    """
+    p = tmp_path / "sess-shapes.jsonl"
+    p.write_text(
+        '{"type":"user","sessionId":"sess-shapes","uuid":"s1",'
+        '"timestamp":"2026-07-26T10:00:01Z","cwd":"/x",'
+        '"message":{"role":"user","content":"ok"}}\n'
+        '"a bare string, valid JSON, not an object"\n'
+        "[1, 2, 3]\n"
+    )
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+
+    sessions, observations, errors = _split_entities(
+        SessionsSource(projects_root=str(tmp_path))
+    )
+
+    assert len(sessions) == 1
+    assert len(observations) == 1
+    assert len(errors) == 2
+    assert all("sess-shapes.jsonl" in e for e in errors)
+
+
 def test_attachment_and_progress_types_preserved_not_bucketed_as_other(tmp_path):
     """M2 fix: real Claude Code JSONLs emit ``type='attachment'`` (hook
     results, file uploads) and ``type='progress'`` (in-flight markers). These

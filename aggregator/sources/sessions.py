@@ -299,13 +299,24 @@ class SessionsSource:
 
     # -- filesystem walk --------------------------------------------------
 
-    def _iter_jsonl_files(self) -> Iterator[Path]:
+    def _iter_jsonl_files(self, errors: list[str] | None = None) -> Iterator[Path]:
         """Yield every non-live JSONL under the projects root.
 
         Live-file skip (5-min window) matches v1 semantics — an actively
         appended file could split observations mid-record. File mtime is a
         container signal only (research §5); we still consult it here to
         avoid reading a partial line.
+
+        A ``stat`` that FAILS is a different thing from a file that is merely
+        live, and conflating them is what this ``errors`` parameter exists to
+        stop. The mtime read answered any OSError with a bare ``continue``: the
+        whole file — every session and every observation in it — vanished from
+        the walk with no error and no log. This is the largest source in the
+        index, so a permission change on one project directory, or a dangling
+        symlink left behind by a moved project, silently shrank it on a run that
+        reported success and exited 0. Recorded and skipped, never just skipped:
+        per-file faults are not fatal here by design, but they are not free
+        either.
         """
         if not self.projects_root.exists():
             return
@@ -313,7 +324,9 @@ class SessionsSource:
         for path in self.projects_root.rglob("*.jsonl"):
             try:
                 mtime = path.stat().st_mtime
-            except OSError:
+            except OSError as e:
+                if errors is not None:
+                    errors.append(f"{path}: stat failed, file skipped entirely: {e}")
                 continue
             if now - mtime < LIVE_WINDOW_SECONDS:
                 continue
@@ -464,6 +477,16 @@ class SessionsSource:
                     errors.append(f"{path}:{lineno} corrupt line")
                     continue
                 if not isinstance(obj, dict):
+                    # Valid JSON, wrong shape — a bare string, a list, a
+                    # number. It used to be dropped with no error and no log at
+                    # all, which is the quietest failure in the whole source: an
+                    # observation simply ceases to exist and the session it
+                    # belonged to looks like it just had fewer lines. Exactly
+                    # what a truncated-then-reappended file leaves behind.
+                    errors.append(
+                        f"{path}:{lineno} skipped: line is a "
+                        f"{type(obj).__name__}, not a JSON object"
+                    )
                     continue
                 parsed = self._parse_line(obj)
                 if parsed is not None:
@@ -505,9 +528,26 @@ class SessionsSource:
     # -- Pass 1: agentId → Agent-tool_use_id index (B1 fix) --------------
 
     def _collect_agent_spawn_index(
-        self, errors: list[str]
+        self, errors: list[str], paths: list[Path] | None = None
     ) -> dict[str, dict[str, str]]:
         """Return ``{parent_session_id: {child_agent_id: tool_use_id}}``.
+
+        ``paths`` is the file list pass 2 is going to walk. Passing it in is
+        what lets the two passes agree: they used to run ``_iter_jsonl_files``
+        independently, so a file crossing the 5-minute live boundary between
+        them was seen by one pass and not the other, and every file was stat'd
+        twice. It also decides where faults get reported — see the ``errors``
+        note below. Left None (``scripts/backfill_spawn_ids.py`` calls this
+        standalone) it walks for itself.
+
+        ERRORS: this pass reports nothing about the files it reads,
+        deliberately. Every file it opens is also opened and read in full by
+        pass 2, which reports each unopenable file and each bad line exactly
+        once; appending here too put the same fault in the sink twice, and the
+        CLI only ever prints ``errors[:5]``, so one file with a few bad lines
+        could crowd every other fault in the run out of the only view an
+        operator gets. The sink is still taken, because the standalone call
+        above has to report the stat failures nobody else will see.
 
         Walks every top-level JSONL and joins each parent-side
         ``Agent``-tool ``tool_result`` back to the child ``agentId`` it
@@ -525,27 +565,29 @@ class SessionsSource:
         This is an EXACT-MATCH join — no time windows, no ambiguity.
         """
         index: dict[str, dict[str, str]] = {}
-        for path in self._iter_jsonl_files():
+        if paths is None:
+            paths = list(self._iter_jsonl_files(errors))
+        for path in paths:
             if self._is_subagent_path(path):
                 continue
             dominant_id = path.stem  # filename == top-level sessionId
             try:
                 fh = path.open(encoding="utf-8", errors="replace")
-            except OSError as e:
-                errors.append(f"{path}: open failed: {e}")
-                continue
+            except OSError:
+                continue  # pass 2 reports it; see the docstring
             try:
-                for lineno, raw in enumerate(fh, 1):
+                # No line numbers: this pass reports nothing, so it has
+                # nothing to number. Pass 2 carries the line-level diagnostics.
+                for raw in fh:
                     line = raw.strip()
                     if not line:
                         continue
                     try:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
-                        errors.append(f"{path}:{lineno} corrupt line")
-                        continue
+                        continue  # pass 2 reports it; see the docstring
                     if not isinstance(obj, dict):
-                        continue
+                        continue  # pass 2 reports it; see the docstring
                     if obj.get("sessionId") != dominant_id:
                         # Resume prefix-copy: skip lines that don't belong
                         # to this file's dominant session.
@@ -641,9 +683,16 @@ class SessionsSource:
         observation past ``since`` is emitted in full).
         """
         sink = errors if errors is not None else []
-        spawn_index = self._collect_agent_spawn_index(sink)
+        # ONE walk, shared by both passes. Walking twice stat'd every file
+        # twice and let the passes disagree about which files exist: a file
+        # crossing the 5-minute live boundary between them was indexed by one
+        # and not the other. It also decided nothing about where a stat failure
+        # gets reported, so threading the sink into both would have put every
+        # such failure in the run's errors twice.
+        paths = list(self._iter_jsonl_files(sink))
+        spawn_index = self._collect_agent_spawn_index(sink, paths)
 
-        for path in self._iter_jsonl_files():
+        for path in paths:
             yield from self._iter_file_entities(path, spawn_index, since, sink)
 
     def _iter_file_entities(
