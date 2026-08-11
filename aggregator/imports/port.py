@@ -1,0 +1,131 @@
+"""The import port: one structural seam every source is adapted onto.
+
+Ports and adapters, the pythonic way — ``typing.Protocol`` for structural
+typing, no ABCs, no factories, no DI container, no entry-point registry. An
+adapter is any object with a ``name`` and a ``get_data``; conformance is
+checked by shape, not by inheritance or registration.
+
+``get_data`` returns an ``AsyncIterator``, i.e. implementations are
+``async def get_data(self)`` containing ``yield``. Deliberately NOT a list:
+the sessions source alone emits ~359k observations and materialising that
+per adapter would hold the whole index in memory while the runner writes.
+Streaming also lets the runner flush in batches, so a crash mid-source keeps
+whatever was already written.
+
+Naming: snake_case ``get_data``, not ``getData`` — PEP 8 wins in Python,
+and the user licensed "the pythonic way of your chosen scripting language".
+
+No ``since`` parameter on the port. Sources that support incremental
+windows take ``since`` at construction time (the adapter closes over it), so
+the port stays the single-verb interface it is meant to be. Adding a
+parameter here would push per-source acquisition knobs into the seam every
+future source has to implement.
+"""
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol, runtime_checkable
+
+from aggregator.sources.base import ObservationRow, Record, SessionRow
+
+# The store has two intentionally-distinct write paths and the port carries
+# both rather than collapsing them (see ``core/store.py`` module docstring —
+# a PR is not naturally a session):
+#
+#   * ``Record``                        -> ``Store.upsert`` (records table,
+#                                          ON CONFLICT(stable_id) DO UPDATE)
+#   * ``SessionRow`` | ``ObservationRow`` -> ``Store.upsert_entities``
+#
+# Sinks dispatch on the concrete type; adapters never have to know which
+# table they land in.
+ImportItem = Record | SessionRow | ObservationRow
+
+
+@runtime_checkable
+class ImportAdapter(Protocol):
+    """What the runner needs from a source. Nothing else.
+
+    ``runtime_checkable`` so tests (and a future ``status`` surface) can
+    duck-type a registry entry with ``isinstance``. Note that
+    ``issubclass`` is not available for protocols carrying non-method
+    members like ``name`` — that is a CPython restriction, not a design
+    intent.
+    """
+
+    name: str
+
+    def get_data(self) -> AsyncIterator[ImportItem]: ...
+
+
+@dataclass(frozen=True)
+class WriteCounts:
+    """What a write actually did. Addable so the runner can fold batches.
+
+    ``added`` — the item's primary key was not in the store before.
+    ``updated`` — it was, and the row was overwritten.
+    ``skipped`` — the sink declined to write it (unknown shape, filtered).
+
+    These have to come back FROM the write. ``cli.py`` reports
+    ``added=len(records) updated=0`` for every run, so its summary is the
+    same three numbers whatever happened; that bug is not repeated here.
+    """
+
+    added: int = 0
+    updated: int = 0
+    skipped: int = 0
+
+    def __add__(self, other: WriteCounts) -> WriteCounts:
+        return WriteCounts(
+            added=self.added + other.added,
+            updated=self.updated + other.updated,
+            skipped=self.skipped + other.skipped,
+        )
+
+
+@runtime_checkable
+class ImportSink(Protocol):
+    """Where the runner puts what an adapter yields.
+
+    Synchronous on purpose. The real sink is SQLite, whose writes are best
+    serialised anyway, and a sync call cannot be suspended mid-way by the
+    event loop — so concurrent adapters can share one sink without a lock
+    and without half-written batches interleaving.
+    """
+
+    def write(self, items: Sequence[ImportItem]) -> WriteCounts: ...
+
+
+@runtime_checkable
+class SupportsNonFatalErrors(Protocol):
+    """Optional: an adapter that survives per-item failures reports them here.
+
+    Existing sources append per-file problems to an ``errors`` list and keep
+    going (partial ingest beats total loss). That policy must not silently
+    lose its output on the new path: the session constraint is that a run
+    ending with a non-empty ``errors`` list still notifies. The runner drains
+    this after the stream ends — including when it ended by raising — and
+    folds the result into the adapter's report.
+    """
+
+    def drain_errors(self) -> list[str]: ...
+
+
+@runtime_checkable
+class SupportsInputFreshness(Protocol):
+    """Optional: when was the newest input this adapter reads last touched?
+
+    Sources differ on ACQUISITION, not parsing. ``research`` / ``sota-watch``
+    / ``dropbox`` read local dirs that other tooling refreshes; the chat
+    exports (``claude-web``, ``chatgpt``, ``substack``) read a
+    manually-downloaded archive that nothing on this machine refreshes, so a
+    timer would happily re-import the same stale zip forever and report
+    success. Returning the newest input timestamp lets a later task say
+    "substack input is 31 days stale" instead. ``None`` means unknown.
+
+    Not built out yet — this is the seam so it can be, without reopening the
+    port.
+    """
+
+    def input_freshness(self) -> datetime | None: ...
