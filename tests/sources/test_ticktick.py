@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from urllib.error import HTTPError
 
 import pytest
 
@@ -64,6 +65,15 @@ def _backup(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join([preamble, HEADER, *rows]) + "\n", encoding="utf-8")
     return path
+
+
+def _poll(tasks, complete=True):
+    """An ``OpenTaskPoll``, the shape ``poll_open_tasks`` now returns.
+
+    Completeness travels with the tasks so no caller can run the completion
+    inference over a partial view — see ``ticktick_api.OpenTaskPoll``.
+    """
+    return ticktick_api.OpenTaskPoll(list(tasks), complete=complete)
 
 
 def _source(tmp_path, **kw):
@@ -132,8 +142,10 @@ def test_api_leg_merges_with_csv(tmp_path, monkeypatch):
     _backup(tmp_path / "downloads" / "TickTick.csv", [_row(task_id="csv1", title="From CSV")])
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": "api1", "title": "From API", "_projectName": "Work"}],
+        "poll_open_tasks",
+        lambda token, errors=None: _poll(
+            [{"id": "api1", "title": "From API", "_projectName": "Work"}]
+        ),
     )
     records = {r.stable_id: r for r in _source(tmp_path, token="tok").iter_records(None)}
     assert set(records) == {"ticktick:csv1", "ticktick:api1"}
@@ -152,8 +164,8 @@ def test_fresher_api_observation_beats_stale_csv(tmp_path, monkeypatch):
     os.utime(path, (stale, stale))
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": "t1", "title": "Reopened"}],
+        "poll_open_tasks",
+        lambda token, errors=None: _poll([{"id": "t1", "title": "Reopened"}]),
     )
     (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
     assert rec.extra["provenance"] == "api"
@@ -170,8 +182,8 @@ def test_fresher_csv_beats_api(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": "t1", "title": "Stale open view"}],
+        "poll_open_tasks",
+        lambda token, errors=None: _poll([{"id": "t1", "title": "Stale open view"}]),
     )
     src = _source(tmp_path, token="tok")
     src._api_observed_at = datetime(2000, 1, 1, tzinfo=UTC)
@@ -192,7 +204,9 @@ def test_completion_inferred_across_two_polls(tmp_path, monkeypatch):
     iteration, so a poll nobody stored is re-offered next time.
     """
     tasks = [{"id": "t1", "title": "Gone"}, {"id": "t2", "title": "Stays"}]
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", lambda token, errors=None: tasks)
+    monkeypatch.setattr(
+        ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll(tasks)
+    )
     first = _source(tmp_path, token="tok")
     list(first.iter_records(None))
     first.commit_after_write()
@@ -218,7 +232,9 @@ def test_an_unchanged_task_is_not_inferred_completed_every_poll(tmp_path, monkey
     anywhere. Two identical polls must produce no completion at all.
     """
     tasks = [{"id": " t1 ", "title": "Padded"}]
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", lambda token, errors=None: tasks)
+    monkeypatch.setattr(
+        ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll(tasks)
+    )
     list(_source(tmp_path, token="tok").iter_records(None))
 
     records = list(_source(tmp_path, token="tok").iter_records(None))
@@ -237,8 +253,8 @@ def test_padded_api_id_does_not_duplicate_the_csv_record(tmp_path, monkeypatch):
     _backup(tmp_path / "downloads" / "TickTick.csv", [_row(task_id="t1", status="2")])
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": " t1 ", "title": "Padded"}],
+        "poll_open_tasks",
+        lambda token, errors=None: _poll([{"id": " t1 ", "title": "Padded"}]),
     )
     records = list(_source(tmp_path, token="tok").iter_records(None))
     assert [r.stable_id for r in records] == ["ticktick:t1"]
@@ -251,7 +267,7 @@ def test_api_failure_records_error_and_keeps_csv(tmp_path, monkeypatch):
     def boom(token, errors=None):
         raise OSError("network down")
 
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", boom)
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", boom)
     errors: list[str] = []
     records = list(_source(tmp_path, token="tok").iter_records(None, errors=errors))
     assert [r.stable_id for r in records] == ["ticktick:abc123"]
@@ -266,9 +282,9 @@ def test_token_file_is_read(tmp_path, monkeypatch):
 
     def fake_fetch(token, errors=None):
         seen["token"] = token
-        return []
+        return _poll([])
 
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", fake_fetch)
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", fake_fetch)
     list(_source(tmp_path, token_file=str(token_file)).iter_records(None))
     assert seen["token"] == "filetoken"
 
@@ -288,9 +304,9 @@ def test_shared_token_store_is_the_fallback(tmp_path, monkeypatch):
 
     def fake_fetch(token, errors=None):
         seen["token"] = token
-        return []
+        return _poll([])
 
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", fake_fetch)
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", fake_fetch)
     list(_source(tmp_path).iter_records(None))
     assert seen["token"] == "shared-token"
 
@@ -397,11 +413,13 @@ def test_unusable_task_payload_is_recorded_and_skipped(tmp_path, monkeypatch):
     _backup(tmp_path / "downloads" / "TickTick.csv", [_row()])
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [
-            {"id": None, "title": "no id"},
-            {"id": "ok1", "title": "fine"},
-        ],
+        "poll_open_tasks",
+        lambda token, errors=None: _poll(
+            [
+                {"id": None, "title": "no id"},
+                {"id": "ok1", "title": "fine"},
+            ]
+        ),
     )
     errors: list[str] = []
     records = list(_source(tmp_path, token="tok").iter_records(None, errors=errors))
@@ -428,8 +446,8 @@ def test_unwritable_state_file_does_not_take_down_the_csv_leg(tmp_path, monkeypa
     _backup(tmp_path / "downloads" / "TickTick.csv", [_row()])
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": "api1", "title": "From API"}],
+        "poll_open_tasks",
+        lambda token, errors=None: _poll([{"id": "api1", "title": "From API"}]),
     )
     errors: list[str] = []
     src = TickTickSource(
@@ -479,15 +497,17 @@ def test_record_shape_documents_every_extra_key_both_legs_write(tmp_path, monkey
     _backup(tmp_path / "downloads" / "TickTick.csv", [_row(task_id="t1")])
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": "t2", "title": "open"}],
+        "poll_open_tasks",
+        lambda token, errors=None: _poll([{"id": "t2", "title": "open"}]),
     )
     src = _source(tmp_path, token="tok")
     list(src.iter_records(None))
     src.commit_after_write()  # the writing caller's barrier; see above
     # Second poll: t2 disappears, so an inferred completion (the third record
     # flavour, and the only one carrying completed_time_approx) shows up too.
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", lambda token, errors=None: [])
+    monkeypatch.setattr(
+        ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll([])
+    )
     records = list(_source(tmp_path, token="tok").iter_records(None))
 
     written = {key for r in records for key in r.extra}
@@ -524,9 +544,9 @@ def test_env_vars_configure_the_api_leg(tmp_path, monkeypatch):
 
     def fake_fetch(token, errors=None):
         seen["token"] = token
-        return []
+        return _poll([])
 
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", fake_fetch)
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", fake_fetch)
     list(_source(tmp_path).iter_records(None))
     assert seen["token"] == "from-env-file"
 
@@ -544,7 +564,7 @@ def test_ingest_counts_records_and_carries_the_errors_out(tmp_path, monkeypatch)
     def boom(token, errors=None):
         raise OSError("network down")
 
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", boom)
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", boom)
     result = _source(tmp_path, token="tok").ingest(None)
     assert (result.added, result.updated, result.skipped) == (1, 0, 0)
     assert len(result.errors) == 1
@@ -574,3 +594,105 @@ def test_newest_backup_mtime_reports_a_stale_export(tmp_path):
 def test_newest_backup_mtime_is_none_without_a_backup(tmp_path):
     """Unknown, not "epoch" — a fabricated timestamp would read as fresh."""
     assert _source(tmp_path).newest_backup_mtime() is None
+
+
+# --- a partial poll must never arm the baseline ---------------------------
+#
+# Driven through the module's real ``_request`` seam rather than a stubbed
+# ``poll_open_tasks``, because the whole defect lived in the join between the
+# project walk and the completion inference: a stub that hands over a task list
+# is exactly the shape that hid it.
+
+
+def _two_projects(*, p2_serves):
+    """A fake ``_request`` for two projects; ``p2_serves`` may raise instead."""
+
+    def fake_request(method, url, token, timeout=30):
+        if url.endswith("/project"):
+            return [{"id": "p1", "name": "Work"}, {"id": "p2", "name": "Home"}]
+        if url.endswith("/project/p1/data"):
+            return {"tasks": [_api_task("t1", "Still open")]}
+        return p2_serves()
+
+    return fake_request
+
+
+def _api_task(task_id, title):
+    # Dated, so the "no parseable timestamp anywhere" tripwire stays quiet and
+    # the errors these tests count are only the ones they are about.
+    return {
+        "id": task_id,
+        "title": title,
+        "status": 0,
+        "modifiedTime": "2026-08-09T04:00:00.000+0000",
+    }
+
+
+def _healthy_p2():
+    return {"tasks": [_api_task("t2", "Also open")]}
+
+
+def _dead_p2():
+    raise HTTPError(f"{ticktick_api.BASE_URL}/project/p2/data", 500, "boom", {}, None)
+
+
+def test_a_blip_on_one_project_does_not_complete_that_projects_tasks(
+    tmp_path, monkeypatch
+):
+    """The measured defect. One project 500s; every open task in it disappears
+    from the poll, which is precisely the signal the completion inference reads
+    as "finished". The Open API serves OPEN tasks only, so nothing it can ever
+    return contradicts that — only a manual CSV export could. So an incomplete
+    poll infers nothing at all, and leaves the baseline exactly where it was.
+    """
+    monkeypatch.setattr(ticktick_api, "_request", _two_projects(p2_serves=_healthy_p2))
+    first = _source(tmp_path, token="tok")
+    list(first.iter_records(None))
+    first.commit_after_write()
+    assert ticktick_api.load_state(tmp_path / "state.json").keys() == {"t1", "t2"}
+
+    monkeypatch.setattr(ticktick_api, "_request", _two_projects(p2_serves=_dead_p2))
+    second = _source(tmp_path, token="tok")
+    errors: list[str] = []
+    records = list(second.iter_records(None, errors=errors))
+    second.commit_after_write()
+
+    assert [r.extra["provenance"] for r in records] == ["api"], (
+        "an open task in the project that 500'd was recorded as completed"
+    )
+    assert ticktick_api.load_state(tmp_path / "state.json").keys() == {"t1", "t2"}, (
+        "the partial poll advanced the baseline, so no later poll can undo this"
+    )
+    # Loud, not merely correct: the failed project AND the consequence.
+    assert len(errors) == 2
+    assert any("p2" in e for e in errors)
+    assert any("SKIPPED" in e for e in errors)
+
+
+def test_the_next_complete_poll_still_infers_the_real_completion(tmp_path, monkeypatch):
+    """Declining to infer costs nothing, which is why declining is safe.
+
+    The baseline was never advanced, so the very next healthy poll diffs against
+    the same still-true baseline and picks up the completion that really did
+    happen during the outage.
+    """
+    monkeypatch.setattr(ticktick_api, "_request", _two_projects(p2_serves=_healthy_p2))
+    first = _source(tmp_path, token="tok")
+    list(first.iter_records(None))
+    first.commit_after_write()
+
+    monkeypatch.setattr(ticktick_api, "_request", _two_projects(p2_serves=_dead_p2))
+    blipped = _source(tmp_path, token="tok")
+    list(blipped.iter_records(None, errors=[]))
+    blipped.commit_after_write()
+
+    # p2 is back, and t2 really was completed while it was down.
+    monkeypatch.setattr(
+        ticktick_api, "_request", _two_projects(p2_serves=lambda: {"tasks": []})
+    )
+    third = _source(tmp_path, token="tok")
+    records = {r.stable_id: r for r in third.iter_records(None, errors=[])}
+    third.commit_after_write()
+
+    assert records["ticktick:t2"].extra["provenance"] == "api-inferred-complete"
+    assert ticktick_api.load_state(tmp_path / "state.json").keys() == {"t1"}

@@ -70,8 +70,10 @@ def state_file(tmp_path):
 def _one_open_task(monkeypatch):
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": "t1", "title": "open"}],
+        "poll_open_tasks",
+        lambda token, errors=None: ticktick_api.OpenTaskPoll(
+            [{"id": "t1", "title": "open"}], complete=True
+        ),
     )
 
 
@@ -275,8 +277,10 @@ def test_never_committing_loses_later_completions_permanently(
     def _serve(*ids):
         monkeypatch.setattr(
             ticktick_api,
-            "fetch_open_tasks",
-            lambda token, errors=None: [{"id": i, "title": i} for i in ids],
+            "poll_open_tasks",
+            lambda token, errors=None: ticktick_api.OpenTaskPoll(
+                [{"id": i, "title": i} for i in ids], complete=True
+            ),
         )
 
     _serve("t1", "t9")  # t9 is new, created after the frozen baseline
@@ -399,7 +403,7 @@ def test_a_failed_poll_does_not_leave_the_previous_polls_commit_armed(
     def _dead_api(token, errors=None):
         raise RuntimeError("ticktick 503")
 
-    monkeypatch.setattr(ticktick_api, "fetch_open_tasks", _dead_api)
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", _dead_api)
     errors: list[str] = []
     list(source.iter_records(None, errors=errors))  # poll 2: CSV-only
     assert errors, "the failed poll is still reported"

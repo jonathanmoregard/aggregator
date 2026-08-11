@@ -345,7 +345,7 @@ class TickTickSource:
 
         observed = self._api_observed_at
         try:
-            tasks = ticktick_api.fetch_open_tasks(token, errors=errors)
+            poll = ticktick_api.poll_open_tasks(token, errors=errors)
         except Exception as e:  # noqa: BLE001 -- network, auth, malformed payload
             # Recorded, never swallowed: the run still reports a non-empty
             # errors list (2026-08-08 "fail loudly"), it just does not lose
@@ -354,7 +354,7 @@ class TickTickSource:
             return {}
 
         candidates: dict[str, tuple[datetime, Record]] = {}
-        for task in tasks:
+        for task in poll.tasks:
             try:
                 record = ticktick_api.task_to_record(task)
             except (ValueError, AttributeError) as e:
@@ -372,6 +372,12 @@ class TickTickSource:
         # loading means nothing ever looks disappeared and inference is
         # silently dead, with no error and no warning.
         #
+        # The whole ``poll`` goes in, not ``poll.tasks``: a partial poll must
+        # neither infer nor arm the baseline, and the planner is where that is
+        # enforced. Passing the tasks alone is exactly how the defect got in —
+        # one project 500ing made every open task in it read as completed, and
+        # the Open API can never serve a completed task to say otherwise.
+        #
         # TWO-PHASE, deliberately. Advancing the baseline is what makes a
         # disappearance unrepeatable, and it used to happen here, mid-poll,
         # before the first record had reached any sink: a store or sink failure
@@ -381,7 +387,7 @@ class TickTickSource:
         # records have landed.
         state = ticktick_api.JsonFileState(self.state_file)
         inferred, commit = ticktick_api.plan_open_task_reconcile(
-            state, tasks, observed, errors
+            state, poll, observed, errors
         )
         self._pending_state_commit = commit
         for record in inferred:

@@ -213,7 +213,7 @@ def test_the_module_opener_replaces_the_default_redirect_handler():
 # --- project walk ---------------------------------------------------------
 
 
-def test_fetch_open_tasks_walks_projects(monkeypatch):
+def test_poll_open_tasks_walks_projects(monkeypatch):
     calls = []
 
     def fake_request(method, url, token, timeout=30):
@@ -225,13 +225,14 @@ def test_fetch_open_tasks_walks_projects(monkeypatch):
         return {"tasks": [_open_task(id="t2", title="Dishes", projectId="p2")]}
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
-    tasks = ticktick_api.fetch_open_tasks("tok")
-    assert {t["id"] for t in tasks} == {"t1", "t2"}
-    assert {t["_projectName"] for t in tasks} == {"Work", "Home"}
+    poll = ticktick_api.poll_open_tasks("tok")
+    assert {t["id"] for t in poll.tasks} == {"t1", "t2"}
+    assert {t["_projectName"] for t in poll.tasks} == {"Work", "Home"}
+    assert poll.complete is True
     assert len(calls) == 3
 
 
-def test_fetch_open_tasks_url_encodes_the_project_id(monkeypatch):
+def test_poll_open_tasks_url_encodes_the_project_id(monkeypatch):
     """The id comes from TickTick, but interpolating it raw is a habit worth not having."""
     calls = []
 
@@ -242,11 +243,11 @@ def test_fetch_open_tasks_url_encodes_the_project_id(monkeypatch):
         return {"tasks": []}
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
-    ticktick_api.fetch_open_tasks("tok")
+    ticktick_api.poll_open_tasks("tok")
     assert calls[1] == f"{ticktick_api.BASE_URL}/project/a%20b%2Fc%3Fd/data"
 
 
-def test_fetch_open_tasks_one_bad_project_does_not_abort(monkeypatch):
+def test_poll_open_tasks_one_bad_project_does_not_abort(monkeypatch):
     def fake_request(method, url, token, timeout=30):
         if url.endswith("/project"):
             return [{"id": "p1", "name": "Work"}, {"id": "p2", "name": "Home"}]
@@ -256,12 +257,15 @@ def test_fetch_open_tasks_one_bad_project_does_not_abort(monkeypatch):
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
-    tasks = ticktick_api.fetch_open_tasks("tok", errors=errors)
-    assert {t["id"] for t in tasks} == {"t2"}
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert {t["id"] for t in poll.tasks} == {"t2"}
     assert len(errors) == 1
+    # The other nine projects still come back — but the view is partial, and
+    # saying so is what stops the completion inference burying p1's open tasks.
+    assert poll.complete is False
 
 
-def test_fetch_open_tasks_propagates_project_list_failure(monkeypatch):
+def test_poll_open_tasks_propagates_project_list_failure(monkeypatch):
     """A dead API must not read as "you have no tasks" (fail loudly, 2026-08-08)."""
 
     def fake_request(method, url, token, timeout=30):
@@ -270,18 +274,18 @@ def test_fetch_open_tasks_propagates_project_list_failure(monkeypatch):
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
     with pytest.raises(HTTPError):
-        ticktick_api.fetch_open_tasks("tok", errors=errors)
+        ticktick_api.poll_open_tasks("tok", errors=errors)
 
 
-def test_fetch_open_tasks_rejects_non_list_project_payload(monkeypatch):
+def test_poll_open_tasks_rejects_non_list_project_payload(monkeypatch):
     monkeypatch.setattr(
         ticktick_api, "_request", lambda method, url, token, timeout=30: {"error": "nope"}
     )
     with pytest.raises(ValueError, match="/project"):
-        ticktick_api.fetch_open_tasks("tok")
+        ticktick_api.poll_open_tasks("tok")
 
 
-def test_fetch_open_tasks_records_malformed_project_data(monkeypatch):
+def test_poll_open_tasks_records_malformed_project_data(monkeypatch):
     """A project whose payload is not an object is skipped, not an AttributeError."""
 
     def fake_request(method, url, token, timeout=30):
@@ -293,10 +297,11 @@ def test_fetch_open_tasks_records_malformed_project_data(monkeypatch):
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
-    tasks = ticktick_api.fetch_open_tasks("tok", errors=errors)
-    assert {t["id"] for t in tasks} == {"t2"}
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert {t["id"] for t in poll.tasks} == {"t2"}
     assert len(errors) == 1
     assert "p1" in errors[0]
+    assert poll.complete is False
 
 
 @pytest.mark.parametrize(
@@ -309,7 +314,7 @@ def test_fetch_open_tasks_records_malformed_project_data(monkeypatch):
         (12, True),  # a number
     ],
 )
-def test_fetch_open_tasks_survives_a_malformed_tasks_value(monkeypatch, bad_tasks, expect_error):
+def test_poll_open_tasks_survives_a_malformed_tasks_value(monkeypatch, bad_tasks, expect_error):
     """One project with a surprising ``tasks`` shape must not kill the other nine.
 
     Every one of these used to raise TypeError from ``task["_projectName"] = …``,
@@ -326,12 +331,15 @@ def test_fetch_open_tasks_survives_a_malformed_tasks_value(monkeypatch, bad_task
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
-    tasks = ticktick_api.fetch_open_tasks("tok", errors=errors)
-    assert {t["id"] for t in tasks} == {"t2"}
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert {t["id"] for t in poll.tasks} == {"t2"}
     assert bool(errors) is expect_error
+    # A dropped task entry is a task that is open and missing from the poll,
+    # which is exactly the input the completion inference misreads.
+    assert poll.complete is not expect_error
 
 
-def test_fetch_open_tasks_tasks_key_missing_entirely(monkeypatch):
+def test_poll_open_tasks_tasks_key_missing_entirely(monkeypatch):
     def fake_request(method, url, token, timeout=30):
         if url.endswith("/project"):
             return [{"id": "p1", "name": "Work"}]
@@ -339,21 +347,29 @@ def test_fetch_open_tasks_tasks_key_missing_entirely(monkeypatch):
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
-    assert ticktick_api.fetch_open_tasks("tok", errors=errors) == []
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert poll.tasks == []
+    assert poll.complete is True
     assert errors == []
 
 
-def test_fetch_open_tasks_skips_projects_without_id(monkeypatch):
+def test_poll_open_tasks_skips_projects_without_id(monkeypatch):
+    """Skipped, but never silently: its tasks are open and now unobserved."""
+
     def fake_request(method, url, token, timeout=30):
         if url.endswith("/project"):
             return [{"name": "Nameless"}, {"id": "p2", "name": "Home"}]
         return {"tasks": [_open_task(id="t2", title="Dishes", projectId="p2")]}
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
-    assert [t["id"] for t in ticktick_api.fetch_open_tasks("tok")] == ["t2"]
+    errors: list[str] = []
+    poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert [t["id"] for t in poll.tasks] == ["t2"]
+    assert poll.complete is False
+    assert len(errors) == 1
 
 
-def test_fetch_open_tasks_never_leaks_the_token(monkeypatch, caplog):
+def test_poll_open_tasks_never_leaks_the_token(monkeypatch, caplog):
     def fake_request(method, url, token, timeout=30):
         if url.endswith("/project"):
             return [{"id": "p1", "name": "Work"}]
@@ -362,7 +378,7 @@ def test_fetch_open_tasks_never_leaks_the_token(monkeypatch, caplog):
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
     with caplog.at_level(logging.DEBUG, logger=API_LOG):
-        ticktick_api.fetch_open_tasks(TOKEN, errors=errors)
+        ticktick_api.poll_open_tasks(TOKEN, errors=errors)
     assert TOKEN not in caplog.text
     assert TOKEN not in " ".join(errors)
 
@@ -370,7 +386,7 @@ def test_fetch_open_tasks_never_leaks_the_token(monkeypatch, caplog):
 # --- coverage limits are reported, not left to be inferred ----------------
 
 
-def test_fetch_open_tasks_notes_the_missing_inbox(monkeypatch, caplog):
+def test_poll_open_tasks_notes_the_missing_inbox(monkeypatch, caplog):
     """59 of 1302 tasks (5 of 238 open) live in an Inbox the listing never returns.
 
     Deliberately **no** ``caplog.at_level``. Nothing under ``aggregator/`` calls
@@ -387,7 +403,7 @@ def test_fetch_open_tasks_notes_the_missing_inbox(monkeypatch, caplog):
         return {"tasks": [_open_task(id="t1", projectId="p1")]}
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
-    ticktick_api.fetch_open_tasks("tok")
+    ticktick_api.poll_open_tasks("tok")
     notes = [r for r in caplog.records if "Inbox" in r.getMessage()]
     assert notes, "the Inbox coverage note is below the default level, so nobody sees it"
     assert notes[0].levelno >= logging.lastResort.level
@@ -403,7 +419,7 @@ def test_no_inbox_note_when_the_listing_does_contain_one(monkeypatch, caplog):
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     with caplog.at_level(logging.INFO, logger=API_LOG):
-        ticktick_api.fetch_open_tasks("tok")
+        ticktick_api.poll_open_tasks("tok")
     assert "out of scope" not in caplog.text
 
 
@@ -425,8 +441,12 @@ def test_a_batch_with_no_parseable_timestamp_is_loud(monkeypatch, caplog):
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
     with caplog.at_level(logging.WARNING, logger=API_LOG):
-        tasks = ticktick_api.fetch_open_tasks("tok", errors=errors)
-    assert len(tasks) == 1
+        poll = ticktick_api.poll_open_tasks("tok", errors=errors)
+    assert len(poll.tasks) == 1
+    # A dateless batch is a field-NAMING fault, not a missing task: every open
+    # task was still observed, so the poll is a complete view and inference
+    # stays live. Conflating the two would kill inference for good.
+    assert poll.complete is True
     assert len(errors) == 1
     for field in ticktick_api.TIMESTAMP_FIELDS:
         assert field in errors[0]
@@ -447,7 +467,7 @@ def test_a_batch_with_timestamps_is_quiet(monkeypatch, caplog):
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
     with caplog.at_level(logging.WARNING, logger=API_LOG):
-        ticktick_api.fetch_open_tasks("tok", errors=errors)
+        ticktick_api.poll_open_tasks("tok", errors=errors)
     assert errors == []
     assert "TIMESTAMP_FIELDS" not in caplog.text
 
@@ -462,7 +482,7 @@ def test_an_empty_batch_is_not_a_timestamp_failure(monkeypatch):
 
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
-    assert ticktick_api.fetch_open_tasks("tok", errors=errors) == []
+    assert ticktick_api.poll_open_tasks("tok", errors=errors).tasks == []
     assert errors == []
 
 
@@ -1313,7 +1333,7 @@ def test_no_inference_on_first_ever_poll():
 def test_a_poll_that_returned_nothing_at_all_is_reported(tmp_path, caplog):
     """Every open task vanishing at once is an outage shape, not 238 completions.
 
-    ``fetch_open_tasks`` sinks a failed project into ``errors`` and carries on,
+    ``poll_open_tasks`` sinks a failed project into ``errors`` and carries on,
     so a run where the project listing succeeded and every project then 500'd
     comes back as an empty task list — indistinguishable, here, from the user
     finishing everything. The records are still emitted (the next healthy poll
@@ -1390,12 +1410,62 @@ def test_the_reconcile_planner_forwards_the_errors_sink(tmp_path):
 
     ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
-        [{"id": "t9", "title": "still open"}],
+        ticktick_api.OpenTaskPoll([{"id": "t9", "title": "still open"}], complete=True),
         datetime(2026, 8, 8, tzinfo=UTC),
         errors,
     )
 
     assert errors and "t1" in errors[0]
+
+
+def test_an_incomplete_poll_infers_nothing_and_leaves_the_baseline_alone(tmp_path):
+    """Inference reads absence as completion, so it needs a COMPLETE view.
+
+    A poll that failed to look at one project reports every open task in it as
+    finished, and the Open API — which serves open tasks only — can never
+    contradict that. The planner therefore refuses both halves: no records, and
+    a commit that does nothing, so the baseline stays exactly where it was.
+    """
+    state = ticktick_api.JsonFileState(tmp_path / "open_tasks.json")
+    ticktick_api.save_state(
+        tmp_path / "open_tasks.json",
+        [{"id": "t1"}, {"id": "t2"}],
+        datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
+    )
+    errors: list[str] = []
+
+    records, commit = ticktick_api.plan_open_task_reconcile(
+        state,
+        ticktick_api.OpenTaskPoll([{"id": "t1"}], complete=False),
+        datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        errors,
+    )
+    commit()
+
+    assert records == []
+    assert state.load().keys() == {"t1", "t2"}
+    assert errors == [ticktick_api.INCOMPLETE_POLL_NOTE]
+
+
+def test_declining_to_infer_is_itself_reported(tmp_path):
+    """A run that quietly declined would be the silent-success shape in reverse.
+
+    The operator has to be able to tell "nothing was completed" apart from "we
+    could not tell", so the skip reaches the errors sink and the run exits
+    non-zero like any other partial ingest.
+    """
+    errors: list[str] = []
+    ticktick_api.reconcile_open_tasks(
+        ticktick_api.JsonFileState(tmp_path / "open_tasks.json"),
+        ticktick_api.OpenTaskPoll([], complete=False),
+        datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+        errors,
+    )
+    assert len(errors) == 1
+    assert not (tmp_path / "open_tasks.json").exists(), (
+        "an incomplete poll must not create a baseline either — a partial first "
+        "poll would freeze in every task it happened to miss"
+    )
 
 
 def test_default_state_path_respects_xdg(monkeypatch, tmp_path):
@@ -1463,7 +1533,8 @@ def test_reconcile_infers_against_the_previous_poll_then_records_this_one():
     state = _InMemoryState(
         {"t1": {"task": {"id": "t1", "title": "Gone"}, "last_seen": "2026-08-07T12:00:00+00:00"}}
     )
-    records = ticktick_api.reconcile_open_tasks(state, [{"id": "t2", "title": "Stays"}], now)
+    poll = ticktick_api.OpenTaskPoll([{"id": "t2", "title": "Stays"}], complete=True)
+    records = ticktick_api.reconcile_open_tasks(state, poll, now)
     assert [r.stable_id for r in records] == ["ticktick:t1"]
     assert state.calls == ["load", "save"]
     assert state.entries.keys() == {"t2"}
@@ -1481,8 +1552,10 @@ def test_the_json_file_is_one_adapter_of_the_port(tmp_path):
 
     first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
     second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
-    assert ticktick_api.reconcile_open_tasks(state, [{"id": "t1"}, {"id": "t2"}], first) == []
-    (rec,) = ticktick_api.reconcile_open_tasks(state, [{"id": "t2"}], second)
+    both = ticktick_api.OpenTaskPoll([{"id": "t1"}, {"id": "t2"}], complete=True)
+    one = ticktick_api.OpenTaskPoll([{"id": "t2"}], complete=True)
+    assert ticktick_api.reconcile_open_tasks(state, both, first) == []
+    (rec,) = ticktick_api.reconcile_open_tasks(state, one, second)
     assert rec.stable_id == "ticktick:t1"
     assert rec.extra["provenance"] == "api-inferred-complete"
     assert state.load().keys() == {"t2"}
@@ -1501,5 +1574,6 @@ def test_reconcile_matches_ids_the_way_the_baseline_keys_them(tmp_path):
     first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
     second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
     tasks = [{"id": "  t1  ", "title": "Padded"}, {"id": 0, "title": "Zero"}, {"title": "No id"}]
-    assert ticktick_api.reconcile_open_tasks(state, tasks, first) == []
-    assert ticktick_api.reconcile_open_tasks(state, tasks, second) == []
+    poll = ticktick_api.OpenTaskPoll(tasks, complete=True)
+    assert ticktick_api.reconcile_open_tasks(state, poll, first) == []
+    assert ticktick_api.reconcile_open_tasks(state, poll, second) == []

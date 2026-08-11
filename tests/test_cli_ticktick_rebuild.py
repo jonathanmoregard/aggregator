@@ -189,8 +189,10 @@ def test_a_refused_rebuild_leaves_the_open_task_baseline_alone(
     # This poll serves only t1, so t2 reads as an inferred completion.
     monkeypatch.setattr(
         ticktick_api,
-        "fetch_open_tasks",
-        lambda token, errors=None: [{"id": "t1", "title": "open"}],
+        "poll_open_tasks",
+        lambda token, errors=None: ticktick_api.OpenTaskPoll(
+            [{"id": "t1", "title": "open"}], complete=True
+        ),
     )
     src = TickTickSource(
         backup_dir=tmp_path / "no-downloads",

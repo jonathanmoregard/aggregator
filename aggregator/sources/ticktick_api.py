@@ -32,7 +32,7 @@ COVERAGE LIMITS — two of them, both structural:
 2. ``GET /open/v1/project`` does not list the Inbox, so Inbox tasks are never
    fetched and can never "disappear" for task 7's completion inference either.
    Measured blast radius on the user's real export: 59 of 1302 tasks, 5 of the
-   238 currently open. ``fetch_open_tasks`` *warns* when the listing comes back
+   238 currently open. ``poll_open_tasks`` *warns* when the listing comes back
    without an Inbox — at WARNING specifically, because nothing under
    ``aggregator/`` configures logging, so ``logging.lastResort`` (level WARNING)
    is the only thing that prints and anything quieter reaches nobody. A first
@@ -172,20 +172,53 @@ def _note(errors: list[str] | None, message: str) -> None:
         errors.append(message)
 
 
+@dataclass(frozen=True)
+class OpenTaskPoll:
+    """One poll of the Open API, and whether it saw ALL of the open tasks.
+
+    The two travel together on purpose. ``complete`` is not decoration: the
+    completion inference at the bottom of this module reads "task was in the
+    baseline, is absent now" as "task was finished", so a poll that merely
+    FAILED to look at one project is indistinguishable from one that watched
+    every task in it get ticked off. Handing the caller a bare ``list[dict]``
+    made that distinction something a caller had to remember to ask about, and
+    the source did not — a single 500 on one project marked every open task in
+    it completed, permanently, because the Open API only ever serves open tasks
+    and can therefore never contradict the inference. Only a manual CSV export
+    could.
+
+    ``complete is False`` means "some of what is open was not observed", from
+    any cause: a project whose fetch failed, a project the listing gave with no
+    usable id, or task entries dropped for being the wrong shape. It does NOT
+    cover the Inbox, which ``GET /open/v1/project`` never lists at all — that
+    gap is permanent, known and reported separately by ``_note_inbox_gap``;
+    folding it in here would mean ``complete`` was False on every healthy poll
+    and inference would be dead forever.
+    """
+
+    tasks: list[dict]
+    complete: bool
+
+
 def _project_tasks(
     data: dict, project_name: str, errors: list[str] | None, label: str
-) -> list[dict]:
-    """Return the well-formed task objects in one ``/project/{id}/data`` payload.
+) -> tuple[list[dict], bool]:
+    """The well-formed task objects in one ``/project/{id}/data`` payload.
 
-    Every shape assumption is checked here rather than in the caller's loop: a
+    Returns them alongside whether the payload was fully understood. Every
+    shape assumption is checked here rather than in the caller's loop: a
     ``tasks`` value that is a string, or a list of strings, used to raise an
     uncaught TypeError from ``task["_projectName"] = ...`` and kill the whole
     walk — one surprising project costing us all the others, which is exactly
     what the per-project error sink exists to prevent.
+
+    A dropped entry makes the poll INCOMPLETE, not merely noisy: the dropped
+    task is open, it is now missing from the poll, and that is the exact input
+    the completion inference misreads.
     """
     raw = data.get("tasks")
     if raw is None:
-        return []
+        return [], True
     if not isinstance(raw, list):
         raise ValueError(f"unexpected tasks payload: {type(raw).__name__}")
     tasks = []
@@ -196,21 +229,29 @@ def _project_tasks(
         tasks.append(entry)
     if len(tasks) != len(raw):
         _note(errors, f"{label}: skipped {len(raw) - len(tasks)} non-object task entr(ies)")
-    return tasks
+        return tasks, False
+    return tasks, True
 
 
-def fetch_open_tasks(token: str, errors: list[str] | None = None) -> list[dict]:
-    """Return every currently-open task across all projects.
+def poll_open_tasks(token: str, errors: list[str] | None = None) -> OpenTaskPoll:
+    """Every currently-open task across all projects, plus a coverage verdict.
 
     A project that fails to fetch is recorded and skipped: one 500 must not
     cost us the other nine projects. The project *listing* is different — if
     that fails we know nothing, so it propagates rather than returning an
     empty list that looks like "you have no tasks".
 
+    Anything that costs the walk a task it should have seen also clears
+    :attr:`OpenTaskPoll.complete`, so the caller can keep the partial records
+    (they are genuine, fresh observations of open tasks) while refusing to run
+    the completion inference over them. See :class:`OpenTaskPoll`.
+
     Two coverage facts are reported rather than left to be inferred from a
     surprising count: the Inbox is not in the listing (see the module
     docstring), and a batch that yields no parseable timestamp at all is an
-    error, not a quiet success.
+    error, not a quiet success. Neither clears ``complete`` — the Inbox gap is
+    permanent and known, and a dateless batch is a field-naming fault, not a
+    missing task.
     """
     projects = _request("GET", f"{BASE_URL}/project", token)
     if not isinstance(projects, list):
@@ -218,9 +259,16 @@ def fetch_open_tasks(token: str, errors: list[str] | None = None) -> list[dict]:
 
     tasks: list[dict] = []
     names: list[str] = []
+    complete = True
     for project in projects:
         project_id = project.get("id") if isinstance(project, dict) else None
         if not project_id:
+            # Its tasks are open and are about to be missing from this poll,
+            # which is the completion inference's input. Skipped, but never as
+            # a silent success: recorded, and the poll is no longer a complete
+            # view of what is open.
+            _note(errors, f"ticktick project listing entry has no usable id: {project!r}")
+            complete = False
             continue
         project_name = project.get("name") or ""
         names.append(str(project_name))
@@ -230,16 +278,19 @@ def fetch_open_tasks(token: str, errors: list[str] | None = None) -> list[dict]:
             data = _request("GET", url, token)
             if not isinstance(data, dict):
                 raise ValueError(f"unexpected payload: {type(data).__name__}")
-            tasks.extend(_project_tasks(data, str(project_name), errors, label))
+            found, whole = _project_tasks(data, str(project_name), errors, label)
+            tasks.extend(found)
+            complete = complete and whole
         except (URLError, OSError, ValueError) as e:
             # Never interpolate the token into a message that gets logged or
             # surfaced to the CLI.
             _note(errors, f"{label}: {e}")
+            complete = False
             continue
 
     _note_inbox_gap(names, len(tasks))
     _warn_no_timestamps(tasks, errors)
-    return tasks
+    return OpenTaskPoll(tasks=tasks, complete=complete)
 
 
 def _note_inbox_gap(project_names: list[str], task_count: int) -> None:
@@ -819,13 +870,14 @@ def infer_completions(
     healthy; routed here it makes the run exit 3 and reach the notifier.
     """
     if previous and not current_ids:
-        # fetch_open_tasks sinks a failed project into ``errors`` and carries
-        # on, so "the listing worked and then every project 500'd" arrives here
-        # as an empty batch and looks exactly like finishing everything. The
-        # inference still runs — the next healthy poll serves those tasks again
-        # with a fresher observation and the merge reverts them, whereas
-        # suppressing would permanently lose a genuine last completion — but it
-        # does not run in silence.
+        # A poll whose projects all failed no longer reaches here at all —
+        # ``poll_open_tasks`` marks it incomplete and the planner refuses to
+        # infer over it. What is left is a COMPLETE poll that legitimately
+        # returned nothing, i.e. the user really did finish everything, plus
+        # the residue that no coverage flag can catch: every project healthy
+        # and genuinely empty. That is a real state and the inference runs —
+        # but not in silence, because it is also what a TickTick-side outage
+        # that answers 200-with-no-tasks would look like.
         log.warning(
             "ticktick api: the poll returned no open tasks at all while %d were open last "
             "time, so all %d are being recorded as inferred completions. If TickTick or the "
@@ -902,13 +954,41 @@ class JsonFileState:
         save_state(self.path, tasks, now)
 
 
+INCOMPLETE_POLL_NOTE = (
+    "ticktick api: this poll did NOT see every open task (a project failed, "
+    "was unidentifiable, or served entries this client could not read), so "
+    "completion inference is being SKIPPED and the open-task baseline is NOT "
+    "being advanced. Inference reads 'was open last poll, absent now' as "
+    "'completed', and the Open API only ever serves open tasks, so running it "
+    "over a partial view would mark every unseen open task completed with no "
+    "way for a later poll to disagree. The next complete poll reconciles "
+    "normally; nothing is lost by waiting"
+)
+
+
 def plan_open_task_reconcile(
     state: OpenTaskState,
-    tasks: Iterable[dict],
+    poll: OpenTaskPoll,
     now: datetime,
     errors: list[str] | None = None,
 ) -> tuple[list[Record], Callable[[], None]]:
     """Diff this poll against the baseline; hand back the save as a callable.
+
+    TAKES AN :class:`OpenTaskPoll`, not a bare task list, and that is
+    load-bearing rather than typing taste. Inference is only sound over a
+    COMPLETE view of what is open: it reads absence as completion, so a poll
+    that failed to fetch one project reports every open task in that project
+    as finished — and the Open API serves open tasks only, so no later poll can
+    ever contradict it. Only a manual CSV export could. Taking the tasks
+    without the verdict made "is this a full view?" a question the caller had
+    to think to ask, and the source did not.
+
+    An INCOMPLETE poll therefore infers nothing and hands back a commit that
+    does nothing: the baseline is neither advanced nor armed, so the next
+    complete poll diffs against the same, still-true baseline and reconciles
+    everything that really did get completed in the meantime. The skip is
+    recorded in ``errors`` — a run that quietly declined to infer would be the
+    same silent-success shape in the other direction.
 
     TWO-PHASE, and that is the point. The diff has to happen now — it needs
     the poll — but advancing the baseline is a destructive act: it is what
@@ -935,8 +1015,12 @@ def plan_open_task_reconcile(
     a completion is being dropped and the commit is about to make that
     permanent. Pass the run's sink; a bare log line reaches nobody on a timer.
     """
+    tasks = list(poll.tasks)
+    if not poll.complete:
+        _note(errors, INCOMPLETE_POLL_NOTE)
+        return [], lambda: None
+
     previous = state.load()
-    tasks = list(tasks)
     records = infer_completions(previous, _open_task_ids(tasks), now, errors)
 
     def commit() -> None:
@@ -947,7 +1031,7 @@ def plan_open_task_reconcile(
 
 def reconcile_open_tasks(
     state: OpenTaskState,
-    tasks: Iterable[dict],
+    poll: OpenTaskPoll,
     now: datetime,
     errors: list[str] | None = None,
 ) -> list[Record]:
@@ -960,6 +1044,6 @@ def reconcile_open_tasks(
     Typed against :class:`OpenTaskState`, so nothing here knows or cares that
     the baseline is a JSON file.
     """
-    records, commit = plan_open_task_reconcile(state, tasks, now, errors)
+    records, commit = plan_open_task_reconcile(state, poll, now, errors)
     commit()
     return records
