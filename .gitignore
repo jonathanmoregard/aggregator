@@ -28,3 +28,6 @@ sync.log
 *.lock
 !flake.lock
 !uv.lock
+
+# arftl per-run state (repo-autosync, 2026-08-13)
+tasks/arftl-run.json
