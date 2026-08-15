@@ -35,9 +35,10 @@ reconstruct it from ``runner._run_one``. It is:
                                      a raise
   4. ``SupportsInputFreshness``      ``input_freshness`` — always
   --- every adapter has now finished; the run's report is assembled ---
-  5. the report reaches a human, or does not (see :class:`Delivery`)
-  6. ``SupportsReportBarrier``       ``commit_after_report`` — ONLY if step 5
-                                     was DECLARED delivered
+  5. some of the report reaches a human, or none of it does (:class:`Delivery`)
+  6. ``SupportsReportBarrier``       ``commit_after_report`` — ONLY for an
+                                     adapter whose EVERY reported line is in
+                                     what step 5 declared delivered
 
 Steps 3 and 4 are order-independent of each other and of 2; they collect,
 they decide nothing. The load-bearing edge is 2 BEFORE 6, and the gap between
@@ -71,10 +72,9 @@ rather than in production six months later.
 """
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from aggregator.sources.base import ObservationRow, Record, SessionRow
@@ -218,41 +218,89 @@ class SupportsWriteBarrier(Protocol):
     def commit_after_write(self) -> None: ...
 
 
-class Delivery(Enum):
-    """Did this run's report actually REACH A HUMAN? The only way to say yes.
+@dataclass(frozen=True)
+class Delivery:
+    """WHICH of this run's reported lines reached a human. Never merely THAT.
 
-    A notify hook returns this. ``DELIVERED`` means a channel that can wake
-    somebody up accepted the report and said so; anything else — ``UNDELIVERED``,
-    ``None``, a stray truthy value a hook happened to return — means it did not.
-    Only ``DELIVERED``, compared by identity, unlocks ``SupportsReportBarrier``.
+    A notify hook returns this, and it is a SET rather than a yes/no because
+    four rounds of this bug were all the same mismatch: delivery was asserted
+    at a coarser grain than suppression, and something in between dropped the
+    one line that mattered.
 
-    A VALUE RATHER THAN A CHECK, because the same bug arrived three times as a
-    check somebody forgot. The receipt that silences a repeated report was
-    stamped when the report was merely EMITTED (round 4), then when ``notify``
-    RETURNED WITHOUT RAISING (round 5) — and the shipped default notifier is a
-    no-op, so round 6 was still stamping receipts on runs with no human channel
-    at all. Every one of those inferred delivery from the absence of an error.
-    Absence of an error is not delivery.
+      R4: stamped when the report was merely EMITTED.
+      R5: stamped when ``notify`` RETURNED WITHOUT RAISING.
+      R6: ...and the shipped default notifier does nothing, which returns
+          without raising — so runs with no channel at all stamped receipts.
+      R7: ``notify`` returned a run-scoped ``DELIVERED`` while the payload it
+          actually sent was ``report.errors[:5]``. Five failures from other
+          sources pushed TickTick's uncovered-project line out of the toast,
+          and its receipt — which suppresses THAT LINE and nothing else — was
+          stamped for a sentence no human ever saw.
 
-    So delivery is DECLARED, and the declaration defaults to no. A function that
-    does nothing returns ``None``, ``None`` is not ``DELIVERED``, and therefore
-    the do-nothing notifier CANNOT stamp a receipt — not because a gate checks
-    for it, but because it has nothing to return. That is the property the
-    previous three fixes lacked: they were all reachable by forgetting a check.
+    THE UNIT OF DELIVERY IS NOW THE UNIT OF SUPPRESSION. A receipt suppresses
+    one adapter's repeat of one report, so delivery is tracked per reported
+    line and ``runner.commit_report_barriers`` fires an adapter's barrier only
+    when EVERY line that adapter reported this run is in here.
 
-    IDENTITY, NOT TRUTHINESS, and that is load-bearing. A hook written as
-    ``lambda report: subprocess.run(...)`` returns a ``CompletedProcess``, which
-    is truthy and would have declared success for a notifier that exited 1.
+    DERIVED FROM THE PAYLOAD, NOT ASSERTED ALONGSIDE IT — see :meth:`accepted`.
+    There is deliberately no ``Delivery.DELIVERED`` constant any more: no value
+    in this module means "all of it got through" without naming what "it" was.
+    That is what makes a fifth layer structurally different from the first four.
+    Every one of those was an OMISSION at a call site (a check nobody wrote, a
+    default nobody considered, a slice nobody re-read), and an omission now
+    fails safe: truncate the payload, reformat it, drop a line, send nothing at
+    all, and the delivered set shrinks by itself because it is computed from the
+    bytes handed over. Over-claiming is no longer reachable by forgetting
+    something; it takes affirmatively passing a payload that was never sent.
 
-    THE FAILURE DIRECTION IS LOUD. A run with no channel does not stamp, so the
-    disappearance is reported again next run, and the next, until a real
-    notifier is configured — which is the bound. Reporting twice costs an
-    operator one duplicate line; not reporting costs them the only alert the
-    mechanism exists to raise, permanently.
+    THE FAILURE DIRECTION IS LOUD. Lines that did not make it are reported
+    again next run, and the next, until a channel carries them. Reporting twice
+    costs an operator a duplicate line; not reporting costs them the only alert
+    the mechanism exists to raise, permanently.
     """
 
-    DELIVERED = "delivered"
-    UNDELIVERED = "undelivered"
+    # Empty is the default and the answer for every run with no channel: no
+    # notifier configured, a hook that only logs, a hook that raised, a hook
+    # that returned some stray value the runner refused.
+    lines: frozenset[str] = frozenset()
+
+    @classmethod
+    def accepted(cls, payload: str, reported: Iterable[str]) -> Delivery:
+        """The lines of ``reported`` that are actually IN ``payload``.
+
+        The only constructor a channel should use, and the reason a truncating
+        channel cannot lie: it hands over the text it sent and this reads the
+        answer out of it. ``_desktop_notification`` sends at most five error
+        lines; the sixth is not in ``payload``, so it is not in the result, so
+        the adapter that reported it does not go quiet. No check to forget.
+
+        Substring, not equality, so a channel may decorate its lines (``  error:
+        {e}``) without losing the identity of what it carried. Blank lines are
+        dropped — ``"" in payload`` is true of every payload, and a report line
+        that is empty carries nothing to a human anyway.
+        """
+        return cls(frozenset(line for line in reported if line and line in payload))
+
+    def covers(self, reported: Sequence[str]) -> bool:
+        """Did every one of ``reported`` reach a human?
+
+        THE EMPTINESS CHECK IS IN HERE, not at the call sites, because "all of
+        an empty list was delivered" is vacuously true and that is precisely the
+        shape of reasoning this class exists to refuse — R4 through R6 were each
+        a version of "nothing went wrong, so somebody must have heard". An
+        adapter that reported nothing has nothing to suppress, so it has no
+        business stamping a receipt on the strength of a channel that carried
+        none of its words.
+        """
+        return bool(reported) and all(line in self.lines for line in reported)
+
+    def __or__(self, other: Delivery) -> Delivery:
+        """Two channels on one run — a terminal somebody watched AND a toast.
+
+        Union, because delivery is a property of the line and the human, not of
+        the channel: a line that made it into either one was heard.
+        """
+        return Delivery(self.lines | other.lines)
 
 
 @runtime_checkable
@@ -275,17 +323,26 @@ class SupportsReportBarrier(Protocol):
     about. One alert, suppressed by a record claiming it was delivered.
 
     So the receipt waits for this, and this waits for a DECLARATION of delivery
-    — see :class:`Delivery`. The runner calls it only when the notify hook
-    returned ``Delivery.DELIVERED``; the single-source CLI path only when its
-    stderr is an interactive terminal, i.e. when the print it just made had a
-    person in front of it. Under a systemd timer stderr is the journal, which
-    nobody reads unprompted, so that path declares nothing and the report stands.
+    — see :class:`Delivery`. Every caller fires it for an adapter only when the
+    declaration COVERS EVERY LINE THAT ADAPTER REPORTED THIS RUN: the runner
+    against what its notify hook's payload carried, the CLI against what it
+    printed to a stderr somebody was watching. Under a systemd timer stderr is
+    the journal, which nobody reads unprompted, so that path declares nothing
+    and the report stands.
+
+    WHOLE-ADAPTER COVERAGE, not "the report was delivered". Round 7: the toast
+    carried ``report.errors[:5]`` and delivery was declared for the run, so five
+    unrelated failures elsewhere silenced the one line this barrier exists to
+    repeat. An adapter that cannot show that everything it said got through has
+    no basis for deciding which of its own sentences to stop saying, so it says
+    them all again — which costs one duplicate line and never an alert.
 
     THERE IS NO "PROBABLY DELIVERED". A hook that raised, a hook that did
-    nothing, a run with no notifier configured at all and an unattended stderr
-    are the same answer: not delivered, nothing stamped, reported again next
-    run. That is deliberately loud forever, and it is bounded by configuring a
-    channel — which is the action the noise is asking for.
+    nothing, a run with no notifier configured at all, an unattended stderr, and
+    a payload that dropped the line are the same answer: not delivered, nothing
+    stamped, reported again next run. That is deliberately loud forever, and it
+    is bounded by configuring a channel — which is the action the noise is
+    asking for.
 
     NOT CALLING IT IS THE SAFE DIRECTION, unlike the write barrier: the cost is
     one more report of a disappearance already reported, never a lost one. The

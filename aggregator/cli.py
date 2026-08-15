@@ -100,6 +100,12 @@ EXIT_COMPLETED_WITH_ERRORS = 3
 # truncated cannot claim its report reached anybody — see ``_stderr_delivery``.
 ERROR_PRINT_LIMIT = 5
 
+# How many error lines fit in a desktop toast before it stops being readable.
+# Same rule as above and the same round-7 consequence: whatever this elides was
+# not delivered, so nothing it gates goes quiet. ``_notification_text`` spends
+# the budget on the lines that gate a receipt first — see there.
+NOTIFY_ERROR_LIMIT = 5
+
 # How old a manually-refreshed input may get before `ingest --all` nags.
 # Overridable with `--stale-after-days`.
 #
@@ -365,8 +371,23 @@ def _commit_after_write(src: Any, errors: list[str]) -> None:
         errors.append(f"{type(e).__name__}: {e}")
 
 
-def _stderr_delivery(errors: list[str]) -> Delivery:
-    """Did printing this run's errors to stderr actually reach a person?
+def _print_errors(errors: Sequence[str], limit: int) -> list[str]:
+    """Put this run's errors on stderr and return EXACTLY what went there.
+
+    The return value is what a delivery declaration is derived from, so no
+    caller can print one thing and claim another: shrink the print, or the
+    limit, or reorder it, and the claim shrinks with it — because the claim is
+    read out of the printed text rather than asserted next to it. See
+    :func:`_stderr_delivery` and ``imports/port.Delivery``.
+    """
+    shown = list(errors[:limit])
+    for e in shown:
+        print(f"  error: {e}", file=sys.stderr)
+    return shown
+
+
+def _stderr_delivery(printed: Sequence[str], reported: Sequence[str]) -> Delivery:
+    """Which of ``reported`` a person actually SAW on stderr. Possibly none.
 
     ONLY AT AN INTERACTIVE TERMINAL. ``aggregator ingest <source>`` installs no
     notifier at all (``--notify`` is refused without ``--all``), so the print is
@@ -381,33 +402,36 @@ def _stderr_delivery(errors: list[str]) -> Delivery:
     the one the shell answers correctly for every redirection: ``2>log``, a pipe,
     a systemd unit and a cron job all say no; a person at a prompt says yes.
 
-    TRUNCATION IS THE SECOND WAY THE PRINT MISSES. The caller shows the first
-    :data:`ERROR_PRINT_LIMIT` errors, and the report barrier's own error — the
-    vanished-project line — is appended mid-run, so a source that logged five
-    unreadable backups first pushes it off the end. The receipt would then be
-    stamped for a sentence that was never on screen. Anything elided means
-    undelivered; the cost is one repeat of a report that is already repeating.
+    TRUNCATION IS THE SECOND WAY THE PRINT MISSES, and it is no longer a
+    separate rule. The caller shows the first :data:`ERROR_PRINT_LIMIT` errors
+    and hands that list in as ``printed``; a line that was pushed off the end is
+    not in the text, so it is not in the result, so nothing it gates goes quiet.
+    Round 6 spelled this as ``if len(errors) > ERROR_PRINT_LIMIT``, which was a
+    check the next surface (the desktop toast, round 7) did not have.
 
-    Never raises: a closed or replaced stream answers "not delivered", which is
-    the direction that keeps reporting rather than the one that goes quiet.
+    Never raises: a closed or replaced stream answers "nothing delivered", which
+    is the direction that keeps reporting rather than the one that goes quiet.
     """
-    if len(errors) > ERROR_PRINT_LIMIT:
-        return Delivery.UNDELIVERED
     try:
         watched = sys.stderr.isatty()
     except (AttributeError, ValueError):  # pragma: no cover - closed/odd stream
-        return Delivery.UNDELIVERED
-    return Delivery.DELIVERED if watched else Delivery.UNDELIVERED
+        return Delivery()
+    if not watched:
+        return Delivery()
+    return Delivery.accepted("\n".join(printed), reported)
 
 
-def _commit_after_report(src: Any, delivery: Delivery) -> str | None:
-    """Let a source record that this run's report reached a human. Or why not.
+def _commit_after_report(
+    src: Any, delivery: Delivery, reported: Sequence[str]
+) -> str | None:
+    """Let a source record that its report reached a human. Or why not.
 
     The single-source half of ``imports/port.SupportsReportBarrier``; the runner
-    does the same when its notify hook declares delivery. Reached only once the
-    summary and every error line are on stderr — and only if ``delivery`` says
-    that print had an audience. See :func:`_stderr_delivery`: on an unattended
-    run it does not, and the run then stamps nothing and reports again next time.
+    does the same, per adapter, in ``runner.commit_report_barriers``. Reached
+    only once the summary and every error line are on stderr — and only if
+    ``delivery`` covers EVERY line this run reported. One source runs on this
+    path, so its report is the whole report, and a run that could only show some
+    of it cannot tell which of its own sentences it is safe to stop saying.
 
     ``delivery`` is a PARAMETER rather than something computed in here, so the
     call site has to name the channel it is claiming. There is exactly one such
@@ -419,7 +443,7 @@ def _commit_after_report(src: Any, delivery: Delivery) -> str | None:
     back and takes exit 3 for it. Loud, but the loss is small: all a failed
     receipt costs is one more report of a disappearance already reported.
     """
-    if delivery is not Delivery.DELIVERED:
+    if not delivery.covers(reported):
         return None
     commit = getattr(src, "commit_after_report", None)
     if commit is None:
@@ -557,13 +581,11 @@ def _cmd_ingest_entities(
         f"ingest {args.source}: sessions={session_count} "
         f"observations={obs_count} errors={len(errors)}"
     )
-    if errors:
-        for e in errors[:ERROR_PRINT_LIMIT]:
-            print(f"  error: {e}", file=sys.stderr)
+    shown = _print_errors(errors, ERROR_PRINT_LIMIT)
     # Same order and same reason as the records path: stderr is the channel, so
     # the receipt is only earned once the lines above are on it AND somebody was
-    # there to read them.
-    late = _commit_after_report(src, _stderr_delivery(errors))
+    # there to read them — all of them, not the first five.
+    late = _commit_after_report(src, _stderr_delivery(shown, errors), errors)
     if late is not None:
         print(f"  error: {late}", file=sys.stderr)
     if errors or late is not None:
@@ -777,13 +799,12 @@ def _cmd_ingest(
         f"ingest {args.source}: added={added} updated={updated} "
         f"skipped={skipped} errors={len(errors)}"
     )
-    if errors:
-        for e in errors[:ERROR_PRINT_LIMIT]:
-            print(f"  error: {e}", file=sys.stderr)
+    shown = _print_errors(errors, ERROR_PRINT_LIMIT)
     # AFTER the errors are on stderr, which is this path's entire delivery
     # channel — there is no notify hook here — and only when that stderr is a
-    # terminal somebody is watching. See ``_stderr_delivery``.
-    late = _commit_after_report(src, _stderr_delivery(errors))
+    # terminal somebody is watching, and only for the lines it actually showed.
+    # See ``_stderr_delivery``.
+    late = _commit_after_report(src, _stderr_delivery(shown, errors), errors)
     if late is not None:
         print(f"  error: {late}", file=sys.stderr)
     if errors or late is not None:
@@ -910,12 +931,27 @@ def _notification_text(report: RunReport) -> tuple[str, str, str] | None:
     A wholly clean run says nothing. A toast on every timer tick is how an
     operator learns to dismiss them without reading, which would cost the two
     cases above the only channel they have.
+
+    THE BUDGET IS SPENT ON THE GATING LINES FIRST. A toast has to stay readable,
+    so only :data:`NOTIFY_ERROR_LIMIT` error lines go in it — and round 7 was
+    five failures from other sources pushing TickTick's uncovered-project line,
+    the one line whose delivery decides whether that gap re-alarms every 30
+    minutes, off the end. ``Delivery`` now makes eliding it merely loud instead
+    of silent (the receipt cannot be stamped for a line that is not in this
+    text), and ordering by what gates a receipt is what keeps "merely loud" from
+    meaning "loud forever": an adapter without a report barrier repeats its
+    errors next run regardless, so its line is the cheaper one to drop.
     """
     if report.errors:
+        gating = set(report.gating_errors)
+        ordered = [
+            *(e for e in report.errors if e in gating),
+            *(e for e in report.errors if e not in gating),
+        ]
         return (
             "critical",
             f"aggregator ingest: {len(report.errors)} error(s)",
-            "\n".join([*report.errors[:5], *report.warnings[:3]]),
+            "\n".join([*ordered[:NOTIFY_ERROR_LIMIT], *report.warnings[:3]]),
         )
     if report.warnings:
         return (
@@ -929,11 +965,17 @@ def _notification_text(report: RunReport) -> tuple[str, str, str] | None:
 def _desktop_notification(report: RunReport) -> Delivery:
     """Tell a human, via ``notify-send`` (or ``$AGGREGATOR_NOTIFY_COMMAND``).
 
-    THE ONE THING IN THIS PROCESS THAT CAN RETURN ``Delivery.DELIVERED``, and it
-    returns it in exactly one place: after the notification program has exited
-    zero. Everywhere else — nothing worth saying, an unresolvable program (which
-    raises), a non-zero exit (which raises) — the answer is UNDELIVERED, so an
-    adapter holding a report barrier keeps reporting. See ``port.Delivery``.
+    DECLARES WHAT IT SENT, in exactly one place: after the notification program
+    has exited zero, out of the very text that was handed to it. Everywhere else
+    — nothing worth saying, an unresolvable program (which raises), a non-zero
+    exit (which raises) — nothing was delivered, so an adapter holding a report
+    barrier keeps reporting. See ``port.Delivery``.
+
+    ROUND 7 WAS THE GAP BETWEEN "SENT" AND "SENT WHAT". This returned a run-wide
+    ``Delivery.DELIVERED`` while the body was ``report.errors[:5]``, so five
+    failures from other sources bought permanent silence for a line that never
+    left the process. The declaration is now read out of ``body``, which means
+    the truncation above cannot outrun it: they are the same string.
 
     THE CLI IS WHERE THIS BELONGS. ``imports/runner.py`` refuses to shell out
     and names this layer as the one that injects a real notifier — but until
@@ -966,7 +1008,7 @@ def _desktop_notification(report: RunReport) -> Delivery:
         # heard it". Costs nothing in practice: a report barrier's receipt only
         # ever exists alongside the error line that earned it, and an error is
         # exactly what ``_notification_text`` refuses to stay quiet about.
-        return Delivery.UNDELIVERED
+        return Delivery()
     urgency, summary, body = text
     # No shell=True: the value is operator configuration, split with shlex and
     # exec'd directly. Timeout because a hung notification daemon must not
@@ -984,8 +1026,9 @@ def _desktop_notification(report: RunReport) -> Delivery:
         timeout=NOTIFY_TIMEOUT_SECONDS,
     )
     # ``check=True``, so reaching this line means the notification daemon
-    # accepted it. That — and only that — is the declaration.
-    return Delivery.DELIVERED
+    # accepted it — and ``body`` is verbatim what it accepted, so the lines this
+    # run may now go quiet about are read back out of it rather than asserted.
+    return Delivery.accepted(body, report.errors)
 
 
 def _notify_argv() -> list[str]:
@@ -1092,9 +1135,8 @@ def _cmd_ingest_all(
     _print_run_report(report)
     for warning in report.warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
+    _print_errors(report.errors, 10)
     if report.errors:
-        for e in report.errors[:10]:
-            print(f"  error: {e}", file=sys.stderr)
         # Same 3 as the single-source path, for the same reason: a run that
         # completed but dropped files is not a success, and a timer that reads
         # 0 as success lets the index rot unnoticed.

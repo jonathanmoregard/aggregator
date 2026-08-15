@@ -1,8 +1,9 @@
-"""Round-6 HIGH 1 + HIGH 2: delivery is DECLARED, never inferred.
+"""The delivery contract: a receipt costs the delivery of THAT line, to a human.
 
-Third round on one bug, and the same conceptual error each time — INFERRING
-DELIVERY FROM THE ABSENCE OF AN ERROR. An uncovered TickTick project must be
-reported once and then go quiet, and the receipt that makes it quiet was stamped:
+Four rounds on one bug and the same conceptual error each time — DELIVERY
+ASSERTED AT A COARSER GRAIN THAN SUPPRESSION. An uncovered TickTick project must
+be reported once and then go quiet, and the receipt that makes it quiet was
+stamped:
 
   R4: whenever the report was EMITTED.                  -> stamp after notify
   R5: when ``notify`` returned without raising.         -> a separate barrier
@@ -13,11 +14,16 @@ reported once and then go quiet, and the receipt that makes it quiet was stamped
   R6 again, one surface over: the single-source CLI path stamped after printing
       to stderr — but the timer that runs these ingests sends stderr to the
       journal, which nobody reads unprompted.
-
-The shape changed rather than the check: a hook now RETURNS
-``Delivery.DELIVERED`` or it did not deliver. ``None`` is the default answer and
-is what a function that does nothing returns, so the no-op notifier cannot stamp
-a receipt — there is no gate to forget, because there is no gate.
+  R7: the hook returned a run-wide "delivered" while the toast it sent was
+      ``report.errors[:5]``. Five failures from other sources pushed the
+      uncovered-project line out of the payload and its receipt was stamped for
+      a sentence that never left the process.
+The shape changed rather than the check. ``Delivery`` is now a SET OF LINES
+built by ``Delivery.accepted(payload, report.errors)`` — read out of the text a
+channel accepted rather than asserted beside it — and a barrier fires only for
+an adapter whose EVERY reported line is in that set. Truncate, reorder, reformat
+or send nothing, and the set shrinks by itself; there is no constant meaning
+"all of it got through" to reach for by mistake.
 
 Stubs first: this file drives a real ``TickTickSource`` and must never reach the
 live API, the developer's credential, or the real baseline.
@@ -27,7 +33,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import shlex
 import sys
+from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
@@ -59,6 +68,9 @@ def _no_real_credentials(monkeypatch, tmp_path):
         "AGGREGATOR_TICKTICK_TOKEN",
         "AGGREGATOR_TICKTICK_TOKEN_FILE",
         "AGGREGATOR_TICKTICK_DIR",
+        # A notifier configured on the developer's machine would install the
+        # real one on the tests below that are about having NO channel.
+        cli.NOTIFY_COMMAND_ENV_VAR,
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -125,11 +137,25 @@ def _reported(report) -> list[str]:
 
 
 def _delivering(heard: list[str]):
-    """A notifier that reached a human AND SAYS SO."""
+    """A notifier that reached a human AND SAYS WHAT IT CARRIED."""
 
     def notify(report) -> Delivery:
+        payload = "\n".join(report.errors)
         heard.extend(report.errors)
-        return Delivery.DELIVERED
+        return Delivery.accepted(payload, report.errors)
+
+    return notify
+
+
+def _lossy(heard: list[str], keep: int):
+    """A channel with a size budget — every real one has. It sends the first
+    ``keep`` lines and, because the declaration is read out of what it sent,
+    cannot claim the rest."""
+
+    def notify(report) -> Delivery:
+        payload = "\n".join(report.errors[:keep])
+        heard.extend(report.errors[:keep])
+        return Delivery.accepted(payload, report.errors)
 
     return notify
 
@@ -170,14 +196,14 @@ def test_a_hook_that_does_nothing_has_nothing_to_declare_delivery_with():
     """Why a fourth layer cannot be written the same way as the first three.
 
     Delivery is a value the hook returns, and the do-nothing hooks are annotated
-    ``-> None``: there is no expression in either of them that could produce
-    ``Delivery.DELIVERED``. The previous three fixes were all conditions at the
+    ``-> None``: neither sends a payload, so neither has anything to build a
+    ``Delivery`` out of. The previous three fixes were all conditions at the
     call site, and a condition is a thing the next call site forgets."""
     report = RunReport()
 
-    assert _no_notification(report) is None
-    assert cli._silent_notification(report) is None
-    assert None is not Delivery.DELIVERED
+    assert not isinstance(_no_notification(report), Delivery)
+    assert not isinstance(cli._silent_notification(report), Delivery)
+    assert not Delivery().covers(["anything at all"])
 
 
 def test_a_truthy_return_value_is_not_a_declaration(tmp_path, state_file):
@@ -261,6 +287,135 @@ def test_a_report_the_terminal_never_showed_is_not_delivered(
     assert UNCOVERED not in terminal.getvalue(), "precondition: it was truncated"
     assert _ingest(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS, (
         "a receipt was stamped for a line the operator never saw"
+    )
+
+
+# -- round 7 HIGH: the payload is the declaration -------------------------
+
+
+class _Noisy:
+    """Another source having a bad day. No report barrier: it repeats its own
+    errors next run regardless, so nothing of its is gating."""
+
+    name = "noisy"
+
+    def __init__(self, count: int = 5) -> None:
+        self._count = count
+
+    async def get_data(self) -> AsyncIterator[object]:
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    def drain_errors(self) -> list[str]:
+        return [f"unrelated failure {n}" for n in range(self._count)]
+
+
+def _run_all(adapters, **kwargs):
+    return asyncio.run(run_imports(adapters, _Sink(), **kwargs))
+
+
+def _toast(tmp_path: Path, monkeypatch) -> Path:
+    """Install a real notify program that records the payload it was handed.
+
+    A stand-in for ``notify-send`` rather than a patched ``subprocess.run``: the
+    whole finding is about what the channel ACTUALLY RECEIVED, so the assertion
+    should be made on bytes that crossed a process boundary.
+    """
+    log = tmp_path / "toast.txt"
+    script = tmp_path / "fake-notify-send"
+    script.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + shlex.quote(str(log)) + "\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv(cli.NOTIFY_COMMAND_ENV_VAR, str(script))
+    return log
+
+
+def test_a_line_the_channel_never_carried_is_not_delivered(tmp_path, state_file):
+    """THE round-7 repro, stated against any lossy channel rather than today's
+    limit. Five failures from other sources, then TickTick's vanished project;
+    the channel has room for five lines, so the sixth reaches nobody — and the
+    receipt was stamped anyway, because delivery was declared for the RUN while
+    the payload was a slice of it."""
+    heard: list[str] = []
+    first = _run_all(
+        [_Noisy(), TickTickAdapter(source=_source(tmp_path, state_file))],
+        notify=_lossy(heard, keep=5),
+    )
+    assert _reported(first), first.errors
+    assert not [e for e in heard if UNCOVERED in e], "precondition: it was cut"
+
+    second = _run_all(
+        [TickTickAdapter(source=_source(tmp_path, state_file))],
+        notify=_delivering([]),
+    )
+
+    assert _reported(second), (
+        "a receipt was stamped for a line the notifier was never given: "
+        f"run 2 reported {second.errors}"
+    )
+
+
+def test_an_adapter_that_could_only_show_half_its_report_stays_loud(
+    tmp_path, state_file
+):
+    """The rule one level down: coverage is per ADAPTER, not per line, because a
+    receipt is the adapter's decision to stop saying something. TickTick reports
+    six things — five unreadable backups and the vanished project — and the
+    channel carries the first five. The gating line got through; the adapter
+    still may not go quiet, because a report it could only half-deliver is not
+    one it can reason about which half of."""
+    heard: list[str] = []
+    noisy = _source(tmp_path, state_file)
+    real_iter = noisy.iter_records
+
+    def iter_records(since, errors=None):
+        if errors is not None:
+            errors.extend(f"unreadable backup {n}" for n in range(5))
+        return real_iter(since, errors=errors)
+
+    noisy.iter_records = iter_records
+
+    first = _run_all(
+        [TickTickAdapter(source=noisy)], notify=_lossy(heard, keep=5)
+    )
+    assert _reported(first), first.errors
+    assert len(first.errors) == 6, first.errors
+
+    assert _reported(_run_all(
+        [TickTickAdapter(source=_source(tmp_path, state_file))],
+        notify=_delivering([]),
+    )), "the adapter went quiet on a report the channel only partly carried"
+
+
+def test_the_shipped_toast_spends_its_budget_on_the_gating_line_first(
+    tmp_path, state_file, monkeypatch
+):
+    """The other half of the fix, and the reason it is not merely loud forever.
+
+    Making an elided line undeliverable is correct and, on its own, means a
+    chronically noisy run re-alarms about a known gap on every tick — which is
+    the round-4 problem back again. So the toast's five slots go to the lines
+    that GATE a receipt first: a source with no report barrier repeats its
+    errors next run anyway, so its line is the cheap one to drop."""
+    log = _toast(tmp_path, monkeypatch)
+
+    first = _run_all(
+        [_Noisy(), TickTickAdapter(source=_source(tmp_path, state_file))],
+        notify=cli._desktop_notification,
+    )
+    assert _reported(first), first.errors
+    payload = log.read_text()
+    assert UNCOVERED in payload, f"pushed out by five unrelated failures:\n{payload}"
+
+    second = _run_all(
+        [_Noisy(), TickTickAdapter(source=_source(tmp_path, state_file))],
+        notify=cli._desktop_notification,
+    )
+
+    assert _reported(second) == [], (
+        f"a human was shown the line and it fired again: {second.errors}"
     )
 
 

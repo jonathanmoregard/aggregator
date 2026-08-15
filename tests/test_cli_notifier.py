@@ -23,7 +23,7 @@ from pathlib import Path
 from aggregator import cli
 from aggregator.cli import NOTIFY_COMMAND_ENV_VAR, main
 from aggregator.core.store import Store
-from aggregator.imports.port import Delivery, ImportItem
+from aggregator.imports.port import ImportItem
 from aggregator.imports.runner import AdapterReport, RunReport
 
 
@@ -89,19 +89,31 @@ def test_a_failing_run_reaches_a_real_notifier_from_env(
 
 def test_the_shipped_notifier_declares_the_delivery_it_made(tmp_path, monkeypatch):
     """Round 6, the production half. A report barrier only fires when the hook
-    returns ``Delivery.DELIVERED``, so the one notifier that ever really reaches
-    a human has to say so — otherwise the fix trades permanent silence for an
-    alarm that repeats forever on the configuration that works.
+    declares delivery, so the one notifier that ever really reaches a human has
+    to say so — otherwise the fix trades permanent silence for an alarm that
+    repeats forever on the configuration that works.
 
-    Both answers, from one run each: the toast that went out, and the healthy
-    run that had nothing to send and therefore delivered nothing.
+    Round 7: it declares WHICH LINES, read out of the body it sent. Three
+    answers from one run each — the line that went out, the line that did not
+    fit in the toast, and the healthy run with nothing to send.
     """
     script, _log = _recording_notifier(tmp_path)
     monkeypatch.setenv(NOTIFY_COMMAND_ENV_VAR, str(script))
-    broken = RunReport(adapters={"ticktick": AdapterReport("ticktick", errors=["x"])})
+    noisy = RunReport(
+        adapters={
+            "ticktick": AdapterReport(
+                "ticktick", errors=[f"e{n}" for n in range(cli.NOTIFY_ERROR_LIMIT + 1)]
+            )
+        }
+    )
 
-    assert cli._desktop_notification(broken) is Delivery.DELIVERED
-    assert cli._desktop_notification(RunReport()) is Delivery.UNDELIVERED
+    delivered = cli._desktop_notification(noisy)
+
+    assert delivered.covers(["ticktick: e0"]), "the toast did carry the first line"
+    assert not delivered.covers(noisy.errors), (
+        "one line did not fit, so the whole report was not delivered"
+    )
+    assert not cli._desktop_notification(RunReport()).covers(["anything"])
 
 
 def test_a_clean_but_stale_run_reaches_the_notifier_too(tmp_path, monkeypatch):

@@ -121,16 +121,19 @@ def _broken_notify(report) -> None:
 
 
 def _working_notify(heard: list[str]):
-    """A hook standing in for a notifier that reached somebody, and SAYS SO.
+    """A hook standing in for a notifier that reached somebody, and SAYS WHAT.
 
-    Returning ``Delivery.DELIVERED`` is the whole declaration (round 6): a hook
-    that merely returns is a hook that might have done nothing, and the default
-    one does exactly nothing. See ``imports/port.Delivery``.
+    The declaration is the whole point (round 6): a hook that merely returns is
+    a hook that might have done nothing, and the default one does exactly
+    nothing. Round 7 narrowed it further — the declaration names the lines the
+    payload carried, so a channel that dropped one cannot silence it. This one
+    sends everything. See ``imports/port.Delivery``.
     """
 
     def notify(report) -> Delivery:
+        payload = "\n".join(report.errors)
         heard.extend(report.errors)
-        return Delivery.DELIVERED
+        return Delivery.accepted(payload, report.errors)
 
     return notify
 
@@ -397,7 +400,14 @@ def test_the_cli_path_records_the_report_it_printed_to_stderr(
 
 
 class _Probe:
-    """A source wearing nothing but the two barriers."""
+    """A source wearing nothing but the two barriers.
+
+    It REPORTS something, because round 7 made that load-bearing: a receipt
+    suppresses a repeat of a line, so an adapter that said nothing this run has
+    nothing a channel could have delivered and no basis for a receipt. A probe
+    that reported nothing and expected the barrier to fire was asserting the
+    vacuous-truth reading this contract exists to refuse.
+    """
 
     name = "probe"
 
@@ -406,6 +416,8 @@ class _Probe:
         self._angry = angry
 
     def iter_records(self, since, errors=None):
+        if errors is not None:
+            errors.append("something worth telling a human")
         return iter(())
 
     def commit_after_write(self) -> None:
