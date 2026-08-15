@@ -338,6 +338,45 @@ def test_a_corrupt_line_is_reported_exactly_once(tmp_path):
     assert len([e for e in errors if "corrupt" in e]) == 1
 
 
+def test_a_badly_corrupt_file_does_not_produce_one_error_per_line(tmp_path):
+    """Round-3 MEDIUM. One entry per file, capped examples, EXACT count.
+
+    Sessions is the largest source in the index (~359k observations). A bad
+    line appended one error each, so one corrupt file ballooned the run report,
+    the desktop notification payload and the memory the list occupies — and the
+    CLI prints only ``errors[:5]``, so that one file also crowded every other
+    fault in the run out of the only view an operator gets.
+
+    Capping must not become the fault hiding, which is why the total is exact
+    and the examples are what get capped. Same shape as github's dropped rows.
+    """
+    p = tmp_path / "sess-many.jsonl"
+    p.write_text("not json at all\n" * 500)
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+
+    _s, _o, errors = _split_entities(SessionsSource(projects_root=str(tmp_path)))
+
+    assert len(errors) == 1
+    assert "DROPPED 500 corrupt line(s)" in errors[0], "the exact count must survive"
+    assert "line 1, 2, 3, 4, 5, ..." in errors[0]
+    assert "6" not in errors[0].split("(line", 1)[1], "the identifiers are capped at five"
+
+
+def test_the_two_line_faults_are_reported_separately(tmp_path):
+    """Corrupt JSON and valid-JSON-wrong-shape are different diagnoses with
+    different causes, so they aggregate into one entry EACH rather than into a
+    single "some lines were bad"."""
+    p = tmp_path / "sess-mixed.jsonl"
+    p.write_text("{not json\n[1, 2, 3]\n{also not json\n")
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+
+    _s, _o, errors = _split_entities(SessionsSource(projects_root=str(tmp_path)))
+
+    assert len(errors) == 2
+    assert any("DROPPED 2 corrupt line(s)" in e for e in errors)
+    assert any("DROPPED 1 line(s) that are valid JSON" in e for e in errors)
+
+
 def test_an_unstattable_file_reaches_the_errors_sink(tmp_path):
     """Round-5 HIGH 3. A whole JSONL dropped by a failed ``stat`` was invisible.
 
@@ -391,8 +430,12 @@ def test_a_non_dict_jsonl_line_reaches_the_errors_sink(tmp_path):
 
     assert len(sessions) == 1
     assert len(observations) == 1
-    assert len(errors) == 2
-    assert all("sess-shapes.jsonl" in e for e in errors)
+    # One entry per file per fault CLASS, with the exact count in it — see
+    # ``test_a_badly_corrupt_file_does_not_produce_one_error_per_line``.
+    assert len(errors) == 1
+    assert "sess-shapes.jsonl" in errors[0]
+    assert "DROPPED 2" in errors[0]
+    assert "2 (str)" in errors[0] and "3 (list)" in errors[0]
 
 
 def test_attachment_and_progress_types_preserved_not_bucketed_as_other(tmp_path):

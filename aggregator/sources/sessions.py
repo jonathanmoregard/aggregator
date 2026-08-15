@@ -111,6 +111,35 @@ _KNOWN_TYPES = frozenset(
 )
 
 
+# How many line identifiers a per-file drop report names before it says
+# ", ...". Deliberately the same five github's ``_note_dropped`` uses, so the
+# two read as one convention rather than two arbitrary limits.
+_MAX_NAMED_DROPS = 5
+
+
+def _note_dropped_lines(
+    path: Path, what: str, dropped: list[str], errors: list[str]
+) -> None:
+    """Report the lines one file lost, as ONE entry with an exact count.
+
+    The cap is on the identifiers, never on the count. A 359k-line corrupt file
+    must not put 359k strings in the run report, the notification payload and
+    memory — but "some lines were bad" is not a fault report, so the exact
+    total leads and the examples follow. Capping that hid the magnitude would
+    trade one failure mode for another.
+
+    Nothing is emitted for a clean file: an entry per healthy file would make
+    the errors list — which is what decides the run's exit code — meaningless.
+    """
+    if not dropped:
+        return
+    errors.append(
+        f"{path}: DROPPED {len(dropped)} {what} — they are NOT in the index "
+        f"(line {', '.join(dropped[:_MAX_NAMED_DROPS])}"
+        f"{', ...' if len(dropped) > _MAX_NAMED_DROPS else ''})"
+    )
+
+
 def _parse_iso(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -466,6 +495,17 @@ class SessionsSource:
         except OSError as e:
             errors.append(f"{path}: open failed: {e}")
             return
+        # AGGREGATED PER FILE, not per line. A dropped line used to append one
+        # error EACH, and this is the largest source in the index (~359k
+        # observations): one corrupt file balloons the run report, the desktop
+        # notification payload and the memory the errors list occupies, and the
+        # CLI only prints ``errors[:5]`` anyway, so a single bad file could
+        # crowd every other fault in the run out of the only view an operator
+        # gets. Same shape as github's dropped rows — a capped list of
+        # identifiers plus an EXACT total, because capping must not become the
+        # fault hiding: the count is the number that says how bad it is.
+        corrupt: list[int] = []
+        wrong_shape: list[str] = []
         try:
             for lineno, raw in enumerate(fh, 1):
                 line = raw.strip()
@@ -474,7 +514,7 @@ class SessionsSource:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
-                    errors.append(f"{path}:{lineno} corrupt line")
+                    corrupt.append(lineno)
                     continue
                 if not isinstance(obj, dict):
                     # Valid JSON, wrong shape — a bare string, a list, a
@@ -483,16 +523,22 @@ class SessionsSource:
                     # observation simply ceases to exist and the session it
                     # belonged to looks like it just had fewer lines. Exactly
                     # what a truncated-then-reappended file leaves behind.
-                    errors.append(
-                        f"{path}:{lineno} skipped: line is a "
-                        f"{type(obj).__name__}, not a JSON object"
-                    )
+                    wrong_shape.append(f"{lineno} ({type(obj).__name__})")
                     continue
                 parsed = self._parse_line(obj)
                 if parsed is not None:
                     yield parsed
         finally:
             fh.close()
+            # In the ``finally`` so an abandoned generator still reports what
+            # it dropped before the consumer walked away.
+            _note_dropped_lines(path, "corrupt line(s)", [str(n) for n in corrupt], errors)
+            _note_dropped_lines(
+                path,
+                "line(s) that are valid JSON but not a JSON object",
+                wrong_shape,
+                errors,
+            )
 
     @staticmethod
     def _dominant_session_id(parsed_lines: list[_ParsedLine], path: Path) -> str | None:
