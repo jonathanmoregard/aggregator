@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
+from aggregator.core.durable import flush_to_disk, replace_durably
 from aggregator.sources import ticktick_api
 from aggregator.sources.base import IngestResult, Record
 from aggregator.sources.ticktick_csv import (
@@ -306,7 +307,7 @@ class TickTickSource:
 
     @staticmethod
     def _copy_private(path: Path, target: Path) -> None:
-        """Copy ``path`` to ``target`` at 0600, atomically, keeping its mtime.
+        """Copy ``path`` to ``target`` at 0600, durably, keeping its mtime.
 
         ``shutil.copy2`` preserved the mode of the file in ~/Downloads, which
         a browser writes at the default umask — typically 0644. This is the
@@ -318,10 +319,22 @@ class TickTickSource:
         scratch fd BEFORE any bytes are written, so there is no window at
         0644, and applied explicitly rather than through ``O_CREAT``'s mode
         argument, which does nothing when a scratch file from an earlier run
-        already exists. The rename then makes the replacement atomic, so an
-        interrupted copy cannot leave a truncated archive — which, for the
-        only surviving copy of an unregenerable export, is the same failure
-        M5 is about.
+        already exists. The rename then makes the replacement atomic, so no
+        READER ever sees a half-copied archive.
+
+        That is where this stopped, and it claimed more than it delivered: "an
+        interrupted copy cannot leave a truncated archive". A rename is a
+        directory-entry change, and the bytes behind it can still be in the page
+        cache, so a power cut inside the filesystem's commit window could leave
+        a zero-length archive — for the only surviving copy of an export nothing
+        regenerates, which is exactly the failure M5 is about. The scratch file
+        is therefore fsynced before it closes and the directory fsynced after
+        the rename; see ``core/durable.py`` for the full recipe and for what
+        remains outside this code's control.
+
+        The fsync happens BEFORE ``os.utime``, so the mtime the copy is stamped
+        with is not itself the thing at risk — see below for why the mtime is
+        load-bearing.
 
         The MTIME IS RESTORED from the source, and that is load-bearing rather
         than tidiness: ``newest_backup_mtime`` reports the age of the newest
@@ -337,11 +350,12 @@ class TickTickSource:
             with os.fdopen(fd, "wb") as out, path.open("rb") as source:
                 os.fchmod(out.fileno(), 0o600)
                 shutil.copyfileobj(source, out)
+                flush_to_disk(out)
             os.utime(scratch, (source_stat.st_atime, source_stat.st_mtime))
         except BaseException:
             scratch.unlink(missing_ok=True)
             raise
-        os.replace(scratch, target)
+        replace_durably(scratch, target)
 
     def _csv_candidates(
         self, since: datetime | None, errors: list[str] | None = None

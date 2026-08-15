@@ -17,12 +17,20 @@ takes the spec default; reading an empty one literally yields a RELATIVE path,
 so the markers would be written wherever the timer happened to start and the
 next run, started elsewhere, would find none and warn all over again.
 
-0600 AND AN ATOMIC RENAME, both copied from ``ticktick_api._write_state``. The
+0600 AND A DURABLE RENAME, both copied from ``ticktick_api._write_state``. The
 mode is set on the scratch fd BEFORE any bytes are written, so there is no
 window at 0644, and applied explicitly rather than through ``O_CREAT``'s mode
 argument, which does nothing when a scratch file from an earlier run already
 exists. The content is a list of the user's source names and export dates —
 not a credential, but not something a state file should publish either.
+
+"Durable" rather than merely "atomic" because the rename alone only guarantees
+that no READER sees a half-written document; the bytes behind it can still be
+in the page cache when the power goes, leaving a zero-length markers file. Here
+that is the mildest of the three write paths that share this recipe — reading
+fails safe, so a lost file costs one repeated warning — but it is the same
+recipe, and a copy that quietly drops a step is how the recipe rots. See
+``core/durable.py``.
 
 READING FAILS SAFE, WHICH IS THE OPPOSITE OF THE TICKTICK BASELINE. There the
 absent file and the broken file are opposite answers and a broken one RAISES,
@@ -44,6 +52,8 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from aggregator.core.durable import flush_to_disk, replace_durably
 
 log = logging.getLogger(__name__)
 
@@ -159,10 +169,11 @@ class IngestMarkers:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     os.fchmod(handle.fileno(), 0o600)
                     handle.write(json.dumps(document))
+                    flush_to_disk(handle)
             except BaseException:
                 scratch.unlink(missing_ok=True)
                 raise
-            scratch.replace(self.path)
+            replace_durably(scratch, self.path)
 
 
 def stale_input_markers(path: Path | None = None) -> dict[str, dict]:

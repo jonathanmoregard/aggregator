@@ -68,6 +68,7 @@ from urllib import request
 from urllib.error import URLError
 from urllib.parse import quote
 
+from aggregator.core.durable import flush_to_disk, replace_durably
 from aggregator.sources.base import Record, stable_id_for
 
 # One vocabulary, defined once, in the module whose file format documents it.
@@ -992,15 +993,24 @@ def default_state_path() -> Path:
 def save_state(
     path: Path, tasks: Iterable[dict], now: datetime, retain: dict[str, dict] | None = None
 ) -> None:
-    """Persist the current open-task set as the next poll's baseline, atomically.
+    """Persist the current open-task set as the next poll's baseline, durably.
 
-    Written to a scratch file in the same directory and renamed into place, so
-    an interrupted write cannot leave truncated JSON behind: the file is always
-    either the previous poll or this one. That matters more here than the usual
-    tidiness argument — a corrupt baseline now stops inference and the baseline
-    advance dead until a human clears it (``load_state`` raises rather than
-    reading it as empty), so leaving truncated JSON behind costs every poll
-    until somebody notices, not just the next one.
+    Written to a scratch file in the same directory, fsynced, renamed into
+    place, and the directory fsynced after the rename. What each step buys is
+    spelled out in ``core/durable.py``, and the distinction is not academic: the
+    rename alone means no READER ever sees a half-written file, and this
+    docstring used to stop there and claim "an interrupted write cannot leave
+    truncated JSON behind". It could. A rename is a directory-entry change and
+    the data behind it may still be in the page cache, so a power cut inside the
+    filesystem's commit window could leave a target that exists and is zero
+    length — a shape ``load_state`` correctly refuses to read, so it would stop
+    inference and the baseline advance dead until a human cleared it, and every
+    completion still pending in the destroyed baseline would be gone for good
+    (the Open API serves open tasks only and can never report one again).
+
+    What IS now guaranteed: the bytes and the rename have both been acknowledged
+    by the device before this returns. What is still not: a drive that lies
+    about its write cache. See ``core/durable.py``.
 
     Keys come from ``_task_id`` — the module's single id rule, the one
     ``task_to_record`` mints stable_ids with — so a baseline key is always
@@ -1099,7 +1109,15 @@ def replace_state(
 def _write_state(
     path: Path, tasks: Iterable[dict], now: datetime, retain: dict[str, dict] | None
 ) -> None:
-    """The bytes half of a save. Call under :func:`_baseline_lock`."""
+    """The bytes half of a save. Call under :func:`_baseline_lock`.
+
+    DURABLE, not merely atomic. The scratch file is fsynced before it closes,
+    then renamed, then the containing directory is fsynced — see
+    ``core/durable.py`` for why the third step is the one that gets forgotten
+    and what it costs. Without it a power cut inside the filesystem's commit
+    window could leave a ZERO-LENGTH baseline here, and the Open API serves open
+    tasks only, so every completion still pending in it would be unrecoverable.
+    """
     payload: dict[str, dict] = dict(retain or {})
     skipped = 0
     for task in tasks:
@@ -1115,7 +1133,8 @@ def _write_state(
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         os.fchmod(handle.fileno(), 0o600)
         handle.write(json.dumps(payload))
-    scratch.replace(path)
+        flush_to_disk(handle)
+    replace_durably(scratch, path)
 
 
 def baseline_identity(path: Path) -> tuple[int, int, int, int] | None:
