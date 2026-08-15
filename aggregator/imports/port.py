@@ -20,6 +20,54 @@ windows take ``since`` at construction time (the adapter closes over it), so
 the port stays the single-verb interface it is meant to be. Adding a
 parameter here would push per-source acquisition knobs into the seam every
 future source has to implement.
+
+THE ORDER A CALLER MUST DRIVE THESE IN
+--------------------------------------
+There are five protocols here and each one documents its own timing, which
+between them did NOT add up to a stated sequence — a writing caller had to
+reconstruct it from ``runner._run_one``. It is:
+
+  1. ``ImportAdapter.get_data``      stream, flushing to the sink in batches
+  2. ``SupportsWriteBarrier``        ``commit_after_write`` — ONLY if the
+                                     stream ended without raising AND the sink
+                                     skipped nothing
+  3. ``SupportsNonFatalErrors``      ``drain_errors`` — always, INCLUDING after
+                                     a raise
+  4. ``SupportsInputFreshness``      ``input_freshness`` — always
+  --- every adapter has now finished; the run's report is assembled ---
+  5. the report reaches a human, or does not (see :class:`Delivery`)
+  6. ``SupportsReportBarrier``       ``commit_after_report`` — ONLY if step 5
+                                     was DECLARED delivered
+
+Steps 3 and 4 are order-independent of each other and of 2; they collect,
+they decide nothing. The load-bearing edge is 2 BEFORE 6, and the gap between
+them is the point: the write barrier answers "did the records land?" and can
+be answered immediately, while the report barrier answers "was a human told?",
+which is not knowable until every adapter has finished and a channel has
+reported success.
+
+WHAT GOING WRONG COSTS, since the two fail in opposite directions:
+
+* 6 before 2 — measured on the one adapter that implements both: the receipt
+  lands, and the advance behind it is then REFUSED, because writing the receipt
+  moved the file the advance was going to compare-and-swap against. It raises,
+  the caller records it, the run exits 3, and the next poll re-derives the
+  advance. Loud and recoverable rather than silent — but it costs a poll, so
+  the order is not a matter of taste.
+* 2 without 6 — the normal state of any run nobody was told about. Cost: one
+  more report next run. This is the DEFAULT and it is deliberate.
+* 6 without 2 — a run whose write failed but whose report was heard. Legal and
+  intended: the human did hear it, and the baseline is re-derived next run
+  identically. Only the report is suppressed, never the retention.
+* NEVER calling 2 — the one unbounded failure. The adapter's state freezes, so
+  a task created after the freeze is never in the baseline and its later
+  disappearance is invisible to every future poll. "Safe to skip" applies to
+  one run, never to the contract.
+
+``tests/imports/test_write_barrier_contract.py`` drives every write path in
+this repo against a probe adapter, and ``tests/test_delivery_contract.py``
+pins step 5-6 end to end, so a new call site that gets this wrong fails there
+rather than in production six months later.
 """
 from __future__ import annotations
 
