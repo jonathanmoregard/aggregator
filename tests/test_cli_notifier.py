@@ -20,9 +20,11 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from aggregator import cli
 from aggregator.cli import NOTIFY_COMMAND_ENV_VAR, main
 from aggregator.core.store import Store
-from aggregator.imports.port import ImportItem
+from aggregator.imports.port import Delivery, ImportItem
+from aggregator.imports.runner import AdapterReport, RunReport
 
 
 class _FakeAdapter:
@@ -83,6 +85,23 @@ def test_a_failing_run_reaches_a_real_notifier_from_env(
     assert "critical" in argv, "the 2026-08-08 constraint says CRITICAL on failure"
     assert any("ticktick" in a for a in argv)
     assert any("token expired" in a for a in argv)
+
+
+def test_the_shipped_notifier_declares_the_delivery_it_made(tmp_path, monkeypatch):
+    """Round 6, the production half. A report barrier only fires when the hook
+    returns ``Delivery.DELIVERED``, so the one notifier that ever really reaches
+    a human has to say so — otherwise the fix trades permanent silence for an
+    alarm that repeats forever on the configuration that works.
+
+    Both answers, from one run each: the toast that went out, and the healthy
+    run that had nothing to send and therefore delivered nothing.
+    """
+    script, _log = _recording_notifier(tmp_path)
+    monkeypatch.setenv(NOTIFY_COMMAND_ENV_VAR, str(script))
+    broken = RunReport(adapters={"ticktick": AdapterReport("ticktick", errors=["x"])})
+
+    assert cli._desktop_notification(broken) is Delivery.DELIVERED
+    assert cli._desktop_notification(RunReport()) is Delivery.UNDELIVERED
 
 
 def test_a_clean_but_stale_run_reaches_the_notifier_too(tmp_path, monkeypatch):
