@@ -727,3 +727,146 @@ def test_the_next_complete_poll_still_infers_the_real_completion(tmp_path, monke
 
     assert records["ticktick:t2"].extra["provenance"] == "api-inferred-complete"
     assert ticktick_api.load_state(tmp_path / "state.json").keys() == {"t1"}
+
+
+# --- guessed data must not overwrite measured data -------------------------
+#
+# Round 4 HIGH 2. "Newest observation wins" is right for freshness and wrong
+# for provenance. An inferred completion carries the POLL's clock, so it is
+# always newer than the backup file it is merged against — and it was
+# therefore replacing the export's exact ``Completed Time`` with an
+# approximate one on the very run that first read that export. The backup is
+# the only place an exact completion timestamp exists, and an incremental run
+# never re-reads it, so nothing could put the measurement back.
+
+
+def _seed_baseline(tmp_path, tasks, when=datetime(2026, 8, 1, tzinfo=UTC)):
+    """Make ``tasks`` the previous poll's open set, without running a poll."""
+    ticktick_api.save_state(tmp_path / "state.json", tasks, when)
+
+
+def _aged(path, hours):
+    stamp = (datetime.now(UTC) - timedelta(hours=hours)).timestamp()
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_an_inferred_completion_never_overwrites_a_measured_one(tmp_path, monkeypatch):
+    """Measured-then-inferred, in one run: the exact timestamp survives.
+
+    The ordinary sequence — a task is open at the last poll, the user finishes
+    it, the user exports a backup, the next run reads both. The backup's
+    ``Completed Time`` is a measurement TickTick made; the poll's inference is
+    a guess that the task's disappearance means completion, stamped 'now'.
+    Recency alone handed the run to the guess.
+    """
+    _seed_baseline(tmp_path, [{"id": "t1", "title": "Ship it", "projectId": "p1"}])
+    _aged(
+        _backup(
+            tmp_path / "downloads" / "TickTick.csv",
+            [_row(task_id="t1", status="2", completed="2026-08-03T17:30:00+0000")],
+        ),
+        hours=1,
+    )
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll([]))
+
+    (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
+
+    assert rec.extra["provenance"] == "csv"
+    assert "completed_time_approx" not in rec.extra
+    assert rec.updated_at == datetime(2026, 8, 3, 17, 30, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("status", ["2", "-1", "7"])
+def test_every_measured_non_open_status_is_protected(tmp_path, monkeypatch, status):
+    """``-1`` (abandoned) is as terminal as ``2``, and an unrecognised code is a
+    measured value this repo keeps verbatim rather than guessing at — replacing
+    either with an approximate completion destroys the same evidence."""
+    _seed_baseline(tmp_path, [{"id": "t1", "projectId": "p1"}])
+    _aged(
+        _backup(
+            tmp_path / "downloads" / "TickTick.csv",
+            [_row(task_id="t1", status=status, completed="2026-08-03T17:30:00+0000")],
+        ),
+        hours=1,
+    )
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll([]))
+
+    (rec,) = list(_source(tmp_path, token="tok").iter_records(None, errors=[]))
+    assert rec.extra["provenance"] == "csv"
+    assert rec.extra["status"] == status
+
+
+def test_a_measured_completion_still_corrects_an_earlier_inferred_one(tmp_path, monkeypatch):
+    """Inferred-then-measured, across two runs: the guess is not permanent.
+
+    Run 1 has no backup at all and infers the completion. Run 2 reads the
+    export the user finally took. The measurement must win — the fix is
+    "provenance outranks recency", not "whatever is in the index stays".
+    """
+    _seed_baseline(tmp_path, [{"id": "t1", "title": "Ship it", "projectId": "p1"}])
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll([]))
+    first = _source(tmp_path, token="tok")
+    (guess,) = list(first.iter_records(None))
+    first.commit_after_write()
+    assert guess.extra["provenance"] == "api-inferred-complete"
+
+    _backup(
+        tmp_path / "downloads" / "TickTick.csv",
+        [_row(task_id="t1", status="2", completed="2026-08-03T17:30:00+0000")],
+    )
+    (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
+
+    assert rec.extra["provenance"] == "csv"
+    assert rec.updated_at == datetime(2026, 8, 3, 17, 30, tzinfo=UTC)
+
+
+def test_a_reopened_task_still_beats_a_stale_measured_completion(tmp_path, monkeypatch):
+    """The rule is about GUESSES, not about completions in general.
+
+    The poll serving a task is a measurement — the Open API only ever serves
+    OPEN tasks — so a re-opened task must still overturn last month's backup
+    row. A rule that read "a completed CSV row always wins" would freeze every
+    re-opened task as finished forever.
+    """
+    _seed_baseline(tmp_path, [{"id": "t1", "projectId": "p1"}])
+    _aged(
+        _backup(
+            tmp_path / "downloads" / "TickTick.csv",
+            [_row(task_id="t1", status="2", completed="2026-07-01T09:00:00+0000")],
+        ),
+        hours=24 * 30,
+    )
+    monkeypatch.setattr(
+        ticktick_api,
+        "poll_open_tasks",
+        lambda token, errors=None: _poll([{"id": "t1", "title": "Reopened", "projectId": "p1"}]),
+    )
+
+    (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
+
+    assert rec.extra["provenance"] == "api"
+    assert "open" in rec.tags
+
+
+def test_both_legs_one_poll_an_open_csv_row_yields_to_the_inference(tmp_path, monkeypatch):
+    """Same task, both legs, one run — and here the inference SHOULD win.
+
+    The backup says the task was open when it was exported; that row holds no
+    completion to protect, and superseding it is the whole reason the API leg
+    exists (a task finished since the last export is completed in the index
+    without waiting for the next manual backup). A guard that fired on any CSV
+    row at all would have quietly disabled completion inference for every task
+    that has ever appeared in a backup.
+    """
+    _seed_baseline(tmp_path, [{"id": "t1", "title": "Ship it", "projectId": "p1"}])
+    _aged(
+        _backup(tmp_path / "downloads" / "TickTick.csv", [_row(task_id="t1", status="0")]),
+        hours=24 * 7,
+    )
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll([]))
+
+    (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
+
+    assert rec.extra["provenance"] == "api-inferred-complete"
+    assert rec.extra["completed_time_approx"] == "true"

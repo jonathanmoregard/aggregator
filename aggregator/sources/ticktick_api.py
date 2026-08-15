@@ -112,6 +112,17 @@ UPDATED_FIELDS = ("completedTime", "modifiedTime")  # ``updated_at`` preference 
 # order; used by the tripwire and by the tests.
 TIMESTAMP_FIELDS = (*UPDATED_FIELDS, CREATED_FIELD)
 
+# What ``extra["provenance"]`` says on a record this module GUESSED rather than
+# observed: the task was open last poll and is absent now, so it is *probably*
+# finished, at a timestamp that is *this poll's*, not TickTick's.
+#
+# A constant because the merge in ``ticktick.py`` keys a precedence rule off it —
+# a measured completion out of a CSV backup is never replaced by a guess — and a
+# second hand-written copy of the string there would let the two drift silently:
+# the rule would simply stop matching and the guess would win again, with nothing
+# raised anywhere.
+INFERRED_COMPLETE_PROVENANCE = "api-inferred-complete"
+
 
 class WriteAttemptError(RuntimeError):
     """Raised when any non-GET request is attempted. See module docstring."""
@@ -1378,7 +1389,9 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
             continue
         try:
             task = entry.get("task") or {}
-            record = task_to_record(task, completed_at=now, provenance="api-inferred-complete")
+            record = task_to_record(
+                task, completed_at=now, provenance=INFERRED_COMPLETE_PROVENANCE
+            )
         except (AttributeError, ValueError):
             # A garbled entry — not an object, or a stored payload with no
             # usable id. Skipped rather than allowed to abort the loop: one bad

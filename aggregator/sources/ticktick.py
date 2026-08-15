@@ -11,6 +11,14 @@ task is never in an API poll at all, so its backup row is unopposed) and the
 API leg authoritative for what is currently open (a task marked completed in
 last month's backup but served by today's poll correctly reads as open again).
 
+WITH ONE EXCEPTION, and it is about provenance rather than freshness: an
+API-INFERRED COMPLETION NEVER REPLACES A MEASURED ONE. Inference stamps the
+poll's own clock on a task that merely stopped appearing, so it is always
+"newer" than the backup it is merged against — and it was therefore
+overwriting the export's exact ``Completed Time`` with an approximation. A
+guess does not get to displace a measurement of the same fact just by being
+younger. See ``iter_records``.
+
 Every emitted record carries ``extra.provenance`` so a search result never
 hides which leg it came from.
 """
@@ -26,7 +34,12 @@ from pathlib import Path
 
 from aggregator.sources import ticktick_api
 from aggregator.sources.base import IngestResult, Record
-from aggregator.sources.ticktick_csv import is_ticktick_backup, parse_backup, row_to_record
+from aggregator.sources.ticktick_csv import (
+    STATUS_OPEN,
+    is_ticktick_backup,
+    parse_backup,
+    row_to_record,
+)
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +78,41 @@ def _note(errors: list[str] | None, message: str) -> None:
     log.warning("%s", message)
     if errors is not None:
         errors.append(message)
+
+
+def _is_inferred(record: Record) -> bool:
+    """True when this record is a GUESS about a completion, not an observation.
+
+    The one thing the merge needs to know about a record's provenance. Read off
+    ``extra``, which is what the store indexes and what a DSL query can filter
+    on, so the rule below is checkable from the outside: any row a human can
+    find with ``provenance:api-inferred-complete`` is one this rule treats as
+    approximate.
+    """
+    return record.extra.get("provenance") == ticktick_api.INFERRED_COMPLETE_PROVENANCE
+
+
+def _is_measured_end(record: Record) -> bool:
+    """True when this record MEASURED a task as no longer open.
+
+    "Measured" is the whole point: an observation from the CSV backup (or from
+    a payload the API actually served) carrying a status that is not ``0``. For
+    the CSV leg that means a real ``Completed Time`` out of the export — the
+    only place an exact completion timestamp exists at all.
+
+    Any non-open status, not just ``2``: ``-1`` (abandoned) is equally a
+    terminal state the vendor recorded, and an unrecognised code is a MEASURED
+    value this repo deliberately keeps verbatim (``status_tag`` tags it
+    ``status-unrecognised`` rather than guessing) — overwriting either with an
+    approximate completion would destroy the evidence in exactly the way this
+    rule exists to prevent.
+
+    An open row is NOT protected, deliberately: it holds no completion to lose,
+    and letting an inference supersede it is the entire purpose of the API leg
+    — a task finished after the last export is completed in the index without
+    waiting for the next manual backup.
+    """
+    return not _is_inferred(record) and record.extra.get("status") != STATUS_OPEN
 
 
 def _merge_key(record: Record) -> str:
@@ -417,7 +465,34 @@ class TickTickSource:
 
         merged = self._csv_candidates(since_utc, errors)
         for task_id, (observed, record) in self._api_candidates(errors).items():
-            if task_id not in merged or merged[task_id][0] < observed:
+            held = merged.get(task_id)
+            if held is None:
+                merged[task_id] = (observed, record)
+                continue
+            # PROVENANCE OUTRANKS RECENCY IN EXACTLY ONE DIRECTION: a guess
+            # never displaces a measurement of the same fact.
+            #
+            # "Newest observation wins" is right for freshness and wrong here.
+            # An inferred completion is stamped with the POLL's clock — the
+            # task merely stopped appearing — so it is always newer than the
+            # backup file it is merged against, and it was therefore
+            # overwriting the exact ``Completed Time`` from the export with an
+            # approximate one on the very run that first read the export. The
+            # backup is the only place an exact completion timestamp exists
+            # (the Open API cannot serve a completed task at all), so nothing
+            # downstream could tell the guess from the measurement afterwards,
+            # and an incremental run never re-reads that backup to put it back.
+            #
+            # Narrow on purpose. It fires only when the incumbent already
+            # measured the task as not-open; a stale backup row saying "open"
+            # is still superseded by the inference, which is the API leg doing
+            # its job. And it says nothing about a MEASURED api record: a task
+            # the poll serves as open is a fresh observation and still beats a
+            # stale CSV completion on recency, which is how re-opening a task
+            # gets back into the index.
+            if _is_inferred(record) and _is_measured_end(held[1]):
+                continue
+            if held[0] < observed:
                 merged[task_id] = (observed, record)
 
         for task_id in sorted(merged):
