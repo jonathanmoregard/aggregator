@@ -490,12 +490,18 @@ def test_a_wholesale_disappearance_reaches_the_runs_errors_sink():
     follows arms an irreversible baseline. A ``log.warning`` left that on an
     exit-0 run, so it never reached the notifier."""
     previous = {
-        "t1": {"task": {"id": "t1", "title": "A"}, "last_seen": "2026-08-07T12:00:00+00:00"},
+        "t1": {
+            "task": {"id": "t1", "title": "A", "projectId": "p1"},
+            "last_seen": "2026-08-07T12:00:00+00:00",
+        },
     }
     errors: list[str] = []
 
     records = ticktick_api.infer_completions(
-        previous, current_ids=set(), now=datetime(2026, 8, 8, tzinfo=UTC), errors=errors
+        previous,
+        ticktick_api.OpenTaskPoll([], complete=True, covered_project_ids=frozenset({"p1"})),
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+        errors=errors,
     )
 
     assert [r.stable_id for r in records] == ["ticktick:t1"]
@@ -1364,7 +1370,11 @@ def test_the_planner_refuses_to_overwrite_a_baseline_it_could_not_read(tmp_path)
 
     records, commit = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
-        ticktick_api.OpenTaskPoll([{"id": "t9", "title": "open now"}], complete=True),
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t9", "title": "open now", "projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
+        ),
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         errors,
     )
@@ -1387,11 +1397,14 @@ def test_an_unreadable_baseline_is_loud_and_a_first_poll_is_not(tmp_path):
     errors sink, because that is what makes the run exit 3 and notify — and a
     timer is the only thing watching.
     """
+    poll = ticktick_api.OpenTaskPoll(
+        [{"id": "t1", "projectId": "p1"}], complete=True, covered_project_ids=frozenset({"p1"})
+    )
     missing = tmp_path / "never-written.json"
     first_run: list[str] = []
     _, commit = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(missing),
-        ticktick_api.OpenTaskPoll([{"id": "t1"}], complete=True),
+        poll,
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         first_run,
     )
@@ -1404,7 +1417,7 @@ def test_an_unreadable_baseline_is_loud_and_a_first_poll_is_not(tmp_path):
     corrupt: list[str] = []
     ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(broken),
-        ticktick_api.OpenTaskPoll([{"id": "t1"}], complete=True),
+        poll,
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         corrupt,
     )
@@ -1521,11 +1534,22 @@ def test_disappeared_task_becomes_inferred_completion(tmp_path):
     second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
     ticktick_api.save_state(
         path,
-        [{"id": "t1", "title": "Gone", "_projectName": "Work"}, {"id": "t2", "title": "Stays"}],
+        [
+            {"id": "t1", "title": "Gone", "_projectName": "Work", "_projectId": "p1"},
+            {"id": "t2", "title": "Stays", "_projectId": "p1"},
+        ],
         first,
     )
     prev = ticktick_api.load_state(path)
-    records = ticktick_api.infer_completions(prev, current_ids={"t2"}, now=second)
+    records = ticktick_api.infer_completions(
+        prev,
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t2", "_projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
+        ),
+        now=second,
+    )
     assert [r.stable_id for r in records] == ["ticktick:t1"]
     rec = records[0]
     assert rec.subject == "Gone"
@@ -1546,7 +1570,15 @@ def test_no_inference_on_first_ever_poll():
     ``infer_completions`` existed: a regression guard on the direction of the
     diff, not a driver.
     """
-    records = ticktick_api.infer_completions({}, current_ids={"t1"}, now=datetime.now(UTC))
+    records = ticktick_api.infer_completions(
+        {},
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t1", "projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
+        ),
+        now=datetime.now(UTC),
+    )
     assert records == []
 
 
@@ -1563,11 +1595,19 @@ def test_a_poll_that_returned_nothing_at_all_is_reported(tmp_path, caplog):
     the index with no explanation is the silent-failure shape this repo forbids.
     """
     previous = {
-        "t1": {"task": {"id": "t1", "title": "A"}, "last_seen": "2026-08-07T12:00:00+00:00"},
-        "t2": {"task": {"id": "t2", "title": "B"}, "last_seen": "2026-08-07T12:00:00+00:00"},
+        "t1": {
+            "task": {"id": "t1", "title": "A", "projectId": "p1"},
+            "last_seen": "2026-08-07T12:00:00+00:00",
+        },
+        "t2": {
+            "task": {"id": "t2", "title": "B", "projectId": "p1"},
+            "last_seen": "2026-08-07T12:00:00+00:00",
+        },
     }
     records = ticktick_api.infer_completions(
-        previous, current_ids=set(), now=datetime(2026, 8, 8, tzinfo=UTC)
+        previous,
+        ticktick_api.OpenTaskPoll([], complete=True, covered_project_ids=frozenset({"p1"})),
+        now=datetime(2026, 8, 8, tzinfo=UTC),
     )
     assert [r.stable_id for r in records] == ["ticktick:t1", "ticktick:t2"]
     notes = [r for r in caplog.records if "outage" in r.getMessage()]
@@ -1587,11 +1627,20 @@ def test_a_garbled_state_entry_does_not_cost_the_other_inferences(caplog):
     """
     previous = {
         "t1": "not an entry object at all",
-        "t2": {"task": {"title": "no id in the stored payload"}},
-        "t3": {"task": {"id": "t3", "title": "Gone"}, "last_seen": "2026-08-07T12:00:00+00:00"},
+        "t2": {"task": {"title": "no id in the stored payload", "projectId": "p1"}},
+        "t3": {
+            "task": {"id": "t3", "title": "Gone", "projectId": "p1"},
+            "last_seen": "2026-08-07T12:00:00+00:00",
+        },
     }
     records = ticktick_api.infer_completions(
-        previous, current_ids={"t4"}, now=datetime(2026, 8, 8, tzinfo=UTC)
+        previous,
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t4", "projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
+        ),
+        now=datetime(2026, 8, 8, tzinfo=UTC),
     )
     assert [r.stable_id for r in records] == ["ticktick:t3"]
     notes = [r for r in caplog.records if "DROPPED" in r.getMessage()]
@@ -1612,13 +1661,13 @@ def test_a_garbled_state_entry_reaches_the_runs_errors_sink():
 
     ticktick_api.infer_completions(
         previous,
-        current_ids=set(),
+        ticktick_api.OpenTaskPoll([], complete=True, covered_project_ids=frozenset({"p1"})),
         now=datetime(2026, 8, 8, tzinfo=UTC),
         errors=errors,
     )
 
-    # Two independent faults, both real: nothing at all came back this poll
-    # (round-5 HIGH 1) *and* neither baseline entry survived the conversion.
+    # No outage note here: an entry that cannot become a record is not a
+    # completion this poll is writing off, so the only fault is the drop.
     dropped = [e for e in errors if "DROPPED" in e]
     assert len(dropped) == 1
     assert "t1" in dropped[0] and "t2" in dropped[0]
@@ -1633,7 +1682,11 @@ def test_the_reconcile_planner_forwards_the_errors_sink(tmp_path):
 
     ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
-        ticktick_api.OpenTaskPoll([{"id": "t9", "title": "still open"}], complete=True),
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t9", "title": "still open", "projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
+        ),
         datetime(2026, 8, 8, tzinfo=UTC),
         errors,
     )
@@ -1652,14 +1705,18 @@ def test_an_incomplete_poll_infers_nothing_and_leaves_the_baseline_alone(tmp_pat
     state = ticktick_api.JsonFileState(tmp_path / "open_tasks.json")
     ticktick_api.save_state(
         tmp_path / "open_tasks.json",
-        [{"id": "t1"}, {"id": "t2"}],
+        [{"id": "t1", "projectId": "p1"}, {"id": "t2", "projectId": "p1"}],
         datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
     )
     errors: list[str] = []
 
     records, commit = ticktick_api.plan_open_task_reconcile(
         state,
-        ticktick_api.OpenTaskPoll([{"id": "t1"}], complete=False),
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t1", "projectId": "p1"}],
+            complete=False,
+            covered_project_ids=frozenset({"p1"}),
+        ),
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         errors,
     )
@@ -1680,7 +1737,7 @@ def test_declining_to_infer_is_itself_reported(tmp_path):
     errors: list[str] = []
     ticktick_api.reconcile_open_tasks(
         ticktick_api.JsonFileState(tmp_path / "open_tasks.json"),
-        ticktick_api.OpenTaskPoll([], complete=False),
+        ticktick_api.OpenTaskPoll([], complete=False, covered_project_ids=frozenset()),
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         errors,
     )
@@ -1689,6 +1746,225 @@ def test_declining_to_infer_is_itself_reported(tmp_path):
         "an incomplete poll must not create a baseline either — a partial first "
         "poll would freeze in every task it happened to miss"
     )
+
+
+# --- coverage: which projects did this poll actually see? -----------------
+#
+# Round 3 HIGH 1, and the third variant of one bug. R1: a poll where one
+# project's fetch FAILED still armed the baseline. R2: a payload with no
+# ``tasks`` key, and a PAGED payload, counted as complete. R3, below: a project
+# that simply STOPS APPEARING in ``GET /project`` — deleted, unshared, a
+# permission change, a truncated listing. Each round patched one more hole in
+# "did this poll see everything?", and each patch worked only against the hole
+# it was written for, because ``complete`` can only ever report faults in
+# projects the listing NAMED. A missing listing entry is not a fault.
+#
+# The shape, not the hole: a poll now carries the ids it actually enumerated
+# and read to completion, and inference is per-task gated on that set. A fourth
+# variant has nowhere to enter — whatever new reason a project goes unread, it
+# is simply not in ``covered_project_ids``.
+
+
+def _serve(monkeypatch, projects, data):
+    """Answer ``GET /project`` with ``projects`` and each project with ``data``."""
+
+    def fake_request(method, url, token, timeout=30):
+        if url.endswith("/project"):
+            return projects
+        return data[url.rsplit("/", 2)[1]]
+
+    monkeypatch.setattr(ticktick_api, "_request", fake_request)
+
+
+def test_a_project_that_leaves_the_listing_does_not_invent_completions(monkeypatch, tmp_path):
+    """Round-3 HIGH 1, end to end, through the real poll.
+
+    Two healthy polls. The second one's listing simply does not mention p2 —
+    nothing 500s, no payload is malformed, nothing is paged, so the poll is
+    complete by every check that existed. Every open task in p2 is nevertheless
+    absent from it, which is the exact input the completion inference misreads,
+    and the Open API serves open tasks only so no later poll could contradict
+    it: only a manual CSV export could.
+    """
+    path = tmp_path / "open_tasks.json"
+    state = ticktick_api.JsonFileState(path)
+
+    _serve(
+        monkeypatch,
+        [{"id": "p1", "name": "One"}, {"id": "p2", "name": "Two"}],
+        {
+            "p1": {"tasks": [_open_task(id="t1", projectId="p1")]},
+            "p2": {"tasks": [_open_task(id="t2", projectId="p2")]},
+        },
+    )
+    first = ticktick_api.poll_open_tasks(TOKEN)
+    assert first.covered_project_ids == frozenset({"p1", "p2"})
+    ticktick_api.reconcile_open_tasks(state, first, datetime(2026, 8, 8, tzinfo=UTC))
+    assert ticktick_api.load_state(path).keys() == {"t1", "t2"}
+
+    _serve(
+        monkeypatch,
+        [{"id": "p1", "name": "One"}],
+        {"p1": {"tasks": [_open_task(id="t1", projectId="p1")]}},
+    )
+    errors: list[str] = []
+    second = ticktick_api.poll_open_tasks(TOKEN, errors)
+    assert second.complete is True, "nothing failed — that is the whole point"
+    assert second.covered_project_ids == frozenset({"p1"})
+    records = ticktick_api.reconcile_open_tasks(
+        state, second, datetime(2026, 8, 9, tzinfo=UTC), errors
+    )
+
+    assert records == [], "a project missing from the listing was read as completions"
+    # And KEPT, not quietly dropped from the baseline instead: dropping it loses
+    # the real completion just as permanently, only later and more quietly.
+    assert ticktick_api.load_state(path).keys() == {"t1", "t2"}
+    assert [e for e in errors if "never covered" in e], "declining to infer was silent"
+
+
+def test_a_project_that_comes_back_reconciles_normally(monkeypatch, tmp_path):
+    """Retention is what makes the refusal above cost nothing.
+
+    p2 drops out for one poll, then returns with t2 genuinely finished. Because
+    t2 stayed in the baseline, the poll that CAN see p2 infers the completion
+    that really happened. Had the uncovered entry been dropped instead, this
+    completion would be invisible to every future poll — the same permanent
+    loss, reached by a quieter route.
+    """
+    path = tmp_path / "open_tasks.json"
+    state = ticktick_api.JsonFileState(path)
+    both = {
+        "p1": {"tasks": [_open_task(id="t1", projectId="p1")]},
+        "p2": {"tasks": [_open_task(id="t2", projectId="p2")]},
+    }
+    listing = [{"id": "p1", "name": "One"}, {"id": "p2", "name": "Two"}]
+
+    _serve(monkeypatch, listing, both)
+    ticktick_api.reconcile_open_tasks(
+        state, ticktick_api.poll_open_tasks(TOKEN), datetime(2026, 8, 8, tzinfo=UTC)
+    )
+    _serve(monkeypatch, [listing[0]], {"p1": both["p1"]})
+    ticktick_api.reconcile_open_tasks(
+        state, ticktick_api.poll_open_tasks(TOKEN), datetime(2026, 8, 9, tzinfo=UTC)
+    )
+    _serve(monkeypatch, listing, {"p1": both["p1"], "p2": {"tasks": []}})
+    records = ticktick_api.reconcile_open_tasks(
+        state, ticktick_api.poll_open_tasks(TOKEN), datetime(2026, 8, 10, tzinfo=UTC)
+    )
+
+    assert [r.stable_id for r in records] == ["ticktick:t2"]
+    assert ticktick_api.load_state(path).keys() == {"t1"}
+
+
+def test_a_retained_entry_keeps_the_observation_it_actually_had(monkeypatch, tmp_path):
+    """A carried-over entry is not restamped: the poll did not see it.
+
+    ``last_seen`` is when this task was last actually observed open. Refreshing
+    it on a poll that never looked at its project would make the file claim an
+    observation that never happened.
+    """
+    path = tmp_path / "open_tasks.json"
+    state = ticktick_api.JsonFileState(path)
+    _serve(
+        monkeypatch,
+        [{"id": "p1", "name": "One"}, {"id": "p2", "name": "Two"}],
+        {
+            "p1": {"tasks": [_open_task(id="t1", projectId="p1")]},
+            "p2": {"tasks": [_open_task(id="t2", projectId="p2")]},
+        },
+    )
+    seen = datetime(2026, 8, 8, tzinfo=UTC)
+    ticktick_api.reconcile_open_tasks(state, ticktick_api.poll_open_tasks(TOKEN), seen)
+
+    _serve(
+        monkeypatch,
+        [{"id": "p1", "name": "One"}],
+        {"p1": {"tasks": [_open_task(id="t1", projectId="p1")]}},
+    )
+    ticktick_api.reconcile_open_tasks(
+        state, ticktick_api.poll_open_tasks(TOKEN), datetime(2026, 8, 9, tzinfo=UTC)
+    )
+
+    kept = ticktick_api.load_state(path)
+    assert kept["t2"]["last_seen"] == seen.isoformat()
+    assert kept["t1"]["last_seen"] == datetime(2026, 8, 9, tzinfo=UTC).isoformat()
+
+
+def test_a_baseline_entry_with_no_project_id_is_never_inferred(tmp_path):
+    """The migration rule: an on-disk baseline that predates coverage.
+
+    Unknown is NOT covered. A stored payload with no project id cannot be
+    checked against ``covered_project_ids``, so its absence proves nothing and
+    it is retained rather than written off — the same side of the line as an
+    uncovered project. It heals on its own: any such task that is still open is
+    re-observed by the next poll and re-saved WITH the project it was walked
+    under, at which point ordinary inference resumes for it.
+
+    (In practice the pre-existing file already carries ``projectId`` — the whole
+    API payload is what gets stored — so this is the belt to that braces.)
+    """
+    path = tmp_path / "open_tasks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "old": {"task": {"id": "old", "title": "no project recorded"}, "last_seen": "x"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = ticktick_api.JsonFileState(path)
+    errors: list[str] = []
+
+    records = ticktick_api.reconcile_open_tasks(
+        state,
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t1", "projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
+        ),
+        datetime(2026, 8, 9, tzinfo=UTC),
+        errors,
+    )
+
+    assert records == [], "an unverifiable entry was assumed covered"
+    assert ticktick_api.load_state(path).keys() == {"old", "t1"}
+    assert any("<no projectId in the baseline entry>" in e for e in errors)
+
+
+def test_a_project_read_incompletely_is_not_covered(monkeypatch):
+    """Coverage is positive, so every existing hole closes through it too.
+
+    p1 answers with no ``tasks`` key. That already cleared ``complete``; it now
+    also keeps p1 out of the covered set, so the two checks cannot disagree
+    about whether p1 was seen.
+    """
+    _serve(
+        monkeypatch,
+        [{"id": "p1", "name": "One"}, {"id": "p2", "name": "Two"}],
+        {
+            "p1": {"project": {"id": "p1"}},
+            "p2": {"tasks": [_open_task(id="t2", projectId="p2")]},
+        },
+    )
+    poll = ticktick_api.poll_open_tasks(TOKEN, [])
+    assert poll.complete is False
+    assert poll.covered_project_ids == frozenset({"p2"})
+
+
+def test_a_polled_task_records_the_project_it_was_walked_under(monkeypatch):
+    """Coverage is checked against the LISTING's id, not the payload's own.
+
+    A payload that omits ``projectId`` would otherwise be permanently
+    unverifiable even though the poll walked straight to it.
+    """
+    _serve(
+        monkeypatch,
+        [{"id": "p1", "name": "One"}],
+        {"p1": {"tasks": [{"id": "t1", "title": "no projectId in the payload"}]}},
+    )
+    poll = ticktick_api.poll_open_tasks(TOKEN)
+    assert ticktick_api.task_project_id(poll.tasks[0]) == "p1"
+    assert poll.covered_project_ids == frozenset({"p1"})
 
 
 def test_default_state_path_respects_xdg(monkeypatch, tmp_path):
@@ -1737,11 +2013,12 @@ class _InMemoryState:
         self.calls.append("load")
         return self.entries
 
-    def save(self, tasks, now) -> None:
+    def save(self, tasks, now, retain=None) -> None:
         self.calls.append("save")
-        self.entries = {
-            str(t["id"]): {"task": t, "last_seen": now.isoformat()} for t in tasks
-        }
+        self.entries = dict(retain or {})
+        self.entries.update(
+            {str(t["id"]): {"task": t, "last_seen": now.isoformat()} for t in tasks}
+        )
 
 
 def test_reconcile_infers_against_the_previous_poll_then_records_this_one():
@@ -1754,9 +2031,18 @@ def test_reconcile_infers_against_the_previous_poll_then_records_this_one():
     """
     now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
     state = _InMemoryState(
-        {"t1": {"task": {"id": "t1", "title": "Gone"}, "last_seen": "2026-08-07T12:00:00+00:00"}}
+        {
+            "t1": {
+                "task": {"id": "t1", "title": "Gone", "projectId": "p1"},
+                "last_seen": "2026-08-07T12:00:00+00:00",
+            }
+        }
     )
-    poll = ticktick_api.OpenTaskPoll([{"id": "t2", "title": "Stays"}], complete=True)
+    poll = ticktick_api.OpenTaskPoll(
+        [{"id": "t2", "title": "Stays", "projectId": "p1"}],
+        complete=True,
+        covered_project_ids=frozenset({"p1"}),
+    )
     records = ticktick_api.reconcile_open_tasks(state, poll, now)
     assert [r.stable_id for r in records] == ["ticktick:t1"]
     assert state.calls == ["load", "save"]
@@ -1775,8 +2061,14 @@ def test_the_json_file_is_one_adapter_of_the_port(tmp_path):
 
     first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
     second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
-    both = ticktick_api.OpenTaskPoll([{"id": "t1"}, {"id": "t2"}], complete=True)
-    one = ticktick_api.OpenTaskPoll([{"id": "t2"}], complete=True)
+    both = ticktick_api.OpenTaskPoll(
+        [{"id": "t1", "projectId": "p1"}, {"id": "t2", "projectId": "p1"}],
+        complete=True,
+        covered_project_ids=frozenset({"p1"}),
+    )
+    one = ticktick_api.OpenTaskPoll(
+        [{"id": "t2", "projectId": "p1"}], complete=True, covered_project_ids=frozenset({"p1"})
+    )
     assert ticktick_api.reconcile_open_tasks(state, both, first) == []
     (rec,) = ticktick_api.reconcile_open_tasks(state, one, second)
     assert rec.stable_id == "ticktick:t1"
@@ -1796,7 +2088,13 @@ def test_reconcile_matches_ids_the_way_the_baseline_keys_them(tmp_path):
     state = ticktick_api.JsonFileState(tmp_path / "open_tasks.json")
     first = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
     second = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
-    tasks = [{"id": "  t1  ", "title": "Padded"}, {"id": 0, "title": "Zero"}, {"title": "No id"}]
-    poll = ticktick_api.OpenTaskPoll(tasks, complete=True)
+    tasks = [
+        {"id": "  t1  ", "title": "Padded", "projectId": "p1"},
+        {"id": 0, "title": "Zero", "projectId": "p1"},
+        {"title": "No id", "projectId": "p1"},
+    ]
+    poll = ticktick_api.OpenTaskPoll(
+        tasks, complete=True, covered_project_ids=frozenset({"p1"})
+    )
     assert ticktick_api.reconcile_open_tasks(state, poll, first) == []
     assert ticktick_api.reconcile_open_tasks(state, poll, second) == []

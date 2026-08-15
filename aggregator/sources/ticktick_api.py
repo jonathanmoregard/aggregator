@@ -29,6 +29,10 @@ COVERAGE LIMITS — two of them, both structural:
    payload's own ``status`` is still read and trusted over that assumption, so
    if the endpoint ever does serve a completed task the record says so and a
    warning fires, instead of the task being silently resurrected as open.
+   Because "absent" is the only completion signal there is, a poll also has to
+   say WHAT IT LOOKED AT: :class:`OpenTaskPoll` carries the project ids it
+   enumerated and read to completion, and a baseline task outside that set is
+   never inferred completed however cleanly the poll otherwise ran.
 2. ``GET /open/v1/project`` does not list the Inbox, so Inbox tasks are never
    fetched and can never "disappear" for task 7's completion inference either.
    Measured blast radius on the user's real export: 59 of 1302 tasks, 5 of the
@@ -184,37 +188,56 @@ def _note(errors: list[str] | None, message: str) -> None:
 
 @dataclass(frozen=True)
 class OpenTaskPoll:
-    """One poll of the Open API, and whether it saw ALL of the open tasks.
+    """One poll of the Open API, and exactly how much of "what is open" it saw.
 
-    The two travel together on purpose. ``complete`` is not decoration: the
-    completion inference at the bottom of this module reads "task was in the
-    baseline, is absent now" as "task was finished", so a poll that merely
-    FAILED to look at one project is indistinguishable from one that watched
-    every task in it get ticked off. Handing the caller a bare ``list[dict]``
-    made that distinction something a caller had to remember to ask about, and
-    the source did not — a single 500 on one project marked every open task in
-    it completed, permanently, because the Open API only ever serves open tasks
-    and can therefore never contradict the inference. Only a manual CSV export
-    could.
+    The three travel together on purpose. The completion inference at the
+    bottom of this module reads "task was in the baseline, is absent now" as
+    "task was finished", so a poll that merely FAILED to look at a project is
+    indistinguishable from one that watched every task in it get ticked off.
+    Handing the caller a bare ``list[dict]`` made that distinction something a
+    caller had to remember to ask about, and the source did not — a single 500
+    on one project marked every open task in it completed, permanently, because
+    the Open API only ever serves open tasks and can therefore never contradict
+    the inference. Only a manual CSV export could.
 
-    ``complete is False`` means "some of what is open MAY not have been
-    observed", from any cause: an empty project listing, a project whose fetch
-    failed, a project the listing gave with no usable id, a project whose
-    payload carried no ``tasks`` key at all, or task entries dropped for being
-    the wrong shape. The bar is deliberately "may": the flag guards an
-    irreversible act, so anything this module cannot positively tell apart from
-    a missed task counts as one.
+    TWO DIFFERENT QUESTIONS, hence two fields, and the second is the one three
+    review rounds kept re-discovering:
 
-    It does NOT cover the Inbox, which ``GET /open/v1/project`` never lists at
-    all — that gap is permanent, known and reported separately by
-    ``_note_inbox_gap``; folding it in here would mean ``complete`` was False on
-    every healthy poll and inference would be dead forever. Nor does a ``tasks``
-    key that is present and EMPTY, which is a project answering "nothing open
-    here" and is a complete view of it.
+    ``complete`` — "did everything this poll TRIED to do succeed?". False from
+    any cause: an empty project listing, a project whose fetch failed, a project
+    the listing gave with no usable id, a project whose payload carried no
+    ``tasks`` key at all, a payload carrying a pagination cursor, or task entries
+    dropped for being the wrong shape. The bar is deliberately "may not have
+    been observed": the flag guards an irreversible act. An incomplete poll
+    neither infers nor arms the baseline at all.
+
+    ``covered_project_ids`` — "which projects did this poll actually enumerate
+    AND read to completion?". ``complete`` can only ever speak about projects
+    the LISTING NAMED. A project that silently drops out of ``GET /project``
+    (deleted, unshared, a permission change, a truncated listing) fails nothing,
+    so ``complete`` stays True while every open task in it goes missing from the
+    poll — which is precisely the input inference misreads. So coverage is
+    recorded positively rather than derived from the absence of faults, and
+    :func:`infer_completions` will not infer for a baseline task whose project
+    is not in this set. A baseline entry with no recorded project id is not in
+    it either: unknown is not covered.
+
+    NEITHER FIELD IS OPTIONAL, deliberately. A default would let a construction
+    site stay silent about coverage, and "the caller forgot to ask" is the
+    shape of every variant of this bug so far.
+
+    Coverage does NOT include the Inbox, which ``GET /open/v1/project`` never
+    lists at all — that gap is permanent, known and reported separately by
+    ``_note_inbox_gap``. Inbox tasks are therefore never in a poll, never in the
+    baseline, and never inferred; that is unchanged and deliberate. Nor is a
+    ``tasks`` key that is present and EMPTY a gap: that is a project answering
+    "nothing open here", which IS a complete view of it, and such a project is
+    covered.
     """
 
     tasks: list[dict]
     complete: bool
+    covered_project_ids: frozenset[str]
 
 
 # Payload keys that would mean "there is more where this came from".
@@ -248,7 +271,7 @@ def _paging_signals(data: dict) -> list[str]:
 
 
 def _project_tasks(
-    data: dict, project_name: str, errors: list[str] | None, label: str
+    data: dict, project_name: str, errors: list[str] | None, label: str, project_id: str
 ) -> tuple[list[dict], bool]:
     """The well-formed task objects in one ``/project/{id}/data`` payload.
 
@@ -304,6 +327,13 @@ def _project_tasks(
         if not isinstance(entry, dict):
             continue
         entry["_projectName"] = project_name
+        # Stamped from the LISTING, not read back out of the payload, and that
+        # is what makes coverage checkable later. The baseline stores this whole
+        # blob, so a stored task carries the id of the project the poll actually
+        # walked to find it — the same string ``covered_project_ids`` holds. A
+        # payload that omits its own ``projectId`` therefore still gets checked
+        # rather than falling into "cannot verify".
+        entry["_projectId"] = project_id
         tasks.append(entry)
     complete = True
     if len(tasks) != len(raw):
@@ -342,6 +372,12 @@ def poll_open_tasks(token: str, errors: list[str] | None = None) -> OpenTaskPoll
     (they are genuine, fresh observations of open tasks) while refusing to run
     the completion inference over them. See :class:`OpenTaskPoll`.
 
+    A project id joins ``covered_project_ids`` only where BOTH halves held:
+    the listing named it with a usable id, and its payload was read to
+    completion. That is recorded here, at the one place that knows, and is a
+    positive statement rather than "no fault was noticed" — the listing itself
+    can be short, and a short listing raises no fault at all.
+
     Two coverage facts are reported rather than left to be inferred from a
     surprising count: the Inbox is not in the listing (see the module
     docstring), and a batch that yields no parseable timestamp at all is an
@@ -355,6 +391,7 @@ def poll_open_tasks(token: str, errors: list[str] | None = None) -> OpenTaskPoll
 
     tasks: list[dict] = []
     names: list[str] = []
+    covered: set[str] = set()
     complete = True
     if not projects:
         # An empty listing is the purest form of the same defect: nothing was
@@ -397,9 +434,17 @@ def poll_open_tasks(token: str, errors: list[str] | None = None) -> OpenTaskPoll
             data = _request("GET", url, token)
             if not isinstance(data, dict):
                 raise ValueError(f"unexpected payload: {type(data).__name__}")
-            found, whole = _project_tasks(data, str(project_name), errors, label)
+            found, whole = _project_tasks(
+                data, str(project_name), errors, label, str(project_id).strip()
+            )
             tasks.extend(found)
             complete = complete and whole
+            if whole:
+                # The ONLY place a project becomes "covered", and it is inside
+                # the try and after the read: a project whose payload was not
+                # fully understood is not covered, so nothing in it can be
+                # inferred completed even though its other tasks did arrive.
+                covered.add(str(project_id).strip())
         except (URLError, OSError, ValueError) as e:
             # Never interpolate the token into a message that gets logged or
             # surfaced to the CLI.
@@ -409,7 +454,7 @@ def poll_open_tasks(token: str, errors: list[str] | None = None) -> OpenTaskPoll
 
     _note_inbox_gap(names, len(tasks))
     _warn_no_timestamps(tasks, errors)
-    return OpenTaskPoll(tasks=tasks, complete=complete)
+    return OpenTaskPoll(tasks=tasks, complete=complete, covered_project_ids=frozenset(covered))
 
 
 def _note_inbox_gap(project_names: list[str], task_count: int) -> None:
@@ -879,8 +924,19 @@ class OpenTaskState(Protocol):
         """
         ...
 
-    def save(self, tasks: Iterable[dict], now: datetime) -> None:
-        """Replace the baseline with the tasks this poll returned."""
+    def save(
+        self, tasks: Iterable[dict], now: datetime, retain: dict[str, dict] | None = None
+    ) -> None:
+        """Replace the baseline with this poll's tasks, plus ``retain``.
+
+        ``retain`` is the previous baseline's entries for projects this poll
+        did NOT cover, carried over verbatim. It is not an optimisation: a poll
+        that declines to infer a completion for an unseen project and then
+        writes a baseline without those tasks has dropped them anyway, and
+        their real completion — whenever the project comes back — becomes
+        invisible to every future poll. Declining to infer is only half of not
+        guessing; keeping the evidence is the other half.
+        """
         ...
 
 
@@ -900,7 +956,9 @@ def default_state_path() -> Path:
     return Path(base) / "aggregator" / "ticktick" / "open_tasks.json"
 
 
-def save_state(path: Path, tasks: Iterable[dict], now: datetime) -> None:
+def save_state(
+    path: Path, tasks: Iterable[dict], now: datetime, retain: dict[str, dict] | None = None
+) -> None:
     """Persist the current open-task set as the next poll's baseline, atomically.
 
     Written to a scratch file in the same directory and renamed into place, so
@@ -926,8 +984,16 @@ def save_state(path: Path, tasks: Iterable[dict], now: datetime) -> None:
     the scratch fd BEFORE any bytes are written, so there is no window at 0644,
     and applied explicitly rather than relying on O_CREAT's mode argument,
     which does nothing when a scratch file from an earlier run already exists.
+
+    ``retain`` seeds the payload with entries this poll could not speak for —
+    the previous baseline's tasks in projects the poll never covered — and THIS
+    POLL'S TASKS WIN any overlap, so a retained task that has since moved into
+    a covered project is refreshed rather than frozen at its old observation.
+    Retained entries keep their original ``last_seen``: this poll did not see
+    them, and stamping them ``now`` would be the file claiming an observation
+    that never happened.
     """
-    payload: dict[str, dict] = {}
+    payload: dict[str, dict] = dict(retain or {})
     skipped = 0
     for task in tasks:
         try:
@@ -1005,32 +1071,119 @@ def load_state(path: Path) -> dict[str, dict]:
     return data
 
 
-def infer_completions(
-    previous: dict[str, dict],
-    current_ids: set[str],
-    now: datetime,
-    errors: list[str] | None = None,
-) -> list[Record]:
-    """Records for the tasks that were open last poll and are absent now.
+def task_project_id(task: object) -> str:
+    """The project a stored or polled task belongs to, or ``""`` for unknown.
 
-    The Open API cannot report a completion, so disappearance is the only
-    signal available — and it is ambiguous: a task that was deleted looks
-    exactly like one that was finished. Recorded as completed anyway, because
-    the alternative is losing it from the index entirely, and never as a plain
-    fact: ``provenance`` says the completion was inferred and
-    ``completed_time_approx`` says the timestamp is the poll's, not TickTick's.
-    A later CSV backup overwrites both with the real Completed Time.
+    ``_projectId`` first — stamped by ``_project_tasks`` from the project the
+    poll actually walked, so it is the same string ``covered_project_ids``
+    holds. ``projectId`` second, which is what a baseline written before
+    coverage existed carries, and is how an on-disk baseline from the previous
+    version keeps working without a migration step.
 
-    Sorted by id so a run's output is deterministic.
-
-    ``errors`` is the run's fault sink and an entry here means DATA WAS LOST.
-    An entry this cannot turn into a record is dropped — and then the write
-    barrier commits the advanced baseline, which is the act that makes the
-    disappearance unrepeatable, so that task's completion is gone for good.
-    A log line alone left that on an exit-0 run where every count looked
-    healthy; routed here it makes the run exit 3 and reach the notifier.
+    ``""`` for anything else, and ``""`` is never in a covered set (only
+    non-empty ids are added), so "no project id recorded" resolves to CANNOT
+    VERIFY rather than to "covered". That direction is the whole point: the
+    other one silently assumes the very thing the caller is trying to check.
     """
-    if previous and not current_ids:
+    if not isinstance(task, dict):
+        return ""
+    for field in ("_projectId", "projectId"):
+        raw = task.get(field)
+        text = "" if raw is None else str(raw).strip()
+        if text:
+            return text
+    return ""
+
+
+def entry_project_id(entry: object) -> str:
+    """``task_project_id`` for one baseline entry. Never raises.
+
+    A baseline is a file, so an entry can be anything at all — a bare string,
+    a null, a hand-edited fragment. A garbled entry answers ``""``, i.e.
+    "cannot verify", which is the same safe side as a missing project id.
+    """
+    return task_project_id(entry.get("task") if isinstance(entry, dict) else None)
+
+
+@dataclass(frozen=True)
+class _BaselineDiff:
+    """What one poll can and cannot say about the previous poll's open tasks.
+
+    Every baseline task that is ABSENT from the poll lands in exactly one of
+    three buckets, and the bucket decides both what is emitted and what the
+    next baseline keeps:
+
+    * ``records`` — absent, and its project WAS covered. Inferred completed.
+    * ``unverifiable`` — absent, and its project was NOT covered (or the entry
+      records no project at all). Proves nothing, so nothing is inferred and
+      the entry is carried into the next baseline verbatim via ``retained``.
+    * ``unusable`` — the stored payload could never become a record whatever
+      the coverage. Dropped, because there is nothing there to lose, and
+      reported for the same reason.
+
+    Computed once and shared by :func:`infer_completions` and
+    :func:`plan_open_task_reconcile` so "not covered" cannot come to mean one
+    thing where completions are decided and another where the baseline is
+    written — which is exactly how a task could be spared the inference and
+    then quietly dropped from the baseline anyway.
+    """
+
+    records: list[Record]
+    retained: dict[str, dict]
+    unusable: list[str]
+    unverifiable: dict[str, list[str]]
+    saw_nothing: bool
+
+
+def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime) -> _BaselineDiff:
+    """Classify every baseline entry against one poll. Emits nothing.
+
+    USABILITY IS CHECKED BEFORE COVERAGE, deliberately. An entry that can
+    never become a record — a bare string, a stored payload with no id — holds
+    no completion to protect, so retaining it because its project happens to be
+    uncovered would leave junk in the baseline reporting itself forever. It is
+    dropped and named instead, which is the pre-existing behaviour and the only
+    bucket where anything is discarded.
+    """
+    current_ids = _open_task_ids(poll.tasks)
+    records: list[Record] = []
+    retained: dict[str, dict] = {}
+    unusable: list[str] = []
+    unverifiable: dict[str, list[str]] = {}
+    for task_id, entry in sorted(previous.items()):
+        if task_id in current_ids:
+            continue
+        try:
+            task = entry.get("task") or {}
+            record = task_to_record(task, completed_at=now, provenance="api-inferred-complete")
+        except (AttributeError, ValueError):
+            # A garbled entry — not an object, or a stored payload with no
+            # usable id. Skipped rather than allowed to abort the loop: one bad
+            # entry must not cost every other completion in the batch, the same
+            # rule the project walk follows for a malformed ``tasks`` payload.
+            unusable.append(task_id)
+            continue
+        project_id = entry_project_id(entry)
+        if project_id not in poll.covered_project_ids:
+            # THE POLL NEVER LOOKED HERE, so this task's absence is not
+            # evidence of anything. Kept, not inferred and not dropped: the
+            # next poll that does cover the project decides.
+            unverifiable.setdefault(project_id, []).append(task_id)
+            retained[task_id] = entry
+            continue
+        records.append(record)
+    return _BaselineDiff(
+        records=records,
+        retained=retained,
+        unusable=unusable,
+        unverifiable=unverifiable,
+        saw_nothing=not current_ids,
+    )
+
+
+def _note_baseline_diff(diff: _BaselineDiff, errors: list[str] | None) -> None:
+    """Report everything the diff decided NOT to do, and everything it lost."""
+    if diff.records and diff.saw_nothing:
         # A poll whose projects all failed no longer reaches here at all —
         # ``poll_open_tasks`` marks it incomplete and the planner refuses to
         # infer over it. What is left is a COMPLETE poll that legitimately
@@ -1046,42 +1199,84 @@ def infer_completions(
         # being written off as completed on a run that exited 0 and notified
         # nobody — the same gap as the two cases above, in the one place where
         # the blast radius is every task at once.
+        count = len(diff.records)
         _note(
             errors,
             f"ticktick api: the poll returned no open tasks at all while "
-            f"{len(previous)} were open last time, so all {len(previous)} are being "
-            f"recorded as inferred completions. If TickTick or the network was down "
-            f"this is an outage, not {len(previous)} completions; the next successful "
-            f"poll re-observes them as open and corrects the index",
+            f"{count} were open last time in the projects it covered, so all "
+            f"{count} are being recorded as inferred completions. If TickTick or the "
+            f"network was down this is an outage, not {count} completions; the next "
+            f"successful poll re-observes them as open and corrects the index",
         )
-    records = []
-    unusable: list[str] = []
-    for task_id, entry in sorted(previous.items()):
-        if task_id in current_ids:
-            continue
-        try:
-            task = entry.get("task") or {}
-            records.append(
-                task_to_record(task, completed_at=now, provenance="api-inferred-complete")
-            )
-        except (AttributeError, ValueError):
-            # A garbled entry — not an object, or a stored payload with no
-            # usable id. Skipped rather than allowed to abort the loop: one bad
-            # entry must not cost every other completion in the batch, the same
-            # rule the project walk follows for a malformed ``tasks`` payload.
-            unusable.append(task_id)
-    if unusable:
+    if diff.unverifiable:
+        projects = sorted(diff.unverifiable)
+        total = sum(len(ids) for ids in diff.unverifiable.values())
+        named = ", ".join(p or "<no projectId in the baseline entry>" for p in projects[:5])
         _note(
             errors,
-            f"ticktick state: {len(unusable)} baseline entr(ies) could not be "
+            f"ticktick api: {total} baseline task(s) are absent from this poll but "
+            f"belong to {len(projects)} project(s) the poll never covered "
+            f"({named}{', ...' if len(projects) > 5 else ''}), so their absence is not "
+            f"evidence of anything and NO completion is inferred for them. They stay in "
+            f"the baseline for the next poll that does cover their project. A project "
+            f"that is gone for good — deleted, or no longer shared with this token — "
+            f"reports this every poll: clear it by deleting those entries from the "
+            f"open-task baseline, which accepts that those tasks' fate is unknowable",
+        )
+    if diff.unusable:
+        _note(
+            errors,
+            f"ticktick state: {len(diff.unusable)} baseline entr(ies) could not be "
             f"turned into completions and are being DROPPED "
-            f"({', '.join(unusable[:5])}"
-            f"{', ...' if len(unusable) > 5 else ''}). The advanced baseline no "
+            f"({', '.join(diff.unusable[:5])}"
+            f"{', ...' if len(diff.unusable) > 5 else ''}). The advanced baseline no "
             f"longer holds them, and the Open API serves open tasks only, so "
             f"these completions cannot be re-derived. Check the open-task "
             f"baseline for a truncated or hand-edited entry",
         )
-    return records
+
+
+def infer_completions(
+    previous: dict[str, dict],
+    poll: OpenTaskPoll,
+    now: datetime,
+    errors: list[str] | None = None,
+) -> list[Record]:
+    """Records for the tasks that were open last poll and are absent now.
+
+    The Open API cannot report a completion, so disappearance is the only
+    signal available — and it is ambiguous: a task that was deleted looks
+    exactly like one that was finished. Recorded as completed anyway, because
+    the alternative is losing it from the index entirely, and never as a plain
+    fact: ``provenance`` says the completion was inferred and
+    ``completed_time_approx`` says the timestamp is the poll's, not TickTick's.
+    A later CSV backup overwrites both with the real Completed Time.
+
+    TAKES THE WHOLE :class:`OpenTaskPoll`, not a set of ids, and that is the
+    structural half of this function's contract rather than a convenience.
+    "Absent from the poll" only means "finished" WITHIN the part of the account
+    the poll actually looked at. Passing a bare id set made the coverage
+    question something a caller had to remember to ask, and across three review
+    rounds a caller never once did: a failed project fetch, then a payload with
+    no ``tasks`` key and a paged payload, then a project that simply stopped
+    appearing in ``GET /project`` at all. Each was the same missing question,
+    patched one hole at a time. Now the answer arrives WITH the ids and there
+    is no way to call this without it, so a fourth variant has nowhere to enter:
+    whatever new reason a project goes unread, it is not in
+    ``covered_project_ids`` and nothing in it can be inferred.
+
+    Sorted by id so a run's output is deterministic.
+
+    ``errors`` is the run's fault sink and an entry here means DATA WAS LOST,
+    or that this poll declined to speak for part of the baseline. The two
+    halves — :func:`_diff_baseline` and :func:`_note_baseline_diff` — are what
+    :func:`plan_open_task_reconcile` calls directly, because it also needs the
+    diff's ``retained`` set; this is the same behaviour for a caller that only
+    wants the records.
+    """
+    diff = _diff_baseline(previous, poll, now)
+    _note_baseline_diff(diff, errors)
+    return diff.records
 
 
 def _open_task_ids(tasks: Iterable[dict]) -> set[str]:
@@ -1117,8 +1312,10 @@ class JsonFileState:
     def load(self) -> dict[str, dict]:
         return load_state(self.path)
 
-    def save(self, tasks: Iterable[dict], now: datetime) -> None:
-        save_state(self.path, tasks, now)
+    def save(
+        self, tasks: Iterable[dict], now: datetime, retain: dict[str, dict] | None = None
+    ) -> None:
+        save_state(self.path, tasks, now, retain)
 
 
 INCOMPLETE_POLL_NOTE = (
@@ -1156,6 +1353,15 @@ def plan_open_task_reconcile(
     everything that really did get completed in the meantime. The skip is
     recorded in ``errors`` — a run that quietly declined to infer would be the
     same silent-success shape in the other direction.
+
+    ``complete`` is the coarse gate and it can only speak about projects the
+    LISTING NAMED. The fine one is ``poll.covered_project_ids``: a project that
+    silently drops out of ``GET /project`` fails nothing, so a poll missing it
+    entirely still reports itself complete while every open task in it goes
+    absent. Inference is therefore additionally per-task, and the commit
+    carries the uncovered baseline entries forward untouched — declining to
+    infer and then writing a baseline without them would lose exactly the same
+    completions by a quieter route.
 
     TWO-PHASE, and that is the point. The diff has to happen now — it needs
     the poll — but advancing the baseline is a destructive act: it is what
@@ -1202,12 +1408,18 @@ def plan_open_task_reconcile(
         _note(errors, str(e))
         return [], lambda: None
 
-    records = infer_completions(previous, _open_task_ids(tasks), now, errors)
+    # The diff and the report are taken separately from ``infer_completions``
+    # because the commit needs the diff's ``retained`` set as well as its
+    # records. Same two halves, one classification: see :class:`_BaselineDiff`
+    # for why a second, independently-written notion of "covered" here would
+    # reintroduce the very loss the coverage check prevents.
+    diff = _diff_baseline(previous, poll, now)
+    _note_baseline_diff(diff, errors)
 
     def commit() -> None:
-        state.save(tasks, now)
+        state.save(tasks, now, diff.retained)
 
-    return records, commit
+    return diff.records, commit
 
 
 def reconcile_open_tasks(

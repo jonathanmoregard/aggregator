@@ -180,8 +180,14 @@ def test_a_refused_rebuild_leaves_the_open_task_baseline_alone(
     state_file.write_text(
         json.dumps(
             {
-                "t1": {"task": {"id": "t1", "title": "open"}, "last_seen": "x"},
-                "t2": {"task": {"id": "t2", "title": "done"}, "last_seen": "x"},
+                "t1": {
+                    "task": {"id": "t1", "title": "open", "projectId": "p1"},
+                    "last_seen": "x",
+                },
+                "t2": {
+                    "task": {"id": "t2", "title": "done", "projectId": "p1"},
+                    "last_seen": "x",
+                },
             }
         ),
         encoding="utf-8",
@@ -191,7 +197,9 @@ def test_a_refused_rebuild_leaves_the_open_task_baseline_alone(
         ticktick_api,
         "poll_open_tasks",
         lambda token, errors=None: ticktick_api.OpenTaskPoll(
-            [{"id": "t1", "title": "open"}], complete=True
+            [{"id": "t1", "title": "open", "projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
         ),
     )
     src = TickTickSource(

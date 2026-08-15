@@ -57,8 +57,14 @@ def state_file(tmp_path):
     path.write_text(
         json.dumps(
             {
-                "t1": {"task": {"id": "t1", "title": "open"}, "last_seen": "x"},
-                "t2": {"task": {"id": "t2", "title": "done"}, "last_seen": "x"},
+                "t1": {
+                    "task": {"id": "t1", "title": "open", "projectId": "p1"},
+                    "last_seen": "x",
+                },
+                "t2": {
+                    "task": {"id": "t2", "title": "done", "projectId": "p1"},
+                    "last_seen": "x",
+                },
             }
         ),
         encoding="utf-8",
@@ -72,7 +78,9 @@ def _one_open_task(monkeypatch):
         ticktick_api,
         "poll_open_tasks",
         lambda token, errors=None: ticktick_api.OpenTaskPoll(
-            [{"id": "t1", "title": "open"}], complete=True
+            [{"id": "t1", "title": "open", "projectId": "p1"}],
+            complete=True,
+            covered_project_ids=frozenset({"p1"}),
         ),
     )
 
@@ -279,7 +287,9 @@ def test_never_committing_loses_later_completions_permanently(
             ticktick_api,
             "poll_open_tasks",
             lambda token, errors=None: ticktick_api.OpenTaskPoll(
-                [{"id": i, "title": i} for i in ids], complete=True
+                [{"id": i, "title": i, "projectId": "p1"} for i in ids],
+                complete=True,
+                covered_project_ids=frozenset({"p1"}),
             ),
         )
 

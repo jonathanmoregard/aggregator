@@ -67,13 +67,17 @@ def _backup(path, rows):
     return path
 
 
-def _poll(tasks, complete=True):
+def _poll(tasks, complete=True, covered=("p1",)):
     """An ``OpenTaskPoll``, the shape ``poll_open_tasks`` now returns.
 
-    Completeness travels with the tasks so no caller can run the completion
-    inference over a partial view — see ``ticktick_api.OpenTaskPoll``.
+    Completeness AND coverage travel with the tasks so no caller can run the
+    completion inference over a partial view, nor over a project this poll
+    never enumerated — see ``ticktick_api.OpenTaskPoll``. Every task fixture in
+    this file lives in ``p1``, so the default covers exactly them.
     """
-    return ticktick_api.OpenTaskPoll(list(tasks), complete=complete)
+    return ticktick_api.OpenTaskPoll(
+        list(tasks), complete=complete, covered_project_ids=frozenset(covered)
+    )
 
 
 def _source(tmp_path, **kw):
@@ -165,7 +169,7 @@ def test_fresher_api_observation_beats_stale_csv(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ticktick_api,
         "poll_open_tasks",
-        lambda token, errors=None: _poll([{"id": "t1", "title": "Reopened"}]),
+        lambda token, errors=None: _poll([{"id": "t1", "title": "Reopened", "projectId": "p1"}]),
     )
     (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
     assert rec.extra["provenance"] == "api"
@@ -183,7 +187,7 @@ def test_fresher_csv_beats_api(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ticktick_api,
         "poll_open_tasks",
-        lambda token, errors=None: _poll([{"id": "t1", "title": "Stale open view"}]),
+        lambda token, errors=None: _poll([{"id": "t1", "title": "Stale open view", "projectId": "p1"}]),
     )
     src = _source(tmp_path, token="tok")
     src._api_observed_at = datetime(2000, 1, 1, tzinfo=UTC)
@@ -203,7 +207,10 @@ def test_completion_inferred_across_two_polls(tmp_path, monkeypatch):
     baseline is advanced by the CLI / runner AFTER the records land, not by
     iteration, so a poll nobody stored is re-offered next time.
     """
-    tasks = [{"id": "t1", "title": "Gone"}, {"id": "t2", "title": "Stays"}]
+    tasks = [
+        {"id": "t1", "title": "Gone", "projectId": "p1"},
+        {"id": "t2", "title": "Stays", "projectId": "p1"},
+    ]
     monkeypatch.setattr(
         ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll(tasks)
     )
@@ -211,7 +218,7 @@ def test_completion_inferred_across_two_polls(tmp_path, monkeypatch):
     list(first.iter_records(None))
     first.commit_after_write()
 
-    tasks = [{"id": "t2", "title": "Stays"}]
+    tasks = [{"id": "t2", "title": "Stays", "projectId": "p1"}]
     records = {r.stable_id: r for r in _source(tmp_path, token="tok").iter_records(None)}
     assert records["ticktick:t1"].extra["provenance"] == "api-inferred-complete"
     # task_to_record writes the STRING "true", not the bool True: extra is
@@ -498,7 +505,7 @@ def test_record_shape_documents_every_extra_key_both_legs_write(tmp_path, monkey
     monkeypatch.setattr(
         ticktick_api,
         "poll_open_tasks",
-        lambda token, errors=None: _poll([{"id": "t2", "title": "open"}]),
+        lambda token, errors=None: _poll([{"id": "t2", "title": "open", "projectId": "p1"}]),
     )
     src = _source(tmp_path, token="tok")
     list(src.iter_records(None))
