@@ -1015,6 +1015,12 @@ def save_state(
     them, and stamping them ``now`` would be the file claiming an observation
     that never happened.
 
+    A retained entry may also carry :data:`UNCOVERED_ACK_KEY`, the receipt that
+    says its project's disappearance has already been reported once. This poll's
+    tasks winning the overlap is what clears it: a project that comes back is
+    observed again, its entry is replaced whole, and a later disappearance is
+    therefore a new fact and loud again.
+
     UNCONDITIONAL: this replaces whatever is on disk. That is right for a
     caller seeding a baseline from nothing, and wrong for a reconcile, which
     must not overwrite a baseline some other run advanced while it was working
@@ -1240,6 +1246,73 @@ def entry_project_id(entry: object) -> str:
     return task_project_id(entry.get("task") if isinstance(entry, dict) else None)
 
 
+# The receipt one poll leaves on a baseline entry it could NOT speak for, so the
+# next poll can tell "this project just vanished" from "I already said so".
+#
+# A sibling key on the entry, never inside ``entry["task"]``: the stored payload
+# is the vendor's, is what ``task_to_record`` re-reads, and is what a poll
+# overwrites verbatim when the task is seen again. Keeping the receipt outside
+# it is what makes the receipt disappear on its own the moment the project comes
+# back — see ``_write_state``, where this poll's tasks replace retained entries.
+UNCOVERED_ACK_KEY = "uncovered_reported"
+
+
+def uncovered_mark(entry: object) -> dict | None:
+    """The receipt on a retained entry, or None if it carries none.
+
+    ``None`` for anything that is not a receipt-shaped dict — a bare string, a
+    null, a hand-edited fragment. Unreadable therefore means UNACKNOWLEDGED,
+    i.e. the next poll reports the project again: the failure direction here has
+    to be one report too many, never one too few.
+    """
+    if not isinstance(entry, dict):
+        return None
+    mark = entry.get(UNCOVERED_ACK_KEY)
+    return mark if isinstance(mark, dict) else None
+
+
+def uncovered_projects(path: Path) -> dict[str, dict[str, object]]:
+    """Every project the baseline is still holding tasks for, keyed by id.
+
+    THE VISIBLE HALF of the report-once rule. Suppressing a repeat report is
+    only defensible if the suppressed state is somewhere a human can go and
+    look, otherwise "quiet" has become "forgotten" — ``aggregator status``
+    prints this, which is the answer to "what is this baseline still carrying
+    that no poll can resolve?".
+
+    Each value is ``{"task_ids": [...], "first_reported": iso}``, the earliest
+    receipt among the project's entries.
+
+    NEVER RAISES, including for a baseline that ``load_state`` refuses to read:
+    this is a read-only report, and the unreadable-baseline alarm belongs to the
+    ingest path (where it blocks a destructive write), not to a status print
+    that would then be unable to show anything at all.
+    """
+    try:
+        entries = load_state(path)
+    except (StateUnreadableError, OSError):
+        return {}
+    grouped: dict[str, list[str]] = {}
+    first_reported: dict[str, str] = {}
+    for task_id, entry in sorted(entries.items()):
+        mark = uncovered_mark(entry)
+        if mark is None:
+            continue
+        project_id = str(mark.get("project_id") or "")
+        grouped.setdefault(project_id, []).append(task_id)
+        stamp = str(mark.get("first_reported") or "")
+        earlier = first_reported.get(project_id, "")
+        if stamp and (not earlier or stamp < earlier):
+            first_reported[project_id] = stamp
+    return {
+        project_id: {
+            "task_ids": ids,
+            "first_reported": first_reported.get(project_id, ""),
+        }
+        for project_id, ids in sorted(grouped.items())
+    }
+
+
 @dataclass(frozen=True)
 class _BaselineDiff:
     """What one poll can and cannot say about the previous poll's open tasks.
@@ -1249,9 +1322,16 @@ class _BaselineDiff:
     next baseline keeps:
 
     * ``records`` — absent, and its project WAS covered. Inferred completed.
-    * ``unverifiable`` — absent, and its project was NOT covered (or the entry
-      records no project at all). Proves nothing, so nothing is inferred and
-      the entry is carried into the next baseline verbatim via ``retained``.
+    * ``unverifiable`` — absent, its project was NOT covered (or the entry
+      records no project at all), and NO previous poll has said so. Proves
+      nothing, so nothing is inferred and the entry is carried into the next
+      baseline via ``retained`` — stamped with a receipt, so the poll after
+      this one can tell it has already been reported.
+    * ``acknowledged`` — the same thing, but a previous poll already reported
+      it under this same project. Retained verbatim (receipt and all) and NOT
+      re-reported: deleting a project in TickTick is a routine act, and an
+      alarm that fires on every poll forever is one an operator learns to
+      ignore, which costs the next REAL failure its audience.
     * ``unusable`` — the stored payload could never become a record whatever
       the coverage. Dropped, because there is nothing there to lose, and
       reported for the same reason.
@@ -1267,6 +1347,7 @@ class _BaselineDiff:
     retained: dict[str, dict]
     unusable: list[str]
     unverifiable: dict[str, list[str]]
+    acknowledged: dict[str, list[str]]
     saw_nothing: bool
 
 
@@ -1279,12 +1360,19 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
     uncovered would leave junk in the baseline reporting itself forever. It is
     dropped and named instead, which is the pre-existing behaviour and the only
     bucket where anything is discarded.
+
+    RETENTION AND REPORTING ARE SEPARATE DECISIONS, and only the second one is
+    suppressed by a receipt. An acknowledged entry is retained exactly as hard
+    as a brand-new one: the tasks are still never inferred completed, and the
+    project coming back still reconciles them normally. What the receipt buys
+    is that the operator hears about it once instead of every 30 minutes.
     """
     current_ids = _open_task_ids(poll.tasks)
     records: list[Record] = []
     retained: dict[str, dict] = {}
     unusable: list[str] = []
     unverifiable: dict[str, list[str]] = {}
+    acknowledged: dict[str, list[str]] = {}
     for task_id, entry in sorted(previous.items()):
         if task_id in current_ids:
             continue
@@ -1303,8 +1391,26 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
             # THE POLL NEVER LOOKED HERE, so this task's absence is not
             # evidence of anything. Kept, not inferred and not dropped: the
             # next poll that does cover the project decides.
+            mark = uncovered_mark(entry)
+            if mark is not None and str(mark.get("project_id") or "") == project_id:
+                # Already reported, under this same project. Verbatim, so the
+                # receipt keeps the date it was FIRST raised rather than
+                # sliding forward one poll at a time.
+                acknowledged.setdefault(project_id, []).append(task_id)
+                retained[task_id] = entry
+                continue
+            # The first poll that cannot account for this entry — either it has
+            # never been reported, or it was reported for a DIFFERENT project
+            # (the task moved, and the new project's disappearance is a new
+            # fact). Loud now, quiet afterwards.
             unverifiable.setdefault(project_id, []).append(task_id)
-            retained[task_id] = entry
+            retained[task_id] = {
+                **entry,
+                UNCOVERED_ACK_KEY: {
+                    "project_id": project_id,
+                    "first_reported": now.isoformat(),
+                },
+            }
             continue
         records.append(record)
     return _BaselineDiff(
@@ -1312,6 +1418,7 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
         retained=retained,
         unusable=unusable,
         unverifiable=unverifiable,
+        acknowledged=acknowledged,
         saw_nothing=not current_ids,
     )
 
@@ -1353,10 +1460,28 @@ def _note_baseline_diff(diff: _BaselineDiff, errors: list[str] | None) -> None:
             f"belong to {len(projects)} project(s) the poll never covered "
             f"({named}{', ...' if len(projects) > 5 else ''}), so their absence is not "
             f"evidence of anything and NO completion is inferred for them. They stay in "
-            f"the baseline for the next poll that does cover their project. A project "
-            f"that is gone for good — deleted, or no longer shared with this token — "
-            f"reports this every poll: clear it by deleting those entries from the "
-            f"open-task baseline, which accepts that those tasks' fate is unknowable",
+            f"the baseline for the next poll that does cover their project. REPORTED "
+            f"ONCE: the advanced baseline records that this was raised, so an unchanged "
+            f"poll will not raise it again — `aggregator status` lists every project "
+            f"still in this state, and a project that comes back and then vanishes anew "
+            f"is loud again. Deleting a project in TickTick reaches here, and is "
+            f"normal; if it is gone for good, delete its entries from the open-task "
+            f"baseline, which accepts that those tasks' fate is unknowable",
+        )
+    if diff.acknowledged:
+        # log.info, NOT ``_note``. This is the whole point of the receipt: a
+        # signal that is permanently red is one an operator learns to ignore,
+        # and the next real ingest failure then arrives invisible. Quiet, but
+        # not forgotten — ``uncovered_projects`` reads the same receipts back
+        # out for ``aggregator status``, which is where this state is meant to
+        # be looked at rather than pushed at somebody every 30 minutes.
+        log.info(
+            "ticktick api: %d baseline task(s) in %d already-reported uncovered "
+            "project(s) (%s) are still retained and still not inferred completed; "
+            "see `aggregator status`",
+            sum(len(ids) for ids in diff.acknowledged.values()),
+            len(diff.acknowledged),
+            ", ".join(p or "<no projectId>" for p in sorted(diff.acknowledged)[:5]),
         )
     if diff.unusable:
         _note(
@@ -1521,6 +1646,16 @@ def plan_open_task_reconcile(
     carries the uncovered baseline entries forward untouched — declining to
     infer and then writing a baseline without them would lose exactly the same
     completions by a quieter route.
+
+    THAT REFUSAL IS REPORTED ONCE PER DISAPPEARANCE, not once per poll: the
+    commit stamps each carried-forward entry with a receipt
+    (:data:`UNCOVERED_ACK_KEY`) and a later poll that finds the same receipt
+    stays quiet. Deleting a project is a routine act, and an error on every
+    30-minute tick forever is an alarm an operator learns to ignore — which
+    costs the next REAL ingest failure its audience, i.e. it defeats the very
+    rule it was written to satisfy. Retention is untouched by this; only the
+    report is. :func:`uncovered_projects` reads the receipts back for
+    ``aggregator status``, so the quiet state stays inspectable.
 
     TWO-PHASE, and that is the point. The diff has to happen now — it needs
     the poll — but advancing the baseline is a destructive act: it is what

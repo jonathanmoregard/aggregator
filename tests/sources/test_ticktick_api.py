@@ -1979,6 +1979,211 @@ def test_a_polled_task_records_the_project_it_was_walked_under(monkeypatch):
     assert poll.covered_project_ids == frozenset({"p1"})
 
 
+# --- a vanished project is loud ONCE, then quiet but not forgotten --------
+#
+# Round 4 HIGH 1. Retention is right — an uncovered project's tasks must never
+# be inferred completed — but reporting it on EVERY poll made deleting a
+# project in TickTick, a completely routine act, pin the run at exit 3 with a
+# CRITICAL notification forever, clearable only by hand-editing state. The rule
+# the project actually holds is "ingest failures must be LOUD, never silent",
+# and a permanently-red signal defeats it: the operator learns to ignore it and
+# the next real failure arrives invisible.
+#
+# The mechanism is a receipt written into the retained baseline entry, so the
+# suppression is a FACT ABOUT THIS PROJECT rather than a timer — a plain mute
+# would re-fire on its own cycle forever, which is the same alarm with extra
+# steps.
+
+
+def _gone(project="deleted"):
+    """A poll that covers ``live`` and nothing else, i.e. ``project`` vanished."""
+    return ticktick_api.OpenTaskPoll(
+        [], complete=True, covered_project_ids=frozenset({"live"})
+    )
+
+
+def _reconcile(path, poll, now, errors):
+    records, commit = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path), poll, now, errors
+    )
+    commit()
+    return records
+
+
+def test_a_vanished_project_is_reported_once_not_on_every_poll(tmp_path):
+    """The repro, promoted. Two identical polls, one report.
+
+    A user deleting a project is normal. Before this, every poll after that
+    deletion appended to ``errors``, so the run exited 3 and fired a CRITICAL
+    desktop notification every 30 minutes until somebody edited the baseline by
+    hand — an alarm that can only be learned and ignored.
+    """
+    path = tmp_path / "open_tasks.json"
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    ticktick_api.save_state(path, [{"id": "t1", "projectId": "deleted"}], now)
+
+    first: list[str] = []
+    _reconcile(path, _gone(), now, first)
+    assert [e for e in first if "never covered" in e], "the first poll must be loud"
+
+    second: list[str] = []
+    _reconcile(path, _gone(), datetime(2026, 8, 16, tzinfo=UTC), second)
+    assert second == [], f"an unchanged poll re-raised the same alarm: {second}"
+
+
+def test_report_once_never_infers_and_never_drops_the_retained_tasks(tmp_path):
+    """Quiet is only about REPORTING. The evidence is retained exactly as hard.
+
+    If suppressing the repeat also let the entry be inferred completed or
+    dropped, the fix would have traded a noisy alarm for the permanent data
+    loss the alarm existed to prevent.
+    """
+    path = tmp_path / "open_tasks.json"
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    ticktick_api.save_state(path, [{"id": "t1", "projectId": "deleted"}], now)
+
+    for poll_number in range(3):
+        records = _reconcile(path, _gone(), now, [])
+        assert records == [], f"poll {poll_number} inferred a completion it cannot know"
+    assert ticktick_api.load_state(path).keys() == {"t1"}
+
+
+def test_a_newly_vanished_project_is_loud_even_beside_an_acknowledged_one(tmp_path):
+    """The receipt is per-project, so it cannot mute a project it never saw.
+
+    A blanket "already reported an uncovered project" flag would swallow the
+    NEXT project's disappearance, which is the first poll that can report it.
+    """
+    path = tmp_path / "open_tasks.json"
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    ticktick_api.save_state(
+        path,
+        [{"id": "t1", "projectId": "deleted"}, {"id": "t2", "projectId": "live"}],
+        now,
+    )
+    # Poll one: ``deleted`` is gone, ``live`` still serves t2. One report.
+    _reconcile(
+        path,
+        ticktick_api.OpenTaskPoll(
+            [{"id": "t2", "projectId": "live"}],
+            complete=True,
+            covered_project_ids=frozenset({"live"}),
+        ),
+        now,
+        [],
+    )
+
+    # Poll two: ``live`` drops out of the listing as well.
+    later: list[str] = []
+    _reconcile(
+        path,
+        ticktick_api.OpenTaskPoll([], complete=True, covered_project_ids=frozenset()),
+        datetime(2026, 8, 16, tzinfo=UTC),
+        later,
+    )
+    reported = [e for e in later if "never covered" in e]
+    assert reported, "a newly vanished project was muted by another project's receipt"
+    assert "live" in reported[0] and "deleted" not in reported[0]
+    assert ticktick_api.load_state(path).keys() == {"t1", "t2"}
+
+
+def test_a_project_that_returns_and_vanishes_again_is_loud_again(tmp_path):
+    """The receipt is cleared by an observation, so it cannot outlive its fact.
+
+    p2 comes back with t1 still open — the poll overwrites that baseline entry
+    verbatim, receipt and all — and then drops out again. That is a NEW
+    disappearance and gets a new report.
+    """
+    path = tmp_path / "open_tasks.json"
+    ticktick_api.save_state(
+        path, [{"id": "t1", "projectId": "p2"}], datetime(2026, 8, 15, tzinfo=UTC)
+    )
+    _reconcile(
+        path,
+        ticktick_api.OpenTaskPoll([], complete=True, covered_project_ids=frozenset({"p1"})),
+        datetime(2026, 8, 15, tzinfo=UTC),
+        [],
+    )
+    back = ticktick_api.OpenTaskPoll(
+        [{"id": "t1", "projectId": "p2"}],
+        complete=True,
+        covered_project_ids=frozenset({"p1", "p2"}),
+    )
+    _reconcile(path, back, datetime(2026, 8, 16, tzinfo=UTC), [])
+    assert ticktick_api.uncovered_mark(ticktick_api.load_state(path)["t1"]) is None
+
+    again: list[str] = []
+    _reconcile(
+        path,
+        ticktick_api.OpenTaskPoll([], complete=True, covered_project_ids=frozenset({"p1"})),
+        datetime(2026, 8, 17, tzinfo=UTC),
+        again,
+    )
+    assert [e for e in again if "never covered" in e], "a fresh disappearance was muted"
+
+
+def test_the_suppressed_state_is_readable_for_the_status_command(tmp_path):
+    """Quiet must not mean forgotten: the receipts are inspectable.
+
+    ``aggregator status`` prints this. Without a surface, the fix would have
+    replaced a permanent alarm with a silent one — which is the failure mode
+    this repo's fail-loudly rule is actually about.
+    """
+    path = tmp_path / "open_tasks.json"
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    ticktick_api.save_state(
+        path,
+        [{"id": "t1", "projectId": "deleted"}, {"id": "t2", "projectId": "deleted"}],
+        now,
+    )
+    _reconcile(path, _gone(), now, [])
+    # A later poll must not slide the "first reported" stamp forward.
+    _reconcile(path, _gone(), datetime(2026, 8, 20, tzinfo=UTC), [])
+
+    assert ticktick_api.uncovered_projects(path) == {
+        "deleted": {"task_ids": ["t1", "t2"], "first_reported": now.isoformat()}
+    }
+
+
+def test_uncovered_projects_reports_nothing_for_a_healthy_or_missing_baseline(tmp_path):
+    """No file, and a file with no receipts, are both "nothing to show"."""
+    assert ticktick_api.uncovered_projects(tmp_path / "nope.json") == {}
+    path = tmp_path / "open_tasks.json"
+    ticktick_api.save_state(
+        path, [{"id": "t1", "projectId": "p1"}], datetime(2026, 8, 15, tzinfo=UTC)
+    )
+    assert ticktick_api.uncovered_projects(path) == {}
+
+
+def test_uncovered_projects_does_not_raise_on_an_unreadable_baseline(tmp_path):
+    """A status print is read-only; the alarm for a broken baseline is the
+    ingest path's, where it stands in front of a destructive write."""
+    path = tmp_path / "open_tasks.json"
+    path.write_text("{ not json", encoding="utf-8")
+    assert ticktick_api.uncovered_projects(path) == {}
+
+
+def test_a_hand_edited_receipt_is_treated_as_no_receipt(tmp_path):
+    """Unreadable means UNACKNOWLEDGED. The safe direction here is one report
+    too many — a receipt shape nobody wrote must never mute a real gap."""
+    path = tmp_path / "open_tasks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "t1": {
+                    "task": {"id": "t1", "projectId": "deleted"},
+                    "last_seen": "x",
+                    ticktick_api.UNCOVERED_ACK_KEY: "yes, honest",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    errors: list[str] = []
+    _reconcile(path, _gone(), datetime(2026, 8, 15, tzinfo=UTC), errors)
+    assert [e for e in errors if "never covered" in e]
+
+
 # --- overlapping runs: the baseline needs a lock --------------------------
 #
 # Round 3 HIGH 2. `ingest ticktick` and `ingest --all`, or a timer firing over a

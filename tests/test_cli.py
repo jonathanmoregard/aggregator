@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 
 from aggregator import cli
 from aggregator.core.store import Store
+from aggregator.sources import ticktick_api
 from aggregator.sources.base import IngestResult, Record
 
 
@@ -53,6 +54,43 @@ def test_status_command_prints_capabilities(tmp_data_home, capsys):
     out = capsys.readouterr().out
     assert "github" in out
     assert "cache_path" in out or "cache.db" in out
+
+
+def test_status_lists_the_uncovered_projects_the_poll_stopped_reporting(
+    tmp_data_home, tmp_path, monkeypatch, capsys
+):
+    """Round 4 HIGH 1's other half: quiet is not the same as forgotten.
+
+    The TickTick poll reports a vanished project ONCE and then suppresses the
+    repeat, because a permanently-red alarm is one an operator learns to
+    ignore. That is only defensible if the suppressed state is somewhere a
+    human can go and look — here, on demand, instead of being pushed at them
+    every 30 minutes.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    ticktick_api.save_state(
+        ticktick_api.default_state_path(),
+        [],
+        datetime(2026, 8, 15, tzinfo=UTC),
+        retain={
+            "t1": {
+                "task": {"id": "t1", "projectId": "gone"},
+                "last_seen": "2026-08-14T00:00:00+00:00",
+                ticktick_api.UNCOVERED_ACK_KEY: {
+                    "project_id": "gone",
+                    "first_reported": "2026-08-15T00:00:00+00:00",
+                },
+            }
+        },
+    )
+    store = Store()
+    _seed_records(store)
+
+    assert cli.main(["status"], _store=store) == 0
+    out = capsys.readouterr().out
+    assert "gone" in out
+    assert "2026-08-15T00:00:00+00:00" in out
+    assert "never inferred completed" in out
 
 
 def test_ingest_command_dispatches(tmp_data_home, capsys):

@@ -61,6 +61,7 @@ from aggregator.mcp import (
 from aggregator.mcp import (
     aggregator_query as _mcp_query,
 )
+from aggregator.sources import ticktick_api
 from aggregator.sources.base import (
     ObservationRow,
     ReadsManualExport,
@@ -296,8 +297,20 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
 
 
 def _cmd_status(args: argparse.Namespace, store: Store) -> int:
-    caps = _mcp_capabilities(_store=store)
+    caps = dict(_mcp_capabilities(_store=store))
+    # WHERE A SUPPRESSED ALARM STAYS VISIBLE. The TickTick poll reports a
+    # vanished project once and then stops (a permanently-red signal is one an
+    # operator learns to ignore, which costs the next real failure its
+    # audience), and this is the other half of that bargain: the tasks it is
+    # still holding, and cannot ever resolve, are listed here on demand. Quiet
+    # is only acceptable because it is not the same as forgotten.
+    #
+    # Read here rather than added to ``aggregator_capabilities``: that surface
+    # is the MCP tool's read-only view of the CACHE, and this is on-disk source
+    # state that no MCP client asked for.
+    uncovered = ticktick_api.uncovered_projects(ticktick_api.default_state_path())
     if args.json:
+        caps["ticktick_uncovered_projects"] = uncovered
         print(json.dumps(caps, indent=2, default=str))
         return 0
     print(f"cache_path: {caps['cache_path']}")
@@ -307,6 +320,19 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     for s in caps["sources"]:
         fresh = caps["freshness"].get(s, "n/a")
         print(f"  {s}: last_updated={fresh}")
+    if uncovered:
+        print(
+            "ticktick uncovered projects (reported once; tasks retained, never "
+            "inferred completed):"
+        )
+        for project_id, info in uncovered.items():
+            task_ids = info["task_ids"]
+            count = len(task_ids) if isinstance(task_ids, list) else 0
+            print(
+                f"  {project_id or '<no projectId in the baseline entry>'}: "
+                f"{count} task(s), first reported {info['first_reported'] or 'unknown'}"
+            )
+        print(f"  baseline: {ticktick_api.default_state_path()}")
     return 0
 
 
