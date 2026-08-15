@@ -68,6 +68,29 @@ def _default_archive_dir() -> Path:
     return Path(base) / "aggregator" / "ticktick" / "backups"
 
 
+def _now() -> datetime:
+    """The API leg's observation clock, as one seam. CALL AT POLL TIME.
+
+    A module function rather than a value captured on the instance, and that is
+    the whole point: an observation timestamp has to describe the observation.
+    The API leg's stamp used to be taken in ``__init__``, which is a different
+    moment from the poll by however long the caller holds the adapter —
+    ``run_imports`` is public, takes adapter INSTANCES, and a long-lived caller
+    (or a test harness, or a future daemon) reuses one across runs.
+
+    What that costs is not cosmetic. The merge is newest-observation-wins, so a
+    stale stamp makes a genuinely fresher poll LOSE to a backup CSV exported in
+    between: a task completed in last week's export and reopened since is served
+    by today's poll — the Open API serves open tasks only — and stayed completed
+    in the index anyway. The same staleness lets an old open row override
+    current inference.
+
+    A seam because the alternative for tests is a future-dated backup file. See
+    ``tests/sources/test_ticktick.py``.
+    """
+    return datetime.now(UTC)
+
+
 def _note(errors: list[str] | None, message: str) -> None:
     """Log a fault and, when the caller is collecting them, surface it too.
 
@@ -153,8 +176,12 @@ class TickTickSource:
         self._token_file = (
             token_file if token_file is not None else os.environ.get(TOKEN_FILE_ENV_VAR)
         )
-        # Overridable in tests to exercise both sides of the precedence rule.
-        self._api_observed_at = datetime.now(UTC)
+        # NO OBSERVATION CLOCK IS READ HERE. The API leg's ``observed_at`` is
+        # taken when the poll happens (see ``_now`` and ``_api_candidates``);
+        # a value captured at construction describes the adapter's birthday,
+        # not the observation, and a reused instance then loses the merge to
+        # any backup exported since.
+        #
         # Set by a poll, run by ``commit_after_write``. See there.
         self._pending_state_commit: Callable[[], None] | None = None
         # Set by the same poll, run by ``commit_after_report`` — LATER, and
@@ -402,7 +429,17 @@ class TickTickSource:
             )
             return {}
 
-        observed = self._api_observed_at
+        # READ HERE, one line before the request goes out — the moment this
+        # leg's records are observations OF. Every consumer treats it as such:
+        # ``iter_records`` merges on it against the backup mtimes, and
+        # ``plan_open_task_reconcile`` stamps it on the baseline advance and on
+        # each inferred completion. Taken at construction it was the adapter's
+        # birthday, which for a reused instance is arbitrarily far in the past.
+        #
+        # BEFORE the poll rather than after: it dates the observation from when
+        # the account was asked, so a slow or retried fetch cannot make this
+        # poll's answer look newer than a backup exported while it ran.
+        observed = _now()
         try:
             poll = ticktick_api.poll_open_tasks(token, errors=errors)
         except Exception as e:  # noqa: BLE001 -- network, auth, malformed payload

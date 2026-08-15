@@ -189,9 +189,12 @@ def test_fresher_csv_beats_api(tmp_path, monkeypatch):
         "poll_open_tasks",
         lambda token, errors=None: _poll([{"id": "t1", "title": "Stale open view", "projectId": "p1"}]),
     )
-    src = _source(tmp_path, token="tok")
-    src._api_observed_at = datetime(2000, 1, 1, tzinfo=UTC)
-    (rec,) = list(src.iter_records(None))
+    # An old POLL against a backup exported since. Patching the clock rather
+    # than the instance, because the stamp is no longer taken at construction:
+    # ``_now`` is read one line before the request goes out. The alternative
+    # would be a backup file dated in the future.
+    monkeypatch.setattr(ticktick, "_now", lambda: datetime(2000, 1, 1, tzinfo=UTC))
+    (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
     assert rec.extra["provenance"] == "csv"
     assert "completed" in rec.tags
 
@@ -870,3 +873,112 @@ def test_both_legs_one_poll_an_open_csv_row_yields_to_the_inference(tmp_path, mo
 
     assert rec.extra["provenance"] == "api-inferred-complete"
     assert rec.extra["completed_time_approx"] == "true"
+
+
+# -- round 5 HIGH 2: an observation timestamp describes the observation ----
+#
+# The API leg's ``observed_at`` was fixed at ADAPTER CONSTRUCTION. ``run_imports``
+# is public and takes adapter INSTANCES, so a long-lived caller reuses one across
+# runs — and the merge is newest-observation-wins, so that stale stamp made a
+# poll happening right now lose to any backup exported since the adapter was
+# built. A reopened task stayed completed, and a stale open row could override
+# current inference. The clock is now read one line before the request goes out.
+
+
+class _Clock:
+    """A wall clock a test can move. Installed over ``ticktick._now``.
+
+    The seam exists because the alternative for testing "the poll is older than
+    the backup" is a backup file dated in the FUTURE, and because a construction-
+    time bug is only visible when construction and the poll are different
+    moments — which, with a real clock, they are by microseconds.
+    """
+
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+
+def test_a_reused_adapter_stamps_the_poll_not_its_own_construction(
+    tmp_path, monkeypatch
+):
+    """THE round-5 finding, in the shape that costs a user real data.
+
+    A task was completed in the backup exported on the 10th and REOPENED since.
+    The poll on the 20th serves it — the Open API serves open tasks only, so
+    that is a measurement of "open right now" — and must win. It did not: the
+    adapter was constructed on the 1st and every record from its API leg was
+    stamped with that, so a nineteen-day-old birthday lost to a ten-day-old
+    file, and the index kept insisting a task the user is working on is done.
+    """
+    clock = _Clock(datetime(2026, 8, 1, tzinfo=UTC))
+    monkeypatch.setattr(ticktick, "_now", clock)
+    src = _source(tmp_path, token="tok")  # built on the 1st, held ever since
+
+    path = _backup(
+        tmp_path / "downloads" / "TickTick.csv",
+        [_row(task_id="t1", status="2", completed="2026-08-09T17:30:00+0000")],
+    )
+    exported = datetime(2026, 8, 10, tzinfo=UTC).timestamp()
+    os.utime(path, (exported, exported))
+    monkeypatch.setattr(
+        ticktick_api,
+        "poll_open_tasks",
+        lambda token, errors=None: _poll(
+            [{"id": "t1", "title": "Reopened", "projectId": "p1"}]
+        ),
+    )
+    clock.value = datetime(2026, 8, 20, tzinfo=UTC)  # ...and polling today
+
+    (rec,) = list(src.iter_records(None))
+
+    assert rec.extra["provenance"] == "api"
+    assert "open" in rec.tags
+
+
+def test_a_poll_time_stamp_still_does_not_let_a_guess_beat_a_measurement(
+    tmp_path, monkeypatch
+):
+    """The interaction the fix must not break, pushed to its limit.
+
+    Poll-time is newer than construction-time by definition, so this moves every
+    API record FORWARD in the merge — including the inferred completions, which
+    are guesses stamped with the poll's own clock. The provenance rule is what
+    keeps that harmless, and it is a rule about provenance rather than about
+    dates: even a clock a year ahead may not overwrite a measured Completed Time.
+    """
+    _seed_baseline(tmp_path, [{"id": "t1", "title": "Ship it", "projectId": "p1"}])
+    _aged(
+        _backup(
+            tmp_path / "downloads" / "TickTick.csv",
+            [_row(task_id="t1", status="2", completed="2026-08-03T17:30:00+0000")],
+        ),
+        hours=1,
+    )
+    monkeypatch.setattr(ticktick_api, "poll_open_tasks", lambda token, errors=None: _poll([]))
+    monkeypatch.setattr(
+        ticktick, "_now", lambda: datetime.now(UTC) + timedelta(days=365)
+    )
+
+    (rec,) = list(_source(tmp_path, token="tok").iter_records(None))
+
+    assert rec.extra["provenance"] == "csv"
+    assert rec.updated_at == datetime(2026, 8, 3, 17, 30, tzinfo=UTC)
+
+
+def test_a_reused_adapter_sees_a_backup_that_landed_after_it_was_built(tmp_path):
+    """The CSV leg's half of the same question, checked rather than assumed.
+
+    Its observation time is the file's mtime, and ``_backup_files`` stats on
+    every scan — so an export a human takes while a long-lived caller is holding
+    the adapter is picked up on the next run with its own timestamp. Nothing
+    about the directory listing is captured at construction.
+    """
+    src = _source(tmp_path)  # no token: CSV-only, so only the mtime decides
+    assert list(src.iter_records(None)) == []
+
+    _backup(tmp_path / "downloads" / "TickTick.csv", [_row()])
+
+    assert [r.stable_id for r in src.iter_records(None)] == ["ticktick:abc123"]
