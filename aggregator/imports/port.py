@@ -132,11 +132,25 @@ class WriteCounts:
     """What a write actually did. Addable so the runner can fold batches.
 
     ``added`` — the item's primary key was not in the store before.
-    ``updated`` — it was, and the row was overwritten.
+    ``updated`` — it was, and the row was reconciled against the store.
     ``skipped`` — the sink declined to write it (unknown shape, filtered).
     Load-bearing beyond the summary: a nonzero ``skipped`` withholds the
     ``SupportsWriteBarrier`` call, because an adapter must not advance state
     that implies rows the sink says it did not write.
+
+    ``unchanged`` — a SUB-COUNT OF ``updated``, not a fourth bucket: the row
+    was already stored byte-identically, so it cost no scrub, no page write and
+    no rowid. Deliberately not folded into ``skipped``, which means "the sink
+    declined" and gates the write barrier; an unchanged row was fully
+    reconciled and must not withhold anything. ``added + updated == len(items)``
+    therefore still holds, which is what keeps every existing reading of these
+    numbers correct.
+
+    Why it is worth a field at all: it is the direct evidence that a re-run
+    costs what a re-run should cost. A run reporting ``updated=372450
+    unchanged=372450`` did nothing expensive; the same line without the second
+    number is indistinguishable from the doom loop, which also reported
+    ~372k updates every 30 minutes.
 
     These have to come back FROM the write. ``cli.py`` reports
     ``added=len(records) updated=0`` for every run, so its summary is the
@@ -146,12 +160,14 @@ class WriteCounts:
     added: int = 0
     updated: int = 0
     skipped: int = 0
+    unchanged: int = 0
 
     def __add__(self, other: WriteCounts) -> WriteCounts:
         return WriteCounts(
             added=self.added + other.added,
             updated=self.updated + other.updated,
             skipped=self.skipped + other.skipped,
+            unchanged=self.unchanged + other.unchanged,
         )
 
 

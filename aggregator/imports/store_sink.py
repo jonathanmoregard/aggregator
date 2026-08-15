@@ -118,8 +118,10 @@ class StoreSink:
         counts = count_writes(
             self._store, "records", [r.stable_id for r in records]
         )
-        self._store.upsert(records)
-        return counts
+        unchanged = self._store.upsert(records)
+        return WriteCounts(
+            added=counts.added, updated=counts.updated, unchanged=unchanged
+        )
 
     def _write_entities(
         self,
@@ -148,8 +150,10 @@ class StoreSink:
         # sink sees one batch at a time and has no memory between calls. The
         # contract on the adapter is therefore the stronger one, checked in
         # ``write`` before anything at all is written.
-        self._store.upsert_entities([*sessions, *observations])
-        return counts
+        unchanged = self._store.upsert_entities([*sessions, *observations])
+        return WriteCounts(
+            added=counts.added, updated=counts.updated, unchanged=unchanged
+        )
 
     def _refuse_orphan_observations(
         self,
