@@ -37,10 +37,15 @@ reconstruct it from ``runner._run_one``. It is:
   --- every adapter has now finished; the run's report is assembled ---
   5. some of the report reaches a human, or none of it does (:class:`Delivery`)
   6. ``SupportsReportBarrier``       ``commit_after_report`` — ONLY for an
-                                     adapter whose EVERY reported line is in
-                                     what step 5 declared delivered
+                                     adapter that DECLARED ``gates_report``
+                                     (:func:`is_report_gating`) and whose EVERY
+                                     reported line is in what step 5 declared
+                                     delivered
 
-Steps 3 and 4 are order-independent of each other and of 2; they collect,
+Steps 1-4 are matched STRUCTURALLY: having the method is opting in, because
+over-inclusion is free or safe for each of them. Step 6 is the exception and is
+opted into by name — see :func:`is_report_gating` for what its over-inclusion
+cost. Steps 3 and 4 are order-independent of each other and of 2; they collect,
 they decide nothing. The load-bearing edge is 2 BEFORE 6, and the gap between
 them is the point: the write barrier answers "did the records land?" and can
 be answered immediately, while the report barrier answers "was a human told?",
@@ -372,9 +377,12 @@ class Delivery:
         return Delivery(self.lines | other.lines)
 
 
-@runtime_checkable
 class SupportsReportBarrier(Protocol):
     """Optional: an adapter that may only go quiet once a human was TOLD.
+
+    DELIBERATELY NOT ``runtime_checkable`` — see :func:`is_report_gating`. It is
+    the one protocol here whose over-inclusion has a cost, and ``isinstance``
+    against a runtime-checkable Protocol tests METHOD PRESENCE ONLY.
 
     The second barrier, and it exists because the first one fires too early to
     answer a different question. ``SupportsWriteBarrier`` asks "did the records
@@ -415,10 +423,54 @@ class SupportsReportBarrier(Protocol):
 
     NOT CALLING IT IS THE SAFE DIRECTION, unlike the write barrier: the cost is
     one more report of a disappearance already reported, never a lost one. The
-    two barriers therefore fail opposite ways on purpose.
+    two barriers therefore fail opposite ways on purpose. Which is also why
+    forgetting ``gates_report`` costs an adapter its suppression rather than its
+    alert — the opt-in below fails the same way the barrier does.
     """
 
+    # THE OPT-IN, and it is a value rather than a shape on purpose. See
+    # ``is_report_gating``.
+    gates_report: bool
+
     def commit_after_report(self) -> None: ...
+
+
+def is_report_gating(adapter: object) -> bool:
+    """Does this adapter OPT IN to receipt gating? A matching shape never does.
+
+    ROUND 8 MEDIUM, and the third defect in one review traceable to the same
+    cause: ``isinstance`` against a ``runtime_checkable`` Protocol checks METHOD
+    PRESENCE and nothing else. ``SyncSourceAdapter`` defines
+    ``commit_after_report`` unconditionally — it FORWARDS it, and forwarding to a
+    source that has none is a no-op, so defining it always was the simple thing
+    — and that made every one of the nine sources satisfy
+    ``SupportsReportBarrier``.
+
+    What that cost is not academic. ``RunReport.gating_errors`` is what the
+    notifier spends its five-line budget on FIRST, precisely so a chronically
+    noisy source cannot push the one receipt-gating line out of the toast. With
+    every adapter "gating", that list is just ``report.errors``, the ordering is
+    a no-op, and five chronic errors from any other source starve TickTick's
+    uncovered-project line out of the payload — on every run, forever. That is
+    the exact starvation ``gating_errors`` was added to prevent, reintroduced by
+    the membership test underneath it.
+
+    So gating is DECLARED, in the adapter's own code, and a shape cannot supply
+    the declaration. ``SupportsReportBarrier`` is not ``runtime_checkable``, so
+    the accidental spelling (``isinstance(adapter, SupportsReportBarrier)``)
+    raises TypeError instead of quietly answering yes; this function is the only
+    way to ask. ``is True`` rather than truthiness, so a half-written marker — a
+    string, a stray object — is refused rather than promoted.
+
+    FORGETTING THE FLAG IS THE SAFE DIRECTION, which is what makes an explicit
+    opt-in affordable here and not on the write barrier: an adapter that gates
+    nothing simply repeats its report next run. The write barrier is the
+    opposite (never calling it is unbounded loss), so that one stays structural
+    and over-inclusive on purpose.
+    """
+    return getattr(adapter, "gates_report", False) is True and callable(
+        getattr(adapter, "commit_after_report", None)
+    )
 
 
 @runtime_checkable

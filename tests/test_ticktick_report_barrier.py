@@ -31,7 +31,13 @@ import pytest
 
 from aggregator import cli
 from aggregator.core.store import Store
-from aggregator.imports.port import Delivery, SupportsReportBarrier, WriteCounts
+from aggregator.imports.port import (
+    Delivery,
+    SupportsReportBarrier,
+    WriteCounts,
+    is_report_gating,
+)
+from aggregator.imports.registry import default_adapters
 from aggregator.imports.runner import run_imports
 from aggregator.imports.sync_bridge import SyncSourceAdapter
 from aggregator.imports.ticktick import TickTickAdapter
@@ -429,11 +435,24 @@ class _Probe:
         self.events.append("report")
 
 
+class _ProbeAdapter(SyncSourceAdapter):
+    """The probe on the port, DECLARING that its lines gate a receipt.
+
+    Round 8: the declaration is the point. ``SyncSourceAdapter`` defines
+    ``commit_after_report`` for every source it wraps — it forwards, and
+    forwarding to a source that has no receipt is a no-op — so a structural
+    check answered "receipt-gating" for all nine sources. A probe that relied on
+    that accident was testing the accident.
+    """
+
+    gates_report = True
+
+
 def test_the_report_barrier_fires_after_the_write_barrier_and_only_once():
     probe = _Probe()
 
     asyncio.run(
-        run_imports([SyncSourceAdapter(probe)], _Sink(), notify=_working_notify([]))
+        run_imports([_ProbeAdapter(probe)], _Sink(), notify=_working_notify([]))
     )
 
     assert probe.events == ["write", "report"]
@@ -443,7 +462,7 @@ def test_a_hook_that_raised_means_the_report_reached_nobody():
     probe = _Probe()
 
     report = asyncio.run(
-        run_imports([SyncSourceAdapter(probe)], _Sink(), notify=_broken_notify)
+        run_imports([_ProbeAdapter(probe)], _Sink(), notify=_broken_notify)
     )
 
     assert "report" not in probe.events
@@ -456,7 +475,7 @@ def test_a_report_barrier_that_raises_is_reported_not_swallowed():
     probe = _Probe(angry=True)
 
     report = asyncio.run(
-        run_imports([SyncSourceAdapter(probe)], _Sink(), notify=_working_notify([]))
+        run_imports([_ProbeAdapter(probe)], _Sink(), notify=_working_notify([]))
     )
 
     assert report.ok is False
@@ -465,8 +484,60 @@ def test_a_report_barrier_that_raises_is_reported_not_swallowed():
 
 def test_ticktick_is_a_report_barrier_adapter_at_both_seams():
     """The contract above is worth nothing if the one source that needs it does
-    not reach either call site: the runner checks structurally, the CLI by
-    attribute."""
+    not reach either call site: the runner asks ``is_report_gating``, the CLI
+    asks the source by attribute."""
     adapter = TickTickAdapter(source=TickTickSource())
-    assert isinstance(adapter, SupportsReportBarrier)
+    assert is_report_gating(adapter)
     assert callable(getattr(TickTickSource(), "commit_after_report", None))
+
+
+def test_a_plain_source_adapter_does_not_gate_a_receipt():
+    """THE round-8 MEDIUM repro. ``SupportsReportBarrier`` was a
+    ``runtime_checkable`` Protocol and ``isinstance`` tests METHOD PRESENCE
+    ONLY, so the bridge's unconditional forwarding method made every source
+    receipt-gating — including the eight that have nothing to suppress.
+
+    That is not a cosmetic mislabel. ``RunReport.gating_errors`` is what the
+    notifier spends its five-line budget on first, so that a chronically noisy
+    source cannot push the one receipt-gating line out of the toast; with all
+    nine "gating" it held every error in the run and reordered nothing."""
+
+    class _PlainSource:
+        name = "plain"
+
+        def iter_records(self, since, errors=None):
+            return iter(())
+
+    adapter = SyncSourceAdapter(_PlainSource())
+
+    assert callable(adapter.commit_after_report), "the shape is still there"
+    assert not is_report_gating(adapter), (
+        "a source with nothing to suppress acquired receipt gating by the "
+        "accident of the bridge defining a forwarding method"
+    )
+
+
+def test_the_accidental_spelling_of_the_check_no_longer_compiles():
+    """The other half, and why this is a fix rather than a correction.
+
+    Three defects in one review came from ``isinstance`` against a
+    ``runtime_checkable`` Protocol matching on presence. Here the reflex spelling
+    now raises instead of quietly answering yes, so the next call site cannot
+    reintroduce it by writing the obvious thing."""
+    with pytest.raises(TypeError, match="runtime_checkable"):
+        isinstance(TickTickAdapter(source=TickTickSource()), SupportsReportBarrier)
+
+
+def test_only_ticktick_gates_a_receipt_among_the_shipped_adapters():
+    """``gating_errors`` is a priority list, and a priority list that names
+    everything is not one. Pinned across the real adapter set so a source that
+    grows a barrier has to say so, and a source that does not cannot drift into
+    starving the one that does.
+
+    Safe to build here: ``default_adapters`` is documented side-effect-free
+    (env and path resolution only, nothing read until ``get_data``), and the
+    autouse fixtures above have already pointed the credential, the state home
+    and the downloads dir away from the developer's own."""
+    gating = [a.name for a in default_adapters() if is_report_gating(a)]
+
+    assert gating == ["ticktick"]

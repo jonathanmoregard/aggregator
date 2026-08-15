@@ -53,6 +53,7 @@ from aggregator import cli
 from aggregator.core.store import Store
 from aggregator.imports.port import Delivery, WriteCounts
 from aggregator.imports.runner import RunReport, _no_notification, run_imports
+from aggregator.imports.sync_bridge import SyncSourceAdapter
 from aggregator.imports.ticktick import TickTickAdapter
 from aggregator.sources import ticktick_api
 from aggregator.sources.ticktick import TickTickSource
@@ -428,6 +429,61 @@ def test_the_shipped_toast_spends_its_budget_on_the_gating_line_first(
     )
 
 
+class _NoisySource:
+    """The same bad day, as a SOURCE driven through the real bridge.
+
+    Which is how all eight non-TickTick sources actually reach the runner, and
+    the difference the round-8 MEDIUM lived in: ``_Noisy`` above wears no
+    ``commit_after_report`` at all, while ``SyncSourceAdapter`` defines one for
+    every source it wraps.
+    """
+
+    name = "noisy-source"
+
+    def iter_records(self, since, errors=None):
+        if errors is not None:
+            errors.extend(f"unrelated failure {n}" for n in range(5))
+        return iter(())
+
+
+def test_a_bridged_source_cannot_starve_the_toast_of_the_gating_line(
+    tmp_path, state_file, monkeypatch
+):
+    """THE round-8 MEDIUM repro, and it is the test above with the noisy source
+    adapted the way real ones are.
+
+    ``SupportsReportBarrier`` was a ``runtime_checkable`` Protocol, so
+    ``isinstance`` matched on METHOD PRESENCE — and the bridge defines
+    ``commit_after_report`` for every source it wraps, because it merely
+    forwards. All nine sources therefore counted as receipt-gating,
+    ``gating_errors`` was the whole error list, "spend the budget on the gating
+    lines first" reordered nothing, and five chronic errors from anywhere kept
+    TickTick's uncovered-project line out of the toast — on every run, forever.
+    Exactly the starvation ``gating_errors`` was added to prevent.
+    """
+    log = _toast(tmp_path, monkeypatch)
+
+    def run():
+        return _run_all(
+            [
+                SyncSourceAdapter(_NoisySource()),
+                TickTickAdapter(source=_source(tmp_path, state_file)),
+            ],
+            notify=cli._desktop_notification,
+        )
+
+    first = run()
+    assert _reported(first), first.errors
+    assert first.gating_errors == first.errors_from("ticktick"), (
+        "only genuinely gating lines may claim the budget: "
+        f"{first.gating_errors}"
+    )
+    payload = log.read_text()
+    assert UNCOVERED in payload, f"starved by five unrelated failures:\n{payload}"
+
+    assert _reported(run()) == [], "a human was shown the line and it fired again"
+
+
 # -- round 7 MEDIUM: an interactive `ingest --all` has an audience ---------
 
 
@@ -489,6 +545,10 @@ class _Probe:
     ``Delivery``, and the cheapest way to state it is two adapters whose report
     lines stand in the offending relation.
     """
+
+    # The explicit opt-in — round 8 MEDIUM. Having ``commit_after_report`` is
+    # not a declaration that this adapter's lines gate a receipt; saying so is.
+    gates_report = True
 
     def __init__(self, name: str, errors: list[str]) -> None:
         self.name = name

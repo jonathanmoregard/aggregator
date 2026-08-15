@@ -32,7 +32,25 @@ class TickTickAdapter(SyncSourceAdapter):
       on whatever leg still works. Draining those into the run report is what
       keeps "degraded to CSV-only" from looking exactly like a healthy run.
     * ``SupportsInputFreshness`` — the age of the newest backup CSV.
+    * ``SupportsReportBarrier`` — declared below, and TickTick is the only
+      source that declares it.
     """
+
+    # THE ONE RECEIPT-GATING SOURCE, said out loud rather than inferred.
+    #
+    # An uncovered TickTick project is reported once and then goes quiet, and the
+    # thing that buys the quiet is a receipt written only after a human was told.
+    # So this adapter's error lines are the ones a size-limited notification must
+    # carry FIRST (``RunReport.gating_errors``): eliding another source's line
+    # costs one line in one toast, because that source repeats itself next run
+    # anyway; eliding this one costs the suppression, and the known gap
+    # re-alarms on every 30-minute tick until an operator stops reading toasts.
+    #
+    # Structural matching used to answer this — and answered yes for every
+    # source, because ``SyncSourceAdapter`` defines the forwarding
+    # ``commit_after_report`` for all of them, which made the prioritisation a
+    # no-op and starved exactly this line. See ``imports/port.is_report_gating``.
+    gates_report = True
 
     def __init__(
         self,

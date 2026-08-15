@@ -19,8 +19,8 @@ from aggregator.imports.port import (
     ImportSink,
     SupportsInputFreshness,
     SupportsNonFatalErrors,
-    SupportsReportBarrier,
     SupportsWriteBarrier,
+    is_report_gating,
 )
 
 # Items buffered before a sink write. Bounded so a 359k-observation source
@@ -45,11 +45,18 @@ class AdapterReport:
     # exists to describe — the clean ones that imported nothing because the
     # input is stale.
     input_newest_at: datetime | None = None
-    # Whether the adapter implements ``SupportsReportBarrier``, i.e. whether
-    # any of this adapter's error lines GATES a receipt. Recorded because the
-    # notifier composes a size-limited payload and has to put those lines in it
-    # first: a line that is elided is a line that was not delivered, and an
-    # adapter that cannot show its whole report got through keeps repeating it.
+    # Whether the adapter OPTED IN to ``SupportsReportBarrier``
+    # (``port.is_report_gating``), i.e. whether any of this adapter's error lines
+    # GATES a receipt. Recorded because the notifier composes a size-limited
+    # payload and has to put those lines in it first: a line that is elided is a
+    # line that was not delivered, and an adapter that cannot show its whole
+    # report got through keeps repeating it.
+    #
+    # Opt-in rather than structural because this field is only useful when it
+    # discriminates. Round 8: ``isinstance`` against the runtime-checkable
+    # protocol answered yes for all nine sources — ``SyncSourceAdapter`` defines
+    # the forwarding method for every one of them — so ``gating_errors`` was the
+    # whole error list and the prioritisation below did nothing at all.
     holds_report_barrier: bool = False
     # Whether the adapter implements ``SupportsInputFreshness`` at all.
     # Without it, ``input_newest_at is None`` conflates two opposite things:
@@ -130,6 +137,11 @@ class RunReport:
         gating one used to cost them the alert entirely, and now costs them the
         suppression that keeps a known, already-reported gap from re-alarming on
         every timer tick.
+
+        Only worth anything while it is a MINORITY of the errors, which is what
+        ``port.is_report_gating``'s explicit opt-in buys: when every adapter
+        counted as gating this returned the whole list and prioritising by it
+        reordered nothing.
         """
         return [
             line
@@ -236,7 +248,7 @@ async def _run_one(
     # TickTick that is permanent, because the Open API reports a completion
     # exactly once. Declining to fire costs one poll's inference; firing costs
     # the inference forever. The asymmetry decides it.
-    report.holds_report_barrier = isinstance(adapter, SupportsReportBarrier)
+    report.holds_report_barrier = is_report_gating(adapter)
     persisted_everything = wrote_everything and report.skipped == 0
     if persisted_everything and isinstance(adapter, SupportsWriteBarrier):
         try:
@@ -476,7 +488,7 @@ def commit_report_barriers(
     direction, and it is still not silent.
     """
     for adapter in adapters:
-        if not isinstance(adapter, SupportsReportBarrier):
+        if not is_report_gating(adapter):
             continue
         if not delivered.covers(report.errors_from(adapter.name)):
             continue

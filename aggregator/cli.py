@@ -448,6 +448,15 @@ def _commit_after_report(
     channel on this path today; a future one (a mailer, a webhook) is then a new
     value passed in, not an assumption already baked into this function.
 
+    ASKS THE SOURCE BY ATTRIBUTE, where the runner asks the adapter for an
+    explicit ``gates_report`` (``port.is_report_gating``). Not an inconsistency:
+    the runner's problem was that ``SyncSourceAdapter`` hands every source a
+    forwarding ``commit_after_report``, so presence there meant nothing. On a
+    SOURCE the method is hand-written — no source in this repo inherits from
+    anything — and this path drives exactly one source, so there is no second
+    adapter whose lines could be confused with its own or starve it out of a
+    payload. Presence is a declaration here; it was an artefact there.
+
     Returns the fault instead of appending to ``errors``, because ``errors`` has
     already been printed by the time this runs; the caller prints what comes
     back and takes exit 3 for it. Loud, but the loss is small: all a failed

@@ -154,6 +154,24 @@ class SyncSourceAdapter:
     adapter instance.
     """
 
+    # NOT RECEIPT-GATING, and this line is the whole round-8 MEDIUM fix.
+    #
+    # ``commit_after_report`` below is defined unconditionally because it merely
+    # FORWARDS, and forwarding to a source that has no receipt is a no-op. While
+    # gating was decided by ``isinstance`` against a runtime-checkable Protocol —
+    # which tests method presence and nothing else — that one convenience made
+    # every source this bridge wraps, i.e. all nine, count as receipt-gating.
+    # ``RunReport.gating_errors`` then held every error in the run, the
+    # notifier's "spend the budget on the gating lines first" ordering reordered
+    # nothing, and five chronic errors from any other source could keep
+    # TickTick's uncovered-project line out of the toast forever: the exact
+    # starvation that ordering was added to prevent.
+    #
+    # So gating is now a declaration a subclass makes (``TickTickAdapter``), and
+    # the default is the safe answer: an adapter that gates nothing repeats its
+    # report next run. See ``imports/port.is_report_gating``.
+    gates_report: bool = False
+
     def __init__(
         self,
         source: Any,
@@ -216,6 +234,10 @@ class SyncSourceAdapter:
         ``imports/port.SupportsReportBarrier`` — a source that suppresses a
         repeat report may only do so once the report actually reached a human,
         which is not known until ``notify`` has run.
+
+        DEFINING IT IS NOT OPTING IN. Whether this adapter's report lines gate a
+        receipt is answered by ``gates_report`` above, never by the existence of
+        this method — that conflation is what made all nine sources gating.
         """
         commit = getattr(self._source, "commit_after_report", None)
         if commit is not None:
