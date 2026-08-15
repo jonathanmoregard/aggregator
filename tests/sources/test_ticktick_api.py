@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import os
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,7 +11,8 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from aggregator.sources import ticktick_api, ticktick_csv
+from aggregator import cli
+from aggregator.sources import ticktick, ticktick_api, ticktick_csv
 
 TOKEN = "sup3r-s3cret-token"
 API_LOG = "aggregator.sources.ticktick_api"
@@ -60,8 +63,17 @@ def _no_real_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ticktick_api, "DEFAULT_ENV_FILE", str(tmp_path / "no-such-env")
     )
-    monkeypatch.delenv("TICKTICK_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("TICKTICK_TOKEN_EXPIRES_AT", raising=False)
+    for var in (
+        "TICKTICK_ACCESS_TOKEN",
+        "TICKTICK_TOKEN_EXPIRES_AT",
+        # The source-level knobs too: this file now drives a whole
+        # ``TickTickSource`` (the write-barrier tests), and an exported override
+        # would point it at a real credential or a real download directory.
+        "AGGREGATOR_TICKTICK_TOKEN",
+        "AGGREGATOR_TICKTICK_TOKEN_FILE",
+        "AGGREGATOR_TICKTICK_DIR",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
 
 def full_task(**over):
@@ -1965,6 +1977,183 @@ def test_a_polled_task_records_the_project_it_was_walked_under(monkeypatch):
     poll = ticktick_api.poll_open_tasks(TOKEN)
     assert ticktick_api.task_project_id(poll.tasks[0]) == "p1"
     assert poll.covered_project_ids == frozenset({"p1"})
+
+
+# --- overlapping runs: the baseline needs a lock --------------------------
+#
+# Round 3 HIGH 2. `ingest ticktick` and `ingest --all`, or a timer firing over a
+# manual run, each do load -> infer -> save independently. A blind replace lets
+# the OLDER poll's save land last, and every task the newer poll saw for the
+# FIRST time drops out of the baseline. A task that was never in the baseline
+# can never be inferred completed when it later disappears, so that completion
+# is gone from every future poll.
+#
+# This was examined twice before and left alone, once as "not genuinely small"
+# and once as a self-correcting residual. That second reading was about a
+# different failure mode: overlapping polls also produce duplicate
+# approx-stamped completions, and those DO heal, because the stable_id upsert
+# collapses them and the next poll re-observes the task. This one heals nothing
+# — the evidence is what went missing.
+
+
+def _one_poll(*ids):
+    return ticktick_api.OpenTaskPoll(
+        [{"id": i, "projectId": "p1"} for i in ids],
+        complete=True,
+        covered_project_ids=frozenset({"p1"}),
+    )
+
+
+def test_an_older_poll_cannot_clobber_a_newer_baseline(tmp_path):
+    """Two reconciles interleaved, older committing last. It must be refused.
+
+    Both load the same (absent) baseline. The newer poll has seen t2 for the
+    first time and saves it. The older poll then saves its own, smaller view —
+    which, unguarded, erases t2 from the baseline forever.
+    """
+    path = tmp_path / "open_tasks.json"
+    _, older = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
+    )
+    _, newer = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path),
+        _one_poll("t1", "t2"),
+        datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
+    )
+
+    newer()
+    with pytest.raises(ticktick_api.StaleBaselineError) as caught:
+        older()
+
+    assert ticktick_api.load_state(path).keys() == {"t1", "t2"}
+    assert "open_tasks.json" in str(caught.value)
+
+
+def test_the_stale_write_is_refused_over_an_existing_baseline_too(tmp_path):
+    """Not only the create-from-nothing case: the same guard over a real file."""
+    path = tmp_path / "open_tasks.json"
+    ticktick_api.save_state(path, [{"id": "t0", "projectId": "p1"}], datetime(2026, 8, 7, tzinfo=UTC))
+
+    _, older = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
+    )
+    _, newer = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path),
+        _one_poll("t1", "t2"),
+        datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
+    )
+    newer()
+    with pytest.raises(ticktick_api.StaleBaselineError):
+        older()
+    assert ticktick_api.load_state(path).keys() == {"t1", "t2"}
+
+
+def test_a_refused_write_is_recoverable_by_the_next_poll(tmp_path):
+    """Refusing costs exactly one advance, which is why refusing is the cheap
+    side of the asymmetry: the very next reconcile loads the current baseline
+    and saves normally."""
+    path = tmp_path / "open_tasks.json"
+    state = ticktick_api.JsonFileState(path)
+    _, older = ticktick_api.plan_open_task_reconcile(
+        state, _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
+    )
+    ticktick_api.reconcile_open_tasks(
+        ticktick_api.JsonFileState(path),
+        _one_poll("t1", "t2"),
+        datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
+    )
+    with pytest.raises(ticktick_api.StaleBaselineError):
+        older()
+
+    records = ticktick_api.reconcile_open_tasks(
+        ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, 1, tzinfo=UTC)
+    )
+    assert [r.stable_id for r in records] == ["ticktick:t2"]
+    assert ticktick_api.load_state(path).keys() == {"t1"}
+
+
+def test_the_refusal_reaches_the_runs_errors_sink(tmp_path, monkeypatch):
+    """Loud, not silent. The records DID land, so the ingest succeeded; a
+    baseline that quietly failed to advance is the silent-success shape."""
+    state_file = tmp_path / "open_tasks.json"
+    src = ticktick.TickTickSource(
+        backup_dir=tmp_path / "no-downloads",
+        archive_dir=tmp_path / "no-archive",
+        token="fake-token",
+        state_file=state_file,
+    )
+    monkeypatch.setattr(
+        ticktick_api, "poll_open_tasks", lambda token, errors=None: _one_poll("t1")
+    )
+    list(src.iter_records(None, errors=[]))
+    # Another run reconciles and saves in the window before this one commits.
+    ticktick_api.reconcile_open_tasks(
+        ticktick_api.JsonFileState(state_file),
+        _one_poll("t1", "t2"),
+        datetime(2026, 8, 8, tzinfo=UTC),
+    )
+
+    errors: list[str] = []
+    cli._commit_after_write(src, errors)
+
+    assert len(errors) == 1
+    assert "StaleBaselineError" in errors[0]
+    assert ticktick_api.load_state(state_file).keys() == {"t1", "t2"}
+
+
+def test_the_write_happens_under_a_cross_process_lock(tmp_path, monkeypatch):
+    """The compare-and-swap is a stat followed by a write, which is not atomic.
+
+    Without a lock around both, a second run can save in between and this one
+    still renames over it — the same clobber, through a smaller window. The lock
+    is a sidecar file rather than the baseline itself because every save renames
+    a new inode into place, so a lock on the baseline would not be held on the
+    file the next writer sees.
+
+    ``flock`` is per open-file-description, so a second ``os.open`` of the same
+    lock file contends even from this process, which is what makes this
+    observable without spawning one.
+    """
+    path = tmp_path / "open_tasks.json"
+    lock_path = path.with_name(path.name + ".lock")
+    observed: dict[str, bool] = {}
+    real_write = ticktick_api._write_state
+
+    def watched(p, tasks, now, retain):
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            observed["held"] = True
+        else:
+            observed["held"] = False
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return real_write(p, tasks, now, retain)
+
+    monkeypatch.setattr(ticktick_api, "_write_state", watched)
+    ticktick_api.save_state(path, [{"id": "t1"}], datetime(2026, 8, 8, tzinfo=UTC))
+    observed.clear()
+    ticktick_api.replace_state(
+        path,
+        [{"id": "t2"}],
+        datetime(2026, 8, 8, tzinfo=UTC),
+        ticktick_api.baseline_identity(path),
+    )
+    assert observed == {"held": True}, "the compare-and-swap wrote outside the lock"
+
+
+def test_a_save_with_no_preceding_load_is_unconditional(tmp_path):
+    """The compare-and-swap needs something to compare against.
+
+    Documented rather than silently permissive: every path in this repo loads
+    first, because the planner does it.
+    """
+    path = tmp_path / "open_tasks.json"
+    ticktick_api.save_state(path, [{"id": "t0"}], datetime(2026, 8, 7, tzinfo=UTC))
+    ticktick_api.JsonFileState(path).save([{"id": "t9"}], datetime(2026, 8, 8, tzinfo=UTC))
+    assert ticktick_api.load_state(path).keys() == {"t9"}
 
 
 def test_default_state_path_respects_xdg(monkeypatch, tmp_path):

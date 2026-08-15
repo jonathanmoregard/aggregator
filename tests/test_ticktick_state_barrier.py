@@ -243,10 +243,13 @@ def test_a_state_write_that_fails_after_the_records_landed_is_reported(
     store = Store(db_path=tmp_path / "cache.db")
     store.migrate()
 
-    def _boom(path, tasks, now):
+    def _boom(path, tasks, now, retain):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(ticktick_api, "save_state", _boom)
+    # ``_write_state`` is the bytes leg both save paths funnel through — the
+    # plain replace and the compare-and-swap — so this stays pointed at the
+    # write however the adapter decides to guard it.
+    monkeypatch.setattr(ticktick_api, "_write_state", _boom)
 
     rc = cli.main(
         ["ingest", "ticktick"],

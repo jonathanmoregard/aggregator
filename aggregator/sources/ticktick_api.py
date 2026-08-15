@@ -53,12 +53,14 @@ by stable_id.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import time
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -122,6 +124,17 @@ class StateUnreadableError(RuntimeError):
     the ingest path can quietly re-absorb it into "the filesystem hiccuped".
     The one thing this must never become again is an empty baseline: see
     :func:`load_state`.
+    """
+
+
+class StaleBaselineError(RuntimeError):
+    """A save was refused because another run advanced the baseline first.
+
+    Deliberately NOT an OSError: an ``except OSError`` around the state write
+    would file this as "the disk hiccuped", and it is the opposite — the write
+    was refused precisely so nothing would be lost. Both write paths already
+    catch it (broadly) and route it to the run's ``errors``, which is what makes
+    the run exit non-zero and notify.
     """
 
 
@@ -595,8 +608,8 @@ def _first_dt(task: dict, fields: tuple[str, ...]) -> datetime | None:
     Driven off ``UPDATED_FIELDS`` rather than a hand-written ``a or b`` chain so
     that the field names live in exactly one place — see ``CREATED_FIELD``.
     """
-    for field in fields:
-        parsed = _parse_api_dt(task.get(field), field=field)
+    for name in fields:
+        parsed = _parse_api_dt(task.get(name), field=name)
         if parsed is not None:
             return parsed
     return None
@@ -936,6 +949,15 @@ class OpenTaskState(Protocol):
         their real completion — whenever the project comes back — becomes
         invisible to every future poll. Declining to infer is only half of not
         guessing; keeping the evidence is the other half.
+
+        AN IMPLEMENTATION SHOULD REFUSE A STALE WRITE — one where the stored
+        baseline changed since this instance's :meth:`load` — by raising
+        :class:`StaleBaselineError`. Two ingests can overlap, and if the older
+        one's save lands last, every task the newer poll saw for the first time
+        drops out of the baseline; a task that was never in the baseline can
+        never be inferred completed when it disappears. Silent, permanent, and
+        not self-correcting. :class:`JsonFileState` does this with a
+        compare-and-swap on file identity under a cross-process lock.
         """
         ...
 
@@ -992,7 +1014,75 @@ def save_state(
     Retained entries keep their original ``last_seen``: this poll did not see
     them, and stamping them ``now`` would be the file claiming an observation
     that never happened.
+
+    UNCONDITIONAL: this replaces whatever is on disk. That is right for a
+    caller seeding a baseline from nothing, and wrong for a reconcile, which
+    must not overwrite a baseline some other run advanced while it was working
+    — see :func:`replace_state`, which is what the shipped adapter uses. The
+    cross-process lock is taken here too, so a plain save cannot interleave with
+    a compare-and-swap or share its scratch file.
     """
+    with _baseline_lock(path):
+        _write_state(path, tasks, now, retain)
+
+
+def replace_state(
+    path: Path,
+    tasks: Iterable[dict],
+    now: datetime,
+    expect: object,
+    retain: dict[str, dict] | None = None,
+) -> None:
+    """``save_state``, but only if the baseline is still what ``expect`` says.
+
+    A COMPARE-AND-SWAP, because a blind replace loses data silently and
+    permanently. Two ingests can overlap — ``ingest ticktick`` and
+    ``ingest --all``, or a timer firing over a manual run — and each runs
+    load -> infer -> save independently. If the OLDER poll's save lands last it
+    overwrites the newer baseline, and every task the newer poll had seen for
+    the first time is gone from it. Those tasks were never recorded as open, so
+    when they later disappear there is nothing to diff against and their
+    completion is invisible to every future poll. Unlike the duplicate
+    approx-stamped completions that overlapping runs also produce — which the
+    stable_id upsert heals — this one does not self-correct at all.
+
+    ``expect`` is the file identity :func:`baseline_identity` returned when this
+    run READ the baseline. Refusing on a mismatch is the whole mechanism: the
+    older run's write is dropped, the newer baseline stands, and the older run's
+    inferred completions are merely re-derived by the next poll.
+
+    The check and the write are both inside the lock. Without it the window
+    between "identity still matches" and "rename into place" is exactly the race
+    being closed, and both runs would also be writing the same ``.tmp`` scratch
+    file.
+
+    Refusing costs one poll's baseline advance, which the next poll redoes.
+    Allowing the stale write costs completions that can never be re-derived, so
+    the asymmetry decides it — the same asymmetry as ``load_state``'s refusal to
+    read an unreadable baseline as empty.
+    """
+    with _baseline_lock(path):
+        current = baseline_identity(path)
+        if current != expect:
+            raise StaleBaselineError(
+                f"REFUSING to write the ticktick open-task baseline at {path}: it "
+                f"changed since this run read it (expected {expect!r}, found "
+                f"{current!r}), which means another ingest — a second `aggregator "
+                f"ingest`, or a timer firing over a manual run — reconciled and saved "
+                f"in the meantime. Writing this poll now would drop every task that "
+                f"run saw for the first time, and a task that was never in the "
+                f"baseline can never be inferred completed when it later disappears, "
+                f"because the Open API serves open tasks only. This poll's baseline "
+                f"advance is skipped; the next poll re-derives it. Avoid overlapping "
+                f"ingests if this recurs"
+            )
+        _write_state(path, tasks, now, retain)
+
+
+def _write_state(
+    path: Path, tasks: Iterable[dict], now: datetime, retain: dict[str, dict] | None
+) -> None:
+    """The bytes half of a save. Call under :func:`_baseline_lock`."""
     payload: dict[str, dict] = dict(retain or {})
     skipped = 0
     for task in tasks:
@@ -1009,6 +1099,51 @@ def save_state(
         os.fchmod(handle.fileno(), 0o600)
         handle.write(json.dumps(payload))
     scratch.replace(path)
+
+
+def baseline_identity(path: Path) -> tuple[int, int, int, int] | None:
+    """What the baseline file IS right now, or None when there is none.
+
+    ``(device, inode, mtime_ns, size)``. The inode alone would almost do —
+    ``_write_state`` renames a fresh scratch file into place, so every save
+    mints a new one — but a filesystem that reuses inodes promptly would defeat
+    that on its own, and the other three cost nothing.
+
+    Content is deliberately NOT hashed: this answers "is this the same file I
+    read?", and two saves that happen to produce identical bytes are still two
+    saves, the second of which this run did not see.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        # Includes "there is no file", which is a real and expected state: the
+        # first-ever poll expects None and a save is refused if some other run
+        # created one in the meantime.
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+@contextmanager
+def _baseline_lock(path: Path) -> Iterator[None]:
+    """Serialise baseline writes across processes, via a sidecar lock file.
+
+    A sidecar rather than the baseline itself, because the baseline is replaced
+    by ``rename`` on every save: a lock held on the old inode says nothing about
+    the new one, so two writers would each hold "the lock" on different files.
+    The sidecar is never renamed, so every writer contends on the same inode.
+
+    Blocking, not ``LOCK_NB``. The critical section is a stat and one small
+    write; a writer that gave up on contention would be back to racing.
+    ``flock`` is released when the fd closes, including if the process dies.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _unreadable(path: Path, reason: str) -> StateUnreadableError:
@@ -1087,8 +1222,8 @@ def task_project_id(task: object) -> str:
     """
     if not isinstance(task, dict):
         return ""
-    for field in ("_projectId", "projectId"):
-        raw = task.get(field)
+    for name in ("_projectId", "projectId"):
+        raw = task.get(name)
         text = "" if raw is None else str(raw).strip()
         if text:
             return text
@@ -1297,25 +1432,49 @@ def _open_task_ids(tasks: Iterable[dict]) -> set[str]:
     return ids
 
 
-@dataclass(frozen=True)
+_NOT_LOADED = object()
+
+
+@dataclass
 class JsonFileState:
     """The shipped adapter: the baseline as one JSON file on disk.
 
-    Deliberately thin — the reading and writing rules are the two module
-    functions above, which is also what the plan's own brief has task 8 call.
-    This is that behaviour wearing the port's shape, not a second
-    implementation of it.
+    Deliberately thin — the reading and writing rules are the module functions
+    above, which is also what the plan's own brief has task 8 call. This is that
+    behaviour wearing the port's shape, not a second implementation of it.
+
+    NOT FROZEN, and that is the one thing it does carry: an instance remembers
+    the file identity it loaded, so its save can be a compare-and-swap. That
+    memory is what spans load -> infer -> save, which is where the overlapping-
+    run race lives — a lock held only across the save would leave the two runs
+    diffing against the same baseline and the older one still writing last. One
+    instance is one run's view of the baseline; the source builds a fresh one
+    per poll.
+
+    A save with no preceding load has nothing to compare against and writes
+    unconditionally. Every path in this repo loads first (the planner does it,
+    which is why it is one function and not three call-site steps).
     """
 
     path: Path
+    _expect: object = field(default=_NOT_LOADED, init=False, repr=False, compare=False)
 
     def load(self) -> dict[str, dict]:
+        # Identity BEFORE content, deliberately. If another run replaces the
+        # file between the two, this pairs newer content with an older identity
+        # and the save is refused — costing one poll's advance. The other order
+        # pairs older content with a newer identity and the save is ALLOWED,
+        # which is the clobber this exists to prevent.
+        self._expect = baseline_identity(self.path)
         return load_state(self.path)
 
     def save(
         self, tasks: Iterable[dict], now: datetime, retain: dict[str, dict] | None = None
     ) -> None:
-        save_state(self.path, tasks, now, retain)
+        if self._expect is _NOT_LOADED:
+            save_state(self.path, tasks, now, retain)
+            return
+        replace_state(self.path, tasks, now, self._expect, retain)
 
 
 INCOMPLETE_POLL_NOTE = (
