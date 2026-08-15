@@ -157,6 +157,9 @@ class TickTickSource:
         self._api_observed_at = datetime.now(UTC)
         # Set by a poll, run by ``commit_after_write``. See there.
         self._pending_state_commit: Callable[[], None] | None = None
+        # Set by the same poll, run by ``commit_after_report`` — LATER, and
+        # only if the run's report was actually delivered. See there.
+        self._pending_report_commit: Callable[[], None] | None = None
 
     def manual_export_input(self) -> str:
         """``sources.base.ReadsManualExport`` — what ``--rebuild`` is refused on.
@@ -352,7 +355,12 @@ class TickTickSource:
         # CSV-only retry writes fine — and the barrier commits poll 1's
         # baseline. The completion poll 1 inferred was never written by anyone
         # and the Open API will never report it again.
+        #
+        # The report commit goes with it, for the same reason one step over: a
+        # receipt planned by poll 1 must never be stamped on the strength of
+        # poll 2's report, which described a different set of facts.
         self._pending_state_commit = None
+        self._pending_report_commit = None
         # INSIDE a try, deliberately. ``resolve_token`` raises
         # TokenUnavailableError (an OSError subclass) when the API leg is
         # configured but its secret cannot be read — an unreadable token file,
@@ -436,11 +444,18 @@ class TickTickSource:
         # no way for a re-run to recover them. The save now waits for
         # ``commit_after_write``, which the writing caller invokes once the
         # records have landed.
+        #
+        # TWO commits back, not one, and they are NOT ordered relative to each
+        # other by anything this class does: the baseline advance may not wait
+        # (a frozen baseline loses completions permanently), while the
+        # uncovered-project receipt may not happen until the run's report has
+        # reached a human. See ``commit_after_report``.
         state = ticktick_api.JsonFileState(self.state_file)
-        inferred, commit = ticktick_api.plan_open_task_reconcile(
+        inferred, commit, commit_receipts = ticktick_api.plan_open_task_reconcile(
             state, poll, observed, errors
         )
         self._pending_state_commit = commit
+        self._pending_report_commit = commit_receipts
         for record in inferred:
             candidates[_merge_key(record)] = (observed, record)
         return candidates
@@ -456,6 +471,7 @@ class TickTickSource:
         # would leave the previous poll's commit armed on a reused instance with
         # no poll of its own to answer for it.
         self._pending_state_commit = None
+        self._pending_report_commit = None
         # ``--since`` parses to a naive datetime; backup mtimes are aware, and
         # comparing the two raises TypeError. Normalised once, here, so the
         # scan below can compare unconditionally.
@@ -534,6 +550,54 @@ class TickTickSource:
         except OSError as e:
             raise OSError(
                 f"ticktick state could not be updated at {self.state_file}: {e}"
+            ) from e
+
+    def commit_after_report(self) -> None:
+        """Record that this run's report REACHED somebody. CALL ONLY AFTER IT DID.
+
+        The other barrier, answering the other question. ``commit_after_write``
+        asks "did the records land?"; this asks "was a human told?", and the
+        only thing it writes is the uncovered-project receipt that lets a later
+        poll stay quiet about a disappearance already reported.
+
+        THE RECEIPT USED TO RIDE ALONG WITH THE BASELINE ADVANCE, which happens
+        before the run's report has left the process. A notify hook that could
+        not run — missing program, non-zero exit, an exception — therefore left
+        behind a mark saying the operator had been told, and every later poll
+        read the disappearance as already-reported and said nothing. The one
+        alert this mechanism exists to deliver was suppressed by a record of its
+        own delivery. So the mark now waits here, where delivery is known.
+
+        NOT CALLING IT IS SAFE, and that is the exact opposite of
+        ``commit_after_write``. The cost is one more report of a disappearance
+        that was already reported — noise, self-correcting, and still loud.
+        Calling it when nothing was delivered is the expensive direction, so
+        every caller must be able to say the report went somewhere: the runner
+        calls it only when ``notify`` returned without raising, and the
+        single-source CLI path after it has printed the run's errors to stderr,
+        which is that path's channel.
+
+        Independent of ``commit_after_write`` on purpose. A run whose write
+        failed still REPORTED the uncovered project, so the human heard it and
+        the receipt is earned; the baseline simply was not advanced, and the
+        next poll re-derives the same diff and finds the receipt waiting.
+
+        Idempotent, and a no-op for a poll that found no vanished project —
+        which is nearly every poll, and costs no read and no write.
+
+        Raises ``OSError`` when the receipt cannot be written; the caller
+        reports it. Nothing is lost, but a receipt that silently never lands
+        turns "reported once" back into "reported forever".
+        """
+        commit, self._pending_report_commit = self._pending_report_commit, None
+        if commit is None:
+            return
+        try:
+            commit()
+        except OSError as e:
+            raise OSError(
+                f"ticktick uncovered-project receipts could not be written at "
+                f"{self.state_file}: {e}"
             ) from e
 
     def newest_backup_mtime(self) -> datetime | None:

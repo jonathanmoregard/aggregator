@@ -18,6 +18,7 @@ from aggregator.imports.port import (
     ImportSink,
     SupportsInputFreshness,
     SupportsNonFatalErrors,
+    SupportsReportBarrier,
     SupportsWriteBarrier,
 )
 
@@ -342,6 +343,7 @@ async def run_imports(
         report.warnings.extend(
             staleness_warnings(report, max_age_days=stale_after_days, now=now)
         )
+    delivered = True
     try:
         notify(report)
     except Exception as e:  # noqa: BLE001
@@ -349,8 +351,43 @@ async def run_imports(
         # still has to be able to print WHICH adapter failed. Recorded,
         # not swallowed: a notifier that cannot notify is itself a fault,
         # and on an otherwise-clean run this is the only thing that says so.
+        delivered = False
         report.run_errors.append(f"notify hook failed: {type(e).__name__}: {e}")
+    if delivered:
+        _commit_after_report(adapter_list, report)
     return report
+
+
+def _commit_after_report(
+    adapters: Sequence[ImportAdapter], report: RunReport
+) -> None:
+    """Let adapters record that this run's report actually reached somebody.
+
+    ONLY ON THE DELIVERED PATH. An adapter that suppresses a repeat report is
+    holding a receipt, and a receipt written when the notify hook blew up says a
+    human was told when nobody was — which permanently silences the one alert
+    that source existed to raise. See ``port.SupportsReportBarrier``.
+
+    Unconditionally after ``notify``, not gated on ``report.ok``: an adapter's
+    receipt is about ITS OWN report reaching the channel, and the channel
+    carried the whole run's report or none of it. Gating on success would mean
+    the one shape that always matters — a run that failed and said so — never
+    got to go quiet, which is the every-30-minutes alarm again.
+
+    A barrier that raises is recorded rather than fatal. The records are
+    written, the report is delivered; all that is lost is the suppression, so
+    the next run reports the same thing once more. That is the harmless
+    direction, and it is still not silent.
+    """
+    for adapter in adapters:
+        if not isinstance(adapter, SupportsReportBarrier):
+            continue
+        try:
+            adapter.commit_after_report()
+        except Exception as e:  # noqa: BLE001 -- one adapter must not stop the rest
+            report.run_errors.append(
+                f"{adapter.name}: commit_after_report failed: {type(e).__name__}: {e}"
+            )
 
 
 def _refuse_duplicate_names(adapters: Sequence[ImportAdapter]) -> None:

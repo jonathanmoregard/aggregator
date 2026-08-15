@@ -207,6 +207,20 @@ class SyncSourceAdapter:
         if commit is not None:
             commit()
 
+    def commit_after_report(self) -> None:
+        """Forward the runner's report barrier to the wrapped source.
+
+        Defined unconditionally for the same reason as ``commit_after_write``:
+        the runner then needs no special case, and a source with nothing to
+        record has nothing to forward it to. See
+        ``imports/port.SupportsReportBarrier`` — a source that suppresses a
+        repeat report may only do so once the report actually reached a human,
+        which is not known until ``notify`` has run.
+        """
+        commit = getattr(self._source, "commit_after_report", None)
+        if commit is not None:
+            commit()
+
     def drain_errors(self) -> list[str]:
         """Hand the source's per-item failures to the runner, then forget them.
 

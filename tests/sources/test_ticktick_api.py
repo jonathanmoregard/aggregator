@@ -427,7 +427,7 @@ def test_a_project_with_no_tasks_key_does_not_bury_its_open_tasks(monkeypatch, t
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
     poll = ticktick_api.poll_open_tasks("tok", errors=errors)
-    records, commit = ticktick_api.plan_open_task_reconcile(
+    records, commit, _receipts = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), poll, second, errors
     )
     commit()
@@ -1380,7 +1380,7 @@ def test_the_planner_refuses_to_overwrite_a_baseline_it_could_not_read(tmp_path)
     original = path.read_bytes()
     errors: list[str] = []
 
-    records, commit = ticktick_api.plan_open_task_reconcile(
+    records, commit, _receipts = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         ticktick_api.OpenTaskPoll(
             [{"id": "t9", "title": "open now", "projectId": "p1"}],
@@ -1414,7 +1414,7 @@ def test_an_unreadable_baseline_is_loud_and_a_first_poll_is_not(tmp_path):
     )
     missing = tmp_path / "never-written.json"
     first_run: list[str] = []
-    _, commit = ticktick_api.plan_open_task_reconcile(
+    _, commit, _receipts = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(missing),
         poll,
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
@@ -1722,7 +1722,7 @@ def test_an_incomplete_poll_infers_nothing_and_leaves_the_baseline_alone(tmp_pat
     )
     errors: list[str] = []
 
-    records, commit = ticktick_api.plan_open_task_reconcile(
+    records, commit, _receipts = ticktick_api.plan_open_task_reconcile(
         state,
         ticktick_api.OpenTaskPoll(
             [{"id": "t1", "projectId": "p1"}],
@@ -2003,10 +2003,19 @@ def _gone(project="deleted"):
 
 
 def _reconcile(path, poll, now, errors):
-    records, commit = ticktick_api.plan_open_task_reconcile(
+    """One whole run: advance the baseline, then record that it was reported.
+
+    Both commits, because a run is not over until its report has been delivered
+    — and these tests are about what the NEXT poll says, which is decided by
+    whether the previous one's report actually reached anybody. The case where
+    it did not is
+    ``test_the_receipt_is_not_written_until_the_report_was_delivered``.
+    """
+    records, commit, commit_receipts = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), poll, now, errors
     )
     commit()
+    commit_receipts()
     return records
 
 
@@ -2217,10 +2226,10 @@ def test_an_older_poll_cannot_clobber_a_newer_baseline(tmp_path):
     which, unguarded, erases t2 from the baseline forever.
     """
     path = tmp_path / "open_tasks.json"
-    _, older = ticktick_api.plan_open_task_reconcile(
+    _, older, _ = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
     )
-    _, newer = ticktick_api.plan_open_task_reconcile(
+    _, newer, _ = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         _one_poll("t1", "t2"),
         datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
@@ -2239,10 +2248,10 @@ def test_the_stale_write_is_refused_over_an_existing_baseline_too(tmp_path):
     path = tmp_path / "open_tasks.json"
     ticktick_api.save_state(path, [{"id": "t0", "projectId": "p1"}], datetime(2026, 8, 7, tzinfo=UTC))
 
-    _, older = ticktick_api.plan_open_task_reconcile(
+    _, older, _ = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
     )
-    _, newer = ticktick_api.plan_open_task_reconcile(
+    _, newer, _ = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         _one_poll("t1", "t2"),
         datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
@@ -2259,7 +2268,7 @@ def test_a_refused_write_is_recoverable_by_the_next_poll(tmp_path):
     and saves normally."""
     path = tmp_path / "open_tasks.json"
     state = ticktick_api.JsonFileState(path)
-    _, older = ticktick_api.plan_open_task_reconcile(
+    _, older, _ = ticktick_api.plan_open_task_reconcile(
         state, _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
     )
     ticktick_api.reconcile_open_tasks(

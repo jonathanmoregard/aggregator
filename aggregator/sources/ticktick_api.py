@@ -1347,6 +1347,13 @@ class _BaselineDiff:
       the coverage. Dropped, because there is nothing there to lose, and
       reported for the same reason.
 
+    ``receipts`` is the mark each ``unverifiable`` entry EARNS, held apart from
+    ``retained`` rather than folded into it. A receipt says a human was told,
+    and at diff time nobody has been: the report has not left the process yet.
+    Keeping the two separate is what lets the baseline advance immediately
+    (which must not wait for anything) while the receipt waits for delivery —
+    see :func:`plan_open_task_reconcile`.
+
     Computed once and shared by :func:`infer_completions` and
     :func:`plan_open_task_reconcile` so "not covered" cannot come to mean one
     thing where completions are decided and another where the baseline is
@@ -1360,6 +1367,7 @@ class _BaselineDiff:
     unverifiable: dict[str, list[str]]
     acknowledged: dict[str, list[str]]
     saw_nothing: bool
+    receipts: dict[str, dict] = field(default_factory=dict)
 
 
 def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime) -> _BaselineDiff:
@@ -1377,6 +1385,10 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
     as a brand-new one: the tasks are still never inferred completed, and the
     project coming back still reconciles them normally. What the receipt buys
     is that the operator hears about it once instead of every 30 minutes.
+
+    EARNING A RECEIPT IS NOT THE SAME AS BEING GIVEN ONE. A newly-unverifiable
+    entry is retained verbatim here and its mark goes to ``receipts``, which
+    only reaches the file once the run's report has actually been delivered.
     """
     current_ids = _open_task_ids(poll.tasks)
     records: list[Record] = []
@@ -1384,6 +1396,7 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
     unusable: list[str] = []
     unverifiable: dict[str, list[str]] = {}
     acknowledged: dict[str, list[str]] = {}
+    receipts: dict[str, dict] = {}
     for task_id, entry in sorted(previous.items()):
         if task_id in current_ids:
             continue
@@ -1417,12 +1430,10 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
             # (the task moved, and the new project's disappearance is a new
             # fact). Loud now, quiet afterwards.
             unverifiable.setdefault(project_id, []).append(task_id)
-            retained[task_id] = {
-                **entry,
-                UNCOVERED_ACK_KEY: {
-                    "project_id": project_id,
-                    "first_reported": now.isoformat(),
-                },
+            retained[task_id] = entry
+            receipts[task_id] = {
+                "project_id": project_id,
+                "first_reported": now.isoformat(),
             }
             continue
         records.append(record)
@@ -1433,6 +1444,7 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
         unverifiable=unverifiable,
         acknowledged=acknowledged,
         saw_nothing=not current_ids,
+        receipts=receipts,
     )
 
 
@@ -1632,8 +1644,8 @@ def plan_open_task_reconcile(
     poll: OpenTaskPoll,
     now: datetime,
     errors: list[str] | None = None,
-) -> tuple[list[Record], Callable[[], None]]:
-    """Diff this poll against the baseline; hand back the save as a callable.
+) -> tuple[list[Record], Callable[[], None], Callable[[], None]]:
+    """Diff this poll against the baseline; hand back both saves as callables.
 
     TAKES AN :class:`OpenTaskPoll`, not a bare task list, and that is
     load-bearing rather than typing taste. Inference is only sound over a
@@ -1660,15 +1672,32 @@ def plan_open_task_reconcile(
     infer and then writing a baseline without them would lose exactly the same
     completions by a quieter route.
 
-    THAT REFUSAL IS REPORTED ONCE PER DISAPPEARANCE, not once per poll: the
-    commit stamps each carried-forward entry with a receipt
-    (:data:`UNCOVERED_ACK_KEY`) and a later poll that finds the same receipt
-    stays quiet. Deleting a project is a routine act, and an error on every
-    30-minute tick forever is an alarm an operator learns to ignore — which
-    costs the next REAL ingest failure its audience, i.e. it defeats the very
-    rule it was written to satisfy. Retention is untouched by this; only the
-    report is. :func:`uncovered_projects` reads the receipts back for
-    ``aggregator status``, so the quiet state stays inspectable.
+    THAT REFUSAL IS REPORTED ONCE PER DISAPPEARANCE, not once per poll: each
+    carried-forward entry is stamped with a receipt (:data:`UNCOVERED_ACK_KEY`)
+    and a later poll that finds the same receipt stays quiet. Deleting a project
+    is a routine act, and an error on every 30-minute tick forever is an alarm
+    an operator learns to ignore — which costs the next REAL ingest failure its
+    audience, i.e. it defeats the very rule it was written to satisfy. Retention
+    is untouched by this; only the report is. :func:`uncovered_projects` reads
+    the receipts back for ``aggregator status``, so the quiet state stays
+    inspectable.
+
+    THE RECEIPT IS THEREFORE THE THIRD RETURN VALUE, not part of ``commit``. A
+    receipt asserts that A HUMAN WAS TOLD, and the baseline advance happens long
+    before that is true: the run's report is delivered — desktop notification,
+    or the caller's stderr — only after every adapter has finished. Written by
+    ``commit``, the receipt recorded "we tried to tell them": a notify hook that
+    could not run (missing program, non-zero exit, an exception) left the mark
+    on disk anyway, so every later poll read the disappearance as
+    already-reported and stayed quiet. The single alert a human was supposed to
+    get was suppressed by a record claiming they got it.
+
+    So ``commit`` advances the baseline (which must not wait for anything —
+    a frozen baseline loses completions permanently) and ``commit_receipts``
+    stamps the marks, to be called ONLY once the report has actually reached
+    its channel. Skipping it costs one more report of the same disappearance,
+    which is the harmless direction; calling it early costs the report
+    altogether, which is not.
 
     TWO-PHASE, and that is the point. The diff has to happen now — it needs
     the poll — but advancing the baseline is a destructive act: it is what
@@ -1698,7 +1727,7 @@ def plan_open_task_reconcile(
     tasks = list(poll.tasks)
     if not poll.complete:
         _note(errors, INCOMPLETE_POLL_NOTE)
-        return [], lambda: None
+        return [], lambda: None, lambda: None
 
     try:
         previous = state.load()
@@ -1713,7 +1742,7 @@ def plan_open_task_reconcile(
         # this turns on: losing the file costs one poll's inference and is
         # recoverable, overwriting it is permanent.
         _note(errors, str(e))
-        return [], lambda: None
+        return [], lambda: None, lambda: None
 
     # The diff and the report are taken separately from ``infer_completions``
     # because the commit needs the diff's ``retained`` set as well as its
@@ -1726,7 +1755,56 @@ def plan_open_task_reconcile(
     def commit() -> None:
         state.save(tasks, now, diff.retained)
 
-    return diff.records, commit
+    def commit_receipts() -> None:
+        _stamp_receipts(state, diff.receipts, now)
+
+    return diff.records, commit, commit_receipts
+
+
+def _stamp_receipts(
+    state: OpenTaskState, receipts: dict[str, dict], now: datetime
+) -> None:
+    """Mark the reported disappearances as reported. Call AFTER delivery.
+
+    A READ-MODIFY-WRITE, not a replay of the poll's own payload. By the time
+    this runs the baseline on disk is the advanced one ``commit`` wrote — and
+    possibly a newer one still, since ``run_imports`` is public and ingests can
+    overlap — so the marks are applied to what is THERE, through the same
+    load/save pair (and therefore the same compare-and-swap) as every other
+    write to this file. Reconstructing the payload from the poll would quietly
+    undo the advance instead.
+
+    Each mark is applied only where it is still true: the entry must still be
+    present, still belong to the project the report NAMED, and not already carry
+    a receipt. A task that moved, came back, or was replaced between the two
+    writes has had a new fact happen to it, and a stale mark would mute the next
+    poll's report of that new fact — the same permanent silence this function
+    exists to prevent, arriving one step later.
+
+    Nothing to stamp is the overwhelmingly common case (no project vanished),
+    and it costs no read and no write at all.
+    """
+    if not receipts:
+        return
+    current = state.load()
+    stamped = False
+    for task_id, mark in receipts.items():
+        entry = current.get(task_id)
+        if not isinstance(entry, dict):
+            continue
+        if entry_project_id(entry) != mark.get("project_id"):
+            continue
+        if uncovered_mark(entry) is not None:
+            continue
+        current[task_id] = {**entry, UNCOVERED_ACK_KEY: mark}
+        stamped = True
+    if not stamped:
+        return
+    # ``tasks=[]`` because ``current`` IS the whole baseline: ``_write_state``
+    # seeds the payload from ``retain`` and then lets this poll's tasks win the
+    # overlap, so passing the poll again here would re-stamp ``last_seen`` on an
+    # observation that happened at ``now`` and is already recorded.
+    state.save([], now, current)
 
 
 def reconcile_open_tasks(
@@ -1743,7 +1821,14 @@ def reconcile_open_tasks(
 
     Typed against :class:`OpenTaskState`, so nothing here knows or cares that
     the baseline is a JSON file.
+
+    Stamps the uncovered-project receipts too, because a caller with nothing to
+    write also has nothing to wait for: its ``errors`` list IS the report and it
+    is complete the moment this returns.
     """
-    records, commit = plan_open_task_reconcile(state, poll, now, errors)
+    records, commit, commit_receipts = plan_open_task_reconcile(
+        state, poll, now, errors
+    )
     commit()
+    commit_receipts()
     return records

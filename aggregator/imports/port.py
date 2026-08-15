@@ -170,6 +170,38 @@ class SupportsWriteBarrier(Protocol):
 
 
 @runtime_checkable
+class SupportsReportBarrier(Protocol):
+    """Optional: an adapter that may only go quiet once a human was TOLD.
+
+    The second barrier, and it exists because the first one fires too early to
+    answer a different question. ``SupportsWriteBarrier`` asks "did the records
+    land?"; this asks "did the run's report reach anybody?" — and the answer to
+    that is not known until every adapter has finished and ``notify`` has run.
+
+    TickTick is again the case. A baseline task whose project the poll could not
+    cover is retained and REPORTED, and the report is deliberately made once per
+    disappearance rather than once per poll (an error on every 30-minute tick is
+    an alarm an operator learns to ignore, which costs the next real failure its
+    audience). The suppression is a receipt written into the baseline — and
+    written by the write barrier it recorded "we tried to tell them", not "they
+    were told": a notify hook that could not run left the receipt behind anyway,
+    so every later poll stayed quiet about a disappearance nobody ever heard
+    about. One alert, suppressed by a record claiming it was delivered.
+
+    So the receipt waits for this. The runner calls it after ``notify`` returns
+    WITHOUT raising; the single-source CLI path calls it after printing the run's
+    errors, which is that path's only channel. A hook that raised means the
+    report reached nobody, so nothing is stamped and the next run reports again.
+
+    NOT CALLING IT IS THE SAFE DIRECTION, unlike the write barrier: the cost is
+    one more report of a disappearance already reported, never a lost one. The
+    two barriers therefore fail opposite ways on purpose.
+    """
+
+    def commit_after_report(self) -> None: ...
+
+
+@runtime_checkable
 class SupportsInputFreshness(Protocol):
     """Optional: when was the newest input this adapter reads last touched?
 

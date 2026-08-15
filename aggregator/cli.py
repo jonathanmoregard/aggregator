@@ -360,6 +360,31 @@ def _commit_after_write(src: Any, errors: list[str]) -> None:
         errors.append(f"{type(e).__name__}: {e}")
 
 
+def _commit_after_report(src: Any) -> str | None:
+    """Let a source record that this run's report reached a human. Or why not.
+
+    The single-source half of ``imports/port.SupportsReportBarrier``; the runner
+    does the same after ``notify`` returns. Reached only once the summary and
+    every error line are on stderr, because on THIS path stderr is the whole
+    delivery channel — no notifier is installed here (``--notify`` is refused
+    without ``--all``), so a human running this command is the audience and the
+    print above is the delivery.
+
+    Returns the fault instead of appending to ``errors``, because ``errors`` has
+    already been printed by the time this runs; the caller prints what comes
+    back and takes exit 3 for it. Loud, but the loss is small: all a failed
+    receipt costs is one more report of a disappearance already reported.
+    """
+    commit = getattr(src, "commit_after_report", None)
+    if commit is None:
+        return None
+    try:
+        commit()
+    except Exception as e:  # noqa: BLE001 -- reported, never fatal to the write
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 def _iterate(
     iter_fn: Callable[..., Any],
     since: datetime | None,
@@ -489,6 +514,12 @@ def _cmd_ingest_entities(
     if errors:
         for e in errors[:5]:
             print(f"  error: {e}", file=sys.stderr)
+    # Same order and same reason as the records path: stderr is the channel, so
+    # the receipt is only earned once the lines above are on it.
+    late = _commit_after_report(src)
+    if late is not None:
+        print(f"  error: {late}", file=sys.stderr)
+    if errors or late is not None:
         return EXIT_COMPLETED_WITH_ERRORS
     return 0
 
@@ -702,6 +733,12 @@ def _cmd_ingest(
     if errors:
         for e in errors[:5]:
             print(f"  error: {e}", file=sys.stderr)
+    # AFTER the errors are on stderr, which is this path's entire delivery
+    # channel — there is no notify hook here. See ``_commit_after_report``.
+    late = _commit_after_report(src)
+    if late is not None:
+        print(f"  error: {late}", file=sys.stderr)
+    if errors or late is not None:
         # 3, not 0: a run that completed but dropped files is not a success,
         # and a partially-successful run is not a successful run — some
         # records landing does not make the missing ones acceptable. A timer
