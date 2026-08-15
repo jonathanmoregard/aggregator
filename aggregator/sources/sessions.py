@@ -140,6 +140,27 @@ def _note_dropped_lines(
     )
 
 
+# The two ways a timestamp costs data, spelled out where the reports are made
+# rather than inline, because they are different diagnoses. A line the parser
+# cannot date is dropped from the session it belongs to; a FILE in which not one
+# line can be dated loses its session row and every observation under it,
+# because ``first_ts``/``last_ts`` have nothing to be derived from.
+#
+# This is the shape a vendor format change takes. Every other line-level fault
+# here is a corrupt or wrongly-shaped line, i.e. damage to one line; a
+# timestamp-spelling change is uniform, hits every line at once, and would have
+# emptied ~5,700 sessions and ~359k observations at exit 0. Measured against the
+# real ~/.claude/projects tree at the time of writing: 0 of 186,285 parsed lines
+# lack a parseable timestamp, so neither of these reports fires on healthy input
+# and neither can crowd another source's line out of the notification budget.
+_UNDATED_LINES = "line(s) whose timestamp is missing or unparseable"
+_UNDATED_FILE = (
+    "line(s) whose timestamp is missing or unparseable — EVERY line in the file, "
+    "so its session row and every observation under it are dropped whole, which "
+    "is the shape a vendor timestamp-format change takes"
+)
+
+
 def _parse_iso(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -254,8 +275,16 @@ def _extract_text_and_tools(content: Any) -> tuple[str, str | None, str | None]:
 
 @dataclass
 class _ParsedLine:
-    """One JSONL line, parsed enough to bucket into sessions."""
+    """One JSONL line, parsed enough to bucket into sessions.
 
+    ``lineno`` is carried purely so a line dropped LATER — after ``_iter_parsed``
+    has handed it over — can still be named in a fault report the same way the
+    corrupt-line and wrong-shape reports name theirs. Without it a drop report
+    could only cite uuids, which do not tell an operator where in the file to
+    look.
+    """
+
+    lineno: int
     session_id: str
     uuid: str
     parent_uuid: str | None
@@ -402,7 +431,7 @@ class SessionsSource:
     # -- JSONL line parsing ----------------------------------------------
 
     @staticmethod
-    def _parse_line(obj: dict) -> _ParsedLine | None:
+    def _parse_line(obj: dict, lineno: int) -> _ParsedLine | None:
         sid = obj.get("sessionId")
         uid = obj.get("uuid")
         if not isinstance(sid, str) or not sid:
@@ -469,6 +498,7 @@ class SessionsSource:
             line_type = "tool_result"
 
         return _ParsedLine(
+            lineno=lineno,
             session_id=sid,
             uuid=uid,
             parent_uuid=parent_uuid,
@@ -525,7 +555,7 @@ class SessionsSource:
                     # what a truncated-then-reappended file leaves behind.
                     wrong_shape.append(f"{lineno} ({type(obj).__name__})")
                     continue
-                parsed = self._parse_line(obj)
+                parsed = self._parse_line(obj, lineno)
                 if parsed is not None:
                     yield parsed
         finally:
@@ -756,7 +786,7 @@ class SessionsSource:
         if is_subagent_file:
             # All lines in a subagent file belong to that stream. Group by
             # sessionId still (defensive; typically only one).
-            for entity in self._emit_subagent(path, parsed, spawn_index, since):
+            for entity in self._emit_subagent(path, parsed, spawn_index, since, errors):
                 yield entity
         else:
             dominant = self._dominant_session_id(parsed, path)
@@ -765,8 +795,38 @@ class SessionsSource:
             # Only ingest lines matching the dominant sessionId — drops the
             # resume prefix-copy portion (which belongs to the parent file).
             own_lines = [p for p in parsed if p.session_id == dominant]
-            for entity in self._emit_top_level(path, dominant, own_lines, since):
+            for entity in self._emit_top_level(path, dominant, own_lines, since, errors):
                 yield entity
+
+    @staticmethod
+    def _dated(
+        path: Path, lines: list[_ParsedLine], errors: list[str]
+    ) -> list[datetime] | None:
+        """The timestamps ``lines`` carry, or None when NOT ONE of them has any.
+
+        Both answers are reported, and neither used to be. A line with no
+        parseable timestamp was dropped by a bare ``if p.ts is None: continue``,
+        and a file in which every line is like that returned before emitting
+        anything at all — no errors entry, no log line, exit 0.
+
+        Sessions is the largest source in the index. The earlier dropped-line
+        reporting covers corrupt JSON and wrong-shaped JSON only, which are
+        per-line accidents; a timestamp-spelling change by the vendor is uniform
+        and would have emptied ~5,700 sessions and ~359k observations while the
+        30-minute timer went on reporting success.
+
+        Aggregated per file — capped example line numbers, EXACT count — for the
+        same reason the corrupt-line report is: a format drift hits every line
+        at once, and one error per line would bury every other fault in the run
+        in the CLI's ``errors[:5]`` view and in the notification payload.
+        """
+        undated = [str(p.lineno) for p in lines if p.ts is None]
+        dated = [p.ts for p in lines if p.ts is not None]
+        if not dated:
+            _note_dropped_lines(path, _UNDATED_FILE, undated, errors)
+            return None
+        _note_dropped_lines(path, _UNDATED_LINES, undated, errors)
+        return dated
 
     def _emit_top_level(
         self,
@@ -774,11 +834,12 @@ class SessionsSource:
         session_id: str,
         lines: list[_ParsedLine],
         since: datetime | None,
+        errors: list[str],
     ) -> Iterator[SessionEntity]:
         if not lines:
             return
-        tss = [p.ts for p in lines if p.ts is not None]
-        if not tss:
+        tss = self._dated(path, lines, errors)
+        if tss is None:
             return
         first_ts, last_ts = min(tss), max(tss)
         since_utc = _normalise_utc(since) if since else None
@@ -824,6 +885,7 @@ class SessionsSource:
         lines: list[_ParsedLine],
         spawn_index: dict[str, dict[str, str]],
         since: datetime | None,
+        errors: list[str],
     ) -> Iterator[SessionEntity]:
         parent_sid = self._parent_session_from_path(path)
         # Agent id: prefer the file name (authoritative); fall back to first
@@ -845,8 +907,8 @@ class SessionsSource:
         dominant = self._dominant_session_id(lines, path)
         own_lines = [p for p in lines if p.session_id == dominant]
 
-        tss = [p.ts for p in own_lines if p.ts is not None]
-        if not tss:
+        tss = self._dated(path, own_lines, errors)
+        if tss is None:
             return
         first_ts, last_ts = min(tss), max(tss)
         since_utc = _normalise_utc(since) if since else None

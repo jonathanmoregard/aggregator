@@ -377,6 +377,122 @@ def test_the_two_line_faults_are_reported_separately(tmp_path):
     assert any("DROPPED 1 line(s) that are valid JSON" in e for e in errors)
 
 
+def _undated_line(uuid: str, ts: str | None, sid: str = "sess-drift") -> str:
+    obj: dict = {
+        "type": "user",
+        "sessionId": sid,
+        "uuid": uuid,
+        "cwd": "/x",
+        "message": {"role": "user", "content": "hi"},
+    }
+    if ts is not None:
+        obj["timestamp"] = ts
+    return json.dumps(obj) + "\n"
+
+
+def test_a_file_no_line_of_which_can_be_dated_reaches_the_errors_sink(tmp_path):
+    """Round-11 MEDIUM 2. A vendor timestamp change must not empty the index.
+
+    ``first_ts``/``last_ts`` are derived from the lines, so a file where not one
+    line can be dated returned before emitting anything — no errors entry, no
+    log line, exit 0. The earlier dropped-line reporting covers corrupt JSON and
+    wrong-shaped JSON ONLY, which are per-line accidents; a timestamp-spelling
+    change is uniform and would have emptied ~5,700 sessions and ~359k
+    observations while the 30-minute timer reported success.
+    """
+    p = tmp_path / "sess-drift.jsonl"
+    p.write_text("".join(_undated_line(f"u{i}", f"26/08/15 10:00:0{i}") for i in range(5)))
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+
+    sessions, observations, errors = _split_entities(
+        SessionsSource(projects_root=str(tmp_path))
+    )
+
+    assert (sessions, observations) == ([], [])
+    assert len(errors) == 1
+    assert "sess-drift.jsonl" in errors[0]
+    assert "DROPPED 5 line(s) whose timestamp is missing or unparseable" in errors[0]
+    assert "EVERY line in the file" in errors[0]
+
+
+def test_individual_undated_lines_reach_the_errors_sink(tmp_path):
+    """The partial case: the session still lands, the dropped lines are named.
+
+    ``if p.ts is None: continue`` dropped these silently. An observation simply
+    ceased to exist and the session it belonged to looked like it just had
+    fewer lines.
+    """
+    p = tmp_path / "sess-partial.jsonl"
+    p.write_text(
+        _undated_line("ok1", "2026-07-26T10:00:01Z", sid="sess-partial")
+        + _undated_line("bad1", None, sid="sess-partial")
+        + _undated_line("bad2", "not-a-date", sid="sess-partial")
+    )
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+
+    sessions, observations, errors = _split_entities(
+        SessionsSource(projects_root=str(tmp_path))
+    )
+
+    assert len(sessions) == 1
+    assert [o.obs_id for o in observations] == ["ok1"]
+    assert len(errors) == 1
+    assert "DROPPED 2 line(s) whose timestamp is missing or unparseable" in errors[0]
+    # The line numbers, so an operator can go and look at the actual bytes.
+    assert "(line 2, 3)" in errors[0]
+
+
+def test_a_wholly_undated_file_does_not_produce_one_error_per_line(tmp_path):
+    """The cap, for the fault most likely to hit every line at once.
+
+    A format drift is uniform by nature, so this is precisely the report that
+    must not put one entry per line into ``errors[:5]`` and the notification
+    payload. Capped identifiers, exact count — same shape as the corrupt-line
+    report, deliberately.
+    """
+    p = tmp_path / "sess-flood.jsonl"
+    p.write_text("".join(_undated_line(f"u{i}", None) for i in range(500)))
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+
+    _s, _o, errors = _split_entities(SessionsSource(projects_root=str(tmp_path)))
+
+    assert len(errors) == 1
+    assert "DROPPED 500 line(s)" in errors[0], "the exact count must survive"
+    assert "line 1, 2, 3, 4, 5, ..." in errors[0]
+    assert "6" not in errors[0].split("(line", 1)[1], "identifiers are capped at five"
+
+
+def test_an_undated_subagent_file_reaches_the_errors_sink(tmp_path):
+    """The subagent emitter had the same two silent drops as the top-level one."""
+    d = tmp_path / "sess-parent" / "subagents"
+    d.mkdir(parents=True)
+    p = d / "agent-a1.jsonl"
+    p.write_text(
+        "".join(
+            _undated_line(f"s{i}", None, sid="sess-sub-drift") for i in range(3)
+        )
+    )
+    os.utime(p, (time.time() - 24 * 60 * 60,) * 2)
+
+    sessions, observations, errors = _split_entities(
+        SessionsSource(projects_root=str(tmp_path))
+    )
+
+    assert (sessions, observations) == ([], [])
+    assert len(errors) == 1
+    assert "agent-a1.jsonl" in errors[0]
+    assert "DROPPED 3 line(s)" in errors[0]
+
+
+def test_a_healthy_file_adds_no_timestamp_error(fixtures_dir):
+    """Only DRIFT is loud. Measured against the real ~/.claude/projects tree,
+    0 of 186,285 parsed lines lack a parseable timestamp — so these reports
+    must stay silent on healthy input, or they become the alert nobody reads
+    and they spend the notification budget every other source competes for."""
+    _s, _o, errors = _split_entities(SessionsSource(projects_root=str(fixtures_dir)))
+    assert [e for e in errors if "timestamp" in e] == []
+
+
 def test_an_unstattable_file_reaches_the_errors_sink(tmp_path):
     """Round-5 HIGH 3. A whole JSONL dropped by a failed ``stat`` was invisible.
 
