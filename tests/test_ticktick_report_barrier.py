@@ -21,8 +21,10 @@ this one costs one more copy of a report that was already made.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sqlite3
+import sys
 from datetime import UTC, datetime
 
 import pytest
@@ -95,6 +97,14 @@ class _Sink:
 class _FailingSink:
     def write(self, items) -> WriteCounts:
         raise sqlite3.OperationalError("database is locked")
+
+
+class _WatchedTerminal(io.StringIO):
+    """stderr with a person in front of it — the only shape in which printing
+    to it is a delivery. See ``cli._stderr_delivery``."""
+
+    def isatty(self) -> bool:
+        return True
 
 
 def _source(tmp_path, state_file) -> TickTickSource:
@@ -270,14 +280,21 @@ def test_a_receipt_is_not_stamped_onto_an_entry_that_moved_meanwhile(tmp_path):
 
 
 def test_the_cli_path_records_the_report_it_printed_to_stderr(
-    tmp_path, state_file, capsys
+    tmp_path, state_file, monkeypatch
 ):
     """``aggregator ingest ticktick`` installs no notifier at all — ``--notify``
     is refused without ``--all`` — so stderr IS the delivery and the receipt is
     earned by printing. Without this the fix would have traded permanent silence
-    for a permanent alarm on the interactive path."""
+    for a permanent alarm on the interactive path.
+
+    ROUND 6 NARROWED THIS to an INTERACTIVE stderr. The claim above is only true
+    with a person in front of the terminal; under the timer, stderr is the
+    journal. See ``tests/test_delivery_contract.py`` for the unattended half.
+    """
     store = Store(db_path=tmp_path / "cache.db")
     store.migrate()
+    terminal = _WatchedTerminal()
+    monkeypatch.setattr(sys, "stderr", terminal)
 
     def _ingest() -> int:
         return cli.main(
@@ -287,10 +304,11 @@ def test_the_cli_path_records_the_report_it_printed_to_stderr(
         )
 
     assert _ingest() == cli.EXIT_COMPLETED_WITH_ERRORS
-    assert UNCOVERED in capsys.readouterr().err
+    assert UNCOVERED in terminal.getvalue()
+    terminal.truncate(0)
 
     assert _ingest() == 0, "the interactive path re-raised a reported alarm"
-    assert UNCOVERED not in capsys.readouterr().err
+    assert UNCOVERED not in terminal.getvalue()
 
 
 # -- the contract, against a probe rather than TickTick -------------------

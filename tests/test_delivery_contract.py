@@ -1,4 +1,4 @@
-"""Round-6 HIGH 1: the default no-op notifier counted as delivery.
+"""Round-6 HIGH 1 + HIGH 2: delivery is DECLARED, never inferred.
 
 Third round on one bug, and the same conceptual error each time — INFERRING
 DELIVERY FROM THE ABSENCE OF AN ERROR. An uncovered TickTick project must be
@@ -10,6 +10,9 @@ reported once and then go quiet, and the receipt that makes it quiet was stamped
       raising. So every run with no notifier configured stamped receipts with no
       human channel in existence, and the single alert the mechanism exists to
       raise was suppressed by a record of its own delivery.
+  R6 again, one surface over: the single-source CLI path stamped after printing
+      to stderr — but the timer that runs these ingests sends stderr to the
+      journal, which nobody reads unprompted.
 
 The shape changed rather than the check: a hook now RETURNS
 ``Delivery.DELIVERED`` or it did not deliver. ``None`` is the default answer and
@@ -22,11 +25,14 @@ live API, the developer's credential, or the real baseline.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import sys
 
 import pytest
 
 from aggregator import cli
+from aggregator.core.store import Store
 from aggregator.imports.port import Delivery, WriteCounts
 from aggregator.imports.runner import RunReport, _no_notification, run_imports
 from aggregator.imports.ticktick import TickTickAdapter
@@ -88,6 +94,13 @@ class _Sink:
         return WriteCounts(added=len(items))
 
 
+class _WatchedTerminal(io.StringIO):
+    """stderr with a person in front of it."""
+
+    def isatty(self) -> bool:
+        return True
+
+
 def _source(tmp_path, state_file) -> TickTickSource:
     return TickTickSource(
         backup_dir=tmp_path / "no-downloads",
@@ -123,6 +136,15 @@ def _delivering(heard: list[str]):
 
 def _broken(report) -> None:
     raise FileNotFoundError("notify-send: command not found")
+
+
+def _ingest(tmp_path, state_file, store) -> int:
+    """``aggregator ingest ticktick`` — the single-source path, no notifier."""
+    return cli.main(
+        ["ingest", "ticktick"],
+        _store=store,
+        _sources={"ticktick": _source(tmp_path, state_file)},
+    )
 
 
 # -- HIGH 1 ---------------------------------------------------------------
@@ -166,6 +188,80 @@ def test_a_truthy_return_value_is_not_a_declaration(tmp_path, state_file):
     assert _reported(first)
 
     assert _reported(_run(tmp_path, state_file)), "a truthy value passed for delivery"
+
+
+# -- HIGH 2 ---------------------------------------------------------------
+
+
+def test_stderr_on_an_unattended_run_is_not_a_delivery_channel(
+    tmp_path, state_file, capsys
+):
+    """THE repro. ``aggregator ingest ticktick`` under the systemd timer writes
+    its errors into the journal and stamps the receipt for having done so — but
+    nobody reads a journal unprompted, so the one alert was spent on nothing.
+    (pytest's captured stderr is not a tty, which is that exact shape.)"""
+    store = Store(db_path=tmp_path / "cache.db")
+    store.migrate()
+    assert not sys.stderr.isatty(), "this fixture is the unattended shape"
+
+    assert _ingest(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS
+    assert UNCOVERED in capsys.readouterr().err
+
+    assert _ingest(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS, (
+        "the disappearance was written to a journal nobody reads and then "
+        "marked as reported to a human"
+    )
+
+
+def test_stderr_with_somebody_watching_it_is_a_delivery_channel(
+    tmp_path, state_file, monkeypatch
+):
+    """The other half, and the round-4 fix it must not cost: at an interactive
+    terminal the print IS the delivery — a person is looking at it — so the
+    alarm is raised once and not on every subsequent run."""
+    store = Store(db_path=tmp_path / "cache.db")
+    store.migrate()
+    terminal = _WatchedTerminal()
+    monkeypatch.setattr(sys, "stderr", terminal)
+
+    assert _ingest(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS
+    assert UNCOVERED in terminal.getvalue()
+
+    assert _ingest(tmp_path, state_file, store) == 0, (
+        "a human was told and the alarm fired again anyway"
+    )
+
+
+def test_a_report_the_terminal_never_showed_is_not_delivered(
+    tmp_path, state_file, monkeypatch
+):
+    """The other way the print misses its audience. Only the first
+    ``ERROR_PRINT_LIMIT`` errors are shown, and the vanished-project line is
+    appended mid-run — enough earlier failures push it off the end, and the
+    receipt would be stamped for a sentence that was never on screen."""
+    terminal = _WatchedTerminal()
+    monkeypatch.setattr(sys, "stderr", terminal)
+    store = Store(db_path=tmp_path / "cache.db")
+    store.migrate()
+    noisy = _source(tmp_path, state_file)
+    real_iter = noisy.iter_records
+
+    def iter_records(since, errors=None):
+        if errors is not None:
+            errors.extend(f"an earlier unrelated failure {n}" for n in range(5))
+        return real_iter(since, errors=errors)
+
+    noisy.iter_records = iter_records
+
+    first = cli.main(
+        ["ingest", "ticktick"], _store=store, _sources={"ticktick": noisy}
+    )
+
+    assert first == cli.EXIT_COMPLETED_WITH_ERRORS
+    assert UNCOVERED not in terminal.getvalue(), "precondition: it was truncated"
+    assert _ingest(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS, (
+        "a receipt was stamped for a line the operator never saw"
+    )
 
 
 # -- the contract, end to end ---------------------------------------------

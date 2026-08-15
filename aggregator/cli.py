@@ -95,6 +95,11 @@ _RATIO_GUARD_KEEP_FRACTION = 0.8  # refuse if new < 0.8 * existing
 # timer that reads 0 as success lets the index rot unnoticed.
 EXIT_COMPLETED_WITH_ERRORS = 3
 
+# How many of a run's errors the single-source path prints. Named because it is
+# no longer only a display choice: what is elided was not reported, so a run that
+# truncated cannot claim its report reached anybody — see ``_stderr_delivery``.
+ERROR_PRINT_LIMIT = 5
+
 # How old a manually-refreshed input may get before `ingest --all` nags.
 # Overridable with `--stale-after-days`.
 #
@@ -360,21 +365,62 @@ def _commit_after_write(src: Any, errors: list[str]) -> None:
         errors.append(f"{type(e).__name__}: {e}")
 
 
-def _commit_after_report(src: Any) -> str | None:
+def _stderr_delivery(errors: list[str]) -> Delivery:
+    """Did printing this run's errors to stderr actually reach a person?
+
+    ONLY AT AN INTERACTIVE TERMINAL. ``aggregator ingest <source>`` installs no
+    notifier at all (``--notify`` is refused without ``--all``), so the print is
+    the entire channel — and a channel nobody is standing in front of is not a
+    channel. Under the systemd timer that runs this repo's ingests, stderr is the
+    journal: it is written, it is retained, and no human reads it unprompted.
+    Treating that as delivery is the round-4/5/6 defect one surface over, and it
+    is worse here than in the runner, because this path has no fallback notifier
+    to be misconfigured — it is silent by design.
+
+    ``isatty`` is the question actually being asked ("is somebody there?") and
+    the one the shell answers correctly for every redirection: ``2>log``, a pipe,
+    a systemd unit and a cron job all say no; a person at a prompt says yes.
+
+    TRUNCATION IS THE SECOND WAY THE PRINT MISSES. The caller shows the first
+    :data:`ERROR_PRINT_LIMIT` errors, and the report barrier's own error — the
+    vanished-project line — is appended mid-run, so a source that logged five
+    unreadable backups first pushes it off the end. The receipt would then be
+    stamped for a sentence that was never on screen. Anything elided means
+    undelivered; the cost is one repeat of a report that is already repeating.
+
+    Never raises: a closed or replaced stream answers "not delivered", which is
+    the direction that keeps reporting rather than the one that goes quiet.
+    """
+    if len(errors) > ERROR_PRINT_LIMIT:
+        return Delivery.UNDELIVERED
+    try:
+        watched = sys.stderr.isatty()
+    except (AttributeError, ValueError):  # pragma: no cover - closed/odd stream
+        return Delivery.UNDELIVERED
+    return Delivery.DELIVERED if watched else Delivery.UNDELIVERED
+
+
+def _commit_after_report(src: Any, delivery: Delivery) -> str | None:
     """Let a source record that this run's report reached a human. Or why not.
 
     The single-source half of ``imports/port.SupportsReportBarrier``; the runner
-    does the same after ``notify`` returns. Reached only once the summary and
-    every error line are on stderr, because on THIS path stderr is the whole
-    delivery channel — no notifier is installed here (``--notify`` is refused
-    without ``--all``), so a human running this command is the audience and the
-    print above is the delivery.
+    does the same when its notify hook declares delivery. Reached only once the
+    summary and every error line are on stderr — and only if ``delivery`` says
+    that print had an audience. See :func:`_stderr_delivery`: on an unattended
+    run it does not, and the run then stamps nothing and reports again next time.
+
+    ``delivery`` is a PARAMETER rather than something computed in here, so the
+    call site has to name the channel it is claiming. There is exactly one such
+    channel on this path today; a future one (a mailer, a webhook) is then a new
+    value passed in, not an assumption already baked into this function.
 
     Returns the fault instead of appending to ``errors``, because ``errors`` has
     already been printed by the time this runs; the caller prints what comes
     back and takes exit 3 for it. Loud, but the loss is small: all a failed
     receipt costs is one more report of a disappearance already reported.
     """
+    if delivery is not Delivery.DELIVERED:
+        return None
     commit = getattr(src, "commit_after_report", None)
     if commit is None:
         return None
@@ -512,11 +558,12 @@ def _cmd_ingest_entities(
         f"observations={obs_count} errors={len(errors)}"
     )
     if errors:
-        for e in errors[:5]:
+        for e in errors[:ERROR_PRINT_LIMIT]:
             print(f"  error: {e}", file=sys.stderr)
     # Same order and same reason as the records path: stderr is the channel, so
-    # the receipt is only earned once the lines above are on it.
-    late = _commit_after_report(src)
+    # the receipt is only earned once the lines above are on it AND somebody was
+    # there to read them.
+    late = _commit_after_report(src, _stderr_delivery(errors))
     if late is not None:
         print(f"  error: {late}", file=sys.stderr)
     if errors or late is not None:
@@ -731,11 +778,12 @@ def _cmd_ingest(
         f"skipped={skipped} errors={len(errors)}"
     )
     if errors:
-        for e in errors[:5]:
+        for e in errors[:ERROR_PRINT_LIMIT]:
             print(f"  error: {e}", file=sys.stderr)
     # AFTER the errors are on stderr, which is this path's entire delivery
-    # channel — there is no notify hook here. See ``_commit_after_report``.
-    late = _commit_after_report(src)
+    # channel — there is no notify hook here — and only when that stderr is a
+    # terminal somebody is watching. See ``_stderr_delivery``.
+    late = _commit_after_report(src, _stderr_delivery(errors))
     if late is not None:
         print(f"  error: {late}", file=sys.stderr)
     if errors or late is not None:
