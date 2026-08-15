@@ -662,6 +662,82 @@ def test_vocabulary_drift_in_a_backup_reaches_the_runs_errors_sink(tmp_path):
     assert "'1'" in errors[0]
 
 
+def test_a_status_drift_across_a_whole_backup_stays_bounded(tmp_path):
+    """Round-11 LOW 4. One error per ROW starves the notification of ticktick's own line.
+
+    ``status_tag`` appends one entry per unrecognised row and a vendor drift is
+    UNIFORM, so across the user's real 1302-row backup this put ~1302 gating
+    ticktick lines into ``report.errors``. The notification budget is five lines
+    and it spends them on receipt-gating errors first — TickTick is the only
+    adapter that gates — so the flood would have crowded out TickTick's own
+    uncovered-project line. That line's receipt is only stamped once it reaches
+    a human (``commit_after_report``), so the alert would never be earned and
+    would repeat, drowned, every 30 minutes. A flood that destroys the alert it
+    is raising.
+    """
+    rows = [_row(task_id=f"t{i}", status="7") for i in range(1302)]
+    _backup(tmp_path / "downloads" / "TickTick.csv", rows)
+    errors: list[str] = []
+
+    records = list(_source(tmp_path).iter_records(None, errors=errors))
+
+    # Every row is still EMITTED — dropping them would lose tasks from an index
+    # whose whole job is to remember them, and nothing regenerates the backup.
+    assert len(records) == 1302
+    assert all(r.extra["status"] == "7" for r in records)
+    # One line, not 1302, and the exact magnitude survives inside it.
+    assert len(errors) == 1
+    assert "1302 rows share this fault" in errors[0]
+    assert "'7'" in errors[0]
+    assert "TickTick.csv" in errors[0]
+
+
+def test_two_drifted_codes_are_two_lines_with_their_own_exact_counts(tmp_path):
+    """Distinct faults are distinct diagnoses; only the repeats collapse."""
+    rows = [_row(task_id=f"a{i}", status="7") for i in range(40)]
+    rows += [_row(task_id=f"b{i}", status="9") for i in range(3)]
+    _backup(tmp_path / "downloads" / "TickTick.csv", rows)
+    errors: list[str] = []
+
+    list(_source(tmp_path).iter_records(None, errors=errors))
+
+    assert len(errors) == 2
+    assert any("40 rows share this fault" in e and "'7'" in e for e in errors)
+    assert any("3 rows share this fault" in e and "'9'" in e for e in errors)
+
+
+def test_many_distinct_drifted_codes_cap_the_kinds_but_not_the_counts(tmp_path):
+    """The cap is on the KINDS named. Capping a count would hide the magnitude,
+    which is the same trade the sessions and github drop reports refuse."""
+    rows = [_row(task_id=f"t{i}", status=str(20 + i)) for i in range(9)]
+    _backup(tmp_path / "downloads" / "TickTick.csv", rows)
+    errors: list[str] = []
+
+    list(_source(tmp_path).iter_records(None, errors=errors))
+
+    assert len(errors) == 6  # five named kinds + one tail line
+    assert "and 4 further DISTINCT row fault(s) not shown" in errors[-1]
+
+
+def test_a_drifted_status_from_the_api_leg_is_bounded_too(tmp_path, monkeypatch):
+    """The two legs share ``status_tag``, so they share the flood."""
+    monkeypatch.setattr(
+        ticktick_api,
+        "poll_open_tasks",
+        lambda token, errors=None: _poll(
+            [{"id": f"t{i}", "projectId": "p1", "status": 7} for i in range(200)]
+        ),
+    )
+    errors: list[str] = []
+
+    records = list(_source(tmp_path, token="tok").iter_records(None, errors=errors))
+
+    assert len(records) == 200
+    assert len(errors) == 1
+    assert "200 rows share this fault" in errors[0]
+    assert "ticktick api poll" in errors[0]
+
+
 def test_a_normal_backup_leaves_the_errors_sink_empty(tmp_path):
     """The other half: an alert that fires on every healthy run is not an alert."""
     _backup(tmp_path / "downloads" / "TickTick.csv", [_row(), _row(task_id="t2", status="2")])

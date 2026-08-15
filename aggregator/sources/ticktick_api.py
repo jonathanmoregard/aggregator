@@ -567,9 +567,11 @@ def task_to_record(
     tag. Task 8 should union tags across the two legs rather than let the API
     record's tag list replace the CSV record's.
 
-    ``errors`` is the run's fault sink, forwarded to ``status_tag`` so a status
-    code neither leg recognises makes the run exit non-zero rather than being
-    quietly filed as open.
+    ``errors`` is forwarded to ``status_tag`` so a status code neither leg
+    recognises makes the run exit non-zero rather than being quietly filed as
+    open. A CALLER LOOPING OVER TASKS MUST PASS A ``ticktick_csv.PerRowFaults``
+    rather than the run's list — one entry per unrecognised task would starve
+    the notification of TickTick's own receipt-gating lines.
     """
     task_id = _task_id(task)  # first, so an unusable payload fails before it warns
     inferred = completed_at is not None

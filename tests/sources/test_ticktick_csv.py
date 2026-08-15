@@ -11,6 +11,7 @@ from aggregator.sources.ticktick_csv import (
     MAX_PREAMBLE_ROWS,
     STATUS_TAGS,
     UNKNOWN_STATUS_TAG,
+    PerRowFaults,
     is_ticktick_backup,
     parse_backup,
     row_to_record,
@@ -236,6 +237,49 @@ def test_a_recognised_status_adds_no_error(tmp_path):
         row = parse_backup(_backup(tmp_path, [_row(status=status)]))[0]
         row_to_record(row, source_file="x.csv", errors=errors)
     assert errors == []
+
+
+def test_per_row_faults_collapses_repeats_and_keeps_the_exact_count():
+    faults = PerRowFaults()
+    for _ in range(1302):
+        faults.append("same fault")
+    errors: list[str] = []
+
+    faults.flush("TickTick.csv", errors)
+
+    assert len(errors) == 1
+    assert "1302 rows share this fault" in errors[0]
+    assert errors[0].startswith("TickTick.csv: ")
+
+
+def test_per_row_faults_names_a_lone_fault_without_a_count_preamble():
+    """A single occurrence must read exactly as it did before this sink existed —
+    the message is carefully written and a "1 rows share this" preamble would
+    only get in its way."""
+    faults = PerRowFaults()
+    faults.append("one odd row")
+    errors: list[str] = []
+
+    faults.flush("TickTick.csv", errors)
+
+    assert errors == ["TickTick.csv: one odd row"]
+
+
+def test_per_row_faults_is_idempotent_and_drops_nothing_twice():
+    faults = PerRowFaults()
+    faults.append("x")
+    errors: list[str] = []
+    faults.flush("f", errors)
+    faults.flush("f", errors)
+    assert errors == ["f: x"]
+
+
+def test_per_row_faults_without_a_sink_reports_nowhere_and_does_not_raise():
+    """``errors is None`` means the source was driven without a sink at all —
+    a degradation ``sync_bridge.unwired_sink_note`` reports one level up."""
+    faults = PerRowFaults()
+    faults.append("x")
+    faults.flush("f", None)  # must not raise
 
 
 def test_status_wins_over_completed_time(tmp_path):

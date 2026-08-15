@@ -208,6 +208,74 @@ def parse_backup(path: Path, errors: list[str] | None = None) -> list[dict[str, 
     return kept
 
 
+# How many DISTINCT per-row faults one file's report names before it says how
+# many kinds it did not show. Deliberately the same five ``parse_backup``'s
+# dropped-row report, github's ``_note_dropped`` and the sessions source use, so
+# the four read as one convention rather than four arbitrary limits.
+_MAX_NAMED_FAULTS = 5
+
+
+class PerRowFaults:
+    """An ``errors`` sink for a per-ROW loop that reports per FILE.
+
+    :func:`status_tag` appends one entry per row it cannot recognise. That is
+    right for a single call and ruinous inside a loop: one vendor status-code
+    drift across the user's real 1302-row backup put ~1302 lines into the run's
+    errors, all saying the same thing.
+
+    Those lines are TickTick's OWN, which is what makes this worse than
+    ordinary noise rather than better. The notification has a five-line budget
+    and spends it on receipt-gating errors first; TickTick is the one adapter
+    that gates, so its flood would crowd out its own uncovered-project line —
+    and ``commit_after_report`` only stamps that receipt once the line has
+    actually reached a human, so the alert would never be earned and would
+    repeat, drowned, forever. A flood that destroys the alert it is trying to
+    raise.
+
+    So a loop passes one of these instead of the run's list and flushes it once
+    per file. Identical messages collapse into ONE entry carrying an exact
+    repeat count — drift is uniform, so in practice that is one line per drifted
+    code — and only the first :data:`_MAX_NAMED_FAULTS` DISTINCT messages are
+    named, with a tail line saying how many kinds were elided. The COUNTS are
+    never capped: capping the magnitude would trade one silent failure for
+    another, which is the same rule ``parse_backup`` and the sessions source
+    follow.
+
+    Duck-types ``list.append`` so it drops into any signature already taking an
+    ``errors`` list, and needs no change to the shared vocabulary helpers.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+
+    def append(self, message: str) -> None:
+        self._counts[message] = self._counts.get(message, 0) + 1
+
+    def flush(self, where: str, errors: list[str] | None) -> None:
+        """Fold everything collected into at most ``_MAX_NAMED_FAULTS + 1`` entries.
+
+        Idempotent: flushing twice reports once. ``errors is None`` means the
+        caller was driven without a sink, which is a degradation reported one
+        level up (``sync_bridge.unwired_sink_note``); dropping the tally here
+        matches what passing ``None`` to ``status_tag`` already did.
+        """
+        counts, self._counts = self._counts, {}
+        if errors is None or not counts:
+            return
+        for message, count in list(counts.items())[:_MAX_NAMED_FAULTS]:
+            errors.append(
+                f"{where}: {message}"
+                if count == 1
+                else f"{where}: {count} rows share this fault, reported once — {message}"
+            )
+        hidden = len(counts) - _MAX_NAMED_FAULTS
+        if hidden > 0:
+            errors.append(
+                f"{where}: and {hidden} further DISTINCT row fault(s) not shown "
+                f"(the counts above are exact; only the kinds are capped)"
+            )
+
+
 def status_tag(
     status: str,
     *,
@@ -219,6 +287,10 @@ def status_tag(
     Shared by both legs: the API leg reads the payload's own ``status`` and must
     tag it with the same word the CSV leg would, or task 8's merge flips a task
     between ``completed`` and ``open`` depending on which leg wrote last.
+
+    ONE ENTRY PER CALL, which is why a caller in a per-row loop must hand it a
+    :class:`PerRowFaults` rather than the run's error list — see that class for
+    what 1302 copies of this message cost.
 
     An unrecognised code is tagged :data:`UNKNOWN_STATUS_TAG` and routed to
     ``errors``, NOT coerced to ``open``. "There is no status 1" was measured
@@ -282,9 +354,12 @@ def row_to_record(
     The status tag comes strictly from ``Status``, never from the presence of a
     ``Completed Time`` — the real export has open rows carrying one.
 
-    ``errors`` is the run's fault sink, forwarded to :func:`status_tag` so a
+    ``errors`` is forwarded to :func:`status_tag`, and to nothing else, so a
     status code this module does not recognise makes the run exit non-zero
-    instead of being quietly filed as open.
+    instead of being quietly filed as open. A CALLER LOOPING OVER ROWS MUST
+    PASS A :class:`PerRowFaults`, not the run's list: this appends one entry per
+    unrecognised row, and a vendor drift is uniform, so a 1302-row backup would
+    otherwise put 1302 lines into a report with a five-line notification budget.
     """
     status = (row.get("Status") or "0").strip()
     created = _parse_dt(row.get("Created Time"))

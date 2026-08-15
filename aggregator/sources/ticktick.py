@@ -37,6 +37,7 @@ from aggregator.sources import ticktick_api
 from aggregator.sources.base import IngestResult, Record
 from aggregator.sources.ticktick_csv import (
     STATUS_OPEN,
+    PerRowFaults,
     is_ticktick_backup,
     parse_backup,
     row_to_record,
@@ -376,11 +377,21 @@ class TickTickSource:
             # sniffed like a backup and then failed to parse must not have
             # already replaced the only surviving copy of the real one.
             self._archive(path)
+            # PER FILE, not per row. ``row_to_record`` forwards this to
+            # ``status_tag``, which appends one entry for every row carrying a
+            # code it does not recognise — and a vendor status drift is uniform,
+            # so across the user's real 1302-row backup that was ~1302 gating
+            # ticktick lines in a report whose notification budget is five. See
+            # ``ticktick_csv.PerRowFaults``: the flood would have starved
+            # TickTick's own uncovered-project line, which is the one line that
+            # has to reach a human before its receipt is stamped.
+            faults = PerRowFaults()
             for row in rows:
-                record = row_to_record(row, source_file=path.name, errors=errors)
+                record = row_to_record(row, source_file=path.name, errors=faults)
                 task_id = _merge_key(record)
                 if task_id not in candidates or candidates[task_id][0] <= mtime:
                     candidates[task_id] = (mtime, record)
+            faults.flush(f"ticktick backup {path.name}", errors)
         return candidates
 
     def _api_candidates(self, errors: list[str] | None) -> dict[str, tuple[datetime, Record]]:
@@ -464,9 +475,13 @@ class TickTickSource:
             return {}
 
         candidates: dict[str, tuple[datetime, Record]] = {}
+        # Per poll, for the same reason the CSV leg aggregates per file: the two
+        # legs share ``status_tag``, so a code the API starts serving floods the
+        # report exactly as a code the export starts writing does.
+        faults = PerRowFaults()
         for task in poll.tasks:
             try:
-                record = ticktick_api.task_to_record(task, errors=errors)
+                record = ticktick_api.task_to_record(task, errors=faults)
             except (ValueError, AttributeError) as e:
                 # A payload with no usable id, or one that is not an object at
                 # all. Skipped rather than allowed to abort the loop: one
@@ -475,6 +490,7 @@ class TickTickSource:
                 _note(errors, f"ticktick api: unusable task payload: {e}")
                 continue
             candidates[_merge_key(record)] = (observed, record)
+        faults.flush("ticktick api poll", errors)
 
         # ``plan_open_task_reconcile`` is the whole state protocol in one call:
         # load the previous poll, diff, and hand back the save as something to
