@@ -41,6 +41,11 @@ reconstruct it from ``runner._run_one``. It is:
                                      (:func:`is_report_gating`) and whose EVERY
                                      reported line is in what step 5 declared
                                      delivered
+  7. the run's own staleness markers — ``runner.commit_staleness_receipts``,
+                                     against the SAME :class:`Delivery`. Not an
+                                     adapter protocol: the warning belongs to
+                                     the run (see ``SupportsInputFreshness``),
+                                     so no adapter has to implement or call it.
 
 Steps 1-4 are matched STRUCTURALLY: having the method is opting in, because
 over-inclusion is free or safe for each of them. Step 6 is the exception and is
@@ -485,6 +490,17 @@ class SupportsInputFreshness(Protocol):
     success. Returning the newest input timestamp lets a later task say
     "substack input is 31 days stale" instead. ``None`` means unknown.
 
+    REPORTED ONCE PER EPISODE, where an episode is one continuous period during
+    which this adapter's input is older than the run's threshold. The warning is
+    not an error and deliberately does NOT change the exit code — systemd would
+    mark the unit failed on every tick for weeks — so the NOTIFICATION IS THE
+    CHANNEL, and a notification that repeats every 30 minutes forever is an
+    alarm an operator learns to dismiss unread. So the runner suppresses the
+    repeat, and the marker that buys the silence waits for the very
+    :class:`Delivery` step 6 waits for. What re-arms it is a human dropping a
+    fresh export: the value returned here IS the episode's identity, which is
+    the second reason it must describe the input rather than the run.
+
     RETURN AN AWARE DATETIME. A naive one satisfies the annotation and is
     therefore not a type error, but every consumer compares it against
     ``datetime.now(UTC)`` and subtracting a naive datetime from an aware one
@@ -496,8 +512,12 @@ class SupportsInputFreshness(Protocol):
     the filesystem actually means (``datetime.fromtimestamp(mtime, tz=UTC)``,
     as the shipped ones do).
 
-    Not built out yet — this is the seam so it can be, without reopening the
-    port.
+    Implementing this is the WHOLE opt-in: the threshold, the wording, the
+    dedup and the marker file all live in ``imports/runner.py`` and
+    ``imports/ingest_state.py``, because they belong to the run rather than to
+    any one source. An adapter answers when its input was last touched and
+    nothing else — which is also why growing this protocol did not make four
+    more adapters ``gates_report`` and starve the toast of TickTick's line.
     """
 
     def input_freshness(self) -> datetime | None: ...

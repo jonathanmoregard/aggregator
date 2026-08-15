@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from aggregator.imports.ingest_state import STALE_INPUTS, IngestMarkers
 from aggregator.imports.port import (
     Delivery,
     ImportAdapter,
@@ -86,7 +87,17 @@ class RunReport:
     # and cannot change the exit code. They live ON the report rather than
     # only on the caller's stderr because otherwise the notify hook, the one
     # thing that can reach a human, cannot see them.
+    #
+    # ONLY THE UN-SUPPRESSED ONES. A source is warned about once per staleness
+    # EPISODE and then goes quiet — see :func:`plan_staleness_report`.
     warnings: list[str] = field(default_factory=list)
+    # This run's staleness verdict and the marker write that has to wait for
+    # delivery, or None when the caller set no staleness policy. Carried on the
+    # report because the CLI has a channel the runner cannot see (a watched
+    # terminal, printed after ``run_imports`` returned) and must be able to
+    # commit against it too — the same reason ``commit_report_barriers`` is
+    # public. See :func:`commit_staleness_receipts`.
+    stale_episodes: StalenessEpisodes | None = None
 
     @property
     def added(self) -> int:
@@ -126,6 +137,23 @@ class RunReport:
             *(line for name in self.adapters for line in self.errors_from(name)),
             *self.run_errors,
         ]
+
+    @property
+    def reported(self) -> list[str]:
+        """EVERYTHING this run said out loud — errors AND warnings.
+
+        What a channel declares delivery against (``Delivery.accepted(payload,
+        report.reported)``). Errors alone was right while a receipt could only
+        ever suppress an error line; a staleness warning is now suppressed by
+        the same mechanism, and a line that is not in ``reported`` can never be
+        in the delivered set, so its marker could never be earned and the
+        warning would repeat on every 30-minute tick forever.
+
+        Warnings LAST, deliberately: a channel that takes a prefix of the
+        payload keeps spending its budget on failures first, and a staleness
+        warning that gets cut is merely repeated next run.
+        """
+        return [*self.errors, *self.warnings]
 
     @property
     def gating_errors(self) -> list[str]:
@@ -328,6 +356,40 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=UTC)
 
 
+def _staleness_line(
+    name: str, entry: AdapterReport, *, max_age_days: int, moment: datetime
+) -> str | None:
+    """The one line this source's input earns right now, or None if it is fine.
+
+    THE ONLY PLACE THIS SENTENCE IS SPELLED, for the same reason
+    ``RunReport.errors_from`` is the only place an error line is: a marker is
+    stamped only when a channel carried the line, and that comparison is
+    WHOLE-LINE identity (``Delivery.accepted``). A second copy of the wording
+    that drifted by one character would make the delivery unachievable — safe,
+    but permanently loud with nothing a reader could point at.
+    """
+    # ``_as_utc`` again, not only in ``_run_one``: the callers are public and
+    # can be handed a report assembled elsewhere. A TypeError here would escape
+    # the whole-run staleness pass and take the report, every adapter's error
+    # listing and the exit code with it.
+    newest = _as_utc(entry.input_newest_at)
+    if newest is None:
+        return (
+            f"{name}: no input found — this source imported "
+            f"nothing, which looks identical to having nothing new. Drop "
+            f"a fresh export where {name} looks for it."
+        )
+    age_days = (moment - newest).days
+    if age_days > max_age_days:
+        return (
+            f"{name}: input is {age_days} days stale "
+            f"(threshold {max_age_days}). Nothing on this machine "
+            f"refreshes it — export a new one, or raise "
+            f"--stale-after-days if that is the intended cadence."
+        )
+    return None
+
+
 def staleness_warnings(
     report: RunReport,
     *,
@@ -335,6 +397,12 @@ def staleness_warnings(
     now: datetime | None = None,
 ) -> list[str]:
     """One line per source whose hand-refreshed input has gone stale.
+
+    THE UNDEDUPLICATED VIEW: every source that is stale right now, whether or
+    not it has already been reported. ``run_imports`` uses
+    :func:`plan_staleness_report` instead, which is this filtered by what a
+    human has already been told; this remains the answer to "what is stale?"
+    for a caller that wants to look rather than to notify.
 
     Only adapters that offered ``input_freshness`` are considered — a live API
     or a continuously-synced directory has no export ritual to forget, and
@@ -348,34 +416,242 @@ def staleness_warnings(
     Deliberately NOT errors, so the exit code keeps meaning exactly one thing
     ("this run failed or dropped data"). A stale zip is not a failure —
     nothing broke, a human just has not exported lately — and it is fixed by a
-    different action than a crashed adapter.
+    different action than a crashed adapter. That is also exactly why
+    deduplicating it matters: the notification IS the channel, so a warning
+    that repeats is a CRITICAL toast every 30 minutes for as long as the export
+    stays old, and an alarm that always fires is one an operator learns to
+    dismiss unread — which costs the next real failure its audience.
     """
     moment = _as_utc(now) or datetime.now(UTC)
     warnings: list[str] = []
     for name, entry in report.adapters.items():
         if not entry.offers_input_freshness:
             continue
-        # ``_as_utc`` again, not only in ``_run_one``: this function is public
-        # and a caller can hand it a report it assembled itself. A TypeError
-        # here would escape the whole-run staleness pass and take the report,
-        # every adapter's error listing and the exit code with it.
-        newest = _as_utc(entry.input_newest_at)
-        if newest is None:
-            warnings.append(
-                f"{name}: no input found — this source imported "
-                f"nothing, which looks identical to having nothing new. Drop "
-                f"a fresh export where {name} looks for it."
-            )
-            continue
-        age_days = (moment - newest).days
-        if age_days > max_age_days:
-            warnings.append(
-                f"{name}: input is {age_days} days stale "
-                f"(threshold {max_age_days}). Nothing on this machine "
-                f"refreshes it — export a new one, or raise "
-                f"--stale-after-days if that is the intended cadence."
-            )
+        line = _staleness_line(name, entry, max_age_days=max_age_days, moment=moment)
+        if line is not None:
+            warnings.append(line)
     return warnings
+
+
+def _episode(entry: AdapterReport, *, max_age_days: int) -> dict[str, object]:
+    """WHICH staleness episode this source is in, as a comparable value.
+
+    An episode is one continuous period during which a source's input is older
+    than the threshold, and what ends it is a human dropping a fresh export.
+    So the identity of an episode is THE INPUT ITSELF — the mtime the adapter
+    reported — and not the warning text, which changes every day as the age
+    ticks up, nor the run, which is what repeating once per run means.
+
+    ``stale_after_days`` rides along because the operator can move the goalposts
+    (see :func:`_silences`). ``None`` is the missing-input case, which no
+    threshold makes more or less true.
+    """
+    newest = _as_utc(entry.input_newest_at)
+    return {
+        # "" for "there is no input at all", which is a real and distinct
+        # episode: an archive that later APPEARS and is already old is a
+        # different fact and gets said out loud again.
+        "input_newest_at": "" if newest is None else newest.isoformat(),
+        "stale_after_days": None if newest is None else max_age_days,
+    }
+
+
+def _same_episode(mark: object, episode: dict[str, object]) -> bool:
+    """Is this marker still about the input in front of us?
+
+    Identity is the input timestamp. A marker whose input differs is about an
+    export that has since been replaced — the episode it recorded is over — so
+    it neither suppresses nor survives the run. Anything that is not a marker
+    at all (a hand-edited fragment, a null, a bare string) answers False, which
+    is the loud direction.
+    """
+    return (
+        isinstance(mark, dict)
+        and mark.get("input_newest_at") == episode["input_newest_at"]
+    )
+
+
+def _silences(mark: object, episode: dict[str, object]) -> bool:
+    """May this marker keep the warning quiet? Only for a threshold as loose.
+
+    THE THRESHOLD RULE, stated: a marker suppresses only a warning raised at a
+    threshold AT LEAST AS LOOSE as the one it was earned at. Lowering
+    ``--stale-after-days`` is the operator saying the old cadence was too
+    generous, and a source they were told about at 14 days is a source they
+    have NOT been told about at 7 — the fact is stricter now — so it warns
+    again and earns a marker at the new threshold. Raising it (or leaving it)
+    reports nothing new: the same input, already heard about, judged by a
+    kinder rule.
+
+    A marker with no recorded threshold is the missing-input case and silences
+    a missing input at any threshold — nothing about "no export exists" is a
+    matter of degree. A marker whose recorded threshold is not an integer is
+    garbled, and a garbled marker never buys silence.
+    """
+    if not isinstance(mark, dict) or not _same_episode(mark, episode):
+        return False
+    recorded = mark.get("stale_after_days")
+    if recorded is None:
+        return episode["stale_after_days"] is None
+    if not isinstance(recorded, int) or isinstance(recorded, bool):
+        return False
+    threshold = episode["stale_after_days"]
+    return isinstance(threshold, int) and threshold >= recorded
+
+
+@dataclass(frozen=True)
+class StalenessEpisodes:
+    """What this run has to SAY about stale inputs, and the write that waits.
+
+    ``warnings`` is the deduplicated list — the sources whose current episode no
+    human has been told about yet. ``suppressed`` is the other half, the ones
+    that were held back and the marker that held them, kept so a caller (and a
+    test) can see that quiet is not the same as unnoticed.
+
+    ``commit`` takes the run's :class:`~aggregator.imports.port.Delivery` and
+    writes the markers for the lines a channel actually carried. Named rather
+    than returned as a bare callable for the reason ``OpenTaskReconcile`` gives:
+    a commit that runs at the wrong moment buys silence for something nobody
+    heard, which is the whole defect class this mechanism lives in.
+    """
+
+    warnings: list[str]
+    suppressed: dict[str, dict]
+    commit: Callable[[Delivery], None]
+
+
+def plan_staleness_report(
+    report: RunReport,
+    *,
+    max_age_days: int,
+    now: datetime | None = None,
+    markers: IngestMarkers | None = None,
+) -> StalenessEpisodes:
+    """Say each stale source ONCE PER EPISODE, and hand back the receipt write.
+
+    THE DEFECT THIS EXISTS FOR. ``staleness_warnings`` is correct and was
+    reported on every run: ``substack``'s export is 31 days old and ``chatgpt``
+    has never been ingested at all, so under the 30-minute timer that is a
+    desktop notification every half hour, forever, until a human downloads a
+    fresh export. It is the same alarm fatigue this branch spent four rounds
+    eliminating for a vanished TickTick project — a permanently-red signal
+    trains an operator to ignore the one that matters — and staleness simply
+    never got the treatment.
+
+    SAME SHAPE AS THE TICKTICK RECEIPT, deliberately, down to the two-phase
+    split: the diff happens now (it needs the run), and the write that buys the
+    silence waits for a human to have been TOLD. Delivery is
+    ``port.Delivery`` and nothing else — the set of lines a channel declares it
+    carried, read out of the payload it sent — so every way a report can miss
+    its audience is already covered: no notifier configured, a hook that only
+    logs, a hook that raised, a toast that truncated, an unwatched journal. Each
+    of those leaves the marker unwritten and the source loud next run, which is
+    the cheap direction.
+
+    RE-ARMING IS THE POINT OF AN EPISODE. A marker survives only while it is
+    still about the input in front of it (:func:`_same_episode`), so:
+
+    * the export is refreshed and the source is fresh -> no warning, and the
+      marker is DROPPED, because a suppressed state that is no longer true
+      would make ``aggregator status`` lie about it;
+    * the refreshed export later goes stale -> different mtime, no marker
+      matches, and the source is loud again.
+
+    PER SOURCE, NEVER A GLOBAL MUTE: markers are keyed by adapter name, so a
+    second source going stale is reported while the first stays quiet.
+
+    A missing or unreadable marker file resolves to "nothing is suppressed" —
+    see ``ingest_state``. One toast too many is a cost; one alert too few is the
+    failure.
+    """
+    store = markers if markers is not None else IngestMarkers()
+    moment = _as_utc(now) or datetime.now(UTC)
+    stored = store.load(STALE_INPUTS)
+
+    # Only the sources this run can speak for. Every other key in the section is
+    # carried through untouched: a partial run (a test, a future single-source
+    # driver) must not prune markers for sources it never looked at.
+    managed: list[str] = []
+    episodes: dict[str, dict[str, object]] = {}
+    warnings: list[str] = []
+    suppressed: dict[str, dict] = {}
+    pending: dict[str, tuple[str, dict]] = {}
+
+    for name, entry in report.adapters.items():
+        if not entry.offers_input_freshness:
+            continue
+        managed.append(name)
+        line = _staleness_line(name, entry, max_age_days=max_age_days, moment=moment)
+        if line is None:
+            # Fresh. Not in ``episodes``, so any marker it still had is dropped
+            # by the commit — this is the re-arm.
+            continue
+        episode = _episode(entry, max_age_days=max_age_days)
+        episodes[name] = episode
+        held = stored.get(name)
+        if _silences(held, episode):
+            suppressed[name] = held
+            continue
+        warnings.append(line)
+        pending[name] = (line, {**episode, "first_reported": moment.isoformat()})
+
+    def commit(delivered: Delivery) -> None:
+        """Write the markers for the warnings a channel actually carried.
+
+        READ-MODIFY-WRITE against what is on disk NOW, not a replay of the plan,
+        because this can run twice for one run: once against what the notify
+        hook declared and once against what the CLI printed to a terminal
+        somebody was watching. Rebuilding from the plan alone, the second call
+        would erase the marker the first one earned.
+
+        Writes only when the section actually changes, so the steady state —
+        every source fresh, or every stale one already reported — costs no write
+        at all.
+        """
+        current = store.load(STALE_INPUTS)
+        updated = {name: mark for name, mark in current.items() if name not in managed}
+        for name, episode in episodes.items():
+            held = current.get(name)
+            if _same_episode(held, episode):
+                updated[name] = held
+        for name, (line, mark) in pending.items():
+            if line in delivered.lines:
+                updated[name] = mark
+        if updated != current:
+            store.save(STALE_INPUTS, updated)
+
+    return StalenessEpisodes(warnings=warnings, suppressed=suppressed, commit=commit)
+
+
+def commit_staleness_receipts(report: RunReport, delivered: Delivery) -> None:
+    """Let this run record which staleness warnings actually reached a human.
+
+    The staleness half of ``commit_report_barriers``, and PUBLIC for the same
+    reason: ``ingest --all`` prints the run's warnings to a terminal AFTER
+    ``run_imports`` has returned, and a person watching that terminal is as much
+    an audience as a toast is. Calling it twice is safe — the second call reads
+    the file the first one wrote and can only add to it — and forgetting to call
+    it is the loud direction.
+
+    A no-op for a caller with no staleness policy: nothing was evaluated, so
+    there is nothing to suppress and, crucially, no marker is pruned on the
+    strength of a run that never asked the question.
+
+    A failed write is recorded rather than raised. The ingest succeeded and the
+    warning was delivered; all that is lost is the silence, so the next run says
+    the same thing once more. It is still reported, because a marker that
+    silently never lands turns "reported once" back into "reported forever" and
+    nothing else in the run would say so.
+    """
+    plan = report.stale_episodes
+    if plan is None:
+        return
+    try:
+        plan.commit(delivered)
+    except Exception as e:  # noqa: BLE001 -- reported, never fatal to the ingest
+        report.run_errors.append(
+            f"staleness markers could not be written: {type(e).__name__}: {e}"
+        )
 
 
 async def run_imports(
@@ -386,6 +662,7 @@ async def run_imports(
     batch_size: int = DEFAULT_BATCH_SIZE,
     stale_after_days: int | None = None,
     now: datetime | None = None,
+    markers: IngestMarkers | None = None,
 ) -> RunReport:
     """Drive every adapter concurrently and return the aggregated report.
 
@@ -414,7 +691,14 @@ async def run_imports(
     ``report.warnings`` BEFORE ``notify`` fires, which is the whole point of
     evaluating them here rather than in the caller: a warning the notifier
     cannot see is stderr text on an exit-0 run, and no timer reads stderr.
-    ``None`` skips the evaluation (a caller with no staleness policy).
+    ``None`` skips the evaluation (a caller with no staleness policy), and
+    skipping it touches no marker — a run that never asked whether an export
+    was stale has no business re-arming or suppressing anything.
+
+    THOSE WARNINGS ARE DEDUPLICATED PER EPISODE and go quiet once a human has
+    been told, on exactly the ``Delivery`` the report barriers use. See
+    :func:`plan_staleness_report`; ``markers`` is the file they live in, and is
+    a parameter for the same reason ``TickTickSource`` takes a ``state_file``.
     """
     adapter_list: Sequence[ImportAdapter] = list(adapters)
     _refuse_duplicate_names(adapter_list)
@@ -423,9 +707,10 @@ async def run_imports(
     )
     report = RunReport(adapters={r.name: r for r in results})
     if stale_after_days is not None:
-        report.warnings.extend(
-            staleness_warnings(report, max_age_days=stale_after_days, now=now)
+        report.stale_episodes = plan_staleness_report(
+            report, max_age_days=stale_after_days, now=now, markers=markers
         )
+        report.warnings.extend(report.stale_episodes.warnings)
     # NOTHING DELIVERED UNTIL A CHANNEL SHOWS WHAT IT CARRIED. The initial value
     # is the answer for every run that has no channel — no notifier configured, a
     # hook that only logs, a hook that raised — and the only thing that changes
@@ -448,6 +733,11 @@ async def run_imports(
         if isinstance(answer, Delivery):
             delivered = answer
     commit_report_barriers(adapter_list, report, delivered)
+    # The same declaration, spent on the other thing a run may go quiet about.
+    # One notion of "delivered", one place it is computed; a staleness marker
+    # that used its own idea of "we told them" would be the fifth round of a bug
+    # this branch has already fixed four times.
+    commit_staleness_receipts(report, delivered)
     return report
 
 
@@ -519,10 +809,13 @@ __all__ = [
     "Delivery",
     "NotifyHook",
     "RunReport",
+    "StalenessEpisodes",
     # Public because the CLI declares a channel the runner never sees: the
-    # errors it prints to a terminal a human is watching, AFTER run_imports has
-    # returned. See ``commit_report_barriers``.
+    # errors and warnings it prints to a terminal a human is watching, AFTER
+    # run_imports has returned. See ``commit_report_barriers``.
     "commit_report_barriers",
+    "commit_staleness_receipts",
+    "plan_staleness_report",
     "run_imports",
     "staleness_warnings",
 ]

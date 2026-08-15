@@ -50,12 +50,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aggregator.core.store import EmptyRebuildRefusedError, Store
+from aggregator.imports.ingest_state import default_marker_path, stale_input_markers
 from aggregator.imports.port import Delivery, ImportAdapter
 from aggregator.imports.registry import default_adapters
 from aggregator.imports.runner import (
     NotifyHook,
     RunReport,
     commit_report_barriers,
+    commit_staleness_receipts,
     run_imports,
 )
 from aggregator.imports.store_sink import StoreSink, count_writes
@@ -330,8 +332,16 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     # is the MCP tool's read-only view of the CACHE, and this is on-disk source
     # state that no MCP client asked for.
     uncovered = ticktick_api.uncovered_projects(ticktick_api.default_state_path())
+    # THE SAME BARGAIN, one source of noise over. A hand-downloaded export that
+    # has gone stale is warned about once per episode and then goes quiet — a
+    # toast every 30 minutes until somebody visits a vendor's export page is how
+    # an operator learns to dismiss toasts unread — so the sources currently
+    # being held quiet, and the export date each was held quiet about, are
+    # listed here on demand.
+    stale_inputs = stale_input_markers()
     if args.json:
         caps["ticktick_uncovered_projects"] = uncovered
+        caps["stale_input_markers"] = stale_inputs
         print(json.dumps(caps, indent=2, default=str))
         return 0
     print(f"cache_path: {caps['cache_path']}")
@@ -354,6 +364,23 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
                 f"{count} task(s), first reported {info['first_reported'] or 'unknown'}"
             )
         print(f"  baseline: {ticktick_api.default_state_path()}")
+    if stale_inputs:
+        print(
+            "stale inputs (reported once; warning stays quiet until a fresh "
+            "export lands or the threshold is lowered):"
+        )
+        for name, mark in sorted(stale_inputs.items()):
+            newest = mark.get("input_newest_at") if isinstance(mark, dict) else None
+            threshold = (
+                mark.get("stale_after_days") if isinstance(mark, dict) else None
+            )
+            first = mark.get("first_reported") if isinstance(mark, dict) else None
+            print(
+                f"  {name}: input {newest or 'MISSING ENTIRELY'}"
+                f"{f', threshold {threshold} days' if threshold is not None else ''}"
+                f", first reported {first or 'unknown'}"
+            )
+        print(f"  markers: {default_marker_path()}")
     return 0
 
 
@@ -394,6 +421,25 @@ def _print_errors(errors: Sequence[str], limit: int) -> list[str]:
     for e in shown:
         print(f"  error: {e}", file=sys.stderr)
     return shown
+
+
+def _print_warnings(warnings: Sequence[str]) -> list[str]:
+    """Put this run's staleness warnings on stderr and return what went there.
+
+    Same contract as :func:`_print_errors`, and now for the same reason rather
+    than for symmetry: a staleness warning goes quiet once a human has been
+    told, so what this printed is what a watched terminal may claim to have
+    delivered. Unlimited, unlike the errors — there are at most four sources
+    that can go stale, and truncating the list would silently cost the elided
+    one its only channel on an interactive run.
+
+    The ``WARNING: `` prefix is display only and is not part of the line, the
+    same way ``  error: `` is not: the return value is the report's own text,
+    which is what ``Delivery`` matches whole lines against.
+    """
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    return list(warnings)
 
 
 def _stderr_delivery(printed: Sequence[str], reported: Sequence[str]) -> Delivery:
@@ -1052,7 +1098,12 @@ def _desktop_notification(report: RunReport) -> Delivery:
     # ``check=True``, so reaching this line means the notification daemon
     # accepted it — and ``body`` is verbatim what it accepted, so the lines this
     # run may now go quiet about are read back out of it rather than asserted.
-    return Delivery.accepted(body, report.errors)
+    #
+    # ``report.reported``, not ``report.errors``: a staleness warning is now
+    # suppressed once a human has been told, by the same machinery, and a line
+    # that is not offered here can never be in the delivered set — so its marker
+    # could never be earned and it would toast every 30 minutes forever.
+    return Delivery.accepted(body, report.reported)
 
 
 def _notify_argv() -> list[str]:
@@ -1164,8 +1215,7 @@ def _cmd_ingest_all(
         )
     )
     _print_run_report(report)
-    for warning in report.warnings:
-        print(f"WARNING: {warning}", file=sys.stderr)
+    shown_warnings = _print_warnings(report.warnings)
     shown = _print_errors(report.errors, RUN_ERROR_PRINT_LIMIT)
     # THE TERMINAL IS A CHANNEL AND THE RUNNER CANNOT SEE IT. Round-7 MEDIUM: an
     # interactive ``ingest --all`` resolves to ``_silent_notification`` and does
@@ -1180,9 +1230,15 @@ def _cmd_ingest_all(
     # A second call is safe — the barriers cleared whatever the notify hook
     # already earned — and it can only ever ADD lines a human saw.
     late = len(report.run_errors)
-    commit_report_barriers(
-        adapters, report, _stderr_delivery(shown, report.errors)
-    )
+    watched = _stderr_delivery([*shown, *shown_warnings], report.reported)
+    commit_report_barriers(adapters, report, watched)
+    # The staleness markers get the same second chance, and need it for the same
+    # reason: an interactive ``ingest --all`` installs no notifier at all, so the
+    # WARNING lines above are the only channel there is, and without this a
+    # person who read them off their own terminal would be told again on every
+    # single run. Under the timer ``_stderr_delivery`` answers "nothing" — the
+    # journal is not an audience — so the unattended case is untouched.
+    commit_staleness_receipts(report, watched)
     # A barrier that raised lands in ``run_errors`` after the block above has
     # printed, so it would otherwise change the exit code with nothing on stderr
     # to explain it. Same treatment as the single-source path's ``late``.
