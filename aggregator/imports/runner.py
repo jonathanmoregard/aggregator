@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from aggregator.imports.port import (
+    Delivery,
     ImportAdapter,
     ImportItem,
     ImportSink,
@@ -104,15 +105,29 @@ class RunReport:
         return not self.failed_adapters and not self.run_errors
 
 
-NotifyHook = Callable[[RunReport], None]
+# A hook may DECLARE delivery by returning ``Delivery.DELIVERED``. ``None`` is
+# in the type because that is what a hook that only prints, only logs, or does
+# nothing at all returns, and every one of those is "not delivered" — see
+# ``port.Delivery``. The runner compares by identity, so no other return value
+# can pass for a declaration either.
+NotifyHook = Callable[[RunReport], Delivery | None]
 
 
 def _no_notification(report: RunReport) -> None:
-    """Default hook: do nothing.
+    """Default hook: do nothing. CANNOT count as delivery, by construction.
 
     Library code must not shell out to ``notify-send``. The CLI / systemd
     layer injects the real notifier, which keeps the failure path testable
     and keeps the desktop dependency out of the import path.
+
+    Annotated ``-> None`` and it means it: this function has no way to return
+    ``Delivery.DELIVERED``, so a run with nothing configured cannot stamp a
+    report barrier's receipt. It used to — the receipt was gated on ``notify``
+    returning without raising, and doing nothing returns without raising, so
+    every default-configured run recorded that a human had been told by a
+    channel that does not exist. Making the default hook's silence unable to
+    speak is the fix; a gate saying ``if notify is not _no_notification`` would
+    have been one an alternative silent hook walks straight past.
     """
 
 
@@ -327,6 +342,14 @@ async def run_imports(
     the value was unreachable by construction. The default hook is a no-op,
     so "fires on every run" costs a caller who wants nothing exactly nothing.
 
+    A hook that actually reached a human RETURNS ``Delivery.DELIVERED``, and
+    only then does any adapter's ``SupportsReportBarrier`` fire. Returning
+    nothing is the default and means nothing was delivered, which is what the
+    no-op above returns and what a hook that merely logs returns. That
+    distinction is the whole reason the hook has a return type: a report barrier
+    lets a source go QUIET about something, and a source may only go quiet
+    because somebody heard it, never because nothing went wrong.
+
     ``stale_after_days`` turns the collected freshness values into
     ``report.warnings`` BEFORE ``notify`` fires, which is the whole point of
     evaluating them here rather than in the caller: a warning the notifier
@@ -343,15 +366,19 @@ async def run_imports(
         report.warnings.extend(
             staleness_warnings(report, max_age_days=stale_after_days, now=now)
         )
-    delivered = True
+    # NOT DELIVERED UNTIL THE HOOK SAYS OTHERWISE. The initial value is the
+    # answer for every run that has no channel — no notifier configured, a hook
+    # that only logs, a hook that raised — and the ONLY thing that changes it is
+    # the hook affirmatively returning ``Delivery.DELIVERED``. See
+    # ``port.Delivery`` for why this is a returned value rather than a check.
+    delivered = False
     try:
-        notify(report)
+        delivered = notify(report) is Delivery.DELIVERED
     except Exception as e:  # noqa: BLE001
         # A missing notify-send must not cost us the report — the caller
         # still has to be able to print WHICH adapter failed. Recorded,
         # not swallowed: a notifier that cannot notify is itself a fault,
         # and on an otherwise-clean run this is the only thing that says so.
-        delivered = False
         report.run_errors.append(f"notify hook failed: {type(e).__name__}: {e}")
     if delivered:
         _commit_after_report(adapter_list, report)
@@ -363,10 +390,12 @@ def _commit_after_report(
 ) -> None:
     """Let adapters record that this run's report actually reached somebody.
 
-    ONLY ON THE DELIVERED PATH. An adapter that suppresses a repeat report is
-    holding a receipt, and a receipt written when the notify hook blew up says a
-    human was told when nobody was — which permanently silences the one alert
-    that source existed to raise. See ``port.SupportsReportBarrier``.
+    ONLY ON THE DECLARED-DELIVERED PATH, i.e. only when the notify hook returned
+    ``Delivery.DELIVERED``. An adapter that suppresses a repeat report is holding
+    a receipt, and a receipt written when nothing reached anybody — the hook blew
+    up, or there was no hook worth the name — says a human was told when nobody
+    was, which permanently silences the one alert that source existed to raise.
+    See ``port.SupportsReportBarrier`` and ``port.Delivery``.
 
     Unconditionally after ``notify``, not gated on ``report.ok``: an adapter's
     receipt is about ITS OWN report reaching the channel, and the channel
@@ -403,6 +432,10 @@ def _refuse_duplicate_names(adapters: Sequence[ImportAdapter]) -> None:
 __all__ = [
     "DEFAULT_BATCH_SIZE",
     "AdapterReport",
+    # Re-exported: a notify hook is written against ``run_imports``, and the
+    # value it has to return to unlock a report barrier should not require
+    # finding a second module first.
+    "Delivery",
     "NotifyHook",
     "RunReport",
     "run_imports",

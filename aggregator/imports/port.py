@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from aggregator.sources.base import ObservationRow, Record, SessionRow
@@ -169,6 +170,43 @@ class SupportsWriteBarrier(Protocol):
     def commit_after_write(self) -> None: ...
 
 
+class Delivery(Enum):
+    """Did this run's report actually REACH A HUMAN? The only way to say yes.
+
+    A notify hook returns this. ``DELIVERED`` means a channel that can wake
+    somebody up accepted the report and said so; anything else — ``UNDELIVERED``,
+    ``None``, a stray truthy value a hook happened to return — means it did not.
+    Only ``DELIVERED``, compared by identity, unlocks ``SupportsReportBarrier``.
+
+    A VALUE RATHER THAN A CHECK, because the same bug arrived three times as a
+    check somebody forgot. The receipt that silences a repeated report was
+    stamped when the report was merely EMITTED (round 4), then when ``notify``
+    RETURNED WITHOUT RAISING (round 5) — and the shipped default notifier is a
+    no-op, so round 6 was still stamping receipts on runs with no human channel
+    at all. Every one of those inferred delivery from the absence of an error.
+    Absence of an error is not delivery.
+
+    So delivery is DECLARED, and the declaration defaults to no. A function that
+    does nothing returns ``None``, ``None`` is not ``DELIVERED``, and therefore
+    the do-nothing notifier CANNOT stamp a receipt — not because a gate checks
+    for it, but because it has nothing to return. That is the property the
+    previous three fixes lacked: they were all reachable by forgetting a check.
+
+    IDENTITY, NOT TRUTHINESS, and that is load-bearing. A hook written as
+    ``lambda report: subprocess.run(...)`` returns a ``CompletedProcess``, which
+    is truthy and would have declared success for a notifier that exited 1.
+
+    THE FAILURE DIRECTION IS LOUD. A run with no channel does not stamp, so the
+    disappearance is reported again next run, and the next, until a real
+    notifier is configured — which is the bound. Reporting twice costs an
+    operator one duplicate line; not reporting costs them the only alert the
+    mechanism exists to raise, permanently.
+    """
+
+    DELIVERED = "delivered"
+    UNDELIVERED = "undelivered"
+
+
 @runtime_checkable
 class SupportsReportBarrier(Protocol):
     """Optional: an adapter that may only go quiet once a human was TOLD.
@@ -188,10 +226,18 @@ class SupportsReportBarrier(Protocol):
     so every later poll stayed quiet about a disappearance nobody ever heard
     about. One alert, suppressed by a record claiming it was delivered.
 
-    So the receipt waits for this. The runner calls it after ``notify`` returns
-    WITHOUT raising; the single-source CLI path calls it after printing the run's
-    errors, which is that path's only channel. A hook that raised means the
-    report reached nobody, so nothing is stamped and the next run reports again.
+    So the receipt waits for this, and this waits for a DECLARATION of delivery
+    — see :class:`Delivery`. The runner calls it only when the notify hook
+    returned ``Delivery.DELIVERED``; the single-source CLI path only when its
+    stderr is an interactive terminal, i.e. when the print it just made had a
+    person in front of it. Under a systemd timer stderr is the journal, which
+    nobody reads unprompted, so that path declares nothing and the report stands.
+
+    THERE IS NO "PROBABLY DELIVERED". A hook that raised, a hook that did
+    nothing, a run with no notifier configured at all and an unattended stderr
+    are the same answer: not delivered, nothing stamped, reported again next
+    run. That is deliberately loud forever, and it is bounded by configuring a
+    channel — which is the action the noise is asking for.
 
     NOT CALLING IT IS THE SAFE DIRECTION, unlike the write barrier: the cost is
     one more report of a disappearance already reported, never a lost one. The

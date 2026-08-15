@@ -50,7 +50,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aggregator.core.store import EmptyRebuildRefusedError, Store
-from aggregator.imports.port import ImportAdapter
+from aggregator.imports.port import Delivery, ImportAdapter
 from aggregator.imports.registry import default_adapters
 from aggregator.imports.runner import NotifyHook, RunReport, run_imports
 from aggregator.imports.store_sink import StoreSink, count_writes
@@ -834,12 +834,16 @@ def _ingest_usage_error(args: argparse.Namespace) -> str | None:
 
 
 def _silent_notification(report: RunReport) -> None:
-    """The CLI's default notifier: do nothing.
+    """The CLI's default notifier: do nothing. Never counts as delivery.
 
     An interactive ``aggregator ingest --all`` prints its report to a terminal
     somebody is already looking at, so it should not also pop a desktop toast.
     An UNATTENDED run is the opposite case — see ``_desktop_notification`` and
     ``--notify``.
+
+    ``-> None`` for the same reason as ``runner._no_notification``: a hook that
+    does nothing must not be able to declare that a human was told, and the way
+    to guarantee that is to leave it nothing to return. See ``port.Delivery``.
     """
 
 
@@ -874,8 +878,14 @@ def _notification_text(report: RunReport) -> tuple[str, str, str] | None:
     return None
 
 
-def _desktop_notification(report: RunReport) -> None:
+def _desktop_notification(report: RunReport) -> Delivery:
     """Tell a human, via ``notify-send`` (or ``$AGGREGATOR_NOTIFY_COMMAND``).
+
+    THE ONE THING IN THIS PROCESS THAT CAN RETURN ``Delivery.DELIVERED``, and it
+    returns it in exactly one place: after the notification program has exited
+    zero. Everywhere else — nothing worth saying, an unresolvable program (which
+    raises), a non-zero exit (which raises) — the answer is UNDELIVERED, so an
+    adapter holding a report barrier keeps reporting. See ``port.Delivery``.
 
     THE CLI IS WHERE THIS BELONGS. ``imports/runner.py`` refuses to shell out
     and names this layer as the one that injects a real notifier — but until
@@ -903,7 +913,12 @@ def _desktop_notification(report: RunReport) -> None:
     argv = _notify_argv()
     text = _notification_text(report)
     if text is None:
-        return
+        # Nothing was sent, so nothing was delivered. Saying otherwise would be
+        # the round-6 defect in miniature — "no error occurred" read as "a human
+        # heard it". Costs nothing in practice: a report barrier's receipt only
+        # ever exists alongside the error line that earned it, and an error is
+        # exactly what ``_notification_text`` refuses to stay quiet about.
+        return Delivery.UNDELIVERED
     urgency, summary, body = text
     # No shell=True: the value is operator configuration, split with shlex and
     # exec'd directly. Timeout because a hung notification daemon must not
@@ -920,6 +935,9 @@ def _desktop_notification(report: RunReport) -> None:
         check=True,
         timeout=NOTIFY_TIMEOUT_SECONDS,
     )
+    # ``check=True``, so reaching this line means the notification daemon
+    # accepted it. That — and only that — is the declaration.
+    return Delivery.DELIVERED
 
 
 def _notify_argv() -> list[str]:

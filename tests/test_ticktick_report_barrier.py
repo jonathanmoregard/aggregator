@@ -29,7 +29,7 @@ import pytest
 
 from aggregator import cli
 from aggregator.core.store import Store
-from aggregator.imports.port import SupportsReportBarrier, WriteCounts
+from aggregator.imports.port import Delivery, SupportsReportBarrier, WriteCounts
 from aggregator.imports.runner import run_imports
 from aggregator.imports.sync_bridge import SyncSourceAdapter
 from aggregator.imports.ticktick import TickTickAdapter
@@ -110,6 +110,21 @@ def _broken_notify(report) -> None:
     raise FileNotFoundError("notify-send: command not found")
 
 
+def _working_notify(heard: list[str]):
+    """A hook standing in for a notifier that reached somebody, and SAYS SO.
+
+    Returning ``Delivery.DELIVERED`` is the whole declaration (round 6): a hook
+    that merely returns is a hook that might have done nothing, and the default
+    one does exactly nothing. See ``imports/port.Delivery``.
+    """
+
+    def notify(report) -> Delivery:
+        heard.extend(report.errors)
+        return Delivery.DELIVERED
+
+    return notify
+
+
 def _run(tmp_path, state_file, notify, sink=None):
     """One whole run through the runner, on a fresh adapter — what a timer does."""
     adapter = TickTickAdapter(source=_source(tmp_path, state_file))
@@ -153,11 +168,7 @@ def test_the_alert_survives_until_a_notifier_that_works_delivers_it(
     _run(tmp_path, state_file, _broken_notify)
 
     delivered: list[str] = []
-    third = _run(
-        tmp_path,
-        state_file,
-        lambda report: delivered.extend(report.errors),
-    )
+    third = _run(tmp_path, state_file, _working_notify(delivered))
 
     assert [e for e in delivered if UNCOVERED in e], (
         f"the working notifier was told nothing about it: {delivered}"
@@ -173,11 +184,11 @@ def test_a_delivered_report_still_silences_the_next_run(tmp_path, state_file):
     forever is an alarm an operator learns to ignore, which costs the next real
     ingest failure its audience."""
     heard: list[str] = []
-    first = _run(tmp_path, state_file, lambda report: heard.extend(report.errors))
+    first = _run(tmp_path, state_file, _working_notify(heard))
     assert _reported(first)
     assert [e for e in heard if UNCOVERED in e], "the hook was told"
 
-    second = _run(tmp_path, state_file, lambda report: heard.extend(report.errors))
+    second = _run(tmp_path, state_file, _working_notify(heard))
 
     assert second.errors == [], f"the same alarm fired twice: {second.errors}"
 
@@ -219,14 +230,14 @@ def test_a_run_whose_write_failed_still_earns_the_receipt_it_reported(
     first = _run(
         tmp_path,
         state_file,
-        lambda report: heard.extend(report.errors),
+        _working_notify(heard),
         sink=_FailingSink(),
     )
     assert first.ok is False
     assert [e for e in heard if UNCOVERED in e]
     assert "t9" not in json.loads(state_file.read_text()), "no advance happened"
 
-    second = _run(tmp_path, state_file, lambda report: None)
+    second = _run(tmp_path, state_file, _working_notify([]))
 
     assert _reported(second) == [], f"already told: {second.errors}"
 
@@ -309,7 +320,9 @@ class _Probe:
 def test_the_report_barrier_fires_after_the_write_barrier_and_only_once():
     probe = _Probe()
 
-    asyncio.run(run_imports([SyncSourceAdapter(probe)], _Sink()))
+    asyncio.run(
+        run_imports([SyncSourceAdapter(probe)], _Sink(), notify=_working_notify([]))
+    )
 
     assert probe.events == ["write", "report"]
 
@@ -330,7 +343,9 @@ def test_a_report_barrier_that_raises_is_reported_not_swallowed():
     silently never lands turns "reported once" back into "reported forever"."""
     probe = _Probe(angry=True)
 
-    report = asyncio.run(run_imports([SyncSourceAdapter(probe)], _Sink()))
+    report = asyncio.run(
+        run_imports([SyncSourceAdapter(probe)], _Sink(), notify=_working_notify([]))
+    )
 
     assert report.ok is False
     assert any("commit_after_report failed" in e for e in report.errors)
