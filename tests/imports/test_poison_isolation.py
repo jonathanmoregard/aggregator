@@ -232,8 +232,15 @@ def test_an_isolated_chunk_does_not_advance_the_mark(store):
     assert marks.plan("dropbox").cursor_value is None
 
 
-def test_a_sink_that_cannot_checkpoint_still_runs(store):
-    """A sink without the optional protocol costs a re-read, never a row."""
+def test_a_sink_that_cannot_checkpoint_still_records_the_mark(store):
+    """The mechanism must work with ANY sink, not only the one that ships.
+
+    A sink without the optional protocol cannot make the chunk and the mark one
+    transaction, so the runner falls back to the safe ORDER instead: the chunk
+    is already committed, then the mark is written. A crash between the two
+    costs a re-read rather than the records — which is the whole reason that
+    order, and not the other one, is the acceptable fallback.
+    """
 
     class PlainSink:
         def __init__(self) -> None:
@@ -250,4 +257,4 @@ def test_a_sink_that_cannot_checkpoint_still_runs(store):
     )
     assert report.adapters["dropbox"].ok
     assert len(sink.items) == 1
-    assert marks.plan("dropbox").cursor_value is None
+    assert marks.plan("dropbox").cursor_value == NOW

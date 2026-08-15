@@ -575,6 +575,21 @@ async def _run_one(
         report.updated += counts.updated
         report.skipped += counts.skipped
         report.unchanged += counts.unchanged
+        # THE FALLBACK, AND ITS ORDER IS THE POINT. A sink that cannot
+        # checkpoint has already committed this chunk, so recording the mark
+        # now is the SAFE half of the two-write problem: data first, mark
+        # second, and a crash in between costs a re-read rather than the
+        # records. Without it a run through such a sink would never stamp its
+        # run time or clear its failure counter, and a source that failed once
+        # could rest forever.
+        if (
+            checkpoint is not None
+            and watermarks is not None
+            and not isinstance(sink, SupportsCheckpoint)
+        ):
+            watermarks.advance(
+                adapter.name, checkpoint.cursor_value, rows=checkpoint.rows
+            )
         tracker.chunk(
             entry,
             rows=len(pending),
@@ -594,6 +609,12 @@ async def _run_one(
                 # what stops one poison record from being scrubbed and retried
                 # on every tick forever; it is still counted, still reported,
                 # and still in the holding table where a human can see it.
+                #
+                # A held SESSION row cascades: its observations then reference a
+                # session the sink has never seen, so they fail the foreign-key
+                # check and are set aside too. That is the correct outcome —
+                # they genuinely cannot be written — and it is noisy rather than
+                # wrong, so it is not special-cased.
                 report.quarantined += 1
                 held_skipped += 1
                 continue
@@ -610,9 +631,11 @@ async def _run_one(
             batch.append(item)
             if len(batch) >= batch_size:
                 await flush()
-            # CHECKED AT CHUNK BOUNDARIES ONLY, never inside one. The chunk just
-            # committed is durable; a half-written one would be rolled back by
-            # SQLite anyway, which is exactly the wanted behaviour.
+            # BETWEEN ITEMS, NEVER INSIDE A CHUNK'S TRANSACTION. Per item
+            # rather than per chunk so a stop is answered promptly even when a
+            # chunk is slow to fill; the buffered remainder is then committed by
+            # the flush below, so the stop still lands on a transaction
+            # boundary and nothing is left half-written.
             if stop is not None and stop():
                 stop_requested = True
                 break
@@ -643,6 +666,12 @@ async def _run_one(
         # propagates — those mean the whole run is being torn down.
         report.errors.append(f"{type(e).__name__}: {e}")
         stream_failed = True
+        # The final flush may have already decided where the mark WOULD go
+        # before raising. It did not get there, so the report must not say it
+        # did — a summary claiming an advance that never committed is exactly
+        # the kind of number that makes the next investigation start from a
+        # false premise.
+        report.advanced_to = None
         try:
             # Partial ingest beats total loss: whatever arrived before the
             # crash still gets written. NEVER with a checkpoint — a failed pass
