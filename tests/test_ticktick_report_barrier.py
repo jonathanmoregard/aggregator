@@ -25,7 +25,7 @@ import io
 import json
 import sqlite3
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -252,6 +252,54 @@ def test_a_run_whose_write_failed_still_earns_the_receipt_it_reported(
     assert _reported(second) == [], f"already told: {second.errors}"
 
 
+def test_a_failed_write_leaves_the_next_run_deriving_exactly_the_same_diff(tmp_path):
+    """Round-6 (a): does the receipt outlive the state that justified it?
+
+    The report barrier fires on a run whose WRITE failed, on the grounds that
+    the human heard the report either way. So a run can report a disappearance,
+    stamp it, and leave the baseline unadvanced — and the question is whether
+    what the next run derives from that baseline is still the same thing that
+    was reported. It is: the receipt is applied by a read-modify-write over
+    whatever is on disk, and it adds one key to one entry, so a covered project's
+    completion is re-inferred exactly as before and only the REPORT is
+    suppressed. Retention and reporting are separate decisions.
+    """
+    path = tmp_path / "open_tasks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "t1": {"task": {"id": "t1", "projectId": "gone"}, "last_seen": "x"},
+                "t5": {"task": {"id": "t5", "projectId": "live"}, "last_seen": "x"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    heard: list[str] = []
+    first = _run(tmp_path, path, _working_notify(heard), sink=_FailingSink())
+    assert first.ok is False
+    assert [e for e in heard if UNCOVERED in e], "t1's project was reported"
+
+    written: list = []
+
+    class _Recording:
+        def write(self, items) -> WriteCounts:
+            written.extend(items)
+            return WriteCounts(added=len(items))
+
+    second = _run(tmp_path, path, _working_notify([]), sink=_Recording())
+
+    inferred = [
+        r.stable_id
+        for r in written
+        if r.extra.get("provenance") == ticktick_api.INFERRED_COMPLETE_PROVENANCE
+    ]
+    assert [s for s in inferred if s.endswith("t5")], (
+        f"the completion the failed run inferred was not re-derived: {inferred}"
+    )
+    assert _reported(second) == [], "only the report was suppressed, not the diff"
+
+
 def test_a_receipt_is_not_stamped_onto_an_entry_that_moved_meanwhile(tmp_path):
     """The receipt is applied by a read-modify-write, so it has to re-check what
     it is marking. A task that came back under another project between the
@@ -274,6 +322,40 @@ def test_a_receipt_is_not_stamped_onto_an_entry_that_moved_meanwhile(tmp_path):
     commit_receipts()
 
     assert ticktick_api.uncovered_mark(ticktick_api.load_state(path)["t1"]) is None
+
+
+def test_a_receipt_is_not_stamped_onto_an_entry_that_was_seen_again(tmp_path):
+    """The same guard, for the case the project check cannot see.
+
+    A task that comes back in the SAME project passes "still there, still that
+    project" — but it has been OBSERVED OPEN since the report was written, so the
+    next time it vanishes that is a new disappearance, and the stale mark would
+    mute the report of it. Reachable whenever two ingests overlap, which is what
+    the baseline's compare-and-swap already exists for: `ingest ticktick` under a
+    timer firing `ingest --all`.
+    """
+    path = tmp_path / "open_tasks.json"
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    ticktick_api.save_state(path, [{"id": "t1", "projectId": "gone"}], now)
+    _, commit, commit_receipts = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(path),
+        ticktick_api.OpenTaskPoll(
+            [], complete=True, covered_project_ids=frozenset({"live"})
+        ),
+        now,
+    )
+    commit()
+    # Another run DID cover "gone" before the report landed, and t1 is open.
+    ticktick_api.save_state(
+        path, [{"id": "t1", "projectId": "gone"}], now + timedelta(hours=1)
+    )
+
+    commit_receipts()
+
+    assert ticktick_api.uncovered_mark(ticktick_api.load_state(path)["t1"]) is None, (
+        "the task was observed open after the report, so its next disappearance "
+        "is a new fact — and this receipt would silence it"
+    )
 
 
 # -- the single-source CLI path has a channel too -------------------------

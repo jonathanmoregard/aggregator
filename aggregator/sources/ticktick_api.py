@@ -1434,6 +1434,14 @@ def _diff_baseline(previous: dict[str, dict], poll: OpenTaskPoll, now: datetime)
             receipts[task_id] = {
                 "project_id": project_id,
                 "first_reported": now.isoformat(),
+                # WHICH OBSERVATION was reported. The mark is applied later, to
+                # whatever is on disk by then, and "same id, same project" is not
+                # enough to know it is still the same fact: an overlapping run
+                # that DID cover the project replaces this entry with a fresh
+                # sighting under the same project id, and stamping the old mark
+                # onto it would mute the report of the NEXT disappearance. See
+                # :func:`_stamp_receipts`.
+                "last_seen": entry.get("last_seen"),
             }
             continue
         records.append(record)
@@ -1775,11 +1783,22 @@ def _stamp_receipts(
     undo the advance instead.
 
     Each mark is applied only where it is still true: the entry must still be
-    present, still belong to the project the report NAMED, and not already carry
-    a receipt. A task that moved, came back, or was replaced between the two
-    writes has had a new fact happen to it, and a stale mark would mute the next
-    poll's report of that new fact — the same permanent silence this function
-    exists to prevent, arriving one step later.
+    present, still belong to the project the report NAMED, still be the same
+    OBSERVATION that was reported, and not already carry a receipt. A task that
+    moved, came back, or was replaced between the two writes has had a new fact
+    happen to it, and a stale mark would mute the next poll's report of that new
+    fact — the same permanent silence this function exists to prevent, arriving
+    one step later.
+
+    "Same observation" is ``last_seen``, and it is the check the other two
+    cannot make. A task that comes back IN THE SAME PROJECT passes "still there,
+    still that project" while being a completely different fact: some run
+    covered that project and saw the task open, so the next time it vanishes
+    that is a new disappearance and it has never been reported. ``_write_state``
+    replaces such an entry whole and re-stamps ``last_seen``, which is what makes
+    the difference visible here. Reachable whenever two ingests overlap, which
+    is the case ``replace_state``'s compare-and-swap already exists for — a timer
+    firing ``ingest --all`` over a manual ``ingest ticktick``.
 
     Nothing to stamp is the overwhelmingly common case (no project vanished),
     and it costs no read and no write at all.
@@ -1793,6 +1812,8 @@ def _stamp_receipts(
         if not isinstance(entry, dict):
             continue
         if entry_project_id(entry) != mark.get("project_id"):
+            continue
+        if entry.get("last_seen") != mark.get("last_seen"):
             continue
         if uncovered_mark(entry) is not None:
             continue
