@@ -5,7 +5,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from aggregator.sources.dropbox import MAX_BODY_CHARS, MAX_TEXT_BYTES, DropboxSource
+from aggregator.sources.dropbox import (
+    MAX_BODY_CHARS,
+    MAX_TEXT_BYTES,
+    DropboxRootUnavailableError,
+    DropboxSource,
+)
 
 
 def _write(root, rel, content="body text"):
@@ -146,6 +151,51 @@ def test_image_only_pdf_skipped_without_error(tmp_path):
     src = DropboxSource(root=tmp_path)
     assert list(src.iter_records(None, errors=errors)) == []
     assert errors == []
+
+
+def test_missing_root_is_a_hard_failure_not_a_clean_empty_run(tmp_path):
+    """An unmounted Dropbox must not be indistinguishable from "nothing changed".
+
+    ``os.walk`` defaults to ``onerror=None``, which swallows the scandir error
+    on the root: a laptop whose Dropbox is not mounted at 03:00 yielded 0
+    records, ``errors=0`` and exit 0, forever. This source has no
+    input-freshness seam either, so there was no second net.
+    """
+    errors: list[str] = []
+    src = DropboxSource(root=tmp_path / "not-mounted")
+    with pytest.raises(DropboxRootUnavailableError) as excinfo:
+        list(src.iter_records(None, errors=errors))
+    assert "not-mounted" in str(excinfo.value)
+
+
+def test_root_that_is_a_file_is_a_hard_failure_too(tmp_path):
+    """Same class of misconfiguration, different errno (NotADirectoryError)."""
+    root = tmp_path / "Dropbox"
+    root.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(DropboxRootUnavailableError):
+        list(DropboxSource(root=root).iter_records(None, errors=[]))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_unreadable_subdirectory_is_reported_and_the_walk_continues(tmp_path):
+    """A permission-denied subtree is a per-item error, not a reason to abort.
+
+    The subtree is genuinely not indexed, so it must leave a record; the rest
+    of the tree is fine, so partial ingest beats total loss.
+    """
+    _write(tmp_path, "ok/keep.md", "fine")
+    blocked = tmp_path / "blocked"
+    _write(tmp_path, "blocked/hidden.md", "unreachable")
+    blocked.chmod(0o000)
+    errors: list[str] = []
+    src = DropboxSource(root=tmp_path)
+    try:
+        subjects = {r.subject for r in src.iter_records(None, errors=errors)}
+    finally:
+        blocked.chmod(0o755)
+    assert subjects == {"keep"}
+    assert len(errors) == 1
+    assert "blocked" in errors[0]
 
 
 def test_ingest_returns_counts(tmp_path):

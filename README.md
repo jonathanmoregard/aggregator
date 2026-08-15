@@ -46,6 +46,8 @@ Where each export comes from:
 
 Only prose/document extensions are indexed (`.md`, `.markdown`, `.txt`, `.docx`, `.pdf`); everything else in the ~25k-file, 4 GB tree (source code, media, `node_modules`) is skipped. No OCR: a PDF with no extractable text layer is skipped as an expected outcome (not an error) once its extracted text falls under 50 characters. Size caps: 2 MB for text/docx files, 20 MB for PDFs; the extracted body itself is truncated at 200,000 characters (`extra.truncated=True` marks a cut record).
 
+A **root that cannot be listed at all** — Dropbox not mounted, not running, `AGGREGATOR_DROPBOX_ROOT` pointing at nothing — is a hard failure, not an empty scan: the run fails loudly rather than reporting `added=0 errors=0`, because nothing was walked and this source has no staleness warning to catch it later. A single **subdirectory** that cannot be listed (permissions) is a per-item error instead: its subtree is missing from the index, one line says so, and the rest of the tree still ingests.
+
 ### TickTick
 
 Task history is merged from two legs, by task id, newest observation wins:

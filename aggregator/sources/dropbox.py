@@ -50,6 +50,45 @@ MAX_BODY_CHARS = 200_000
 MIN_PDF_TEXT_CHARS = 50
 
 
+class DropboxRootUnavailableError(OSError):
+    """The configured Dropbox ROOT could not be listed at all.
+
+    A HARD failure, deliberately, and the only one this source raises. Every
+    other fault here is per-item: one corrupt PDF, one unreadable file, one
+    permission-denied subtree — the tree is still there and partial ingest
+    beats total loss. A root that cannot be listed is a different KIND of fact:
+    the source is not configured as this machine believes it is. Nothing was
+    scanned, so "0 records" carries no information at all, and there is no
+    input-freshness seam here (Dropbox's own client owns the tree) to catch it
+    on the second pass.
+
+    Raising rather than appending to ``errors`` is what makes the difference
+    visible where it matters. On the per-source CLI path the errors sink is
+    dropped when the iterator raises, but the run prints the failure and exits
+    1 instead of the 3 it gives a partial run; on the run-all path the runner's
+    isolation boundary records ``DropboxRootUnavailableError: ...`` in
+    ``report.errors``, so the record exists either way. It also lands BEFORE
+    any store write, which is what keeps ``--rebuild`` on an unmounted laptop
+    from reaching the DELETE at all.
+    """
+
+
+def _root_unavailable(root: Path, exc: OSError) -> DropboxRootUnavailableError:
+    """The one message an operator gets for a root that will not list.
+
+    Names the likely cause and the fix, because on an unattended timer this is
+    the failure that repeats every 30 minutes until a human acts.
+    """
+    return DropboxRootUnavailableError(
+        f"the Dropbox root {root} could not be listed ({type(exc).__name__}: "
+        f"{exc}). REFUSING to report this as an empty scan: nothing was walked, "
+        f"so 0 records here means 'the source is not configured as believed', "
+        f"not 'nothing changed'. Usually the Dropbox client is not running or "
+        f"the tree is not mounted yet; check that, or point "
+        f"AGGREGATOR_DROPBOX_ROOT at the right directory"
+    )
+
+
 def _is_skipped_dir(name: str) -> bool:
     """Directories pruned during the walk: known junk plus any dot-directory."""
     return name in SKIP_DIR_NAMES or name.startswith(".")
@@ -98,14 +137,36 @@ class DropboxSource:
         raw = exclude if exclude is not None else os.environ.get("AGGREGATOR_DROPBOX_EXCLUDE", "")
         self.exclude: tuple[str, ...] = tuple(p for p in raw.split(":") if p)
 
-    def _iter_candidate_paths(self) -> Iterator[Path]:
+    def _iter_candidate_paths(self, errors: list[str] | None = None) -> Iterator[Path]:
         """Yield indexable file paths, pruning junk directories during the walk.
 
         Pruning happens by mutating ``dirnames`` in place so os.walk never
         descends into node_modules at all — on this tree that is the
         difference between statting 25k files and statting 12k.
+
+        ``onerror`` IS PASSED, and its absence was a silent-loss bug. os.walk
+        defaults to ``onerror=None``, which swallows every scandir failure: a
+        root that is not mounted and a subtree this process may not read both
+        produced zero records, ``errors=0`` and exit 0, which is exactly what a
+        healthy run with nothing new looks like. The two failures are routed
+        differently on purpose — see :class:`DropboxRootUnavailableError` for
+        why the root is the one hard failure this source has.
         """
-        for dirpath, dirnames, filenames in os.walk(self.root):
+
+        def _on_walk_error(exc: OSError) -> None:
+            failed = getattr(exc, "filename", None)
+            if failed is None or Path(failed) == self.root:
+                raise _root_unavailable(self.root, exc)
+            message = (
+                f"{failed}: directory listing failed, so this subtree is NOT "
+                f"indexed and every file under it is missing from the index: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            log.warning("%s", message)
+            if errors is not None:
+                errors.append(message)
+
+        for dirpath, dirnames, filenames in os.walk(self.root, onerror=_on_walk_error):
             dirnames[:] = sorted(d for d in dirnames if not _is_skipped_dir(d))
             here = Path(dirpath)
             rel_dir = here.relative_to(self.root)
@@ -174,14 +235,17 @@ class DropboxSource:
         an incremental run costs a stat per file rather than a parse.
 
         Error policy: a file that cannot be parsed appends to ``errors`` and is
-        skipped — one corrupt PDF never aborts an ingest of 1600 files. An
-        image-only PDF is NOT an error (see MIN_PDF_TEXT_CHARS).
+        skipped — one corrupt PDF never aborts an ingest of 1600 files. A
+        directory that cannot be listed does the same for its whole subtree. An
+        image-only PDF is NOT an error (see MIN_PDF_TEXT_CHARS). The single
+        exception is the root itself, which raises — see
+        :class:`DropboxRootUnavailableError`.
         """
         since_utc: datetime | None = None
         if since is not None:
             since_utc = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
 
-        for path in self._iter_candidate_paths():
+        for path in self._iter_candidate_paths(errors):
             try:
                 stat = path.stat()
             except OSError as e:

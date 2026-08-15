@@ -18,7 +18,9 @@ from aggregator.imports.port import (
     ImportAdapter,
     SupportsInputFreshness,
     SupportsNonFatalErrors,
+    WriteCounts,
 )
+from aggregator.imports.runner import run_imports
 from aggregator.sources.base import Record
 from aggregator.sources.dropbox import DropboxSource
 
@@ -91,6 +93,48 @@ def test_unreadable_file_surfaces_through_drain_errors(tmp_path):
     errors = adapter.drain_errors()
     assert len(errors) == 1
     assert "zzz.md" in errors[0]
+
+
+class _CountingSink:
+    def write(self, items):
+        return WriteCounts(added=len(list(items)), updated=0, skipped=0)
+
+
+def test_unmounted_root_lands_in_the_run_report_instead_of_a_clean_zero(tmp_path):
+    """The unattended path, concretely: the 03:00 timer must not report success.
+
+    ``DropboxRootUnavailableError`` is raised by the source, caught by the
+    runner's per-adapter isolation boundary and recorded — so an unmounted
+    Dropbox produces a line a human can read and ``ok is False``, where it used
+    to produce ``added=0 errors=0`` and a green run forever.
+    """
+    adapter = DropboxAdapter(root=tmp_path / "not-mounted", exclude="")
+
+    report = asyncio.run(run_imports([adapter], _CountingSink()))
+
+    assert report.ok is False
+    assert any("not-mounted" in e for e in report.errors), report.errors
+    assert any("DropboxRootUnavailableError" in e for e in report.errors)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_unreadable_subtree_surfaces_through_drain_errors(tmp_path):
+    """A subtree the walk cannot list is a per-item fault, not a hard failure."""
+    root = _write_tree(tmp_path)
+    blocked = root / "blocked"
+    blocked.mkdir()
+    (blocked / "hidden.md").write_text("# Hidden\n")
+    blocked.chmod(0o000)
+    try:
+        adapter = DropboxAdapter(root=root, exclude="")
+        items = asyncio.run(_drain(adapter))
+    finally:
+        blocked.chmod(0o755)
+
+    assert [i.extra["relpath"] for i in items] == ["notes/one.md", "notes/two.md"]
+    errors = adapter.drain_errors()
+    assert len(errors) == 1
+    assert "blocked" in errors[0]
 
 
 def test_cli_registry_registers_the_same_source():
