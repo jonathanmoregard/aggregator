@@ -333,7 +333,13 @@ _DDL: list[str] = [
         last_ok_at           TEXT,
         rows_seen            INTEGER NOT NULL DEFAULT 0,
         consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        last_error           TEXT
+        last_error           TEXT,
+        -- When this source may be tried again, or NULL for "right now".
+        -- STORED rather than recomputed on read, because the delay is
+        -- jittered: recomputing it would let two reads inside one run
+        -- disagree about whether the source runs, which is a decision that
+        -- must be made once and stay made.
+        next_attempt_at      TEXT
     );
     """,
     # --- v4: the poison-record quarantine ------------------------------
@@ -448,6 +454,20 @@ class Store:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def commit(self) -> None:
+        """End the open transaction. For a caller composing SEVERAL writes.
+
+        Every write method here commits on its own by default. This exists for
+        the one caller that must not let them: the chunk write, which passes
+        ``_commit=False`` to the data write AND to the watermark advance so the
+        two land as one atomic unit. See ``imports/store_sink.write_checkpoint``.
+        """
+        self._c().commit()
+
+    def rollback(self) -> None:
+        """Discard the open transaction. The other half of :meth:`commit`."""
+        self._c().rollback()
 
     def _ensure_writable(self) -> None:
         if self.read_only:
@@ -878,6 +898,240 @@ class Store:
             scope,
         )
         c.execute(f"DELETE FROM sessions WHERE origin IN ({placeholders})", scope)
+
+    # -- ingest state: the per-source high-water mark ----------------------
+
+    def read_ingest_state(self, source: str) -> dict[str, object]:
+        """One source's row from ``ingest_state``, or ``{}`` if it has none.
+
+        ``{}`` is the first-run answer and means "no window" — a full scan,
+        which is what a first run must be. Never raises for a missing row; a
+        watermark that could not be read has to degrade to re-reading, never to
+        skipping.
+        """
+        row = self._c().execute(
+            "SELECT source, cursor_value, cursor_kind, last_run_at, last_ok_at, "
+            "rows_seen, consecutive_failures, last_error, next_attempt_at "
+            "FROM ingest_state WHERE source = ?",
+            (source,),
+        ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def all_ingest_state(self) -> dict[str, dict[str, object]]:
+        """Every source's ingest state, for ``aggregator status``."""
+        rows = self._c().execute(
+            "SELECT source, cursor_value, cursor_kind, last_run_at, last_ok_at, "
+            "rows_seen, consecutive_failures, last_error, next_attempt_at "
+            "FROM ingest_state ORDER BY source"
+        )
+        return {row["source"]: dict(row) for row in rows}
+
+    def advance_ingest_cursor(
+        self,
+        source: str,
+        *,
+        cursor_kind: str,
+        cursor_value: str | None,
+        rows: int,
+        at: str,
+        _commit: bool = True,
+    ) -> None:
+        """Move one source's mark forward. FORWARD ONLY, and never to NULL.
+
+        THE MONOTONICITY GUARD IS IN THE SQL, not in the caller, so no code
+        path can route around it: ``cursor_value`` is only taken when it is
+        strictly greater than what is stored. A retry of an older chunk, a
+        clock that stepped backwards, or two runs racing would otherwise rewind
+        the window — and everything between the two values then gets re-read
+        (harmless) or, if the guard were ever missing on the way up, skipped
+        forever (not).
+
+        ISO-8601 strings compare lexicographically in the same order as the
+        instants they name, as long as they share an offset and a precision.
+        Every value written here comes from ``datetime.isoformat()`` on an
+        aware UTC datetime produced by this codebase, so that holds — and the
+        Python-side ``Watermarks`` never hands over a value it did not parse.
+
+        ``COALESCE(?, cursor_value)`` is the empty-run rule: a pass that found
+        nothing still stamps ``last_run_at`` and clears the failure counter,
+        but must not write NULL over a live mark. The same defect is on record
+        in another implementation of this pattern (an empty sync nuking state
+        to ``{}``); here it would full-scan 372k rows on the very next tick.
+
+        ``_commit=False`` leaves the transaction open, which is the whole point
+        of the mark living in this database: the caller commits it together
+        with the chunk it describes, so no crash can leave one without the
+        other.
+        """
+        self._ensure_writable()
+        c = self._c()
+        try:
+            c.execute(
+                """
+                INSERT INTO ingest_state(
+                    source, cursor_value, cursor_kind, last_run_at, last_ok_at,
+                    rows_seen, consecutive_failures, last_error, next_attempt_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+                ON CONFLICT(source) DO UPDATE SET
+                    cursor_value = CASE
+                        WHEN excluded.cursor_value IS NOT NULL
+                         AND (ingest_state.cursor_value IS NULL
+                              OR excluded.cursor_value > ingest_state.cursor_value)
+                        THEN excluded.cursor_value
+                        ELSE ingest_state.cursor_value
+                    END,
+                    cursor_kind          = excluded.cursor_kind,
+                    last_run_at          = excluded.last_run_at,
+                    last_ok_at           = excluded.last_ok_at,
+                    rows_seen            = ingest_state.rows_seen + excluded.rows_seen,
+                    consecutive_failures = 0,
+                    last_error           = NULL,
+                    next_attempt_at      = NULL
+                """,
+                (source, cursor_value, cursor_kind, at, at, rows),
+            )
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    def record_ingest_failure(
+        self,
+        source: str,
+        *,
+        cursor_kind: str,
+        error: str,
+        at: str,
+        next_attempt_at: str | None,
+        _commit: bool = True,
+    ) -> None:
+        """Count a failed pass. DELIBERATELY LEAVES THE MARK WHERE IT WAS.
+
+        A failed run must not advance anything: the next run re-reads the same
+        window — cheap, because the apply is idempotent — and nothing between
+        the old mark and wherever this run got to can be lost. Advancing on
+        failure is the one ordering that loses records silently.
+
+        ``next_attempt_at`` is computed by the caller (which owns the backoff
+        policy) and STORED, because the delay is jittered: recomputing it on
+        every read would let two reads inside one run disagree about whether
+        the source runs at all.
+        """
+        self._ensure_writable()
+        c = self._c()
+        try:
+            c.execute(
+                """
+                INSERT INTO ingest_state(
+                    source, cursor_value, cursor_kind, last_run_at, last_ok_at,
+                    rows_seen, consecutive_failures, last_error, next_attempt_at
+                )
+                VALUES (?, NULL, ?, ?, NULL, 0, 1, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    cursor_kind          = excluded.cursor_kind,
+                    last_run_at          = excluded.last_run_at,
+                    consecutive_failures = ingest_state.consecutive_failures + 1,
+                    last_error           = excluded.last_error,
+                    next_attempt_at      = excluded.next_attempt_at
+                """,
+                (source, cursor_kind, at, error, next_attempt_at),
+            )
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    # -- ingest state: records that could not be written -------------------
+
+    def read_poison(self, source: str) -> list[dict[str, object]]:
+        """Every held record for one source, due or not. Policy is the caller's."""
+        rows = self._c().execute(
+            "SELECT source, record_key, error_type, error_detail, attempts, "
+            "first_seen_at, last_seen_at, next_retry_at "
+            "FROM quarantine WHERE source = ?",
+            (source,),
+        )
+        return [dict(row) for row in rows]
+
+    def hold_poison(
+        self,
+        source: str,
+        record_key: str,
+        *,
+        error_type: str,
+        error_detail: str,
+        at: str,
+        next_retry_at: str | None,
+        _commit: bool = True,
+    ) -> None:
+        """Record one record that could not be written, or bump its attempt count.
+
+        ``first_seen_at`` is preserved across attempts — how long something has
+        been broken is the number that decides whether a human cares.
+        """
+        self._ensure_writable()
+        c = self._c()
+        try:
+            c.execute(
+                """
+                INSERT INTO quarantine(
+                    source, record_key, error_type, error_detail, attempts,
+                    first_seen_at, last_seen_at, next_retry_at
+                )
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(source, record_key) DO UPDATE SET
+                    error_type    = excluded.error_type,
+                    error_detail  = excluded.error_detail,
+                    attempts      = quarantine.attempts + 1,
+                    last_seen_at  = excluded.last_seen_at,
+                    next_retry_at = excluded.next_retry_at
+                """,
+                (source, record_key, error_type, error_detail, at, at, next_retry_at),
+            )
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    def release_poison(self, source: str, record_key: str, *, _commit: bool = True) -> None:
+        """A record that used to fail wrote cleanly. Stop holding it."""
+        self._ensure_writable()
+        c = self._c()
+        c.execute(
+            "DELETE FROM quarantine WHERE source = ? AND record_key = ?",
+            (source, record_key),
+        )
+        if _commit:
+            c.commit()
+
+    def poison_summary(self) -> list[dict[str, object]]:
+        """One row per (source, error_type, terminal-or-not) with a count.
+
+        The entire "what is broken" report, and the reason held rows are never
+        deleted: a failure nobody can count is a gap that reads as coverage.
+        """
+        rows = self._c().execute(
+            "SELECT source, error_type, "
+            "       next_retry_at IS NULL AS terminal, count(*) AS n "
+            "FROM quarantine GROUP BY source, error_type, terminal "
+            "ORDER BY source, error_type"
+        )
+        return [
+            {
+                "source": row["source"],
+                "error_type": row["error_type"],
+                "terminal": bool(row["terminal"]),
+                "count": int(row["n"]),
+            }
+            for row in rows
+        ]
 
     # -- writes: legacy records (GitHub) ----------------------------------
 

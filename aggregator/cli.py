@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -50,7 +51,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from aggregator.core.store import EmptyRebuildRefusedError, Store
-from aggregator.imports.ingest_state import default_marker_path, stale_input_markers
+from aggregator.imports.ingest_state import (
+    SOURCE_CURSORS,
+    PoisonLedger,
+    Watermarks,
+    default_marker_path,
+    stale_input_markers,
+)
 from aggregator.imports.port import Delivery, ImportAdapter
 from aggregator.imports.registry import default_adapters
 from aggregator.imports.runner import (
@@ -58,6 +65,7 @@ from aggregator.imports.runner import (
     RunReport,
     commit_report_barriers,
     commit_staleness_receipts,
+    graceful_shutdown,
     run_imports,
 )
 from aggregator.imports.store_sink import StoreSink, count_writes
@@ -339,9 +347,19 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     # being held quiet, and the export date each was held quiet about, are
     # listed here on demand.
     stale_inputs = stale_input_markers()
+    # WHERE "IS THIS RUN INCREMENTAL?" IS ANSWERED WITHOUT READING CODE. The
+    # high-water marks and the records that could not be written are both
+    # things a run may legitimately go quiet about — a mark that stopped moving
+    # and a record set aside three weeks ago produce no output at all on a
+    # healthy tick — so the on-demand view is the other half of that bargain.
+    # Quiet is only acceptable while it is not the same as forgotten.
+    ingest_state = store.all_ingest_state()
+    held_records = store.poison_summary()
     if args.json:
         caps["ticktick_uncovered_projects"] = uncovered
         caps["stale_input_markers"] = stale_inputs
+        caps["ingest_state"] = ingest_state
+        caps["held_records"] = held_records
         print(json.dumps(caps, indent=2, default=str))
         return 0
     print(f"cache_path: {caps['cache_path']}")
@@ -351,6 +369,34 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     for s in caps["sources"]:
         fresh = caps["freshness"].get(s, "n/a")
         print(f"  {s}: last_updated={fresh}")
+    print("ingest windows (per-source high-water marks):")
+    for name in sorted(SOURCE_CURSORS):
+        cursor = SOURCE_CURSORS[name]
+        state = ingest_state.get(name, {})
+        mark = state.get("cursor_value")
+        if not cursor.is_incremental:
+            # SAID OUT LOUD, EVERY TIME IT IS ASKED. A source that full-scans
+            # while reporting like an incremental one is the failure this whole
+            # change exists to remove, so its line names the kind rather than
+            # showing an empty mark that reads as "nothing new yet".
+            print(f"  {name}: FULL SCAN every run — {cursor.note}")
+            continue
+        print(
+            f"  {name}: {cursor.kind} on {cursor.field}, "
+            f"mark={mark or 'none yet (next run is a full scan)'}, "
+            f"last_run={state.get('last_run_at') or 'never'}, "
+            f"failures={state.get('consecutive_failures') or 0}"
+        )
+        if state.get("last_error"):
+            print(f"    last error: {state['last_error']}")
+    if held_records:
+        print("records set aside after write failures (retained, never deleted):")
+        for entry in held_records:
+            when = "terminal, never retried" if entry["terminal"] else "will retry"
+            print(
+                f"  {entry['source']}: {entry['count']} x "
+                f"{entry['error_type']} ({when})"
+            )
     if uncovered:
         print(
             "ticktick uncovered projects (reported once; tasks retained, never "
@@ -1170,11 +1216,33 @@ def _resolve_notify(
     return _silent_notification
 
 
+def _configure_ingest_logging() -> None:
+    """Send the runner's progress lines somewhere a human can find them.
+
+    NOTHING UNDER ``aggregator/`` CONFIGURED LOGGING, which is why the
+    2026-08-15 run was silent: ``logging.lastResort`` prints WARNING and above,
+    so every INFO-level progress line this pipeline might have emitted would
+    have gone nowhere anyway. pypdf's WARNING-level chatter got through, was
+    the only thing that did, and its absence was then read as a hang.
+
+    stderr, so the report on stdout stays parseable and the journal gets both.
+    ``basicConfig`` no-ops when the root logger already has handlers, so a
+    library embedder's or pytest's configuration wins — which is the correct
+    precedence for a CLI that is also an importable package.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
 def _cmd_ingest_all(
     args: argparse.Namespace,
     store: Store,
     adapters: Sequence[ImportAdapter],
     notify: NotifyHook = _silent_notification,
+    watermarks: Watermarks | None = None,
 ) -> int:
     """Drive every adapter through the one runner and report what happened.
 
@@ -1202,18 +1270,28 @@ def _cmd_ingest_all(
     it is the journal, which is none. Both answers come out of the same
     ``_stderr_delivery`` the single-source path uses.
     """
-    report = asyncio.run(
-        run_imports(
-            adapters,
-            StoreSink(store),
-            notify=notify,
-            stale_after_days=(
-                args.stale_after_days
-                if args.stale_after_days is not None
-                else DEFAULT_STALE_AFTER_DAYS
-            ),
-        )
-    )
+    _configure_ingest_logging()
+
+    async def _drive() -> RunReport:
+        # THE SIGNAL HANDLER LIVES HERE, not in the runner: the process owns
+        # its signals and library code merely reads the flag. Installed inside
+        # the coroutine because ``add_signal_handler`` needs the running loop.
+        with graceful_shutdown() as stop:
+            return await run_imports(
+                adapters,
+                StoreSink(store),
+                notify=notify,
+                stale_after_days=(
+                    args.stale_after_days
+                    if args.stale_after_days is not None
+                    else DEFAULT_STALE_AFTER_DAYS
+                ),
+                watermarks=watermarks,
+                poison=PoisonLedger(store) if watermarks is not None else None,
+                stop=stop,
+            )
+
+    report = asyncio.run(_drive())
     _print_run_report(report)
     shown_warnings = _print_warnings(report.warnings)
     shown = _print_errors(report.errors, RUN_ERROR_PRINT_LIMIT)
@@ -1265,16 +1343,26 @@ def _print_run_report(report: RunReport) -> None:
     also prints ``warnings=1``, and that is what makes the difference legible
     in a journal entry read after the fact.
     """
-    print("ingest --all:")
+    print(f"ingest --all: run={report.run_id}")
     for name, a in report.adapters.items():
+        # ``unchanged`` and ``window`` are what tell an incremental run from
+        # the doom loop in a journal read after the fact. Both printed a run
+        # that "updated" ~372k rows; only one of them did any work, and only
+        # one of them was given a window.
         print(
             f"  {name}: added={a.added} updated={a.updated} "
-            f"skipped={a.skipped} errors={len(a.errors)}"
+            f"unchanged={a.unchanged} skipped={a.skipped} "
+            f"errors={len(a.errors)} window={a.window or 'n/a'}"
+            f"{' INTERRUPTED' if a.interrupted else ''}"
+            f"{' RESTING' if a.skipped_for_backoff else ''}"
         )
+        for note in a.notes:
+            print(f"    note: {note}")
     print(
         f"  total: added={report.added} updated={report.updated} "
-        f"skipped={report.skipped} errors={len(report.errors)} "
-        f"warnings={len(report.warnings)}"
+        f"unchanged={report.unchanged} skipped={report.skipped} "
+        f"errors={len(report.errors)} warnings={len(report.warnings)}"
+        f"{' (INTERRUPTED — stopped at a chunk boundary; the next run resumes)' if report.interrupted else ''}"
     )
 
 
@@ -1474,13 +1562,25 @@ def main(
             except ValueError:
                 print(f"bad --since: {args.since}", file=sys.stderr)
                 return 2
+            # ONE ``Watermarks`` FOR THE WHOLE RUN, shared by the registry
+            # (which turns each mark into the adapter's ``since``) and the
+            # runner (which describes the window in the report and advances the
+            # mark afterwards). Two instances would be two reads of the same
+            # table and could not disagree today — but they could tomorrow, and
+            # a report describing a different window from the one the adapters
+            # were handed is worse than no report.
+            watermarks = Watermarks(store, override=since)
             adapters = (
                 _adapters
                 if _adapters is not None
-                else default_adapters(since=since)
+                else default_adapters(watermarks=watermarks)
             )
             return _cmd_ingest_all(
-                args, store, adapters, _resolve_notify(args, _notify)
+                args,
+                store,
+                adapters,
+                _resolve_notify(args, _notify),
+                watermarks=watermarks,
             )
         # Round-2 MEDIUM: the atomic DELETE + upsert lives inside
         # ``_cmd_ingest`` via ``store.rebuild_and_upsert`` when

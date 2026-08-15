@@ -115,15 +115,21 @@ def test_ingest_all_runs_every_adapter(tmp_path, capsys):
     assert store.count_by_source("alpha") == 1
     assert store.count_by_source("beta") == 2
     out = capsys.readouterr().out
-    assert "alpha: added=1 updated=0 skipped=0 errors=0" in out
-    assert "beta: added=2 updated=0 skipped=0 errors=0" in out
+    assert "alpha: added=1 updated=0 unchanged=0 skipped=0 errors=0" in out
+    assert "beta: added=2 updated=0 unchanged=0 skipped=0 errors=0" in out
 
 
 def test_summary_reports_real_counts_not_hardcoded_zeros(tmp_path, capsys):
     """The single-source path used to print ``added=len(records) updated=0``
     on every run, so an import of 313 new PRs and a re-write of the same 313
     rows read identically. That bug is not repeated here: a second pass over
-    unchanged input must report updates, not adds."""
+    unchanged input must report updates, not adds.
+
+    ``unchanged=1`` is the newer half of the same idea. A run reporting
+    ``updated=372450`` and a run reporting ``updated=372450 unchanged=372450``
+    are the doom loop and a healthy re-read respectively, and until this
+    number existed the summary could not tell them apart.
+    """
     store = _store(tmp_path)
 
     def adapters():
@@ -136,7 +142,7 @@ def test_summary_reports_real_counts_not_hardcoded_zeros(tmp_path, capsys):
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "alpha: added=0 updated=1 skipped=0 errors=0" in out
+    assert "alpha: added=0 updated=1 unchanged=1 skipped=0 errors=0" in out
     assert store.count_by_source("alpha") == 1
 
 
@@ -159,7 +165,7 @@ def test_one_source_failing_does_not_stop_the_others(tmp_path, capsys):
     assert store.count_by_source("alpha") == 1
     assert store.count_by_source("beta") == 1
     captured = capsys.readouterr()
-    assert "boom: added=0 updated=0 skipped=0 errors=1" in captured.out
+    assert "boom: added=0 updated=0 unchanged=0 skipped=0 errors=1" in captured.out
     assert "token expired" in captured.err
 
 
@@ -198,7 +204,7 @@ def test_non_fatal_errors_exit_three(tmp_path, capsys):
 
     assert rc == 3
     captured = capsys.readouterr()
-    assert "alpha: added=1 updated=0 skipped=0 errors=1" in captured.out
+    assert "alpha: added=1 updated=0 unchanged=0 skipped=0 errors=1" in captured.out
     assert "a/file.pdf" in captured.err
 
 
@@ -212,7 +218,7 @@ def test_run_total_is_printed(tmp_path, capsys):
     main(["ingest", "--all"], _store=store, _adapters=adapters)
 
     out = capsys.readouterr().out
-    assert "total: added=3 updated=0 skipped=0 errors=0" in out
+    assert "total: added=3 updated=0 unchanged=0 skipped=0 errors=0" in out
 
 
 # -- input staleness -------------------------------------------------------
@@ -415,7 +421,7 @@ def test_the_printed_total_counts_the_warnings(tmp_path, capsys):
     )
 
     out = capsys.readouterr().out
-    assert "total: added=0 updated=0 skipped=0 errors=0 warnings=1" in out
+    assert "total: added=0 updated=0 unchanged=0 skipped=0 errors=0 warnings=1" in out
 
 
 def test_the_threshold_reaches_the_report_not_just_stderr(tmp_path):
@@ -568,13 +574,24 @@ def test_the_real_registry_drives_the_run_when_nothing_is_injected(
     tmp_path, monkeypatch
 ):
     """REGRESSION GUARD. Without it the command could be green against
-    injected fakes and import nothing in production. ``--since`` has to reach
-    the registry too: the port has no ``since`` parameter, so an adapter that
-    was not built with one silently ignores the window."""
+    injected fakes and import nothing in production.
+
+    THE WINDOW HAS TO REACH THE REGISTRY, because the port has no ``since``
+    parameter — an adapter that was not BUILT with one silently ignores it, and
+    that is the exact shape of the 2026-08-15 bug: ``cli.py`` set ``since``
+    only from ``--since``, so every unattended run handed all nine sources
+    ``None`` and re-ingested 372k observations on every 30-minute tick.
+
+    ``--since`` and the stored watermark now arrive by the same route, so this
+    pins both: the registry receives a ``Watermarks``, and asking it for a
+    source's window returns what the operator typed.
+    """
     seen: list[datetime | None] = []
 
-    def fake_registry(since=None):
-        seen.append(since)
+    def fake_registry(since=None, *, watermarks=None, now=None):
+        seen.append(
+            watermarks.plan("alpha").since if watermarks is not None else since
+        )
         return [_FakeAdapter("alpha", records=[_record("alpha")])]
 
     monkeypatch.setattr("aggregator.cli.default_adapters", fake_registry)
