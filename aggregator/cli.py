@@ -52,7 +52,12 @@ from typing import Any
 from aggregator.core.store import EmptyRebuildRefusedError, Store
 from aggregator.imports.port import Delivery, ImportAdapter
 from aggregator.imports.registry import default_adapters
-from aggregator.imports.runner import NotifyHook, RunReport, run_imports
+from aggregator.imports.runner import (
+    NotifyHook,
+    RunReport,
+    commit_report_barriers,
+    run_imports,
+)
 from aggregator.imports.store_sink import StoreSink, count_writes
 from aggregator.imports.sync_bridge import accepts_errors_kwarg, unwired_sink_note
 from aggregator.mcp import (
@@ -105,6 +110,11 @@ ERROR_PRINT_LIMIT = 5
 # not delivered, so nothing it gates goes quiet. ``_notification_text`` spends
 # the budget on the lines that gate a receipt first — see there.
 NOTIFY_ERROR_LIMIT = 5
+
+# How many of a run's errors `ingest --all` prints to stderr. Larger than the
+# toast because a terminal scrolls and a journal is read after the fact; a
+# person watching that terminal is a delivery channel for exactly these lines.
+RUN_ERROR_PRINT_LIMIT = 10
 
 # How old a manually-refreshed input may get before `ingest --all` nags.
 # Overridable with `--stale-after-days`.
@@ -913,6 +923,11 @@ def _silent_notification(report: RunReport) -> None:
     ``-> None`` for the same reason as ``runner._no_notification``: a hook that
     does nothing must not be able to declare that a human was told, and the way
     to guarantee that is to leave it nothing to return. See ``port.Delivery``.
+
+    THAT DOES NOT MAKE THE INTERACTIVE RUN UNDELIVERABLE, which was the round-7
+    MEDIUM. This hook is silent because the CHANNEL IS ELSEWHERE: ``ingest
+    --all`` prints the report itself, after ``run_imports`` has returned, and
+    declares what that print showed a watched terminal. See ``_cmd_ingest_all``.
     """
 
 
@@ -1119,6 +1134,13 @@ def _cmd_ingest_all(
     imported nothing from a month-old export is clean and is still the thing
     an operator needs told — see ``runner.run_imports``. Defaults to the
     runner's no-op so library and test callers stay silent.
+
+    THE PRINT BELOW IS ALSO A CHANNEL, and this function is the only place that
+    can say so: the runner's hook has already fired by the time these lines
+    reach stderr. Interactively that stderr is a terminal with a person in front
+    of it, which is exactly as much of an audience as a toast; under the timer
+    it is the journal, which is none. Both answers come out of the same
+    ``_stderr_delivery`` the single-source path uses.
     """
     report = asyncio.run(
         run_imports(
@@ -1135,7 +1157,27 @@ def _cmd_ingest_all(
     _print_run_report(report)
     for warning in report.warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
-    _print_errors(report.errors, 10)
+    shown = _print_errors(report.errors, RUN_ERROR_PRINT_LIMIT)
+    # THE TERMINAL IS A CHANNEL AND THE RUNNER CANNOT SEE IT. Round-7 MEDIUM: an
+    # interactive ``ingest --all`` resolves to ``_silent_notification`` and does
+    # its reporting HERE, after ``run_imports`` has returned — so a person
+    # watching these lines scroll past was told, the runner never heard about
+    # it, and the same TickTick gap re-reported on every single run, forever.
+    # Declared here because this is where the print happens; derived from
+    # ``shown`` because that is what the print actually put on screen.
+    #
+    # NOT A WEAKENING OF THE UNATTENDED CASE: ``_stderr_delivery`` answers
+    # "nothing" unless stderr is a tty, and under the timer it is the journal.
+    # A second call is safe — the barriers cleared whatever the notify hook
+    # already earned — and it can only ever ADD lines a human saw.
+    late = len(report.run_errors)
+    commit_report_barriers(
+        adapters, report, _stderr_delivery(shown, report.errors)
+    )
+    # A barrier that raised lands in ``run_errors`` after the block above has
+    # printed, so it would otherwise change the exit code with nothing on stderr
+    # to explain it. Same treatment as the single-source path's ``late``.
+    _print_errors(report.run_errors[late:], RUN_ERROR_PRINT_LIMIT)
     if report.errors:
         # Same 3 as the single-source path, for the same reason: a run that
         # completed but dropped files is not a success, and a timer that reads

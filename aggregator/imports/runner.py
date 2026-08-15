@@ -452,6 +452,13 @@ def commit_report_barriers(
     channel; an ``if`` at each call site is the shape the first four rounds of
     this bug all had.
 
+    PUBLIC, because the CLI has a channel the runner cannot see: ``ingest --all``
+    prints the run's errors to a terminal AFTER ``run_imports`` has returned, and
+    a person watching that terminal is as much an audience as a toast is. Calling
+    it a second time is safe — the adapters' pending receipts are cleared when
+    they fire — and forgetting to call it is the loud direction, which is what
+    separates this from the four rounds where forgetting bought silence.
+
     Not gated on ``report.ok``: a run that failed and said so is exactly the
     shape that must be allowed to go quiet, or the alarm repeats every 30
     minutes and the operator learns to dismiss it unread.
@@ -493,6 +500,10 @@ __all__ = [
     "Delivery",
     "NotifyHook",
     "RunReport",
+    # Public because the CLI declares a channel the runner never sees: the
+    # errors it prints to a terminal a human is watching, AFTER run_imports has
+    # returned. See ``commit_report_barriers``.
+    "commit_report_barriers",
     "run_imports",
     "staleness_warnings",
 ]

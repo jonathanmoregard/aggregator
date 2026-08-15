@@ -18,6 +18,11 @@ stamped:
       ``report.errors[:5]``. Five failures from other sources pushed the
       uncovered-project line out of the payload and its receipt was stamped for
       a sentence that never left the process.
+  R7 again, the other direction: an interactive ``ingest --all`` prints its
+      report to a terminal a person is watching, AFTER ``run_imports`` returned,
+      so the runner never heard about the one channel that actually worked and
+      the same gap re-reported on every run, forever.
+
 The shape changed rather than the check. ``Delivery`` is now a SET OF LINES
 built by ``Delivery.accepted(payload, report.errors)`` — read out of the text a
 channel accepted rather than asserted beside it — and a barrier fires only for
@@ -416,6 +421,57 @@ def test_the_shipped_toast_spends_its_budget_on_the_gating_line_first(
 
     assert _reported(second) == [], (
         f"a human was shown the line and it fired again: {second.errors}"
+    )
+
+
+# -- round 7 MEDIUM: an interactive `ingest --all` has an audience ---------
+
+
+def _ingest_all(tmp_path, state_file, store) -> int:
+    """``aggregator ingest --all`` with nothing configured — no ``--notify``,
+    no ``$AGGREGATOR_NOTIFY_COMMAND``. stderr is the only channel there is."""
+    return cli.main(
+        ["ingest", "--all"],
+        _store=store,
+        _adapters=[TickTickAdapter(source=_source(tmp_path, state_file))],
+    )
+
+
+def test_an_interactive_ingest_all_is_a_delivery_channel(
+    tmp_path, state_file, monkeypatch
+):
+    """THE repro. ``--all`` resolves to ``_silent_notification`` and does its
+    reporting AFTER ``run_imports`` returns, so the runner never saw the one
+    channel that worked: a person sitting at the terminal watching the report
+    scroll past got the same TickTick gap re-reported every run, forever."""
+    store = Store(db_path=tmp_path / "cache.db")
+    store.migrate()
+    terminal = _WatchedTerminal()
+    monkeypatch.setattr(sys, "stderr", terminal)
+
+    assert _ingest_all(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS
+    assert UNCOVERED in terminal.getvalue()
+
+    assert _ingest_all(tmp_path, state_file, store) == 0, (
+        "the operator read it off their own terminal and it alarmed again"
+    )
+
+
+def test_an_unattended_ingest_all_is_not_a_delivery_channel(
+    tmp_path, state_file, capsys
+):
+    """The half the fix above must not cost. Under the systemd timer stdout and
+    stderr go to the journal — written, retained, and read by nobody unprompted.
+    (pytest's captured streams are not a tty, which is that exact shape.)"""
+    store = Store(db_path=tmp_path / "cache.db")
+    store.migrate()
+    assert not sys.stderr.isatty(), "this fixture is the unattended shape"
+
+    assert _ingest_all(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS
+    assert UNCOVERED in capsys.readouterr().err
+
+    assert _ingest_all(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS, (
+        "the journal was treated as an audience"
     )
 
 
