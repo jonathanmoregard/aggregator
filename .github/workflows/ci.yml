@@ -8,6 +8,13 @@ on:
 jobs:
   gitleaks:
     runs-on: ubuntu-latest
+    # The repo default workflow token is contents:read only, so the action's
+    # pull-request scan 403s on GET /pulls/{n}/commits and crashes before it
+    # scans anything. Grant the read scope it needs, and no more: comments are
+    # off, so a leak fails the job loudly instead of needing a write token.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,13 +22,16 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
 
   lint-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: ruff
-        run: uv run ruff check aggregator tests
+        run: uv run --extra dev ruff check aggregator tests
       - name: pytest
-        run: uv run pytest -q --ignore=tests/test_integration_smoke.py
+        run: uv run --extra dev pytest -q --ignore=tests/test_integration_smoke.py
