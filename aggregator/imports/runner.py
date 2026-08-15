@@ -99,9 +99,16 @@ class RunReport:
         The one place the ``"{adapter}: {error}"`` rendering lives, because two
         renderings would silently disagree: a report barrier fires only when a
         channel's payload contained every line ITS adapter reported, and that
-        comparison is string membership. A second copy of this format that
-        drifted would make coverage unachievable — safe, but permanently loud
-        for no reason a reader could find.
+        comparison is WHOLE-LINE identity (``Delivery.accepted``). A second copy
+        of this format that drifted would make coverage unachievable — safe, but
+        permanently loud for no reason a reader could find.
+
+        The prefix is also what keeps two adapters from ever rendering the same
+        line, which is why ``Delivery`` can treat identical text as one
+        sentence. It is NOT what keeps one adapter's line from being delivered
+        by another's: names are not validated against being suffixes of each
+        other, and under R8's substring matching ``box: file unreadable`` was
+        covered by ``dropbox: file unreadable``.
         """
         entry = self.adapters.get(name)
         return [] if entry is None else [f"{entry.name}: {e}" for e in entry.errors]

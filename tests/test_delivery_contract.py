@@ -22,6 +22,10 @@ stamped:
       report to a terminal a person is watching, AFTER ``run_imports`` returned,
       so the runner never heard about the one channel that actually worked and
       the same gap re-reported on every run, forever.
+  R8: the set was right and its MEMBERSHIP TEST was ``line in payload``, i.e.
+      substring. One adapter reporting ``box: file unreadable`` and another
+      reporting ``dropbox: file unreadable``: send only the second and the first
+      was marked delivered, receipt and all, for a sentence never sent.
 
 The shape changed rather than the check. ``Delivery`` is now a SET OF LINES
 built by ``Delivery.accepted(payload, report.errors)`` — read out of the text a
@@ -473,6 +477,136 @@ def test_an_unattended_ingest_all_is_not_a_delivery_channel(
     assert _ingest_all(tmp_path, state_file, store) == cli.EXIT_COMPLETED_WITH_ERRORS, (
         "the journal was treated as an audience"
     )
+
+
+# -- round 8 HIGH: a line is delivered by ITSELF, not by one containing it -
+
+
+class _Probe:
+    """An adapter that reports exactly what it is told and records its receipt.
+
+    Deliberately not TickTick: this finding is about the identity test inside
+    ``Delivery``, and the cheapest way to state it is two adapters whose report
+    lines stand in the offending relation.
+    """
+
+    def __init__(self, name: str, errors: list[str]) -> None:
+        self.name = name
+        self._errors = list(errors)
+        self.receipted = False
+
+    async def get_data(self) -> AsyncIterator[object]:
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    def drain_errors(self) -> list[str]:
+        return list(self._errors)
+
+    def commit_after_report(self) -> None:
+        self.receipted = True
+
+
+def test_a_line_is_not_delivered_by_a_longer_line_that_contains_it():
+    """THE round-8 repro. Membership was ``line in payload`` — SUBSTRING — so a
+    line was "delivered" by any longer line that happened to contain it.
+
+    ``box`` and ``dropbox`` both report ``file unreadable``; rendered, the first
+    is a substring of the second. Send only dropbox's line and box's receipt was
+    stamped for a sentence that never left the process — which is the exact
+    thing rounds 4 through 7 were each about, arrived at by a fifth route.
+
+    Adapter names are never validated against being suffixes of one another, and
+    two lines from ONE adapter need no coincidence at all (``A`` and ``A plus
+    detail``), which the next test pins directly.
+    """
+    box = _Probe("box", ["file unreadable"])
+    dropbox = _Probe("dropbox", ["file unreadable"])
+
+    def notify(report) -> Delivery:
+        # A channel with room for one source's worth of report — every real one
+        # has a budget, and which lines fall inside it is not this class's call.
+        return Delivery.accepted("\n".join(report.errors_from("dropbox")), report.errors)
+
+    _run_all([box, dropbox], notify=notify)
+
+    assert dropbox.receipted, "the line that WAS sent must still earn its receipt"
+    assert not box.receipted, (
+        "a receipt was stamped for a line the channel never carried — it was "
+        "merely a substring of one that it did"
+    )
+
+
+def test_one_adapters_own_prefix_line_is_not_delivered_by_its_longer_one():
+    """The same defect without the naming coincidence, and the more likely one.
+
+    A source that reports both ``A`` and ``A plus detail`` is ordinary — a
+    summary line and a detailed one. Under substring matching, a channel that
+    carried only the detailed line covered BOTH, so the adapter went quiet about
+    a sentence nobody read. Stated on ``Delivery`` directly because that is
+    where the rule lives; the test above proves the runner honours it.
+    """
+    delivered = Delivery.accepted("A plus detail", ["A", "A plus detail"])
+
+    assert delivered.lines == frozenset({"A plus detail"})
+    assert not delivered.covers(["A", "A plus detail"])
+
+
+def test_the_delivered_set_is_read_off_whole_lines():
+    """The neighbours of the identity test, each decided the loud way.
+
+    A trailing newline on the payload and a CRLF channel must both still
+    deliver: getting those wrong is safe but permanently loud, and loud-forever
+    is the round-4 alarm fatigue this whole mechanism exists to avoid. Padding
+    is the other direction and is a MISMATCH — a channel that changed the text
+    does not get to have this class guess how much change is still the same
+    line.
+    """
+    assert Delivery.accepted("a\nb\n", ["b"]).lines == frozenset({"b"})
+    assert Delivery.accepted("a\r\nb", ["a", "b"]).lines == frozenset({"a", "b"})
+    assert Delivery.accepted("A ", ["A"]).lines == frozenset()
+    assert Delivery.accepted(" A", ["A"]).lines == frozenset()
+    assert Delivery.accepted("", ["A"]).lines == frozenset()
+    # A blank report line gates nothing: it carries no sentence to a human, and
+    # under substring matching it was delivered by every payload in existence.
+    assert Delivery.accepted("anything", ["", "   "]).lines == frozenset()
+
+
+def test_a_multi_line_report_entry_is_delivered_only_as_one_block():
+    """Exception text with an embedded newline is real, and the channel carries
+    it verbatim. Refusing it would keep an adapter loud forever over a line the
+    human demonstrably read — so it is matched, but only as a CONTIGUOUS run of
+    lines, never assembled out of pieces of other reports."""
+    entry = "CalledProcessError: notify-send failed\n  stderr: no such display"
+
+    assert Delivery.accepted(f"first line\n{entry}", [entry]).lines == frozenset({entry})
+    scattered = "CalledProcessError: notify-send failed\nunrelated\n  stderr: no such display"
+    assert Delivery.accepted(scattered, [entry]).lines == frozenset()
+
+
+def test_two_identical_reported_lines_are_one_sentence():
+    """THE DECISION on duplicates, stated so the next reader does not re-open it.
+
+    A line reported twice and carried once counts as delivered for both
+    occurrences. This is a set of TEXT and a receipt suppresses a repeat of that
+    text; a human who read the sentence has read it, and a verbatim second copy
+    cannot be a sentence they missed.
+
+    It is the fail-safe choice because it can never silence anything unread —
+    the only thing it over-covers is an exact duplicate of a line that WAS on
+    screen. Counting multiplicity instead would leave an adapter that stuttered
+    loud forever with nothing an operator could do about it, and adapter-name
+    prefixing already means two DIFFERENT adapters can never render the same
+    line.
+    """
+    stutter = _Probe("stutter", ["the same failure", "the same failure"])
+
+    def notify(report) -> Delivery:
+        # Carried once, reported twice.
+        return Delivery.accepted("stutter: the same failure", report.errors)
+
+    _run_all([stutter], notify=notify)
+
+    assert stutter.receipted, "the operator read that sentence; it may go quiet"
 
 
 # -- the contract, end to end ---------------------------------------------

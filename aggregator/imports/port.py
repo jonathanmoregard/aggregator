@@ -218,6 +218,26 @@ class SupportsWriteBarrier(Protocol):
     def commit_after_write(self) -> None: ...
 
 
+def _carried_whole(carried: Sequence[str], wanted: Sequence[str]) -> bool:
+    """Did ``carried`` contain ``wanted`` as a run of COMPLETE lines?
+
+    The identity test behind :meth:`Delivery.accepted`, factored out because it
+    is the entire difference between a receipt that means something and one that
+    a longer sentence elsewhere in the payload can forge. ``wanted`` is normally
+    one line and this is then set membership spelled as a scan; it is a scan
+    because a reported line may legitimately contain newlines (exception text),
+    and such a line is delivered only when the channel carried its lines
+    adjacent and in order — never assembled out of pieces of other reports.
+    """
+    if not wanted:
+        return False
+    span = len(wanted)
+    return any(
+        list(carried[i : i + span]) == list(wanted)
+        for i in range(len(carried) - span + 1)
+    )
+
+
 @dataclass(frozen=True)
 class Delivery:
     """WHICH of this run's reported lines reached a human. Never merely THAT.
@@ -236,6 +256,10 @@ class Delivery:
           sources pushed TickTick's uncovered-project line out of the toast,
           and its receipt — which suppresses THAT LINE and nothing else — was
           stamped for a sentence no human ever saw.
+      R8: the set was right and its membership test was ``line in payload``,
+          i.e. SUBSTRING. A line was then delivered by any longer line that
+          contained it, so the same "stamped for something never sent" arrived
+          by a fifth route. See :meth:`accepted`.
 
     THE UNIT OF DELIVERY IS NOW THE UNIT OF SUPPRESSION. A receipt suppresses
     one adapter's repeat of one report, so delivery is tracked per reported
@@ -266,7 +290,7 @@ class Delivery:
 
     @classmethod
     def accepted(cls, payload: str, reported: Iterable[str]) -> Delivery:
-        """The lines of ``reported`` that are actually IN ``payload``.
+        """The lines of ``reported`` that ``payload`` carried AS WHOLE LINES.
 
         The only constructor a channel should use, and the reason a truncating
         channel cannot lie: it hands over the text it sent and this reads the
@@ -274,12 +298,57 @@ class Delivery:
         lines; the sixth is not in ``payload``, so it is not in the result, so
         the adapter that reported it does not go quiet. No check to forget.
 
-        Substring, not equality, so a channel may decorate its lines (``  error:
-        {e}``) without losing the identity of what it carried. Blank lines are
-        dropped — ``"" in payload`` is true of every payload, and a report line
-        that is empty carries nothing to a human anyway.
+        WHOLE-LINE IDENTITY, NOT SUBSTRING. Round 8: this asked ``line in
+        payload``, which is substring containment, so a line was "delivered" by
+        any longer line that happened to contain it. One adapter reporting
+        ``box: file unreadable`` and another reporting ``dropbox: file
+        unreadable`` is the whole bug — send only the second and the first is
+        marked delivered, and its receipt (which is the thing that buys silence)
+        is stamped for a sentence no human ever saw. Adapter names are not
+        validated against being suffixes of each other and two lines from ONE
+        adapter need no such coincidence at all: ``A`` and ``A plus detail``
+        does it. So ``payload`` is split into the lines the channel actually
+        took and compared as complete strings.
+
+        THE NEIGHBOURS, all decided in the fail-safe direction:
+
+        * ``splitlines`` rather than ``split("\\n")``, so a CRLF channel and a
+          payload with a trailing newline both answer correctly. Getting these
+          wrong is merely loud, but loud-forever is the round-4 alarm fatigue
+          this whole mechanism is trying not to cause.
+        * Trailing or leading whitespace is now a MISMATCH. A channel that pads
+          or re-indents is a channel that changed the text, and this class only
+          ever gets to be honest by refusing to guess how much change is still
+          "the same line". No shipped channel pads — both of them join the raw
+          report lines with ``\\n`` — so this costs nothing today and stays loud
+          rather than silent if one ever starts.
+        * A reported line that itself spans several lines is matched as a
+          CONTIGUOUS BLOCK. Exception text with an embedded newline is real
+          (``f"{type(e).__name__}: {e}"`` over a subprocess error), the channel
+          does carry it verbatim, and refusing it would keep an adapter loud
+          forever over a line the human demonstrably read.
+        * DUPLICATE IDENTICAL LINES COUNT AS DELIVERED FOR EVERY OCCURRENCE.
+          This is a set of TEXT, and a receipt suppresses a repeat of that text;
+          a human who read the sentence once has read it, so a second identical
+          copy in the report cannot be a sentence they missed. Fail-safe because
+          it can never silence anything unread — the only thing it over-covers
+          is a verbatim duplicate of a line that WAS on screen. (Counting
+          multiplicity instead would make an adapter that stuttered stay loud
+          forever with nothing an operator could do about it, and adapter-name
+          prefixing means two different adapters can never render the same line
+          anyway.)
+
+        Blank and whitespace-only report lines are dropped: they carry nothing
+        to a human, so nothing they might gate should go quiet on their account.
         """
-        return cls(frozenset(line for line in reported if line and line in payload))
+        carried = payload.splitlines()
+        return cls(
+            frozenset(
+                line
+                for line in reported
+                if line.strip() and _carried_whole(carried, line.splitlines())
+            )
+        )
 
     def covers(self, reported: Sequence[str]) -> bool:
         """Did every one of ``reported`` reach a human?
