@@ -1647,12 +1647,48 @@ INCOMPLETE_POLL_NOTE = (
 )
 
 
+@dataclass(frozen=True)
+class OpenTaskReconcile:
+    """What one poll inferred, plus the two writes it may NOT do yet.
+
+    A RECORD RATHER THAN A TUPLE, and deliberately not a NamedTuple: this is not
+    iterable, so ``records, commit, receipts = plan_open_task_reconcile(...)``
+    raises instead of quietly binding whatever happened to be in each slot. The
+    two callables have identical types (``Callable[[], None]``), so nothing —
+    not a type checker, not a test that calls both — can catch them being swapped
+    by a future caller; but swapping them would stamp a receipt where the
+    baseline should have advanced, which is a permanent alert loss AND a frozen
+    baseline at once. Naming them makes the mistake unwriteable rather than
+    merely unlikely.
+
+    THE TWO COMMITS ARE NOT ORDERED RELATIVE TO EACH OTHER by anything here,
+    because they answer different questions and wait for different events:
+
+    * ``commit_baseline`` — the advance. Runs once the inferred records have been
+      PERSISTED, from the caller's write barrier
+      (``port.SupportsWriteBarrier.commit_after_write``). Must not wait for
+      anything else: a baseline that never advances loses every later completion.
+    * ``commit_receipts`` — the report-once marks. Runs once the run's report has
+      actually REACHED A HUMAN, from the caller's report barrier
+      (``port.SupportsReportBarrier.commit_after_report``), which is later still
+      and often never.
+
+    Calling either is optional in the sense that skipping one costs a single
+    poll's worth of work; calling ``commit_receipts`` when nothing was delivered
+    is the expensive mistake. See :func:`plan_open_task_reconcile`.
+    """
+
+    records: list[Record]
+    commit_baseline: Callable[[], None]
+    commit_receipts: Callable[[], None]
+
+
 def plan_open_task_reconcile(
     state: OpenTaskState,
     poll: OpenTaskPoll,
     now: datetime,
     errors: list[str] | None = None,
-) -> tuple[list[Record], Callable[[], None], Callable[[], None]]:
+) -> OpenTaskReconcile:
     """Diff this poll against the baseline; hand back both saves as callables.
 
     TAKES AN :class:`OpenTaskPoll`, not a bare task list, and that is
@@ -1690,22 +1726,24 @@ def plan_open_task_reconcile(
     the receipts back for ``aggregator status``, so the quiet state stays
     inspectable.
 
-    THE RECEIPT IS THEREFORE THE THIRD RETURN VALUE, not part of ``commit``. A
+    THE RECEIPT IS THEREFORE ITS OWN COMMIT, not part of the baseline advance. A
     receipt asserts that A HUMAN WAS TOLD, and the baseline advance happens long
-    before that is true: the run's report is delivered — desktop notification,
-    or the caller's stderr — only after every adapter has finished. Written by
-    ``commit``, the receipt recorded "we tried to tell them": a notify hook that
-    could not run (missing program, non-zero exit, an exception) left the mark
-    on disk anyway, so every later poll read the disappearance as
-    already-reported and stayed quiet. The single alert a human was supposed to
-    get was suppressed by a record claiming they got it.
+    before that is true: the run's report is delivered — a desktop notification
+    that a hook DECLARED it made, or a print to a terminal somebody is watching —
+    only after every adapter has finished. Written by the advance, the receipt
+    recorded "we tried to tell them": a notify hook that could not run (missing
+    program, non-zero exit, an exception), or a run with no notifier configured
+    at all, left the mark on disk anyway, so every later poll read the
+    disappearance as already-reported and stayed quiet. The single alert a human
+    was supposed to get was suppressed by a record claiming they got it.
 
-    So ``commit`` advances the baseline (which must not wait for anything —
-    a frozen baseline loses completions permanently) and ``commit_receipts``
-    stamps the marks, to be called ONLY once the report has actually reached
-    its channel. Skipping it costs one more report of the same disappearance,
-    which is the harmless direction; calling it early costs the report
-    altogether, which is not.
+    So ``commit_baseline`` advances the baseline (which must not wait for
+    anything — a frozen baseline loses completions permanently) and
+    ``commit_receipts`` stamps the marks, to be called ONLY once the report has
+    actually reached its channel. Skipping it costs one more report of the same
+    disappearance, which is the harmless direction; calling it early costs the
+    report altogether, which is not. :class:`OpenTaskReconcile` names both so a
+    caller cannot swap them by unpacking in the wrong order.
 
     TWO-PHASE, and that is the point. The diff has to happen now — it needs
     the poll — but advancing the baseline is a destructive act: it is what
@@ -1715,8 +1753,8 @@ def plan_open_task_reconcile(
     later store or sink failure into permanent loss, with a re-run unable to
     recover it.
 
-    So the caller gets the records and a ``commit`` it may only invoke once
-    those records have landed. Skipping ONE commit costs one poll's worth of
+    So the caller gets the records and a ``commit_baseline`` it may only invoke
+    once those records have landed. Skipping ONE commit costs one poll's worth of
     inference and nothing else: the next poll diffs against the same baseline
     and infers the same completions again. Never committing at all is a
     different and worse thing — the baseline freezes, a task created after the
@@ -1735,7 +1773,7 @@ def plan_open_task_reconcile(
     tasks = list(poll.tasks)
     if not poll.complete:
         _note(errors, INCOMPLETE_POLL_NOTE)
-        return [], lambda: None, lambda: None
+        return OpenTaskReconcile([], lambda: None, lambda: None)
 
     try:
         previous = state.load()
@@ -1750,7 +1788,7 @@ def plan_open_task_reconcile(
         # this turns on: losing the file costs one poll's inference and is
         # recoverable, overwriting it is permanent.
         _note(errors, str(e))
-        return [], lambda: None, lambda: None
+        return OpenTaskReconcile([], lambda: None, lambda: None)
 
     # The diff and the report are taken separately from ``infer_completions``
     # because the commit needs the diff's ``retained`` set as well as its
@@ -1760,13 +1798,13 @@ def plan_open_task_reconcile(
     diff = _diff_baseline(previous, poll, now)
     _note_baseline_diff(diff, errors)
 
-    def commit() -> None:
+    def commit_baseline() -> None:
         state.save(tasks, now, diff.retained)
 
     def commit_receipts() -> None:
         _stamp_receipts(state, diff.receipts, now)
 
-    return diff.records, commit, commit_receipts
+    return OpenTaskReconcile(diff.records, commit_baseline, commit_receipts)
 
 
 def _stamp_receipts(
@@ -1847,9 +1885,7 @@ def reconcile_open_tasks(
     write also has nothing to wait for: its ``errors`` list IS the report and it
     is complete the moment this returns.
     """
-    records, commit, commit_receipts = plan_open_task_reconcile(
-        state, poll, now, errors
-    )
-    commit()
-    commit_receipts()
-    return records
+    plan = plan_open_task_reconcile(state, poll, now, errors)
+    plan.commit_baseline()
+    plan.commit_receipts()
+    return plan.records

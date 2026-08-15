@@ -488,12 +488,15 @@ class TickTickSource:
         # uncovered-project receipt may not happen until the run's report has
         # reached a human. See ``commit_after_report``.
         state = ticktick_api.JsonFileState(self.state_file)
-        inferred, commit, commit_receipts = ticktick_api.plan_open_task_reconcile(
-            state, poll, observed, errors
-        )
-        self._pending_state_commit = commit
-        self._pending_report_commit = commit_receipts
-        for record in inferred:
+        plan = ticktick_api.plan_open_task_reconcile(state, poll, observed, errors)
+        # By name, because the two are interchangeable to every checker there is
+        # (both ``Callable[[], None]``) and swapping them would stamp a receipt
+        # where the baseline should have advanced — a lost alert and a frozen
+        # baseline at once. ``OpenTaskReconcile`` is not unpackable for that
+        # reason.
+        self._pending_state_commit = plan.commit_baseline
+        self._pending_report_commit = plan.commit_receipts
+        for record in plan.records:
             candidates[_merge_key(record)] = (observed, record)
         return candidates
 

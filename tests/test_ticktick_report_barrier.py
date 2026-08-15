@@ -308,18 +308,18 @@ def test_a_receipt_is_not_stamped_onto_an_entry_that_moved_meanwhile(tmp_path):
     path = tmp_path / "open_tasks.json"
     now = datetime(2026, 8, 15, tzinfo=UTC)
     ticktick_api.save_state(path, [{"id": "t1", "projectId": "gone"}], now)
-    _, commit, commit_receipts = ticktick_api.plan_open_task_reconcile(
+    plan = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         ticktick_api.OpenTaskPoll(
             [], complete=True, covered_project_ids=frozenset({"live"})
         ),
         now,
     )
-    commit()
+    plan.commit_baseline()
     # Another run observed t1 under a different project before the report landed.
     ticktick_api.save_state(path, [{"id": "t1", "projectId": "elsewhere"}], now)
 
-    commit_receipts()
+    plan.commit_receipts()
 
     assert ticktick_api.uncovered_mark(ticktick_api.load_state(path)["t1"]) is None
 
@@ -337,20 +337,20 @@ def test_a_receipt_is_not_stamped_onto_an_entry_that_was_seen_again(tmp_path):
     path = tmp_path / "open_tasks.json"
     now = datetime(2026, 8, 15, tzinfo=UTC)
     ticktick_api.save_state(path, [{"id": "t1", "projectId": "gone"}], now)
-    _, commit, commit_receipts = ticktick_api.plan_open_task_reconcile(
+    plan = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         ticktick_api.OpenTaskPoll(
             [], complete=True, covered_project_ids=frozenset({"live"})
         ),
         now,
     )
-    commit()
+    plan.commit_baseline()
     # Another run DID cover "gone" before the report landed, and t1 is open.
     ticktick_api.save_state(
         path, [{"id": "t1", "projectId": "gone"}], now + timedelta(hours=1)
     )
 
-    commit_receipts()
+    plan.commit_receipts()
 
     assert ticktick_api.uncovered_mark(ticktick_api.load_state(path)["t1"]) is None, (
         "the task was observed open after the report, so its next disappearance "

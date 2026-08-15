@@ -427,12 +427,14 @@ def test_a_project_with_no_tasks_key_does_not_bury_its_open_tasks(monkeypatch, t
     monkeypatch.setattr(ticktick_api, "_request", fake_request)
     errors: list[str] = []
     poll = ticktick_api.poll_open_tasks("tok", errors=errors)
-    records, commit, _receipts = ticktick_api.plan_open_task_reconcile(
+    plan = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), poll, second, errors
     )
-    commit()
+    plan.commit_baseline()
 
-    assert records == [], "a project we never saw had its open tasks marked completed"
+    assert plan.records == [], (
+        "a project we never saw had its open tasks marked completed"
+    )
     assert ticktick_api.load_state(path).keys() == {"t1"}, "the baseline was armed anyway"
     assert errors
 
@@ -1380,7 +1382,7 @@ def test_the_planner_refuses_to_overwrite_a_baseline_it_could_not_read(tmp_path)
     original = path.read_bytes()
     errors: list[str] = []
 
-    records, commit, _receipts = ticktick_api.plan_open_task_reconcile(
+    plan = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         ticktick_api.OpenTaskPoll(
             [{"id": "t9", "title": "open now", "projectId": "p1"}],
@@ -1390,9 +1392,9 @@ def test_the_planner_refuses_to_overwrite_a_baseline_it_could_not_read(tmp_path)
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         errors,
     )
-    commit()
+    plan.commit_baseline()
 
-    assert records == []
+    assert plan.records == []
     assert path.read_bytes() == original, (
         "the unreadable baseline was overwritten from an empty one — every "
         "completion it still held is now unrecoverable"
@@ -1414,13 +1416,13 @@ def test_an_unreadable_baseline_is_loud_and_a_first_poll_is_not(tmp_path):
     )
     missing = tmp_path / "never-written.json"
     first_run: list[str] = []
-    _, commit, _receipts = ticktick_api.plan_open_task_reconcile(
+    plan = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(missing),
         poll,
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         first_run,
     )
-    commit()
+    plan.commit_baseline()
     assert first_run == [], "a first-ever poll is normal and must stay quiet"
     assert ticktick_api.load_state(missing).keys() == {"t1"}
 
@@ -1722,7 +1724,7 @@ def test_an_incomplete_poll_infers_nothing_and_leaves_the_baseline_alone(tmp_pat
     )
     errors: list[str] = []
 
-    records, commit, _receipts = ticktick_api.plan_open_task_reconcile(
+    plan = ticktick_api.plan_open_task_reconcile(
         state,
         ticktick_api.OpenTaskPoll(
             [{"id": "t1", "projectId": "p1"}],
@@ -1732,9 +1734,9 @@ def test_an_incomplete_poll_infers_nothing_and_leaves_the_baseline_alone(tmp_pat
         datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
         errors,
     )
-    commit()
+    plan.commit_baseline()
 
-    assert records == []
+    assert plan.records == []
     assert state.load().keys() == {"t1", "t2"}
     assert errors == [ticktick_api.INCOMPLETE_POLL_NOTE]
 
@@ -2011,12 +2013,12 @@ def _reconcile(path, poll, now, errors):
     it did not is
     ``test_the_receipt_is_not_written_until_the_report_was_delivered``.
     """
-    records, commit, commit_receipts = ticktick_api.plan_open_task_reconcile(
+    plan = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), poll, now, errors
     )
-    commit()
-    commit_receipts()
-    return records
+    plan.commit_baseline()
+    plan.commit_receipts()
+    return plan.records
 
 
 def test_a_vanished_project_is_reported_once_not_on_every_poll(tmp_path):
@@ -2218,6 +2220,30 @@ def _one_poll(*ids):
     )
 
 
+def test_the_plan_cannot_be_unpacked_and_therefore_cannot_be_mis_ordered(tmp_path):
+    """Round-6 (b). The planner used to return a 3-tuple whose second and third
+    slots are both ``Callable[[], None]``.
+
+    Nothing could catch those being swapped — not a type checker, not a test
+    that calls both — and swapping them stamps a receipt where the baseline
+    should have advanced: a permanently silenced alert and a frozen baseline at
+    once. ``OpenTaskReconcile`` is a frozen dataclass rather than a NamedTuple
+    precisely so that positional access does not exist to be got wrong.
+    """
+    plan = ticktick_api.plan_open_task_reconcile(
+        ticktick_api.JsonFileState(tmp_path / "open_tasks.json"),
+        _one_poll("t1"),
+        datetime(2026, 8, 8, tzinfo=UTC),
+    )
+
+    with pytest.raises(TypeError):
+        # Exactly what ``records, commit, receipts = plan`` does.
+        list(plan)
+
+    assert plan.commit_baseline is not plan.commit_receipts
+    assert plan.records == []
+
+
 def test_an_older_poll_cannot_clobber_a_newer_baseline(tmp_path):
     """Two reconciles interleaved, older committing last. It must be refused.
 
@@ -2226,18 +2252,18 @@ def test_an_older_poll_cannot_clobber_a_newer_baseline(tmp_path):
     which, unguarded, erases t2 from the baseline forever.
     """
     path = tmp_path / "open_tasks.json"
-    _, older, _ = ticktick_api.plan_open_task_reconcile(
+    older = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
     )
-    _, newer, _ = ticktick_api.plan_open_task_reconcile(
+    newer = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         _one_poll("t1", "t2"),
         datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
     )
 
-    newer()
+    newer.commit_baseline()
     with pytest.raises(ticktick_api.StaleBaselineError) as caught:
-        older()
+        older.commit_baseline()
 
     assert ticktick_api.load_state(path).keys() == {"t1", "t2"}
     assert "open_tasks.json" in str(caught.value)
@@ -2248,17 +2274,17 @@ def test_the_stale_write_is_refused_over_an_existing_baseline_too(tmp_path):
     path = tmp_path / "open_tasks.json"
     ticktick_api.save_state(path, [{"id": "t0", "projectId": "p1"}], datetime(2026, 8, 7, tzinfo=UTC))
 
-    _, older, _ = ticktick_api.plan_open_task_reconcile(
+    older = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
     )
-    _, newer, _ = ticktick_api.plan_open_task_reconcile(
+    newer = ticktick_api.plan_open_task_reconcile(
         ticktick_api.JsonFileState(path),
         _one_poll("t1", "t2"),
         datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
     )
-    newer()
+    newer.commit_baseline()
     with pytest.raises(ticktick_api.StaleBaselineError):
-        older()
+        older.commit_baseline()
     assert ticktick_api.load_state(path).keys() == {"t1", "t2"}
 
 
@@ -2268,7 +2294,7 @@ def test_a_refused_write_is_recoverable_by_the_next_poll(tmp_path):
     and saves normally."""
     path = tmp_path / "open_tasks.json"
     state = ticktick_api.JsonFileState(path)
-    _, older, _ = ticktick_api.plan_open_task_reconcile(
+    older = ticktick_api.plan_open_task_reconcile(
         state, _one_poll("t1"), datetime(2026, 8, 8, tzinfo=UTC)
     )
     ticktick_api.reconcile_open_tasks(
@@ -2277,7 +2303,7 @@ def test_a_refused_write_is_recoverable_by_the_next_poll(tmp_path):
         datetime(2026, 8, 8, 0, 5, tzinfo=UTC),
     )
     with pytest.raises(ticktick_api.StaleBaselineError):
-        older()
+        older.commit_baseline()
 
     records = ticktick_api.reconcile_open_tasks(
         ticktick_api.JsonFileState(path), _one_poll("t1"), datetime(2026, 8, 8, 1, tzinfo=UTC)
