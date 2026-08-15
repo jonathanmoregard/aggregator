@@ -356,6 +356,15 @@ class GitHubSource:
 
     name = "github"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild`` — why ``--rebuild`` is allowed here.
+
+        A live API. Every PR and issue the store holds is still served by
+        ``gh api``, so a re-scan reproduces the whole population and a row it
+        drops really has gone from GitHub.
+        """
+        return "the GitHub API via `gh api`, which serves the whole history live"
+
     def __init__(
         self,
         _scope_fetcher: Callable[[], list[str]] = _default_scope_fetcher,
@@ -543,6 +552,16 @@ class GitHubSource:
         ``+updated:>=YYYY-MM-DD`` qualifier to each endpoint path so the
         API returns only records touched in the window we care about
         (pre-fix, every timer fire refetched lifetime PRs/issues).
+
+        Cross-vendor HIGH-2: a row the converters cannot use is DROPPED, and
+        a drop used to be a ``log.warning`` and nothing else. This source runs
+        unattended on a 30-minute timer, so that log line reached nobody: the
+        run exited 0, notified nothing, and API rows were silently missing
+        from the index. Drops now reach ``errors`` — one entry per endpoint
+        rather than per row, so a pathologically broken response cannot bury
+        the report — which makes the run exit non-zero and notify, while
+        still not aborting the ingest (per-item faults are collected by
+        design, spec §Error handling).
         """
         self._check_scopes()
         for kind, subkind, path in self._ENDPOINTS:
@@ -554,6 +573,7 @@ class GitHubSource:
                 if errors is not None:
                     errors.append(f"{scoped_path}: {e}")
                 continue
+            dropped: list[str] = []
             for row in rows:
                 if kind == "pr":
                     rec = self._pr_to_record(row)
@@ -562,8 +582,31 @@ class GitHubSource:
                 # Codex Phase 2 BLOCKER: converter may return None when the
                 # row is malformed enough that we can't derive a repo — skip
                 # rather than emit a `unknown/unknown` collision magnet.
-                if rec is not None:
-                    yield rec
+                if rec is None:
+                    dropped.append(_row_label(row))
+                    continue
+                yield rec
+            if dropped:
+                self._note_dropped(scoped_path, dropped, errors)
+
+    @staticmethod
+    def _note_dropped(scoped_path: str, dropped: list[str], errors: list[str] | None) -> None:
+        """Report rows this run could not turn into records. Never silent.
+
+        Aggregated per endpoint and capped at five identifiers: the point is to
+        make the run non-zero and name enough to go looking with, not to let a
+        wholesale schema change write one error per row into a desktop
+        notification.
+        """
+        message = (
+            f"{scoped_path}: DROPPED {len(dropped)} row(s) with no derivable "
+            f"repo (neither repository_url nor a parseable html_url) — they are "
+            f"NOT in the index: {', '.join(dropped[:5])}"
+            f"{', ...' if len(dropped) > 5 else ''}"
+        )
+        log.warning("%s", message)
+        if errors is not None:
+            errors.append(message)
 
     @staticmethod
     def _apply_since(path: str, since: datetime | None) -> str:
@@ -629,6 +672,22 @@ def _parse_iso(s: str | None) -> datetime | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _row_label(row: dict) -> str:
+    """Whatever identifies a dropped row well enough to go find it on GitHub.
+
+    Best effort by construction — a row is only ever labelled here *because*
+    it was too malformed to convert, so every field is suspect. ``repr`` keeps
+    a surprising type readable instead of raising a second time inside the
+    error path.
+    """
+    if not isinstance(row, dict):
+        return f"<non-object row {type(row).__name__}>"
+    url = row.get("html_url") or row.get("url")
+    if isinstance(url, str) and url:
+        return url
+    return f"number={row.get('number')!r} id={row.get('id')!r}"
 
 
 def _extract_repo(row: dict) -> str | None:

@@ -11,6 +11,8 @@ import contextlib
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from aggregator.core.store import SCHEMA_VERSION, Store
 from aggregator.sources.base import (
     ObservationRow,
@@ -827,3 +829,130 @@ def test_wal_files_land_in_db_dir(tmp_data_home):
     s.upsert_entities([_sess("sess-a"), _obs("o1", "sess-a", "hi")])
     db = Path(s.db_path)
     assert db.exists()
+
+
+def test_existing_ids_reports_which_primary_keys_are_already_stored(tmp_data_home):
+    """Batch existence probe. The import runner needs it to report REAL
+    added-vs-updated counts instead of ``added=len(items)``."""
+    s = Store()
+    s.migrate()
+    s.upsert([_rec("github:1", "github", "a", "b")])
+    s.upsert_entities([_sess("sess-a"), _obs("o1", "sess-a", "hi")])
+
+    assert s.existing_ids("records", ["github:1", "github:2"]) == {"github:1"}
+    assert s.existing_ids("sessions", ["sess-a", "sess-b"]) == {"sess-a"}
+    assert s.existing_ids("observations", ["o1", "o2"]) == {"o1"}
+    assert s.existing_ids("records", []) == set()
+
+
+def test_existing_ids_rejects_a_table_not_on_the_allowlist(tmp_data_home):
+    """Table name is interpolated into SQL, so it can only ever be one of
+    three literals — never caller-supplied text."""
+    s = Store()
+    s.migrate()
+    with pytest.raises(ValueError, match="unknown table"):
+        s.existing_ids("records; DROP TABLE records", ["x"])
+
+
+# --- a re-observation must not erase a timestamp it does not carry --------
+#
+# Round-1 MEDIUM: ``ON CONFLICT ... updated_at = excluded.updated_at`` let a
+# record with no timestamp overwrite a real one. ticktick is where it bites: a
+# task payload carrying none of completedTime/modifiedTime/createdTime yields
+# ``updated_at=None``, and the merge lets the fresher API observation win, so
+# a NULL landed on the date the CSV leg had parsed. ``_warn_no_timestamps``
+# only fires when the WHOLE batch is dateless, so a partially-dated batch
+# degrades every date query it touches in complete silence.
+
+
+def _dated(sid: str, created=None, updated=None) -> Record:
+    return Record(
+        stable_id=sid,
+        source="ticktick",
+        subject="task",
+        body="body",
+        created_at=created,
+        updated_at=updated,
+    )
+
+
+def _dates(store: Store, sid: str) -> tuple[str | None, str | None]:
+    row = store._c().execute(
+        "SELECT created_at, updated_at FROM records WHERE stable_id = ?", (sid,)
+    ).fetchone()
+    return row["created_at"], row["updated_at"]
+
+
+REAL_TS = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+
+
+def test_a_dateless_reobservation_does_not_null_a_real_updated_at(tmp_data_home):
+    s = Store()
+    s.migrate()
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    s.upsert([_dated("ticktick:t1")])  # API leg won the merge, carrying nothing
+
+    _, updated = _dates(s, "ticktick:t1")
+    assert updated == REAL_TS.isoformat()
+
+
+def test_a_real_updated_at_still_overwrites_an_older_one(tmp_data_home):
+    """The guard must not freeze the column: a genuine newer observation is
+    the normal case and has to land."""
+    s = Store()
+    s.migrate()
+    newer = datetime(2026, 8, 1, tzinfo=UTC)
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=newer)])
+
+    _, updated = _dates(s, "ticktick:t1")
+    assert updated == newer.isoformat()
+
+
+def test_a_dateless_reobservation_survives_the_rebuild_write_path_too(
+    tmp_data_home,
+):
+    """``upsert`` and ``_do_write_records`` are two copies of the same SQL and
+    must not drift; the rebuild path deletes first, so this pins the INSERT
+    half rather than the conflict half."""
+    s = Store()
+    s.migrate()
+
+    s.rebuild_and_upsert("ticktick", [_dated("ticktick:t1", updated=REAL_TS)])
+    s.upsert([_dated("ticktick:t1")])
+
+    _, updated = _dates(s, "ticktick:t1")
+    assert updated == REAL_TS.isoformat()
+
+
+def test_a_row_first_written_dateless_gains_a_created_at_later(tmp_data_home):
+    """Round-1 LOW: ``created_at`` was omitted from the ON CONFLICT SET list
+    entirely, so a row written before ticktick's CREATED_FIELD is corrected
+    kept its NULL forever — breaking the tripwire's own promise that
+    correcting the field names "fixes the records as well as this warning"."""
+    s = Store()
+    s.migrate()
+    s.upsert([_dated("ticktick:t1")])
+    assert _dates(s, "ticktick:t1") == (None, None)
+
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    created, _ = _dates(s, "ticktick:t1")
+    assert created == REAL_TS.isoformat()
+
+
+def test_a_known_created_at_never_moves(tmp_data_home):
+    """Why created_at was left out of the SET list in the first place, and the
+    half worth keeping: a creation time is minted once."""
+    s = Store()
+    s.migrate()
+    s.upsert([_dated("ticktick:t1", created=REAL_TS, updated=REAL_TS)])
+
+    s.upsert(
+        [_dated("ticktick:t1", created=datetime(2020, 1, 1, tzinfo=UTC))]
+    )
+
+    created, _ = _dates(s, "ticktick:t1")
+    assert created == REAL_TS.isoformat()

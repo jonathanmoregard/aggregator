@@ -25,6 +25,22 @@ def _isolated_downloads_dir(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state_home(tmp_path, monkeypatch):
+    """No test may read or write the developer's own TickTick open-task baseline.
+
+    ``ticktick_api.default_state_path()`` resolves under ``$XDG_STATE_HOME``,
+    and ``aggregator status`` now reads that file to list the uncovered
+    projects it is holding. Unset, that is the real ``~/.local/state`` copy of
+    the user's live task payloads — titles and notes — so a status test's
+    output would depend on whose machine ran it, and a test that saved state
+    would edit the user's real baseline. Same reasoning as
+    ``_isolated_downloads_dir``; tests that care about the fallback delete or
+    blank the variable in their own body, which wins over this.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+
+
 @pytest.fixture
 def repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

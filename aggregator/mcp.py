@@ -26,10 +26,11 @@ Security invariants (spec §Security):
 Routing: two ontologies, one DSL surface.
 
 * ``records`` + ``records_fts`` — row-per-unit-of-work sources (GitHub PRs +
-  issues; research reports; sota-watch proposals; substack posts; future:
-  Gmail, Calendar). Filter keys: ``source:github``, ``source:research``,
-  ``source:sota-watch``, ``source:substack``, ``tag:``, ``state:``,
-  ``check:``, ``mergeable:``, ``author:``.
+  issues; research reports; sota-watch proposals; substack posts; dropbox
+  files; ticktick tasks; future: Gmail, Calendar). Filter keys:
+  ``source:<any of the above>``, ``tag:``, ``state:``, ``check:``,
+  ``mergeable:``, ``author:``. The authoritative list is
+  ``_RECORDS_SOURCES`` below — do not re-enumerate it in prose.
 * ``sessions`` + ``observations`` + ``obs_fts`` — Claude Code conversation
   streams (Langfuse-derived). Filter keys: ``source:sessions``, ``session:``,
   ``top:``, ``agent:``, ``type:``, ``active:``.
@@ -38,8 +39,9 @@ Route selection (see ``_wants_sessions`` / ``_route_mode``):
 
 * Explicit ``source:sessions|subagents|observations`` → sessions path
   (chat-export origins ``chatgpt``/``claude-web`` too — session-shaped).
-* Explicit ``source:github|records|research|sota-watch|substack`` → records path. If the query ALSO
-  carries session-only keys the paths are incompatible — return empty +
+* Explicit records-shaped source (``_RECORDS_SOURCES``) → records path. If
+  the query ALSO carries session-only keys the paths are incompatible —
+  return empty +
   a structured ``notice`` explaining the ontology mismatch (records don't
   have session ids).
 * Session-only keys with no source → sessions path.
@@ -56,17 +58,12 @@ by running FTS on both ``records_fts`` and ``obs_fts``.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import sqlite3
 from dataclasses import replace
 from typing import Any
 
 from fastmcp import FastMCP
-from mcp import types
-from mcp.server import Server
-from mcp.server.lowlevel.server import NotificationOptions
-from mcp.server.stdio import stdio_server
 
 from aggregator.core.dsl import DSLError, format_help, parse
 from aggregator.core.scrub import scrub
@@ -270,8 +267,26 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
 # to union mode, whose sessions side has no origin filter for unknown
 # sources and would return every session row.
 # Chunk 7: ``sota-watch`` (self-generated SOTA proposals) same shape.
+# Task 8: ``ticktick`` (CSV backup + Open API poll, merged) same shape — one
+# record per task, no conversation stream anywhere in it.
+# ``dropbox`` (one record per indexed file) likewise.
+#
+# The membership of this set is not decorative: ``cli.py::_default_sources()``
+# decides a source's shape by which iterator it exposes (``iter_records`` vs
+# ``iter_entities``), and every records-shaped entry there must appear here or
+# it becomes ingestible and simultaneously unqueryable.
+# ``tests/test_mcp_routing.py::test_every_default_source_is_routed_by_its_own_shape``
+# reads the registry and enforces exactly that.
 _SESSIONS_SOURCES = {"sessions", "subagents", "observations", *CHAT_ORIGINS}
-_RECORDS_SOURCES = {"github", "records", "research", "sota-watch", "substack"}
+_RECORDS_SOURCES = {
+    "dropbox",
+    "github",
+    "records",
+    "research",
+    "sota-watch",
+    "substack",
+    "ticktick",
+}
 
 # Records-only extra keys (interpreted by the github Source in its extra dict).
 # When these show up on a sessions-scoped query the paths are incompatible.

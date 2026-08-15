@@ -64,6 +64,18 @@ class ResearchReportsSource:
 
     name = "research"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild`` — why ``--rebuild`` is allowed here.
+
+        The reports directory is written by the research agent on this machine
+        and every stored row comes from a file still in it, so a re-scan
+        reproduces the whole population the DELETE can reach.
+        """
+        return (
+            "the research reports directory on this machine, which the "
+            "research agent writes and keeps"
+        )
+
     def __init__(self, reports_dir: str | os.PathLike[str] | None = None):
         self.reports_dir = Path(
             reports_dir

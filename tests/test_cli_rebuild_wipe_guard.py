@@ -35,6 +35,11 @@ class _StubSource:
 
     name = "github"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
+
     def __init__(self, records: list[Record], errors: list[str] | None = None):
         self._records = list(records)
         self._errors = list(errors or [])
@@ -151,7 +156,11 @@ def test_rebuild_refuses_when_store_nonempty_and_zero_records_zero_errors(
 def test_rebuild_succeeds_with_records_and_errors(tmp_data_home):
     """Partial ingest is legitimate: some endpoints succeeded, some failed.
     As long as at least one record arrived, --rebuild proceeds (errors are
-    surfaced via warning, not by refusing)."""
+    surfaced via warning, not by refusing).
+
+    The write proceeding is not the same as the run succeeding: task 9 made
+    the exit code 3 whenever the run ends with errors, so this asserts the
+    rows landed AND that the run still reports itself as failed."""
     store = Store()
     store.migrate()
     _seed(store, 3)
@@ -170,7 +179,7 @@ def test_rebuild_succeeds_with_records_and_errors(tmp_data_home):
         _store=store,
         _sources={"github": source},
     )
-    assert rc == 0
+    assert rc == cli.EXIT_COMPLETED_WITH_ERRORS
     ids = {r.stable_id for r in store.query(QueryAST(source="github"))}
     assert ids == {"github:acme/api:99"}, "rebuild should have replaced seed rows"
 
@@ -391,7 +400,11 @@ def test_cli_surfaces_endpoint_errors_after_successful_ingest(
 ):
     """MEDIUM #3 (collapsed into HIGH): CLI must actually plumb errors from
     iter_records into its error print path. Pre-fix, the local
-    ``errors: list[str] = []`` was initialized but never populated."""
+    ``errors: list[str] = []`` was initialized but never populated.
+
+    Task 9: those same errors now also drive the exit code (3), so the
+    endpoint failure is loud on both channels — text on stderr and a
+    non-zero status for the timer."""
     store = Store()
     store.migrate()
 
@@ -409,7 +422,7 @@ def test_cli_surfaces_endpoint_errors_after_successful_ingest(
         _store=store,
         _sources={"github": source},
     )
-    assert rc == 0
+    assert rc == cli.EXIT_COMPLETED_WITH_ERRORS
     cap = capsys.readouterr()
     combined = cap.out + cap.err
     # The endpoint error text should appear in the CLI output/stderr.

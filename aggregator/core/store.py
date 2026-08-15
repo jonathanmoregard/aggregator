@@ -54,7 +54,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -75,6 +75,14 @@ SCHEMA_VERSION = 3
 # default 'claude-code'. Kept as a module constant so the WHERE builders,
 # capabilities, and the MCP routing layer stay in lockstep.
 CHAT_ORIGINS = ("chatgpt", "claude-web")
+
+# Tables whose primary key ``existing_ids`` may probe, and that key's column.
+# Allowlist, not a hint: the table name is interpolated into SQL.
+_PK_BY_TABLE = {
+    "records": "stable_id",
+    "sessions": "session_id",
+    "observations": "obs_id",
+}
 
 
 class EmptyRebuildRefusedError(RuntimeError):
@@ -379,9 +387,35 @@ class Store:
         ``rebuild_and_upsert_entities`` can nest the writes under its
         SAVEPOINT (COMMIT inside a savepoint releases it, which then breaks
         the surrounding RELEASE).
+
+        A batch that raises part-way through is ROLLED BACK. sqlite3 opens an
+        implicit transaction before the first DML and holds it until someone
+        ends it; without this, the rows written before the raise sat pending
+        on the shared connection and the NEXT writer's COMMIT published them.
+        They land while every count that described them was discarded with the
+        exception — rows in the store that no report ever mentioned.
+
+        Only when this call owns the transaction. Under ``_commit=False`` the
+        caller holds a SAVEPOINT and does its own ``ROLLBACK TO SAVEPOINT``; a
+        connection-wide rollback here would destroy the savepoint it is about
+        to release.
         """
         self._ensure_writable()
         c = self._c()
+        try:
+            self._do_write_entities(c, entities)
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    @staticmethod
+    def _do_write_entities(
+        c: sqlite3.Connection, entities: Iterable[SessionEntity]
+    ) -> None:
+        """The entity write loop. Transaction handling belongs to the caller."""
         for e in entities:
             if isinstance(e, SessionRow):
                 c.execute(
@@ -453,22 +487,33 @@ class Store:
                 )
             else:
                 raise TypeError(f"unknown entity type: {type(e)!r}")
-        if _commit:
-            c.commit()
 
     def rebuild_and_upsert_entities(
         self,
         entities: Iterable[SessionEntity],
         *,
         min_sessions: int = 0,
+        origins: Sequence[str] | None = None,
     ) -> None:
-        """Atomic replacement of ALL session + observation rows.
+        """Atomic replacement of session + observation rows.
 
         Materializes the iterable before opening the savepoint so
         ``min_sessions`` guards against silent wipes on transient parse
         failure — same round-3 HIGH pattern as the Record-shaped path.
         Sessions source is monolithic (one call across all JSONLs) so no
         per-file granularity is exposed here.
+
+        ``origins`` SCOPES the DELETE. The sessions and observations tables
+        hold three populations that no single source can regenerate for the
+        others: ``claude-code`` (rebuildable — the JSONLs are still on disk),
+        ``chatgpt`` and ``claude-web`` (NOT rebuildable — their only source is
+        a vendor export archive a human downloads by hand, and once the drop
+        is gone the rows are the last copy). An unscoped rebuild driven by the
+        sessions source therefore deletes rows it cannot put back. Callers
+        that know which population they are re-scanning pass it here; the
+        DELETE then cannot reach the others. ``None`` keeps the historical
+        whole-table behaviour and is only for a caller that genuinely means
+        every origin.
         """
         materialised = list(entities)
         session_count = sum(1 for e in materialised if isinstance(e, SessionRow))
@@ -477,12 +522,29 @@ class Store:
                 f"refusing to rebuild sessions: got {session_count} session "
                 f"rows, min_sessions={min_sessions}"
             )
+        if origins is not None:
+            scope = list(origins)
+            stray = sorted(
+                {
+                    e.origin
+                    for e in materialised
+                    if isinstance(e, SessionRow) and e.origin not in scope
+                }
+            )
+            if stray:
+                # The incoming rows would be INSERTed while the DELETE never
+                # reached their existing counterparts — a rebuild that is not
+                # a rebuild for those origins. Refuse rather than half-apply.
+                raise EmptyRebuildRefusedError(
+                    f"refusing to rebuild origins {scope}: the entity stream "
+                    f"also carries origin(s) {stray}, which the scoped DELETE "
+                    f"would not replace"
+                )
         self._ensure_writable()
         c = self._c()
         c.execute("SAVEPOINT rebuild_entities")
         try:
-            c.execute("DELETE FROM observations")
-            c.execute("DELETE FROM sessions")
+            self._delete_entity_rows(c, origins)
             # _commit=False: don't COMMIT inside the savepoint (would release
             # it prematurely and break the surrounding RELEASE).
             self.upsert_entities(materialised, _commit=False)
@@ -493,6 +555,31 @@ class Store:
         c.execute("RELEASE SAVEPOINT rebuild_entities")
         c.commit()
 
+    @staticmethod
+    def _delete_entity_rows(
+        c: sqlite3.Connection, origins: Sequence[str] | None
+    ) -> None:
+        """Clear sessions + observations, optionally scoped to ``origins``.
+
+        Observations first: ``observations.session_id`` is a real FK and
+        ``PRAGMA foreign_keys`` is ON, so dropping the parents first would
+        abort the statement.
+        """
+        if origins is None:
+            c.execute("DELETE FROM observations")
+            c.execute("DELETE FROM sessions")
+            return
+        scope = list(origins)
+        if not scope:
+            return
+        placeholders = ",".join("?" * len(scope))
+        c.execute(
+            "DELETE FROM observations WHERE session_id IN "
+            f"(SELECT session_id FROM sessions WHERE origin IN ({placeholders}))",
+            scope,
+        )
+        c.execute(f"DELETE FROM sessions WHERE origin IN ({placeholders})", scope)
+
     # -- writes: legacy records (GitHub) ----------------------------------
 
     def upsert(self, records: list[Record]) -> None:
@@ -500,49 +587,19 @@ class Store:
 
         Idempotent per ``stable_id``: re-upsert of the same ID overwrites the
         row (INSERT ... ON CONFLICT DO UPDATE); a fresh ID inserts a new row.
+
+        A batch that raises part-way through is ROLLED BACK, for the same
+        reason as ``upsert_entities`` — the rows written before the raise
+        would otherwise sit in the implicit transaction and be committed by
+        the next writer, uncounted by any report.
         """
         self._ensure_writable()
         c = self._c()
-        for r in records:
-            scrubbed_body = scrub(r.body).text
-            scrubbed_subject = scrub(r.subject).text
-            c.execute(
-                """
-                INSERT INTO records(
-                    stable_id, source, subject, body, tags,
-                    created_at, updated_at, extra
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(stable_id) DO UPDATE SET
-                    subject    = excluded.subject,
-                    body       = excluded.body,
-                    tags       = excluded.tags,
-                    updated_at = excluded.updated_at,
-                    extra      = excluded.extra
-                """,
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    json.dumps(r.tags),
-                    r.created_at.isoformat() if r.created_at else None,
-                    r.updated_at.isoformat() if r.updated_at else None,
-                    json.dumps(r.extra, default=str),
-                ),
-            )
-            c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
-            c.execute(
-                "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    " ".join(r.tags),
-                ),
-            )
+        try:
+            self._do_write_records(c, list(records))
+        except BaseException:
+            c.rollback()
+            raise
         c.commit()
 
     def rebuild(self, source: str) -> None:
@@ -607,7 +664,25 @@ class Store:
                     subject    = excluded.subject,
                     body       = excluded.body,
                     tags       = excluded.tags,
-                    updated_at = excluded.updated_at,
+                    -- Existing value first, so a creation time never moves
+                    -- once known — that is why created_at was left out of
+                    -- this SET list originally. Omitting it entirely went too
+                    -- far: a row first written dateless kept its NULL forever,
+                    -- including after ticktick's CREATED_FIELD is corrected,
+                    -- which breaks the tripwire's promise that fixing the
+                    -- field names also repairs the records it already wrote.
+                    created_at = COALESCE(records.created_at, excluded.created_at),
+                    -- COALESCE, not a plain overwrite: a re-observation that
+                    -- carries NO timestamp must not erase the one already
+                    -- stored. ticktick is where this bites — a task payload
+                    -- with none of completedTime/modifiedTime/createdTime
+                    -- yields updated_at=None, and the merge lets the fresher
+                    -- API observation win, so a NULL landed on top of the real
+                    -- date the CSV leg parsed. The row then drops out of every
+                    -- date query while looking perfectly healthy, and only a
+                    -- WHOLE batch being dateless trips the API tripwire, so a
+                    -- partially-dated batch degrades in silence.
+                    updated_at = COALESCE(excluded.updated_at, records.updated_at),
                     extra      = excluded.extra
                 """,
                 (
@@ -753,6 +828,64 @@ class Store:
                 "SELECT COUNT(*) AS n FROM records WHERE source = ?", (source,)
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    def count_sessions_by_origin(self, origins: Sequence[str] | None = None) -> int:
+        """Rows in ``sessions``, optionally restricted to ``origins``.
+
+        Exists so the CLI's shrink guard can measure the SAME population its
+        DELETE will reach. Measured against the whole table instead, a rebuild
+        that replaces 840 claude-code sessions in a store also holding 160
+        claude-web ones reads as a 16% shrink — inside the 20% slack, so no
+        prompt fires — while actually destroying every claude-web row.
+        """
+        c = self._c()
+        if origins is None:
+            row = c.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()
+        else:
+            scope = list(origins)
+            if not scope:
+                return 0
+            placeholders = ",".join("?" * len(scope))
+            row = c.execute(
+                f"SELECT COUNT(*) AS n FROM sessions WHERE origin IN ({placeholders})",
+                scope,
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def existing_ids(self, table: str, ids: Iterable[str]) -> set[str]:
+        """Return the subset of ``ids`` already present in ``table``.
+
+        Read-only batch existence probe. Exists so an import sink can report
+        REAL added-vs-updated counts: both write paths are upserts, so after
+        the fact there is no way to tell a fresh row from an overwritten one,
+        and a summary that always says ``added=<batch size>`` is the bug
+        ``cli.py`` currently ships.
+
+        ``table`` is interpolated into the SQL (SQLite cannot parameterise an
+        identifier) and is therefore constrained to the three-entry allowlist
+        below — never caller-supplied text. The ids themselves are bound.
+        """
+        pk = _PK_BY_TABLE.get(table)
+        if pk is None:
+            raise ValueError(
+                f"unknown table {table!r}; expected one of {sorted(_PK_BY_TABLE)}"
+            )
+        id_list = list(ids)
+        if not id_list:
+            return set()
+        found: set[str] = set()
+        c = self._c()
+        # Chunked to stay under SQLITE_MAX_VARIABLE_NUMBER (999 on older
+        # builds) regardless of the caller's batch size.
+        for start in range(0, len(id_list), 500):
+            chunk = id_list[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = c.execute(
+                f"SELECT {pk} AS id FROM {table} WHERE {pk} IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            found.update(row["id"] for row in rows)
+        return found
 
     def probe_fts(self, text: str) -> None:
         """Run cheap MATCH probes to surface FTS5 syntax errors.

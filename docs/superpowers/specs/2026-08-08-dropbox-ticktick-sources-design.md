@@ -92,15 +92,24 @@ The source therefore has two legs, merged before yielding.
 ### Leg A — CSV backup (archive, authoritative)
 
 Directory from `AGGREGATOR_TICKTICK_DIR`, default `~/Downloads`. Every `*.csv`
-is opened and validated by structure, not filename: TickTick backups carry six
-metadata lines followed by a header on line 7. Files that do not match are
-ignored silently.
+is opened and validated by structure, not filename: TickTick backups carry a
+preamble of metadata fields followed by the column header. The header is **not**
+at a fixed line number — the third preamble field is a single quoted value
+spanning four physical lines, so the header sits at csv row index 3, not 6. It
+is found by scanning rows for the required columns, bounded by
+`MAX_PREAMBLE_ROWS`; never count lines. Files that do not match are ignored
+silently.
 
 Columns consumed: `Folder Name`, `List Name`, `Title`, `Tags`, `Content`,
 `Start Date`, `Due Date`, `Repeat`, `Priority`, `Status`, `Created Time`,
-`Completed Time`, `taskId`, `parentId`. `Status` is `0` normal, `1` completed,
-`2` archived. `Content` is multiline-quoted and must be parsed with the `csv`
-module, not split.
+`Completed Time`, `taskId`, `parentId`. `Status` is `0` normal, `2` completed,
+`-1` abandoned — **there is no status `1`**, and `archived` is not a task status
+(the export documents these codes in its own preamble; measured across all 1302
+tasks of the reference backup as `2`×1051 / `0`×238 / `-1`×13). `Content` is
+multiline-quoted and must be parsed with the `csv` module, not split.
+
+Measured facts about the real export — column count, encoding, header discovery
+— live in `TICKTICK-FORMAT-GROUND-TRUTH.md` and override this document.
 
 On successful parse, the CSV is copied into
 `$XDG_DATA_HOME/aggregator/ticktick/backups/`. This makes `--rebuild`
