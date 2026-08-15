@@ -57,6 +57,7 @@ import fcntl
 import json
 import logging
 import os
+import ssl
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -170,9 +171,64 @@ class _HttpsOnlyRedirectHandler(request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """A verifying TLS context that carries its OWN trust anchors.
+
+    MEASURED, NOT DEFENSIVE. On the 2026-08-15 live timer run this source died
+    with ``CERTIFICATE_VERIFY_FAILED - self-signed certificate in certificate
+    chain`` against ``api.ticktick.com``. Reproduced locally with the same
+    interpreter: ``ssl.create_default_context().cert_store_stats()`` returned
+    ``{'x509': 0, 'x509_ca': 0}``. The unit set neither ``SSL_CERT_FILE`` nor
+    ``NIX_SSL_CERT_FILE``, so OpenSSL fell back to an absent
+    ``/etc/ssl/cert.pem`` and a ``/etc/ssl/certs`` with no ``c_rehash`` symlinks
+    — a context that verifies rigorously against nothing at all. Not a MITM,
+    and every https source that ever gets added here would have hit it;
+    TickTick was merely the only one speaking HTTPS from Python (github shells
+    out to ``gh``).
+
+    THE PRIMARY FIX IS THE UNIT'S ENVIRONMENT and lives on a separate track.
+    This is the belt-and-braces half: a personal aggregator that stops
+    importing because a trust store moved is exactly the silent-rot failure
+    this repo keeps ruling out, and the process carrying its own bundle costs
+    one dependency that was already installed.
+
+    STILL VERIFYING. ``create_default_context`` keeps ``CERT_REQUIRED`` and
+    ``check_hostname``; the only thing overridden is WHICH anchors are trusted.
+    A context that stopped checking would be a worse bug than the one it fixes.
+
+    FALLS BACK RATHER THAN FAILING TO IMPORT. If ``certifi`` is somehow absent
+    the source degrades to the platform default — which may be the empty store
+    above, in which case the handshake fails loudly with the same verify error
+    and lands in the run's ``errors`` list. A missing optional bundle must not
+    take the module out at import time and cost the CSV leg its 1302 rows.
+    """
+    try:
+        import certifi
+    except ImportError:  # pragma: no cover - certifi is a declared dependency
+        log.warning(
+            "certifi is not installed; falling back to the platform trust "
+            "store, which on a NixOS user unit with no SSL_CERT_FILE holds "
+            "zero CAs and fails every https handshake"
+        )
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+# Built ONCE, at import: loading a CA bundle is file I/O and parsing, and this
+# opener is shared by every call in the process. Kept module-level and named so
+# a test can assert the handler below is actually bound to it — a context that
+# is constructed and never installed is the shape of a fix that passes its own
+# unit test and changes nothing in production.
+_SSL_CONTEXT = _ssl_context()
+
 # Module-private opener rather than install_opener(): this must not change the
-# redirect behaviour of every other urllib user in the process.
-_OPENER = request.build_opener(_HttpsOnlyRedirectHandler())
+# redirect behaviour of every other urllib user in the process. The explicit
+# ``HTTPSHandler`` replaces the one ``build_opener`` would have installed with
+# the platform default context, so every request through this opener — the
+# initial one and any https->https redirect — verifies against ``_SSL_CONTEXT``.
+_OPENER = request.build_opener(
+    _HttpsOnlyRedirectHandler(), request.HTTPSHandler(context=_SSL_CONTEXT)
+)
 
 
 def _open(req: request.Request, timeout: int):
