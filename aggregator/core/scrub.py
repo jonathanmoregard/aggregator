@@ -36,14 +36,55 @@ log = logging.getLogger(__name__)
 
 # --- Presidio detection (optional dependency; regex fallback covers CI/dev env)
 
+def _spacy_model_present() -> bool:
+    """True when the spaCy model Presidio is configured for is already installed.
+
+    Presidio builds its NLP engine eagerly and, if the model is missing, calls
+    ``spacy.cli.download`` — which shells out to pip and, on failure, calls
+    ``sys.exit(1)``. Two problems with letting that happen at import time:
+
+    * ``sys.exit`` raises ``SystemExit``, a ``BaseException``. The ``except
+      Exception`` below does NOT catch it, so a missing model took the whole
+      process down at import instead of taking the regex fallback this module
+      documents. That is how CI died: pytest aborted with ``INTERNALERROR>
+      SystemExit: 1`` while merely collecting tests.
+    * Even when it succeeds it is an unannounced network install triggered by
+      an ``import``.
+
+    So: look before leaping, and never let the download run. Any failure to
+    answer the question is treated as "not present" — the regex path is the
+    safe direction to fail in.
+    """
+    try:
+        import spacy.util
+        from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+        configured = {
+            m["model_name"]
+            for m in NlpEngineProvider().nlp_configuration.get("models", [])
+        }
+        installed = set(spacy.util.get_installed_models())
+        return bool(configured) and configured <= installed
+    except Exception:  # noqa: BLE001 -- unanswerable -> assume absent
+        return False
+
+
 try:
+    if not _spacy_model_present():
+        raise RuntimeError(
+            "spaCy model for Presidio is not installed; install it with "
+            "`python -m spacy download en_core_web_lg`"
+        )
     from presidio_analyzer import AnalyzerEngine
     from presidio_anonymizer import AnonymizerEngine
 
     _analyzer: AnalyzerEngine | None = AnalyzerEngine()
     _anonymizer: AnonymizerEngine | None = AnonymizerEngine()
     _PRESIDIO_OK = True
-except Exception as e:  # noqa: BLE001 -- any import/init failure -> regex path
+# SystemExit is listed explicitly: it is a BaseException, so it is not covered
+# by `except Exception`, and it is exactly what an in-process spaCy download
+# raises. KeyboardInterrupt is deliberately NOT caught.
+except (Exception, SystemExit) as e:  # noqa: BLE001 -- init failure -> regex path
     log.warning(
         "Presidio unavailable (%s); PII scrubbing will use regex fallback only", e
     )
