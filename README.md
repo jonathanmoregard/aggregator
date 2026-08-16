@@ -76,6 +76,8 @@ Every registered source is a plain object with `iter_records`/`iter_entities` (o
 - `2` — usage error: unknown source name, an unparseable `--since`, or an unrecognised subcommand.
 - `3` — completed with errors (`EXIT_COMPLETED_WITH_ERRORS`): the run finished and wrote what it could, but its errors list is non-empty. A partially-successful run still exits 3, not 0 — distinct from `2` so a systemd wrapper can tell "you typed a bad source name" apart from "the run dropped three PDFs", which need different notifications.
 
+**There is deliberately no fourth code for "finished, known poison present".** Input that can never be parsed — two malformed lines in a JSONL file — is reported loudly the first time its exact identity is seen (exit 3, notification) and is a *note* on every run after that, so a run whose only faults are already-known ones exits `0`. A distinct code would still be non-zero, and `aggregator-ingest.service` treats every non-zero exit as a failure and fires `OnFailure=`, so introducing one would keep notifying every 30 minutes about a file that has been broken since March — the exact alarm fatigue the ledger exists to end. What a non-zero code would have signalled is signalled instead by things a stale unit file cannot suppress: `poison=N` on the run summary, a `note:` line naming each fault under its source, and the full listing in `aggregator status` (file, record count, first-seen date). The ledger itself is `PoisonLedger` in `aggregator/imports/ingest_state.py`.
+
 ## Non-negotiables (from spec)
 
 - Read-only credentials only. GitHub ingester refuses to run against a write-capable token unless `AGGREGATOR_ALLOW_WRITE_TOKEN=1`.

@@ -66,8 +66,10 @@ from typing import Any
 from aggregator.sources.base import (
     IngestResult,
     ObservationRow,
+    PermanentFault,
     SessionEntity,
     SessionRow,
+    fault_stamp,
 )
 
 log = logging.getLogger(__name__)
@@ -118,7 +120,11 @@ _MAX_NAMED_DROPS = 5
 
 
 def _note_dropped_lines(
-    path: Path, what: str, dropped: list[str], errors: list[str]
+    path: Path,
+    what: str,
+    dropped: list[str],
+    errors: list[str],
+    faults: list[PermanentFault] | None = None,
 ) -> None:
     """Report the lines one file lost, as ONE entry with an exact count.
 
@@ -130,14 +136,36 @@ def _note_dropped_lines(
 
     Nothing is emitted for a clean file: an entry per healthy file would make
     the errors list — which is what decides the run's exit code — meaningless.
+
+    ``faults`` IS THE "AND THIS WILL NEVER FIX ITSELF" DECLARATION, and it is
+    optional because only some of the callers may make it. A line the JSON
+    parser rejects is damage to that line and no future run can parse it; a
+    file in which no line carries a readable timestamp is the shape a VENDOR
+    FORMAT CHANGE takes, which must stay loud on every run until a human looks.
+    So the first passes a sink here and the second deliberately does not — see
+    ``_dated``. The identity carries the FULL, uncapped ``dropped`` list even
+    though the message shows five, because a sixth bad line in a file that
+    already has five must not inherit the fifth's silence.
     """
     if not dropped:
         return
-    errors.append(
+    line = (
         f"{path}: DROPPED {len(dropped)} {what} — they are NOT in the index "
         f"(line {', '.join(dropped[:_MAX_NAMED_DROPS])}"
         f"{', ...' if len(dropped) > _MAX_NAMED_DROPS else ''})"
     )
+    errors.append(line)
+    if faults is not None:
+        faults.append(
+            PermanentFault(
+                scope=str(path),
+                stamp=fault_stamp(path),
+                reason=what,
+                detail=",".join(dropped),
+                count=len(dropped),
+                line=line,
+            )
+        )
 
 
 # The two ways a timestamp costs data, spelled out where the reports are made
@@ -333,6 +361,24 @@ class SessionsSource:
         self.projects_root = Path(
             projects_root or os.path.expanduser("~/.claude/projects")
         )
+        # The permanent faults THIS pass found, drained by the runner. A
+        # SECOND sink beside ``errors`` rather than a richer ``errors``,
+        # because ``errors: list[str]`` is the contract every one of the nine
+        # sources and their tests are written against, and the two lists say
+        # different things: everything in ``errors`` is loud, and this is the
+        # subset that has earned the right to go quiet once a human has been
+        # told about it exactly once.
+        self._faults: list[PermanentFault] = []
+
+    def drain_faults(self) -> list[PermanentFault]:
+        """Hand this pass's permanent faults to the runner, then forget them.
+
+        Same shape as ``drain_errors`` on the adapter: drained after the stream
+        ends, and emptied by the read so a second pass on the same instance
+        cannot re-report the first pass's findings.
+        """
+        faults, self._faults = self._faults, []
+        return faults
 
     def record_shape(self) -> dict[str, str]:
         return {
@@ -562,12 +608,22 @@ class SessionsSource:
             fh.close()
             # In the ``finally`` so an abandoned generator still reports what
             # it dropped before the consumer walked away.
-            _note_dropped_lines(path, "corrupt line(s)", [str(n) for n in corrupt], errors)
+            # BOTH DECLARED PERMANENT. A line the JSON parser rejects and a
+            # line that parses to a bare string or a list are damage to that
+            # one line: no future run parses it differently, so re-reporting it
+            # as a fresh failure every 30 minutes is noise, not vigilance. They
+            # are reported loudly ONCE (the ledger has never seen the identity)
+            # and then remembered — a different bad line, or one more of them,
+            # is a different identity and is loud all over again.
+            _note_dropped_lines(
+                path, "corrupt line(s)", [str(n) for n in corrupt], errors, self._faults
+            )
             _note_dropped_lines(
                 path,
                 "line(s) that are valid JSON but not a JSON object",
                 wrong_shape,
                 errors,
+                self._faults,
             )
 
     @staticmethod
@@ -759,6 +815,10 @@ class SessionsSource:
         observation past ``since`` is emitted in full).
         """
         sink = errors if errors is not None else []
+        # Cleared HERE and not only by ``drain_faults``, so a caller that never
+        # drains (the single-source ``aggregator ingest sessions`` path) cannot
+        # accumulate one run's findings into the next one's identity set.
+        self._faults = []
         # ONE walk, shared by both passes. Walking twice stat'd every file
         # twice and let the passes disagree about which files exist: a file
         # crossing the 5-minute live boundary between them was indexed by one

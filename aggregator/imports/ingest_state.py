@@ -78,7 +78,7 @@ import json
 import logging
 import os
 import random
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -86,6 +86,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from aggregator.core.durable import flush_to_disk, replace_durably
+from aggregator.sources.base import PermanentFault, fault_stamp
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
     from aggregator.core.store import Store
@@ -498,6 +499,50 @@ class HeldRecord:
         return self.next_retry_at is None
 
 
+@dataclass(frozen=True)
+class KnownFault:
+    """One permanent fault AS STORED — i.e. one a human has already been told about.
+
+    Distinct from :class:`~aggregator.sources.base.PermanentFault`, which is
+    what a source reports THIS run, because the two carry different facts and
+    only one of them can be re-derived. ``first_seen_at`` is the number that
+    decides whether anybody cares and exists only in the ledger; ``stamp`` is
+    what the artifact looked like when we last saw the fault, and comparing it
+    against the file now is how a fault that has been fixed stops being
+    reported as quarantined.
+    """
+
+    source: str
+    key: str
+    scope: str
+    reason: str
+    detail: str
+    count: int
+    line: str
+    first_seen_at: datetime | None
+    last_seen_at: datetime | None
+    stamp: str = ""
+
+
+@dataclass(frozen=True)
+class FaultVerdict:
+    """What this run's permanent faults mean, split three ways.
+
+    ``new`` is loud (it stays in the run's errors and fails the run), ``known``
+    is quiet (it becomes a note), and ``released`` is a row that has left the
+    ledger because the input parses again. A run with all three is normal.
+    """
+
+    known: list[KnownFault]
+    new: list[PermanentFault]
+    released: list[KnownFault]
+
+    @property
+    def quarantined_records(self) -> int:
+        """How many records are currently being held quiet by this source."""
+        return sum(fault.count for fault in self.known)
+
+
 class PoisonLedger:
     """Per-record failures, held in ``cache.db`` beside the data.
 
@@ -576,6 +621,135 @@ class PoisonLedger:
     def summary(self) -> list[dict[str, object]]:
         """``(source, error_type, count, terminal)`` — the whole "what is broken" report."""
         return self._store.poison_summary()
+
+    # -- the other half: input that will never parse ----------------------
+
+    def reconcile_faults(
+        self,
+        source: str,
+        reported: Sequence[PermanentFault],
+        *,
+        now: datetime | None = None,
+    ) -> FaultVerdict:
+        """Sort this run's permanent faults into KNOWN, NEW and GONE.
+
+        THE THREE ANSWERS, and the whole alert-fatigue fix is the difference
+        between the first two:
+
+        * **known** — this exact identity is already in the ledger, so a human
+          has already been told about it and told once is the contract. Its
+          error line comes OUT of the run's errors and becomes a note; the run
+          can then exit 0 and the timer stops notifying about a file that has
+          been broken since March.
+        * **new** — never seen. Stays in the errors list, fails the run, fires
+          the notification. Nothing about this path is softened, and that is
+          the point: "fail loudly" means the operator learns of each new
+          problem exactly once, not that the same permanent problem shouts
+          twice an hour.
+        * **released** — a stored fault whose artifact has CHANGED since it was
+          recorded and which this run did not re-report. The file was rewritten
+          and now parses, so the records are in the index and the row would
+          otherwise have ``aggregator status`` overstating the damage forever.
+
+        WHY "CHANGED **AND** NOT RE-REPORTED", both halves. Changed alone is
+        wrong: ``~/.claude/projects`` files are APPENDED TO by every resumed
+        session, so a live file's stamp moves constantly while its corrupt line
+        at 318 sits exactly where it was — dropping the row on a stamp change
+        would re-alarm that file on every resume, i.e. the original bug with
+        extra steps. Not-re-reported alone is wrong the other way: an
+        incremental run legitimately skips files below its watermark, and
+        forgetting a fault merely because this pass did not look at the file
+        would re-alarm it the moment the file is next read.
+
+        A ledger write happens here for the known and released cases only.
+        Recording a NEW fault waits for :func:`runner.commit_fault_receipts`,
+        because a fault reported to nobody must not buy any silence.
+        """
+        moment = now or datetime.now(UTC)
+        stored = {
+            str(row["fault_key"]): _known_from_row(row)
+            for row in self._store.read_faults(source)
+        }
+        seen = {fault.key for fault in reported}
+        known: list[KnownFault] = []
+        fresh: list[PermanentFault] = []
+        for fault in reported:
+            held = stored.get(fault.key)
+            if held is None:
+                fresh.append(fault)
+                continue
+            # Still true, and still the same fault. Refresh what MOVES (the
+            # stamp, the sighting time) and never ``first_seen_at``.
+            self.record_fault(source, fault, now=moment)
+            known.append(
+                KnownFault(
+                    source=source,
+                    key=fault.key,
+                    scope=fault.scope,
+                    reason=fault.reason,
+                    detail=fault.detail,
+                    count=fault.count,
+                    line=fault.line,
+                    first_seen_at=held.first_seen_at,
+                    last_seen_at=moment,
+                )
+            )
+        released = [
+            held
+            for key, held in stored.items()
+            if key not in seen and fault_stamp(held.scope) != held.stamp
+        ]
+        for held in released:
+            self._store.forget_fault(source, held.key)
+        return FaultVerdict(known=known, new=fresh, released=released)
+
+    def record_fault(
+        self, source: str, fault: PermanentFault, *, now: datetime | None = None
+    ) -> None:
+        """Write one permanent fault into the ledger. THE RECEIPT, in one call.
+
+        Called for a NEW fault only once a channel has declared it carried the
+        line — see :func:`runner.commit_fault_receipts` — and for a known one on
+        every sighting, to refresh the stamp.
+        """
+        moment = (now or datetime.now(UTC)).isoformat()
+        self._store.record_fault(
+            source,
+            fault.key,
+            scope=fault.scope,
+            scope_stamp=fault.stamp,
+            reason=fault.reason,
+            detail=fault.detail,
+            record_count=fault.count,
+            line=fault.line,
+            at=moment,
+        )
+
+    def fault_summary(self) -> list[dict[str, object]]:
+        """Every permanently-bad input this ledger is holding quiet.
+
+        THE VISIBLE HALF OF THE BARGAIN, and it is the reason going quiet is
+        defensible at all: the same rule the TickTick uncovered-project report
+        and the staleness markers already live under. A suppressed alarm that
+        nothing can show you on demand has not been suppressed, it has been
+        lost. ``aggregator status`` prints this.
+        """
+        return self._store.fault_summary()
+
+
+def _known_from_row(row: Mapping[str, object]) -> KnownFault:
+    return KnownFault(
+        source=str(row["source"]),
+        key=str(row["fault_key"]),
+        scope=str(row["scope"]),
+        reason=str(row["reason"]),
+        detail=str(row["detail"]),
+        count=int(row["record_count"] or 0),
+        line=str(row["line"]),
+        first_seen_at=_parse(row.get("first_seen_at")),
+        last_seen_at=_parse(row.get("last_seen_at")),
+        stamp=str(row.get("scope_stamp") or ""),
+    )
 
 
 def _held_from_row(row: Mapping[str, object]) -> HeldRecord:
@@ -766,8 +940,10 @@ __all__ = [
     "SOURCE_CURSORS",
     "STALE_INPUTS",
     "CursorKind",
+    "FaultVerdict",
     "HeldRecord",
     "IngestMarkers",
+    "KnownFault",
     "PoisonLedger",
     "SourceCursor",
     "SourcePlan",

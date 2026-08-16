@@ -364,10 +364,50 @@ _DDL: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS quarantine_terminal "
     "ON quarantine(source, next_retry_at);",
+    # --- the other half of the quarantine: PERMANENTLY-BAD INPUT -------
+    #
+    # ``quarantine`` above holds records the SINK refused, which is a thing
+    # that might work next time — hence ``attempts`` and ``next_retry_at``.
+    # This holds input that will NEVER parse: two malformed lines in a JSONL
+    # file are not going to become valid, so there is nothing to retry and the
+    # only question is whether a human has already been told. Reported loudly
+    # the first time the identity is seen, then quiet, and always listed by
+    # ``aggregator status`` — because quiet is only acceptable while it is not
+    # the same as forgotten.
+    #
+    # ``fault_key`` is a hash of source + scope + reason + the EXACT record
+    # list, never of the count: suppressing by count would let a different bad
+    # line inherit a known one's silence. ``scope_stamp`` is the artifact's
+    # mtime+size when the fault was recorded, which is how a rewritten file
+    # gets its row dropped instead of reporting a quarantine that is over.
+    #
+    # No version bump. The table is additive and created by a
+    # ``CREATE TABLE IF NOT EXISTS`` that ``migrate()`` runs on every single
+    # CLI invocation, so an existing v4 database grows it on the next command;
+    # bumping ``user_version`` would instead point every such database at the
+    # drop-and-rebuild path for a table that holds nothing anyone can rebuild.
+    """
+    CREATE TABLE IF NOT EXISTS poison_faults (
+        source        TEXT NOT NULL,
+        fault_key     TEXT NOT NULL,
+        scope         TEXT NOT NULL,
+        scope_stamp   TEXT NOT NULL,
+        reason        TEXT NOT NULL,
+        detail        TEXT NOT NULL,
+        record_count  INTEGER NOT NULL DEFAULT 0,
+        line          TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at  TEXT NOT NULL,
+        PRIMARY KEY (source, fault_key)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS poison_faults_scope "
+    "ON poison_faults(source, scope);",
 ]
 
 
 _DROP_ALL: list[str] = [
+    "DROP TABLE IF EXISTS poison_faults;",
     "DROP TABLE IF EXISTS quarantine;",
     "DROP TABLE IF EXISTS ingest_state;",
     "DROP TRIGGER IF EXISTS observations_ai;",
@@ -1129,6 +1169,123 @@ class Store:
                 "error_type": row["error_type"],
                 "terminal": bool(row["terminal"]),
                 "count": int(row["n"]),
+            }
+            for row in rows
+        ]
+
+    # -- ingest state: input that will never parse -------------------------
+
+    def read_faults(self, source: str) -> list[dict[str, object]]:
+        """Every permanent fault recorded for one source. Policy is the caller's."""
+        rows = self._c().execute(
+            "SELECT source, fault_key, scope, scope_stamp, reason, detail, "
+            "record_count, line, first_seen_at, last_seen_at "
+            "FROM poison_faults WHERE source = ? ORDER BY scope, reason",
+            (source,),
+        )
+        return [dict(row) for row in rows]
+
+    def record_fault(
+        self,
+        source: str,
+        fault_key: str,
+        *,
+        scope: str,
+        scope_stamp: str,
+        reason: str,
+        detail: str,
+        record_count: int,
+        line: str,
+        at: str,
+        _commit: bool = True,
+    ) -> None:
+        """Remember one permanently-bad input, or refresh what is known about it.
+
+        ``first_seen_at`` survives every refresh — how long something has been
+        broken is the number that decides whether a human cares, and it is the
+        one ``aggregator status`` prints. ``scope_stamp`` does NOT survive: it
+        is refreshed on every sighting so that "the file changed" keeps meaning
+        "changed since we last looked at it", which is what lets a fault
+        outlive an append to its file without re-alarming.
+        """
+        self._ensure_writable()
+        c = self._c()
+        try:
+            c.execute(
+                """
+                INSERT INTO poison_faults(
+                    source, fault_key, scope, scope_stamp, reason, detail,
+                    record_count, line, first_seen_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, fault_key) DO UPDATE SET
+                    scope_stamp  = excluded.scope_stamp,
+                    record_count = excluded.record_count,
+                    line         = excluded.line,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    source,
+                    fault_key,
+                    scope,
+                    scope_stamp,
+                    reason,
+                    detail,
+                    record_count,
+                    line,
+                    at,
+                    at,
+                ),
+            )
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    def forget_fault(self, source: str, fault_key: str, *, _commit: bool = True) -> None:
+        """This input parses again (or is gone). Stop reporting it as quarantined.
+
+        Deleted rather than tombstoned, unlike ``quarantine``: a held RECORD is
+        kept forever because a failure nobody can count is a gap that reads as
+        coverage, but a fault that no longer reproduces describes no gap at all
+        — the records are in the index. Keeping the row would make
+        ``aggregator status`` overstate the damage, which is the same lie in
+        the other direction.
+        """
+        self._ensure_writable()
+        c = self._c()
+        c.execute(
+            "DELETE FROM poison_faults WHERE source = ? AND fault_key = ?",
+            (source, fault_key),
+        )
+        if _commit:
+            c.commit()
+
+    def fault_summary(self) -> list[dict[str, object]]:
+        """Every permanent fault, newest-source-first — the whole quiet set.
+
+        Rows rather than counts, because the question ``aggregator status``
+        answers is "what exactly is being held quiet, and since when", and an
+        aggregate cannot name the file.
+        """
+        rows = self._c().execute(
+            "SELECT source, fault_key, scope, reason, detail, record_count, "
+            "       line, first_seen_at, last_seen_at "
+            "FROM poison_faults ORDER BY source, scope, reason"
+        )
+        return [
+            {
+                "source": row["source"],
+                "fault_key": row["fault_key"],
+                "scope": row["scope"],
+                "reason": row["reason"],
+                "detail": row["detail"],
+                "count": int(row["record_count"]),
+                "line": row["line"],
+                "first_seen_at": row["first_seen_at"],
+                "last_seen_at": row["last_seen_at"],
             }
             for row in rows
         ]

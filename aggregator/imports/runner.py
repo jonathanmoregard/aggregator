@@ -40,8 +40,10 @@ from datetime import UTC, datetime, timedelta
 
 from aggregator.imports.ingest_state import (
     STALE_INPUTS,
+    FaultVerdict,
     HeldRecord,
     IngestMarkers,
+    KnownFault,
     PoisonLedger,
     SourcePlan,
     Watermarks,
@@ -56,12 +58,18 @@ from aggregator.imports.port import (
     SupportsCheckpoint,
     SupportsInputFreshness,
     SupportsNonFatalErrors,
+    SupportsPermanentFaults,
     SupportsWriteBarrier,
     WriteCounts,
     is_report_gating,
 )
 from aggregator.imports.progress import RunProgress
-from aggregator.sources.base import ObservationRow, Record, SessionRow
+from aggregator.sources.base import (
+    ObservationRow,
+    PermanentFault,
+    Record,
+    SessionRow,
+)
 
 # Items buffered before a sink write. Bounded so a 359k-observation source
 # streams through in constant memory instead of materialising.
@@ -145,6 +153,18 @@ class AdapterReport:
     # the forwarding method for every one of them — so ``gating_errors`` was the
     # whole error list and the prioritisation below did nothing at all.
     holds_report_barrier: bool = False
+    # Permanently-bad input this adapter reported that the ledger had ALREADY
+    # been told about. Their error lines are removed from ``errors`` above and
+    # rendered as notes instead, which is what lets a run whose only faults are
+    # known ones exit 0 and stop notifying. Never dropped silently: the count is
+    # in the run summary and every one of them is listed by ``aggregator
+    # status``.
+    known_faults: list[KnownFault] = field(default_factory=list)
+    # Permanently-bad input NOBODY has been told about yet. These stay in
+    # ``errors`` — the run fails, the notification fires — and they are written
+    # into the ledger only once a channel declares it carried their line. See
+    # ``commit_fault_receipts``.
+    new_faults: list[PermanentFault] = field(default_factory=list)
     # Whether the adapter implements ``SupportsInputFreshness`` at all.
     # Without it, ``input_newest_at is None`` conflates two opposite things:
     # "this source has no export ritual and never goes stale" (github reads a
@@ -205,6 +225,27 @@ class RunReport:
     @property
     def quarantined(self) -> int:
         return sum(a.quarantined for a in self.adapters.values())
+
+    @property
+    def known_faults(self) -> list[KnownFault]:
+        """Every permanently-bad input this run went quiet about."""
+        return [f for a in self.adapters.values() for f in a.known_faults]
+
+    @property
+    def new_faults(self) -> list[PermanentFault]:
+        """Every permanently-bad input this run reported for the FIRST time."""
+        return [f for a in self.adapters.values() for f in a.new_faults]
+
+    @property
+    def quarantined_records(self) -> int:
+        """How many records the known faults cost the index, this run's view.
+
+        The number an operator actually wants when a run reports zero errors
+        over a file that has been unparseable since March. Printed in the run
+        summary; ``aggregator status`` prints the whole ledger, including the
+        faults from sources this run never reached.
+        """
+        return sum(f.count for f in self.known_faults)
 
     @property
     def updated(self) -> int:
@@ -273,13 +314,32 @@ class RunReport:
         ``port.is_report_gating``'s explicit opt-in buys: when every adapter
         counted as gating this returned the whole list and prioritising by it
         reordered nothing.
+
+        A NEVER-SEEN PERMANENT FAULT GATES TOO, and for exactly the same reason
+        a report barrier does: its line is what buys the entry in the poison
+        ledger, so a line elided from the toast is a fault that will be
+        reported all over again next run. With eight of them and a five-line
+        budget the run converges in two ticks instead of one; without the
+        priority a chatty unrelated source could keep one of them out of the
+        payload indefinitely, which is the round-7 starvation in a new costume.
         """
-        return [
-            line
-            for name, a in self.adapters.items()
-            if a.holds_report_barrier
-            for line in self.errors_from(name)
-        ]
+        gating = {
+            *(
+                line
+                for name, a in self.adapters.items()
+                if a.holds_report_barrier
+                for line in self.errors_from(name)
+            ),
+            *(
+                f"{name}: {fault.line}"
+                for name, a in self.adapters.items()
+                for fault in a.new_faults
+            ),
+        }
+        # Filtered out of ``errors`` rather than assembled independently, so the
+        # lines keep the report's order and a line that is somehow not in the
+        # report cannot be prioritised into the payload.
+        return [line for line in self.errors if line in gating]
 
     @property
     def failed_adapters(self) -> list[str]:
@@ -732,6 +792,27 @@ async def _run_one(
             report.errors.extend(_validated_errors(adapter.drain_errors()))
         except Exception as e:  # noqa: BLE001
             report.errors.append(f"drain_errors failed: {type(e).__name__}: {e}")
+    if poison is not None and isinstance(adapter, SupportsPermanentFaults):
+        # AFTER ``drain_errors`` AND NEVER BEFORE IT. Every fault names a line
+        # that list must already contain, because what this does is move a line
+        # from "error" to "note"; run the other way round and the line is
+        # re-added by the drain and the run fails on a fault it just excused.
+        try:
+            verdict = poison.reconcile_faults(
+                adapter.name, _validated_faults(adapter.drain_faults())
+            )
+        except Exception as e:  # noqa: BLE001 -- bookkeeping must not fail a run
+            # LOUD, and in the direction that costs noise rather than silence:
+            # a ledger that cannot be read, or an adapter whose faults cannot
+            # be trusted, excuses nothing — every line this adapter reported
+            # stays in ``errors`` and the run fails exactly as it did before
+            # this mechanism existed.
+            report.errors.append(
+                f"permanent faults could not be reconciled, so nothing was "
+                f"held quiet this run: {type(e).__name__}: {e}"
+            )
+        else:
+            _apply_fault_verdict(report, verdict)
     if isinstance(adapter, SupportsInputFreshness):
         report.offers_input_freshness = True
         try:
@@ -765,6 +846,68 @@ async def _run_one(
         ),
     )
     return report
+
+
+def _apply_fault_verdict(report: AdapterReport, verdict: FaultVerdict) -> None:
+    """Turn a known fault's error line into a note, and say what changed.
+
+    THE ONE PLACE A LINE GOES QUIET, and it goes quiet by IDENTITY: only lines
+    that a fault in ``verdict.known`` names are removed, and a fault is only
+    ``known`` when its exact ``source + file + reason + record list`` hash is
+    already in the ledger. No count threshold, no substring, no "the sessions
+    source is noisy so mute it" — a different bad line in the same file hashes
+    differently, is new, and fails the run.
+
+    Every removed line reappears as a NOTE, which the CLI prints under its
+    source and which changes no exit code. That is the whole bargain: the run
+    stops re-failing over a file that has been broken since March, and the file
+    is still named on every single run, plus in ``aggregator status``, plus in
+    the ledger with the date it was first seen.
+    """
+    report.known_faults = list(verdict.known)
+    report.new_faults = list(verdict.new)
+    quiet = {fault.line for fault in verdict.known}
+    report.errors = [line for line in report.errors if line not in quiet]
+    for fault in verdict.known:
+        since = (
+            fault.first_seen_at.isoformat()
+            if fault.first_seen_at is not None
+            else "an earlier run"
+        )
+        report.notes.append(
+            f"{report.name}: KNOWN BAD INPUT, {fault.count} record(s) still "
+            f"missing from the index, first reported {since} and not repeated "
+            f"as a failure since — {fault.line}"
+        )
+    for fault in verdict.released:
+        report.notes.append(
+            f"{report.name}: {fault.scope} parses again ({fault.count} "
+            f"record(s) recovered); it is no longer held in the poison ledger"
+        )
+
+
+def _validated_faults(drained: object) -> list[PermanentFault]:
+    """Check what ``drain_faults`` actually returned, at the boundary.
+
+    Same reasoning as :func:`_validated_errors`, with more at stake: a fault is
+    a REQUEST TO GO QUIET, so a malformed one must never be honoured. The
+    protocol is ``runtime_checkable`` and therefore gates on method presence
+    alone, so an adapter whose ``drain_faults`` returns strings, dicts or None
+    reaches here looking perfectly conformant.
+
+    Anything that is not a ``PermanentFault`` is DROPPED rather than coerced —
+    dropping it costs the adapter its suppression and nothing else, so the line
+    it was about stays in ``errors`` and keeps failing the run. Guessing at an
+    identity instead would silence a line on the strength of a hash of
+    something nobody designed. A non-iterable answer raises into the caller's
+    handler, which reports it and excuses nothing.
+    """
+    if not isinstance(drained, Iterable) or isinstance(drained, str | bytes):
+        raise TypeError(
+            f"drain_faults returned {type(drained).__name__}, not "
+            f"list[PermanentFault] (adapter contract); nothing was held quiet"
+        )
+    return [fault for fault in drained if isinstance(fault, PermanentFault)]
 
 
 def _validated_errors(drained: object) -> list[str]:
@@ -1249,7 +1392,65 @@ async def run_imports(
     # that used its own idea of "we told them" would be the fifth round of a bug
     # this branch has already fixed four times.
     commit_staleness_receipts(report, delivered)
+    # And the third thing, on the same declaration for the same reason. A
+    # permanent fault is written into the ledger — which is what stops it being
+    # re-reported — only for lines this channel actually carried.
+    commit_fault_receipts(report, delivered, poison)
     return report
+
+
+def commit_fault_receipts(
+    report: RunReport, delivered: Delivery, poison: PoisonLedger | None
+) -> None:
+    """Record the permanent faults a channel actually carried, and only those.
+
+    THE RECEIPT, AND WHY IT IS NOT OPTIONAL. Writing a fault into the ledger
+    buys permanent silence for it: no future run fails on that identity again.
+    Buying that silence on the strength of "the run reported it" is the exact
+    defect ``port.Delivery`` documents four rounds of — reported is not heard.
+    A run with no notifier, a hook that only logs, a hook that raised, a toast
+    whose five-line budget cut this line: each of those leaves the ledger
+    untouched and the fault loud again next run, which costs one duplicate line
+    and never an unheard alert.
+
+    PER LINE, not per adapter and not per run, unlike ``commit_report_barriers``
+    — which fires an adapter's barrier only when EVERY line it reported got
+    through. A fault is its own sentence and its own ledger row, so eight new
+    faults against a five-line toast record five now and the remaining three on
+    the next tick. Whole-adapter coverage here would mean a source that also
+    happens to have an unrelated transient error can never record anything.
+
+    Called with the ledger the run used, or ``None`` for a caller running
+    without one — in which case nothing was ever held quiet and there is
+    nothing to record. Calling it twice is safe: a recorded fault is dropped
+    from ``new_faults``, so the second call (the CLI's, against a terminal a
+    human was watching) can only ever add.
+
+    A failed write is recorded rather than raised, like the staleness commit:
+    the ingest succeeded and the operator was told; all that is lost is the
+    silence, so next run says the same thing again.
+    """
+    if poison is None:
+        return
+    for name, entry in report.adapters.items():
+        carried = [
+            fault
+            for fault in entry.new_faults
+            if f"{name}: {fault.line}" in delivered.lines
+        ]
+        if not carried:
+            continue
+        try:
+            for fault in carried:
+                poison.record_fault(name, fault)
+        except Exception as e:  # noqa: BLE001 -- reported, never fatal to the ingest
+            report.run_errors.append(
+                f"{name}: the permanent-fault ledger could not be written, so "
+                f"this input will be reported again next run: "
+                f"{type(e).__name__}: {e}"
+            )
+        else:
+            entry.new_faults = [f for f in entry.new_faults if f not in carried]
 
 
 def commit_report_barriers(
@@ -1388,6 +1589,7 @@ __all__ = [
     # Public because the CLI declares a channel the runner never sees: the
     # errors and warnings it prints to a terminal a human is watching, AFTER
     # run_imports has returned. See ``commit_report_barriers``.
+    "commit_fault_receipts",
     "commit_report_barriers",
     "commit_staleness_receipts",
     # The CLI installs this around ``run_imports`` — the process owns its

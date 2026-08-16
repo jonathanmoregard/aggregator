@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, TypeVar
 
 from aggregator.imports.port import ImportItem
+from aggregator.sources.base import PermanentFault
 
 T = TypeVar("T")
 
@@ -253,6 +254,23 @@ class SyncSourceAdapter:
         """
         errors, self._errors = self._errors, []
         return errors
+
+    def drain_faults(self) -> list[PermanentFault]:
+        """Forward the wrapped source's PERMANENT faults, or say there are none.
+
+        Defined unconditionally, like the two barriers above, and here that
+        costs nothing at all: over-inclusion on this protocol buys an adapter
+        no silence, because what may go quiet is declared per FAULT and a
+        source with nothing to declare answers with an empty list. See
+        ``imports/port.SupportsPermanentFaults`` for why that is the opposite
+        of ``gates_report``, which had to be an explicit opt-in.
+
+        The result is validated at the runner boundary rather than trusted:
+        ``runtime_checkable`` gates on method presence only, so a source with a
+        ``drain_faults`` of some other shape reaches here looking correct.
+        """
+        drain = getattr(self._source, "drain_faults", None)
+        return list(drain()) if drain is not None else []
 
 
 __all__ = [
