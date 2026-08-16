@@ -230,6 +230,20 @@ class SubstackSource:
         raw = drops_dir or os.environ.get("AGGREGATOR_DROPS_DIR") or DEFAULT_DROPS_DIR
         self.drops_dir = Path(raw).expanduser()
 
+    def manual_export_input(self) -> str:
+        """``sources.base.ReadsManualExport`` — what ``--rebuild`` is refused on.
+
+        Identical acquisition story to chatgpt and claude-web, which is the
+        point: this source's ``--rebuild`` used to be allowed purely because
+        the refusal was a hand-kept list and a record-shaped source was not on
+        it.
+        """
+        return (
+            "a Substack data-export zip (Settings → Exports) that a human "
+            "downloads by hand; nothing on this machine refreshes it, so a "
+            "post whose zip has left ~/Downloads exists only in this store"
+        )
+
     def record_shape(self) -> dict[str, str]:
         """DSL-facing field surface (M2 help generator)."""
         return {

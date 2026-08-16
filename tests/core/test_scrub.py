@@ -9,6 +9,7 @@ falls back to regex-only PII patterns when it isn't. The assertions below hold
 under BOTH regimes (the regex fallback covers every fixture case), so this test
 file is Presidio-agnostic.
 """
+import importlib
 from pathlib import Path
 
 from aggregator.core.scrub import ScrubResult, scrub
@@ -176,3 +177,76 @@ def test_ipv6_full_length_still_redacted():
     result = scrub(f"host at {addr} lives")
     assert addr not in result.text
     assert result.counts.get("ipv6", 0) >= 1
+
+
+# --- Presidio degradation: absence must fall back, never abort -------------
+#
+# Both tests reload the module, because the Presidio decision is made once at
+# import time. Each restores the real module in a `finally` so ordering with
+# the rest of the suite cannot matter.
+
+
+def _reload_scrub():
+    import aggregator.core.scrub as mod
+
+    return importlib.reload(mod)
+
+
+def test_missing_spacy_model_degrades_to_regex_instead_of_exiting():
+    """A machine without the spaCy model must degrade, not kill the process.
+
+    Presidio builds its NLP engine on construction and, when the model is
+    absent, calls ``spacy.cli.download`` — which on failure calls
+    ``sys.exit(1)``. ``SystemExit`` is a ``BaseException``, so the module's
+    ``except Exception`` never saw it and the import took the interpreter
+    down: CI aborted during collection with ``INTERNALERROR> SystemExit: 1``
+    on every run from 2026-08-08 onward.
+    """
+    import spacy.util
+
+    original = spacy.util.get_installed_models
+    spacy.util.get_installed_models = lambda: []
+    try:
+        mod = _reload_scrub()
+        assert mod._spacy_model_present() is False
+        assert mod._PRESIDIO_OK is False
+        # The regex layer is unaffected by Presidio's absence.
+        assert mod.scrub("write to bob@example.com").counts.get("email", 0) >= 1
+    finally:
+        spacy.util.get_installed_models = original
+        _reload_scrub()
+
+
+def test_systemexit_from_engine_construction_is_caught():
+    """Directly guard the ``except (Exception, SystemExit)`` widening.
+
+    Pins the failure mode rather than the path to it: if someone narrows the
+    clause back to ``except Exception``, this fails loudly here instead of as
+    an INTERNALERROR in CI. Written to hold whether or not the real model is
+    installed on the machine running it.
+    """
+    import presidio_analyzer
+    import spacy.util
+    from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+    configured = [
+        m["model_name"]
+        for m in NlpEngineProvider().nlp_configuration.get("models", [])
+    ]
+    original_models = spacy.util.get_installed_models
+    original_engine = presidio_analyzer.AnalyzerEngine
+
+    def _exit_like_spacy_download(*_args, **_kwargs):
+        raise SystemExit(1)
+
+    # Claim the model IS present so the guard passes and construction runs.
+    spacy.util.get_installed_models = lambda: configured
+    presidio_analyzer.AnalyzerEngine = _exit_like_spacy_download
+    try:
+        mod = _reload_scrub()  # must not propagate SystemExit
+        assert mod._PRESIDIO_OK is False
+        assert mod.scrub("write to bob@example.com").counts.get("email", 0) >= 1
+    finally:
+        spacy.util.get_installed_models = original_models
+        presidio_analyzer.AnalyzerEngine = original_engine
+        _reload_scrub()

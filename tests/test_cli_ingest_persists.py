@@ -27,10 +27,18 @@ class _StubRecordSource:
 
     name = "github"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
+
     def __init__(self, records: list[Record]):
         self._records = records
 
-    def iter_records(self, since):
+    # Carries ``errors`` because every real source does. Without it the CLI
+    # now (correctly) reports that it drove this source with no error sink,
+    # which would make these persistence tests exit 3 for an unrelated reason.
+    def iter_records(self, since, errors=None):
         for r in self._records:
             if since and r.updated_at and r.updated_at < since:
                 continue
@@ -120,6 +128,11 @@ class _StubEntitySource:
     """Yields SessionRow + ObservationRow entities via iter_entities."""
 
     name = "sessions"
+
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild``: --rebuild is opt-in per source,
+        and this stub stands in for one whose input a machine keeps current."""
+        return "a stub input this test controls entirely"
 
     def __init__(self, entities):
         self._entities = list(entities)

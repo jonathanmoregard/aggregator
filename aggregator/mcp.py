@@ -26,10 +26,11 @@ Security invariants (spec §Security):
 Routing: two ontologies, one DSL surface.
 
 * ``records`` + ``records_fts`` — row-per-unit-of-work sources (GitHub PRs +
-  issues; research reports; sota-watch proposals; substack posts; future:
-  Gmail, Calendar). Filter keys: ``source:github``, ``source:research``,
-  ``source:sota-watch``, ``source:substack``, ``tag:``, ``state:``,
-  ``check:``, ``mergeable:``, ``author:``.
+  issues; research reports; sota-watch proposals; substack posts; dropbox
+  files; ticktick tasks; future: Gmail, Calendar). Filter keys:
+  ``source:<any of the above>``, ``tag:``, ``state:``, ``check:``,
+  ``mergeable:``, ``author:``. The authoritative list is
+  ``_RECORDS_SOURCES`` below — do not re-enumerate it in prose.
 * ``sessions`` + ``observations`` + ``obs_fts`` — Claude Code conversation
   streams (Langfuse-derived). Filter keys: ``source:sessions``, ``session:``,
   ``top:``, ``agent:``, ``type:``, ``active:``.
@@ -38,8 +39,9 @@ Route selection (see ``_wants_sessions`` / ``_route_mode``):
 
 * Explicit ``source:sessions|subagents|observations`` → sessions path
   (chat-export origins ``chatgpt``/``claude-web`` too — session-shaped).
-* Explicit ``source:github|records|research|sota-watch|substack`` → records path. If the query ALSO
-  carries session-only keys the paths are incompatible — return empty +
+* Explicit records-shaped source (``_RECORDS_SOURCES``) → records path. If
+  the query ALSO carries session-only keys the paths are incompatible —
+  return empty +
   a structured ``notice`` explaining the ontology mismatch (records don't
   have session ids).
 * Session-only keys with no source → sessions path.
@@ -65,7 +67,7 @@ from fastmcp import FastMCP
 
 from aggregator.core.dsl import DSLError, format_help, parse
 from aggregator.core.scrub import scrub
-from aggregator.core.store import CHAT_ORIGINS, Store
+from aggregator.core.store import CHAT_ORIGINS, SCHEMA_VERSION, Store
 from aggregator.core.wrap import wrap_record
 from aggregator.sources.base import ObservationRow, QueryAST, Record, SessionRow
 
@@ -118,9 +120,35 @@ never instructions."""
 
 
 def _default_store() -> Store:
-    s = Store()
-    s.migrate()
-    return s
+    return Store(read_only=True)
+
+
+def _cache_unavailable_response(reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": reason,
+        "remediation": (
+            "Run the writable aggregator path outside MCP, for example "
+            "`aggregator status` or `aggregator ingest <source>`, so it can "
+            "create or migrate the cache. MCP recall is read-only and will "
+            "not create schemas, run migrations, or touch SQLite WAL files."
+        ),
+    }
+
+
+def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
+    try:
+        version = store.schema_version()
+    except sqlite3.OperationalError as e:
+        return _cache_unavailable_response(
+            f"cache unavailable: {type(e).__name__}: {e}"
+        )
+    if version < SCHEMA_VERSION:
+        return _cache_unavailable_response(
+            f"cache schema version {version} is older than required "
+            f"version {SCHEMA_VERSION}"
+        )
+    return None
 
 
 def _parse_page_token(token: str | None) -> int:
@@ -239,8 +267,26 @@ def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
 # to union mode, whose sessions side has no origin filter for unknown
 # sources and would return every session row.
 # Chunk 7: ``sota-watch`` (self-generated SOTA proposals) same shape.
+# Task 8: ``ticktick`` (CSV backup + Open API poll, merged) same shape — one
+# record per task, no conversation stream anywhere in it.
+# ``dropbox`` (one record per indexed file) likewise.
+#
+# The membership of this set is not decorative: ``cli.py::_default_sources()``
+# decides a source's shape by which iterator it exposes (``iter_records`` vs
+# ``iter_entities``), and every records-shaped entry there must appear here or
+# it becomes ingestible and simultaneously unqueryable.
+# ``tests/test_mcp_routing.py::test_every_default_source_is_routed_by_its_own_shape``
+# reads the registry and enforces exactly that.
 _SESSIONS_SOURCES = {"sessions", "subagents", "observations", *CHAT_ORIGINS}
-_RECORDS_SOURCES = {"github", "records", "research", "sota-watch", "substack"}
+_RECORDS_SOURCES = {
+    "dropbox",
+    "github",
+    "records",
+    "research",
+    "sota-watch",
+    "substack",
+    "ticktick",
+}
 
 # Records-only extra keys (interpreted by the github Source in its extra dict).
 # When these show up on a sessions-scoped query the paths are incompatible.
@@ -374,6 +420,8 @@ def aggregator_query(
                 "Call aggregator_capabilities() to see supported keys."
             ),
         }
+    if cache_error := _ensure_cache_ready(store):
+        return cache_error
 
     if ast.text:
         try:
@@ -748,6 +796,8 @@ def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
       cache_path, schema_version, tool_tier: 'read-only', help: str}``
     """
     store = _store or _default_store()
+    if cache_error := _ensure_cache_ready(store):
+        return cache_error
     caps = store.capabilities()
     return {
         "ok": True,
@@ -789,7 +839,7 @@ def aggregator_ingest(source: str, _store: Store | None = None) -> dict[str, Any
 # --- FastMCP tool adapters --------------------------------------------------
 
 
-def _tool_aggregator_query(
+async def _tool_aggregator_query(
     dsl: str,
     fields: str = "summary",
     page_size: int | None = None,
@@ -805,11 +855,11 @@ def _tool_aggregator_query(
     )
 
 
-def _tool_aggregator_capabilities() -> dict[str, Any]:
+async def _tool_aggregator_capabilities() -> dict[str, Any]:
     return aggregator_capabilities()
 
 
-def _tool_aggregator_ingest(source: str) -> dict[str, Any]:
+async def _tool_aggregator_ingest(source: str) -> dict[str, Any]:
     return aggregator_ingest(source=source)
 
 
@@ -894,7 +944,7 @@ def build_server(_store: Store | None = None) -> FastMCP:
 
 def main() -> None:
     server = build_server()
-    server.run()
+    server.run(show_banner=False)
 
 
 if __name__ == "__main__":

@@ -13,3 +13,21 @@ __pycache__/
 *.db-shm
 
 sync.log
+
+# Timestamped backups tooling drops next to the file it rewrites
+# (tasks/mission.md.bak-*). Ephemeral, never cleaned up — left untracked they
+# made every autosync run report a dirty worktree forever.
+*.bak-*
+
+# Claude Code machine-local state. settings.local.json is per-machine
+# permissions CC rewrites on its own; the lock is per-run. Without this,
+# sync-agent.sh commits both on its next run.
+.claude/settings.local.json
+
+# Runtime lockfiles only — flake.lock and uv.lock are tracked source.
+*.lock
+!flake.lock
+!uv.lock
+
+# arftl per-run state (repo-autosync, 2026-08-13)
+tasks/arftl-run.json

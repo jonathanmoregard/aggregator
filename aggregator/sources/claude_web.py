@@ -118,6 +118,14 @@ class ClaudeWebSource:
         )
         self.drops_dir = Path(os.path.expanduser(root))
 
+    def manual_export_input(self) -> str:
+        """``sources.base.ReadsManualExport`` — what ``--rebuild`` is refused on."""
+        return (
+            "a claude.ai data-export archive a human downloads by hand; "
+            "nothing on this machine refreshes it, so a conversation whose "
+            "export is gone exists only in this store"
+        )
+
     def record_shape(self) -> dict[str, str]:
         return {
             "session_id": "str ('claude-web:<conversation-uuid>')",

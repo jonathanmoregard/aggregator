@@ -566,6 +566,108 @@ def test_source_sota_watch_with_session_key_returns_notice(tmp_data_home):
     assert "notice" in r
 
 
+# --- Task 8: ticktick is records-shaped -----------------------------------
+
+
+def test_source_ticktick_routes_to_records_mode(tmp_data_home):
+    """``source:ticktick`` targets the records table. Unlisted, it falls
+    through to union mode, whose sessions side has no origin filter for an
+    unknown source and would hand back every session row — the source becomes
+    ingestible and simultaneously unqueryable."""
+    store = Store()
+    store.migrate()
+    store.upsert(
+        [
+            Record(
+                stable_id="ticktick:abc123",
+                source="ticktick",
+                subject="Buy milk",
+                body="from the good shop",
+                tags=["errand", "open"],
+                created_at=datetime(2026, 8, 1, tzinfo=UTC),
+                updated_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+        ]
+    )
+    store.upsert_entities([_sess("cc-sess"), _obs("o1", "cc-sess", "chat")])
+    r = aggregator_query(dsl="source:ticktick", _store=store)
+    assert r["ok"] is True
+    assert r["mode"] == "records"
+    ids = {rec["stable_id"] for rec in r["records"]}
+    assert ids == {"ticktick:abc123"}
+    assert "cc-sess" not in ids
+
+
+# --- every registered source must be routed by its real shape -------------
+
+
+def test_source_dropbox_routes_to_records_mode(tmp_data_home):
+    """``source:dropbox`` targets the records table.
+
+    Live bug before this test: dropbox was missing from ``_RECORDS_SOURCES``,
+    so the query fell through to union mode, whose sessions side has no
+    origin filter for an unknown source — a search for the 4 dropbox records
+    handed back every session row instead.
+    """
+    store = Store()
+    store.migrate()
+    store.upsert(
+        [
+            Record(
+                stable_id="dropbox:notes/plan.md",
+                source="dropbox",
+                subject="Plan",
+                body="document body",
+                tags=["notes", "md"],
+                created_at=None,
+                updated_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+        ]
+    )
+    store.upsert_entities([_sess("cc-sess"), _obs("o1", "cc-sess", "chat")])
+    r = aggregator_query(dsl="source:dropbox", _store=store)
+    assert r["ok"] is True
+    assert r["mode"] == "records"
+    ids = {rec["stable_id"] for rec in r["records"]}
+    assert ids == {"dropbox:notes/plan.md"}
+    assert "cc-sess" not in ids
+
+
+def test_every_default_source_is_routed_by_its_own_shape():
+    """Whole-registry guard against the next omission of this class.
+
+    A source's shape is not a matter of opinion — ``cli.py`` dispatches
+    ingest on it: ``iter_entities`` means session-shaped, ``iter_records``
+    means records-shaped. The MCP router must agree with that dispatch for
+    every registered source, or the source is ingestible and simultaneously
+    unqueryable (it falls through to union mode and leaks the sessions
+    table). Reads the registry rather than a hand-kept list, so a source
+    added to ``_default_sources()`` and forgotten in ``_RECORDS_SOURCES``
+    fails here.
+
+    ``_default_sources()`` constructors are side-effect-free (env/dir
+    resolution only), so building the real registry touches nothing.
+    """
+    from aggregator import cli
+    from aggregator.core.dsl import parse
+    from aggregator.mcp import _route_mode
+
+    misrouted: list[str] = []
+    for name, src in cli._default_sources().items():
+        if hasattr(src, "iter_entities"):
+            expected = "sessions"
+        elif hasattr(src, "iter_records"):
+            expected = "records"
+        else:  # pragma: no cover -- a source with neither can't be ingested
+            raise AssertionError(
+                f"{name} has neither iter_entities nor iter_records"
+            )
+        actual = _route_mode(parse(f"source:{name}"))
+        if actual != expected:
+            misrouted.append(f"{name}: expected {expected}, routed {actual}")
+    assert not misrouted, "mis-routed sources: " + "; ".join(misrouted)
+
+
 def test_cross_source_no_filters_unions(tmp_data_home):
     """No filters at all also unions — "show me everything" surface."""
     store = Store()

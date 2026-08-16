@@ -42,6 +42,7 @@ import logging
 import os
 import zipfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +156,38 @@ def discover_export_files(
             elif path.suffix.lower() == ".zip":
                 _classify_zip(path, kind, found, sink)
     return found
+
+
+def newest_export_mtime(
+    kind: str, dirs: list[Path] | None = None
+) -> datetime | None:
+    """When the newest export archive of ``kind`` was last written, or None.
+
+    These archives are MANUAL: a human asks the vendor for an export, waits,
+    downloads the zip and drops it here. Nothing on this machine refreshes
+    them, so a timer would re-import the same months-old file forever and
+    report success every run — the "empty result looks like success" shape the
+    fail-loudly constraint exists to stop. This is the number that lets a run
+    say "substack input is 31 days stale" instead.
+
+    The FILE's mtime, not any member's: a vendor zip's internal timestamps are
+    whenever the vendor built the archive, while the question here is when the
+    human last acquired one.
+
+    ``None`` means no export was found at all — unknown, NOT fresh. Discovery
+    errors are swallowed on purpose: this is a probe, and the ingest run
+    itself reports them through the ``errors`` sink. Reporting them twice
+    would double-count one broken file in the run report.
+    """
+    newest: float | None = None
+    for f in discover_export_files(kind, dirs=dirs, errors=[]):
+        try:
+            mtime = f.path.stat().st_mtime
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+    return datetime.fromtimestamp(newest, tz=UTC) if newest is not None else None
 
 
 def _classify_bare(

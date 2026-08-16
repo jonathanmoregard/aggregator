@@ -45,6 +45,18 @@ class SotaWatchSource:
 
     name = "sota-watch"
 
+    def rebuild_input(self) -> str:
+        """``sources.base.SupportsRebuild`` — why ``--rebuild`` is allowed here.
+
+        The proposals directory is written by sota-watch on this machine and
+        every stored row comes from a file still in it, so a re-scan reproduces
+        the whole population the DELETE can reach.
+        """
+        return (
+            "the sota-watch proposals directory on this machine, which "
+            "sota-watch itself writes and keeps"
+        )
+
     def __init__(self, proposals_dir: str | os.PathLike[str] | None = None):
         self.proposals_dir = Path(
             proposals_dir

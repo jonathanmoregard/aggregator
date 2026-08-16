@@ -5,6 +5,12 @@ Subcommands:
   ingest SOURCE   - trigger one source's ingest cycle (does the actual work;
                     the MCP ``aggregator_ingest`` tool only prints
                     instructions pointing here — this is the human-approve gate)
+  ingest --all    - run EVERY source through the unified import runner
+                    (``imports/runner.py``), one pass, one report. This is the
+                    command a single systemd timer runs: per-source failures
+                    are isolated, counts are real, and inputs that only a
+                    human refreshes get a staleness warning. Exit 3 when any
+                    source ended with errors.
   status          - print capabilities (sources, freshness, cache path)
 
 v2 (Schema B): sessions ingest routes through the entity path
@@ -19,32 +25,73 @@ entity path (session-shaped; discovery scans the drops dir AND ~/Downloads);
 Injection seams:
 * ``_store`` — swap the SQLite backing for tests (default: XDG cache).
 * ``_sources`` — swap the source registry for tests.
+* ``_adapters`` — swap the import-port registry driving ``ingest --all``.
+* ``_notify`` — the run-report notifier. Fires on EVERY ``--all`` run, not
+  only failing ones: a run that imported nothing because the export archive
+  is a month old exits 0 and is otherwise indistinguishable from a healthy
+  no-op. Defaults to doing nothing INTERACTIVELY; ``--all --notify`` or
+  ``$AGGREGATOR_NOTIFY_COMMAND`` installs the real desktop notifier, which is
+  what an unattended timer run needs (stderr on an exit-0 run reaches nobody).
 
 Argparse (not click) per plan.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import logging
+import os
+import shlex
+import shutil
+import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from aggregator.core.store import EmptyRebuildRefusedError, Store
+from aggregator.imports.ingest_state import (
+    SOURCE_CURSORS,
+    PoisonLedger,
+    Watermarks,
+    default_marker_path,
+    stale_input_markers,
+)
+from aggregator.imports.port import Delivery, ImportAdapter
+from aggregator.imports.registry import default_adapters
+from aggregator.imports.runner import (
+    NotifyHook,
+    RunReport,
+    commit_report_barriers,
+    commit_staleness_receipts,
+    graceful_shutdown,
+    run_imports,
+)
+from aggregator.imports.store_sink import StoreSink, count_writes
+from aggregator.imports.sync_bridge import accepts_errors_kwarg, unwired_sink_note
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
 from aggregator.mcp import (
     aggregator_query as _mcp_query,
 )
-from aggregator.sources.base import ObservationRow, SessionRow
+from aggregator.sources import ticktick_api
+from aggregator.sources.base import (
+    ObservationRow,
+    ReadsManualExport,
+    SessionRow,
+    SupportsRebuild,
+)
 from aggregator.sources.chatgpt import ChatGPTSource
 from aggregator.sources.claude_web import ClaudeWebSource
+from aggregator.sources.dropbox import DropboxSource
 from aggregator.sources.github import GitHubSource
 from aggregator.sources.research_reports import ResearchReportsSource
 from aggregator.sources.sessions import SessionsSource
 from aggregator.sources.sota_watch import SotaWatchSource
 from aggregator.sources.substack import SubstackSource
+from aggregator.sources.ticktick import TickTickSource
 
 # Round-1 HIGH-2: partial-parse silent-wipe threshold.
 # When --rebuild would drop >20% of rows for a source that already holds
@@ -53,6 +100,90 @@ from aggregator.sources.substack import SubstackSource
 # ratio check — nothing to protect at that scale.
 _RATIO_GUARD_MIN_EXISTING = 100
 _RATIO_GUARD_KEEP_FRACTION = 0.8  # refuse if new < 0.8 * existing
+
+# Exit codes. 0 clean; 1 hard failure; 2 usage error (unknown source, bad
+# --since, unknown subcommand) — both pre-existing and deliberately not
+# renumbered. 3 is the new one: the run completed but ended with a non-empty
+# errors list. Distinct from 2 so the systemd wrapper can tell a typo'd
+# source name from a run that dropped three PDFs; distinct from 0 because
+# `tasks/session-constraints.md` requires a failed ingest to be loud, and a
+# timer that reads 0 as success lets the index rot unnoticed.
+EXIT_COMPLETED_WITH_ERRORS = 3
+
+# How many of a run's errors the single-source path prints. Named because it is
+# no longer only a display choice: what is elided was not reported, so a run that
+# truncated cannot claim its report reached anybody — see ``_stderr_delivery``.
+ERROR_PRINT_LIMIT = 5
+
+# How many error lines fit in a desktop toast before it stops being readable.
+# Same rule as above and the same round-7 consequence: whatever this elides was
+# not delivered, so nothing it gates goes quiet. ``_notification_text`` spends
+# the budget on the lines that gate a receipt first — see there.
+NOTIFY_ERROR_LIMIT = 5
+
+# How many of a run's errors `ingest --all` prints to stderr. Larger than the
+# toast because a terminal scrolls and a journal is read after the fact; a
+# person watching that terminal is a delivery channel for exactly these lines.
+RUN_ERROR_PRINT_LIMIT = 10
+
+# How old a manually-refreshed input may get before `ingest --all` nags.
+# Overridable with `--stale-after-days`.
+#
+# 14 days, chosen against the ritual it is nagging about: the export-archive
+# sources (chatgpt, claude-web, substack, and ticktick's CSV leg) are realistic
+# to refresh about monthly, so two weeks is half a cycle — late enough that a
+# freshly-run ritual is never nagged, early enough that the operator is told
+# before the gap is a month wide. Tighter and the warning fires on healthy
+# runs and gets tuned out, which is worse than not warning at all.
+DEFAULT_STALE_AFTER_DAYS = 14
+
+# How a run reaches a human when nobody is watching the terminal.
+#
+# ``--notify`` installs the real notifier; ``$AGGREGATOR_NOTIFY_COMMAND``
+# installs it too AND replaces the program, so a systemd unit can wire this up
+# through its ``Environment=`` without anyone editing an argv. The value is
+# shlex-split, so it may carry arguments ("dunstify --replace 42").
+NOTIFY_COMMAND_ENV_VAR = "AGGREGATOR_NOTIFY_COMMAND"
+DEFAULT_NOTIFY_COMMAND = "notify-send"
+# A hung notification daemon must not wedge the timer's unit.
+NOTIFY_TIMEOUT_SECONDS = 10
+
+# Which ``sessions.origin`` populations `ingest sessions --rebuild` is allowed
+# to DELETE. Exactly the one the sessions source can regenerate: it scans
+# ~/.claude/projects and every row it emits carries the ``SessionRow.origin``
+# default, ``'claude-code'``.
+#
+# The sessions and observations tables also hold ``chatgpt`` and
+# ``claude-web`` rows, and those are NOT regenerable — their only source is a
+# vendor export archive a human downloads by hand, so once the drop is gone
+# the rows in this database are the last copy. Before this scope existed the
+# rebuild's DELETE was unqualified and took them too, and the >20% shrink
+# guard could not catch it: it compared the incoming claude-code count against
+# the WHOLE table, so a store of 840 claude-code + 160 claude-web rows read as
+# a 16% shrink, sailed through the guard, exited 0, and destroyed all 160.
+SESSIONS_REBUILD_ORIGINS = ("claude-code",)
+
+# Per-source ``--rebuild`` refusals whose reason NO PROPERTY CAPTURES.
+#
+# Not the general rule. The general rule is ``sources.base.ReadsManualExport``
+# — a source declares that its input is an archive a human downloads, and
+# ``_rebuild_refusal`` derives the refusal from that. This dict was the whole
+# mechanism until round 2, which is how ``substack`` (the same Settings →
+# Exports zip as chatgpt and claude-web) ended up with --rebuild allowed.
+#
+# What stays here is the reason that is specific to one source's ontology
+# rather than to how its input is acquired.
+REBUILD_UNSUPPORTED_SOURCES: dict[str, str] = {
+    "ticktick": (
+        "its stored rows include api-inferred-complete tasks that nothing can "
+        "regenerate. The Open API serves OPEN tasks only and reports a "
+        "completion exactly once, as a disappearance between two polls, so a "
+        "completed task is never in a poll again; and the CSV backups that "
+        "would confirm it are a manual export whose only surviving copy is "
+        "the local archive. A rebuild that shrinks the source by under 20% "
+        "clears the shrink guard silently and takes those rows with it."
+    ),
+}
 
 
 def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
@@ -65,6 +196,19 @@ def _ratio_guard_would_trip(new_count: int, existing_count: int) -> bool:
         existing_count > _RATIO_GUARD_MIN_EXISTING
         and new_count < _RATIO_GUARD_KEEP_FRACTION * existing_count
     )
+
+
+def _parse_since(raw: str | None) -> datetime | None:
+    """Parse ``--since`` into an aware UTC datetime. Raises ``ValueError``.
+
+    Naive input is stamped UTC because every timestamp downstream is aware and
+    comparing the two raises. Shared by both ingest paths so the single-source
+    and run-all windows cannot mean different things.
+    """
+    if not raw:
+        return None
+    since = datetime.fromisoformat(raw)
+    return since if since.tzinfo is not None else since.replace(tzinfo=UTC)
 
 
 def _confirm_force_on_stdin(prompt: str) -> bool:
@@ -81,6 +225,38 @@ def _confirm_force_on_stdin(prompt: str) -> bool:
     return answer == "y"
 
 
+class _UnbuildableSource:
+    """Stands in for a source whose constructor RAISED.
+
+    The mirror of ``imports/registry._UnbuildableAdapter``, for the
+    single-source path. Same reasoning: construction here is documented as
+    side-effect-free (env and path resolution only), which is exactly why an
+    environment-dependent raise is the plausible failure — and exactly why it
+    must cost only its own source.
+
+    It carries no ``iter_entities`` / ``iter_records`` / ``ingest``, so it can
+    never be mistaken for a working source and quietly ingest nothing; the
+    ingest path checks for it by type and reports the original error.
+    """
+
+    def __init__(self, name: str, error: BaseException) -> None:
+        self.name = name
+        self.error = error
+
+    def __str__(self) -> str:
+        return (
+            f"{self.name}: source could not be constructed: "
+            f"{type(self.error).__name__}: {self.error}"
+        )
+
+
+def _build_source(name: str, factory: Callable[[], Any]) -> Any:
+    try:
+        return factory()
+    except Exception as e:  # noqa: BLE001 -- isolation boundary, see the class
+        return _UnbuildableSource(name, e)
+
+
 def _default_sources() -> dict[str, Any]:
     """Real source registry. Kept in a function so tests can bypass with
     ``_sources={...}`` without importing the real sources' heavy deps
@@ -88,16 +264,28 @@ def _default_sources() -> dict[str, Any]:
 
     All constructors are side-effect-free (env/dir resolution only); no
     filesystem or network work happens until the chosen source's ingest
-    runs."""
-    return {
-        "sessions": SessionsSource(),
-        "github": GitHubSource(),
-        "chatgpt": ChatGPTSource(),
-        "claude-web": ClaudeWebSource(),
-        "research": ResearchReportsSource(),
-        "sota-watch": SotaWatchSource(),
-        "substack": SubstackSource(),
-    }
+    runs. A constructor that raises anyway yields an ``_UnbuildableSource``
+    under the same name instead of propagating — one broken source costs its
+    own ``ingest <name>`` and nothing else.
+
+    Called LAZILY, from the commands that need it (see ``main``). Built
+    eagerly before dispatch, as it was, a single raising constructor took down
+    ``query`` and ``status``, which consult no source at all, and ``ingest
+    --all``, which drives the adapter registry instead — and it did so
+    UPSTREAM of ``_UnbuildableAdapter``, so the run-all isolation never got to
+    contain anything."""
+    factories: list[tuple[str, Callable[[], Any]]] = [
+        ("sessions", SessionsSource),
+        ("github", GitHubSource),
+        ("chatgpt", ChatGPTSource),
+        ("claude-web", ClaudeWebSource),
+        ("research", ResearchReportsSource),
+        ("sota-watch", SotaWatchSource),
+        ("substack", SubstackSource),
+        ("dropbox", DropboxSource),
+        ("ticktick", TickTickSource),
+    ]
+    return {name: _build_source(name, factory) for name, factory in factories}
 
 
 def _cmd_query(args: argparse.Namespace, store: Store) -> int:
@@ -140,8 +328,38 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
 
 
 def _cmd_status(args: argparse.Namespace, store: Store) -> int:
-    caps = _mcp_capabilities(_store=store)
+    caps = dict(_mcp_capabilities(_store=store))
+    # WHERE A SUPPRESSED ALARM STAYS VISIBLE. The TickTick poll reports a
+    # vanished project once and then stops (a permanently-red signal is one an
+    # operator learns to ignore, which costs the next real failure its
+    # audience), and this is the other half of that bargain: the tasks it is
+    # still holding, and cannot ever resolve, are listed here on demand. Quiet
+    # is only acceptable because it is not the same as forgotten.
+    #
+    # Read here rather than added to ``aggregator_capabilities``: that surface
+    # is the MCP tool's read-only view of the CACHE, and this is on-disk source
+    # state that no MCP client asked for.
+    uncovered = ticktick_api.uncovered_projects(ticktick_api.default_state_path())
+    # THE SAME BARGAIN, one source of noise over. A hand-downloaded export that
+    # has gone stale is warned about once per episode and then goes quiet — a
+    # toast every 30 minutes until somebody visits a vendor's export page is how
+    # an operator learns to dismiss toasts unread — so the sources currently
+    # being held quiet, and the export date each was held quiet about, are
+    # listed here on demand.
+    stale_inputs = stale_input_markers()
+    # WHERE "IS THIS RUN INCREMENTAL?" IS ANSWERED WITHOUT READING CODE. The
+    # high-water marks and the records that could not be written are both
+    # things a run may legitimately go quiet about — a mark that stopped moving
+    # and a record set aside three weeks ago produce no output at all on a
+    # healthy tick — so the on-demand view is the other half of that bargain.
+    # Quiet is only acceptable while it is not the same as forgotten.
+    ingest_state = store.all_ingest_state()
+    held_records = store.poison_summary()
     if args.json:
+        caps["ticktick_uncovered_projects"] = uncovered
+        caps["stale_input_markers"] = stale_inputs
+        caps["ingest_state"] = ingest_state
+        caps["held_records"] = held_records
         print(json.dumps(caps, indent=2, default=str))
         return 0
     print(f"cache_path: {caps['cache_path']}")
@@ -151,7 +369,243 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     for s in caps["sources"]:
         fresh = caps["freshness"].get(s, "n/a")
         print(f"  {s}: last_updated={fresh}")
+    print("ingest windows (per-source high-water marks):")
+    for name in sorted(SOURCE_CURSORS):
+        cursor = SOURCE_CURSORS[name]
+        state = ingest_state.get(name, {})
+        mark = state.get("cursor_value")
+        if not cursor.is_incremental:
+            # SAID OUT LOUD, EVERY TIME IT IS ASKED. A source that full-scans
+            # while reporting like an incremental one is the failure this whole
+            # change exists to remove, so its line names the kind rather than
+            # showing an empty mark that reads as "nothing new yet".
+            print(f"  {name}: FULL SCAN every run — {cursor.note}")
+            continue
+        print(
+            f"  {name}: {cursor.kind} on {cursor.field}, "
+            f"mark={mark or 'none yet (next run is a full scan)'}, "
+            f"last_run={state.get('last_run_at') or 'never'}, "
+            f"failures={state.get('consecutive_failures') or 0}"
+        )
+        if state.get("last_error"):
+            print(f"    last error: {state['last_error']}")
+    if held_records:
+        print("records set aside after write failures (retained, never deleted):")
+        for entry in held_records:
+            when = "terminal, never retried" if entry["terminal"] else "will retry"
+            print(
+                f"  {entry['source']}: {entry['count']} x "
+                f"{entry['error_type']} ({when})"
+            )
+    if uncovered:
+        print(
+            "ticktick uncovered projects (reported once; tasks retained, never "
+            "inferred completed):"
+        )
+        for project_id, info in uncovered.items():
+            task_ids = info["task_ids"]
+            count = len(task_ids) if isinstance(task_ids, list) else 0
+            print(
+                f"  {project_id or '<no projectId in the baseline entry>'}: "
+                f"{count} task(s), first reported {info['first_reported'] or 'unknown'}"
+            )
+        print(f"  baseline: {ticktick_api.default_state_path()}")
+    if stale_inputs:
+        print(
+            "stale inputs (reported once; warning stays quiet until a fresh "
+            "export lands or the threshold is lowered):"
+        )
+        for name, mark in sorted(stale_inputs.items()):
+            newest = mark.get("input_newest_at") if isinstance(mark, dict) else None
+            threshold = (
+                mark.get("stale_after_days") if isinstance(mark, dict) else None
+            )
+            first = mark.get("first_reported") if isinstance(mark, dict) else None
+            print(
+                f"  {name}: input {newest or 'MISSING ENTIRELY'}"
+                f"{f', threshold {threshold} days' if threshold is not None else ''}"
+                f", first reported {first or 'unknown'}"
+            )
+        print(f"  markers: {default_marker_path()}")
     return 0
+
+
+def _commit_after_write(src: Any, errors: list[str]) -> None:
+    """Let a source advance state that its records had to land first.
+
+    The single-source half of ``imports/port.SupportsWriteBarrier``; the
+    runner does the same after its final flush. Reached ONLY once the write
+    above returned — every failing path returns before here, which is the
+    whole guarantee. TickTick's open-task baseline is what needs it: advancing
+    it is what makes a completion unrepeatable, and it used to happen during
+    iteration, before a single row was written.
+
+    A failure is recorded, not raised. The records are already in the store,
+    so the ingest itself succeeded; but a baseline that never advances loses
+    every completion from here on, so it becomes an ``errors`` entry and the
+    run exits 3.
+    """
+    commit = getattr(src, "commit_after_write", None)
+    if commit is None:
+        return
+    try:
+        commit()
+    except Exception as e:  # noqa: BLE001 -- reported, never fatal to the write
+        errors.append(f"{type(e).__name__}: {e}")
+
+
+def _print_errors(errors: Sequence[str], limit: int) -> list[str]:
+    """Put this run's errors on stderr and return EXACTLY what went there.
+
+    The return value is what a delivery declaration is derived from, so no
+    caller can print one thing and claim another: shrink the print, or the
+    limit, or reorder it, and the claim shrinks with it — because the claim is
+    read out of the printed text rather than asserted next to it. See
+    :func:`_stderr_delivery` and ``imports/port.Delivery``.
+    """
+    shown = list(errors[:limit])
+    for e in shown:
+        print(f"  error: {e}", file=sys.stderr)
+    return shown
+
+
+def _print_warnings(warnings: Sequence[str]) -> list[str]:
+    """Put this run's staleness warnings on stderr and return what went there.
+
+    Same contract as :func:`_print_errors`, and now for the same reason rather
+    than for symmetry: a staleness warning goes quiet once a human has been
+    told, so what this printed is what a watched terminal may claim to have
+    delivered. Unlimited, unlike the errors — there are at most four sources
+    that can go stale, and truncating the list would silently cost the elided
+    one its only channel on an interactive run.
+
+    The ``WARNING: `` prefix is display only and is not part of the line, the
+    same way ``  error: `` is not: the return value is the report's own text,
+    which is what ``Delivery`` matches whole lines against.
+    """
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    return list(warnings)
+
+
+def _stderr_delivery(printed: Sequence[str], reported: Sequence[str]) -> Delivery:
+    """Which of ``reported`` a person actually SAW on stderr. Possibly none.
+
+    ONLY AT AN INTERACTIVE TERMINAL. ``aggregator ingest <source>`` installs no
+    notifier at all (``--notify`` is refused without ``--all``), so the print is
+    the entire channel — and a channel nobody is standing in front of is not a
+    channel. Under the systemd timer that runs this repo's ingests, stderr is the
+    journal: it is written, it is retained, and no human reads it unprompted.
+    Treating that as delivery is the round-4/5/6 defect one surface over, and it
+    is worse here than in the runner, because this path has no fallback notifier
+    to be misconfigured — it is silent by design.
+
+    ``isatty`` is the question actually being asked ("is somebody there?") and
+    the one the shell answers correctly for every redirection: ``2>log``, a pipe,
+    a systemd unit and a cron job all say no; a person at a prompt says yes.
+
+    TRUNCATION IS THE SECOND WAY THE PRINT MISSES, and it is no longer a
+    separate rule. The caller shows the first :data:`ERROR_PRINT_LIMIT` errors
+    and hands that list in as ``printed``; a line that was pushed off the end is
+    not in the text, so it is not in the result, so nothing it gates goes quiet.
+    Round 6 spelled this as ``if len(errors) > ERROR_PRINT_LIMIT``, which was a
+    check the next surface (the desktop toast, round 7) did not have.
+
+    Never raises: a closed or replaced stream answers "nothing delivered", which
+    is the direction that keeps reporting rather than the one that goes quiet.
+    """
+    try:
+        watched = sys.stderr.isatty()
+    except (AttributeError, ValueError):  # pragma: no cover - closed/odd stream
+        return Delivery()
+    if not watched:
+        return Delivery()
+    return Delivery.accepted("\n".join(printed), reported)
+
+
+def _commit_after_report(
+    src: Any, delivery: Delivery, reported: Sequence[str]
+) -> str | None:
+    """Let a source record that its report reached a human. Or why not.
+
+    The single-source half of ``imports/port.SupportsReportBarrier``; the runner
+    does the same, per adapter, in ``runner.commit_report_barriers``. Reached
+    only once the summary and every error line are on stderr — and only if
+    ``delivery`` covers EVERY line this run reported. One source runs on this
+    path, so its report is the whole report, and a run that could only show some
+    of it cannot tell which of its own sentences it is safe to stop saying.
+
+    ``delivery`` is a PARAMETER rather than something computed in here, so the
+    call site has to name the channel it is claiming. There is exactly one such
+    channel on this path today; a future one (a mailer, a webhook) is then a new
+    value passed in, not an assumption already baked into this function.
+
+    ASKS THE SOURCE BY ATTRIBUTE, where the runner asks the adapter for an
+    explicit ``gates_report`` (``port.is_report_gating``). Not an inconsistency:
+    the runner's problem was that ``SyncSourceAdapter`` hands every source a
+    forwarding ``commit_after_report``, so presence there meant nothing. On a
+    SOURCE the method is hand-written — no source in this repo inherits from
+    anything — and this path drives exactly one source, so there is no second
+    adapter whose lines could be confused with its own or starve it out of a
+    payload. Presence is a declaration here; it was an artefact there.
+
+    Returns the fault instead of appending to ``errors``, because ``errors`` has
+    already been printed by the time this runs; the caller prints what comes
+    back and takes exit 3 for it. Loud, but the loss is small: all a failed
+    receipt costs is one more report of a disappearance already reported.
+    """
+    if not delivery.covers(reported):
+        return None
+    commit = getattr(src, "commit_after_report", None)
+    if commit is None:
+        return None
+    try:
+        commit()
+    except Exception as e:  # noqa: BLE001 -- reported, never fatal to the write
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def _iterate(
+    iter_fn: Callable[..., Any],
+    since: datetime | None,
+    errors: list[str],
+) -> Any:
+    """Call a source's iterator, passing ``errors`` only if it takes one.
+
+    The signature is PROBED, never discovered by calling and catching. Both
+    ingest paths used to do this::
+
+        try:
+            records = list(src.iter_records(since, errors=errors))
+        except TypeError:
+            records = list(src.iter_records(since))
+
+    Argument binding raises TypeError at call time, so that handled the
+    old-signature case — and equally handled a genuine TypeError raised from
+    arbitrary depth inside the iteration, whereupon it silently ran the source
+    AGAIN. Iterating a source is not a read-only act: the TickTick poll's
+    ``reconcile_open_tasks`` advances the on-disk open-task baseline while it
+    runs, and the API only ever serves OPEN tasks, so the second pass sees no
+    disappearances and that poll's inferred completions are gone for good —
+    on a run that then exits 0 because the retry succeeded.
+
+    Same helper the run-all path uses (``sync_bridge.accepts_errors_kwarg``),
+    so the two surfaces cannot drift on which sources get an errors sink — and
+    the same note when the probe says no, so they cannot drift on whether that
+    degradation is reported either.
+
+    THE FALLBACK IS NOT FREE, and it used to be silent. Driving a source
+    without ``errors`` means every per-item failure it takes internally has
+    nowhere to land, so the run prints ``errors=0`` and exits 0 for a source
+    that may have skipped half its input. The source still runs — that is the
+    whole point of the fallback — but the run says the count cannot be
+    trusted for it.
+    """
+    if accepts_errors_kwarg(iter_fn):
+        return iter_fn(since, errors=errors)
+    errors.append(unwired_sink_note(getattr(iter_fn, "__qualname__", str(iter_fn))))
+    return iter_fn(since)
 
 
 def _cmd_ingest_entities(
@@ -163,16 +617,14 @@ def _cmd_ingest_entities(
     """v2 ingest path: source yields SessionRow + ObservationRow entities.
 
     ``--rebuild`` swaps sessions + observations atomically via
-    ``store.rebuild_and_upsert_entities``. Applies the same round-3 HIGH
-    silent-wipe guard as the Record path: refuse if the iterator yielded
-    zero session rows while errors surfaced.
+    ``store.rebuild_and_upsert_entities``, SCOPED to the origins the source
+    can regenerate (see ``SESSIONS_REBUILD_ORIGINS``). Applies the same
+    round-3 HIGH silent-wipe guard as the Record path: refuse if the iterator
+    yielded zero session rows while errors surfaced.
     """
     errors: list[str] = []
     try:
-        try:
-            entities = list(src.iter_entities(since, errors=errors))
-        except TypeError:
-            entities = list(src.iter_entities(since))
+        entities = list(_iterate(src.iter_entities, since, errors))
     except Exception as e:  # noqa: BLE001
         print(f"ingest {args.source} failed: {e}", file=sys.stderr)
         return 1
@@ -181,24 +633,14 @@ def _cmd_ingest_entities(
     obs_count = sum(1 for e in entities if isinstance(e, ObservationRow))
 
     if args.rebuild:
-        # Chunk 4 guard: `rebuild_and_upsert_entities` atomically replaces
-        # the ENTIRE sessions + observations tables — it has no per-origin
-        # granularity. Running it for a chat-export source (chatgpt,
-        # claude-web) would silently wipe every claude-code session. Only
-        # the sessions source (which scans all claude-code JSONLs) may
-        # drive the whole-table rebuild; chat exports re-ingest via the
-        # idempotent upsert instead.
-        if args.source != "sessions":
-            print(
-                f"ERROR: --rebuild is not supported for source "
-                f"{args.source!r}: the entity rebuild path replaces the "
-                f"entire sessions/observations tables and would wipe other "
-                f"origins' rows. Re-run without --rebuild (ingest is an "
-                f"idempotent upsert per session/observation id).",
-                file=sys.stderr,
-            )
-            return 2
-        existing = store.count_by_source(args.source)
+        # Whether --rebuild is supported at all was settled by
+        # ``_rebuild_refusal`` BEFORE the iterator ran — see there for why the
+        # order matters.
+        #
+        # Counted over the SAME origins the DELETE will reach. Counted over
+        # the whole table instead, the chat-export rows pad the denominator
+        # and hide a shrink the operator would otherwise be asked about.
+        existing = store.count_sessions_by_origin(SESSIONS_REBUILD_ORIGINS)
         if session_count == 0 and (errors or existing > 0):
             print(
                 f"ERROR: refusing to rebuild {args.source}: iterator yielded "
@@ -234,21 +676,118 @@ def _cmd_ingest_entities(
                     return 1
         min_sessions = 1 if existing > 0 else 0
         try:
-            store.rebuild_and_upsert_entities(entities, min_sessions=min_sessions)
+            store.rebuild_and_upsert_entities(
+                entities,
+                min_sessions=min_sessions,
+                origins=SESSIONS_REBUILD_ORIGINS,
+            )
         except EmptyRebuildRefusedError as e:
             print(f"ERROR: {e}; store left intact", file=sys.stderr)
             return 1
     else:
         store.upsert_entities(entities)
+    _commit_after_write(src, errors)
 
     print(
         f"ingest {args.source}: sessions={session_count} "
         f"observations={obs_count} errors={len(errors)}"
     )
-    if errors:
-        for e in errors[:5]:
-            print(f"  error: {e}", file=sys.stderr)
+    shown = _print_errors(errors, ERROR_PRINT_LIMIT)
+    # Same order and same reason as the records path: stderr is the channel, so
+    # the receipt is only earned once the lines above are on it AND somebody was
+    # there to read them — all of them, not the first five.
+    late = _commit_after_report(src, _stderr_delivery(shown, errors), errors)
+    if late is not None:
+        print(f"  error: {late}", file=sys.stderr)
+    if errors or late is not None:
+        return EXIT_COMPLETED_WITH_ERRORS
     return 0
+
+
+def _rebuild_refusal(name: str, src: Any) -> str | None:
+    """Why ``--rebuild`` is refused for this source, or None if it is allowed.
+
+    REFUSAL IS THE DEFAULT. A source is allowed the destructive path only if it
+    declares ``sources.base.SupportsRebuild``; everything below that is a more
+    specific, better-worded refusal for a case we can name. Round 3: the checks
+    used to be the whole rule, so they only ever caught evidence AGAINST a
+    rebuild and a source that declared nothing at all — the normal state of a
+    source whose author never read this function — got the DELETE. Measured on
+    a fresh record-shaped source: 150 stored, 140 re-scanned, 10 last-copy rows
+    deleted, ``added=0 updated=140 skipped=0 errors=0``, exit 0. Forgetting a
+    declaration now costs a refusal an operator can read, which is recoverable;
+    the old default was not.
+
+    CALLED BEFORE THE SOURCE IS ITERATED, and that ordering is the point.
+    ``_cmd_ingest`` used to list the iterator first and only then decide
+    whether the rebuild was permitted or whether a guard refused it — but
+    iterating a source is not a read-only act. The TickTick poll's
+    ``reconcile_open_tasks`` diffs against the previous open-task baseline and
+    then makes THIS poll the new baseline, on disk, during iteration. A run
+    that consumed that baseline and then exited without writing anything took
+    every completion it had just inferred with it: the API only ever serves
+    OPEN tasks, so a task that disappeared between two polls is reported
+    exactly once, and there is no second chance to notice. Deciding first
+    means a refused run never touches it.
+
+    Refusals are exit code 2 (usage error): the flag cannot mean what it says
+    for this source, which is a different thing from a guard refusing a
+    particular run's numbers.
+    """
+    reason = REBUILD_UNSUPPORTED_SOURCES.get(name)
+    if reason is not None:
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: "
+            f"{reason} Re-run without --rebuild (ingest is an idempotent "
+            f"upsert per stable_id, so a re-scan already overwrites every row "
+            f"it can produce)."
+        )
+    if isinstance(src, ReadsManualExport):
+        # THE RULE, and it is a property, not a list. Round 2: substack reads
+        # a Settings → Exports zip exactly like chatgpt and claude-web, and its
+        # --rebuild was allowed anyway — the refusal was decided by the
+        # hand-kept dict above plus the accident that the other two are
+        # entity-shaped. An old or partial archive then deleted last-copy rows
+        # under the ratio guard's slack, at exit 0 (measured: 150 stored, 140
+        # re-scanned, 10 gone, `added=0 updated=140 skipped=0 errors=0`).
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: its "
+            f"input is {src.manual_export_input()}. --rebuild DELETEs every "
+            f"row the re-scan did not reproduce, so an older or partial "
+            f"archive silently destroys the rest. Re-run without --rebuild "
+            f"(ingest is an idempotent upsert, so a re-scan already overwrites "
+            f"every row it can produce)."
+        )
+    if hasattr(src, "iter_entities") and name != "sessions":
+        # A second, shape-derived reason that outlives the property: the entity
+        # rebuild path replaces the sessions + observations rows wholesale for
+        # the origins it is scoped to, and only the sessions source can
+        # regenerate its origin. Kept for a future entity-shaped source whose
+        # input is NOT a manual export.
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: the "
+            f"entity rebuild path replaces the sessions/observations rows "
+            f"wholesale and only the sessions source can regenerate the origin "
+            f"it is scoped to. Re-run without --rebuild (ingest is an "
+            f"idempotent upsert per session/observation id)."
+        )
+    if not isinstance(src, SupportsRebuild):
+        # THE DEFAULT, and it is deliberately the last word rather than the
+        # first: the checks above produce a better message for a case we can
+        # name, and this catches everything else — including the case that
+        # matters most, a source nobody has thought about yet.
+        return (
+            f"ERROR: --rebuild is not supported for source {name!r}: it does "
+            f"not declare that a re-scan reproduces everything the DELETE "
+            f"would remove. --rebuild DELETEs every row the re-scan did not "
+            f"produce, so a source whose stored rows outlive its current input "
+            f"silently destroys the difference. Re-run without --rebuild "
+            f"(ingest is an idempotent upsert, so a re-scan already overwrites "
+            f"every row it can produce). If this source really can regenerate "
+            f"its whole population, give it a rebuild_input() saying what keeps "
+            f"its input current (sources.base.SupportsRebuild)."
+        )
+    return None
 
 
 def _cmd_ingest(
@@ -259,15 +798,21 @@ def _cmd_ingest(
         print(f"unknown source: {args.source}", file=sys.stderr)
         print(f"known sources: {sorted(sources)}", file=sys.stderr)
         return 2
-    since: datetime | None = None
-    if args.since:
-        try:
-            since = datetime.fromisoformat(args.since)
-        except ValueError:
-            print(f"bad --since: {args.since}", file=sys.stderr)
+    if isinstance(src, _UnbuildableSource):
+        # 1 (hard failure), not 2 (usage error): the operator typed a real
+        # source name, and this machine's environment is why it cannot run.
+        print(f"ingest {src}", file=sys.stderr)
+        return 1
+    try:
+        since = _parse_since(args.since)
+    except ValueError:
+        print(f"bad --since: {args.since}", file=sys.stderr)
+        return 2
+    if args.rebuild:
+        refusal = _rebuild_refusal(args.source, src)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
             return 2
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=UTC)
     # v2: entity-shaped sources (sessions) route through iter_entities +
     # upsert_entities. Record-shaped (github) fall through to iter_records +
     # upsert. Sources exposing only ingest() (old test stubs) use the
@@ -280,16 +825,20 @@ def _cmd_ingest(
             # Round-3 HIGH/MEDIUM#3: plumb the errors sink into iter_records
             # so we can (a) refuse a wipe when every endpoint degrades to []
             # with errors present and (b) surface warnings post-ingest.
-            # Older iter_records signatures without an ``errors`` kwarg
-            # (e.g. the CLI persistence stub) are handled via TypeError
-            # fallback so we don't break narrow test doubles.
-            try:
-                records = list(src.iter_records(since, errors=errors))
-            except TypeError:
-                records = list(src.iter_records(since))
+            records = list(_iterate(src.iter_records, since, errors))
         except Exception as e:  # noqa: BLE001 -- surface as CLI error, don't crash
             print(f"ingest {args.source} failed: {e}", file=sys.stderr)
             return 1
+        # Counts are probed BEFORE any write. Every write path here is an
+        # upsert (and --rebuild deletes first), so once the write has landed
+        # there is no way to tell an insert from an overwrite — which is how
+        # this summary came to print ``added=len(records) updated=0`` on
+        # every run, identical whether the run imported 313 new PRs or
+        # re-wrote the same 313 rows. Same helper the runner's sink uses, so
+        # the two surfaces cannot drift apart on what "added" means.
+        # On --rebuild the question is still "was this id already known?",
+        # answered against the pre-run store, not the emptied one.
+        counts = count_writes(store, "records", [r.stable_id for r in records])
         # Round-2 MEDIUM: when --rebuild is set, run the DELETE + upsert
         # atomically so a fault during upsert can't leave the store empty
         # for the source. Without --rebuild the plain upsert path is fine
@@ -349,19 +898,472 @@ def _cmd_ingest(
                 return 1
         else:
             store.upsert(records)
-        added = len(records)
+        _commit_after_write(src, errors)
+        added, updated, skipped = counts.added, counts.updated, counts.skipped
     else:
         result = src.ingest(since=since)
         added = result.added
+        updated = result.updated
+        skipped = result.skipped
         errors = list(result.errors)
     print(
-        f"ingest {args.source}: added={added} updated=0 skipped=0 "
-        f"errors={len(errors)}"
+        f"ingest {args.source}: added={added} updated={updated} "
+        f"skipped={skipped} errors={len(errors)}"
     )
-    if errors:
-        for e in errors[:5]:
-            print(f"  error: {e}", file=sys.stderr)
+    shown = _print_errors(errors, ERROR_PRINT_LIMIT)
+    # AFTER the errors are on stderr, which is this path's entire delivery
+    # channel — there is no notify hook here — and only when that stderr is a
+    # terminal somebody is watching, and only for the lines it actually showed.
+    # See ``_stderr_delivery``.
+    late = _commit_after_report(src, _stderr_delivery(shown, errors), errors)
+    if late is not None:
+        print(f"  error: {late}", file=sys.stderr)
+    if errors or late is not None:
+        # 3, not 0: a run that completed but dropped files is not a success,
+        # and a partially-successful run is not a successful run — some
+        # records landing does not make the missing ones acceptable. A timer
+        # reporting success while the index rots is indistinguishable from
+        # one with nothing to do. 3 rather than 2 because 2 is this file's
+        # usage-error code and the systemd wrapper must tell them apart:
+        # "you typed a bad source name" and "the run dropped three PDFs"
+        # need different notification text and different human responses.
+        return EXIT_COMPLETED_WITH_ERRORS
     return 0
+
+
+def _ingest_usage_error(args: argparse.Namespace) -> str | None:
+    """Reject ingest invocations that cannot mean what they say. None = fine.
+
+    Every case here would otherwise SUCCEED while doing something other than
+    what was typed, which is the failure shape this repo keeps ruling out —
+    a run that looks like it worked is worse than one that stops.
+    """
+    if args.all_sources and args.source:
+        return (
+            f"ingest: --all takes no source name (got {args.source!r}); "
+            f"run either `aggregator ingest {args.source}` or "
+            f"`aggregator ingest --all`"
+        )
+    if not args.all_sources and not args.source:
+        return (
+            "ingest: name a source, or pass --all to run every source "
+            "through the unified runner"
+        )
+    if args.all_sources and args.rebuild:
+        # --rebuild drops a source's rows before re-scanning and is guarded
+        # per-source (ratio guard, empty-result guard, stdin confirmation).
+        # Across nine sources at once those guards would each need their own
+        # answer, and the entity rebuild replaces the WHOLE sessions +
+        # observations tables — it would wipe the chat-export origins. The
+        # runner path is upsert-only, which is idempotent per id anyway.
+        return (
+            "ingest: --rebuild is not supported with --all; rebuild one "
+            "source at a time (`aggregator ingest <name> --rebuild`)"
+        )
+    if args.rebuild and args.since:
+        # Round-2 HIGH-3. The two flags contradict each other on the one thing
+        # --rebuild adds over a plain ingest: the DELETE of every row the scan
+        # did not reproduce. --since narrows what the scan CAN reproduce, so
+        # the combination deletes the history outside the window — data the
+        # run never even looked at.
+        #
+        # Neither guard catches it. The ratio guard is bypassed outright below
+        # 100 existing rows (measured: 5 rows in, window covers 1, store ends
+        # at 1, exit 0), and above it a window covering >=80% of the store
+        # keeps the shrink under the threshold. Nothing prints a ``deleted=``
+        # count, so the summary of that run reads
+        # ``added=0 updated=1 skipped=0 errors=0``.
+        return (
+            f"ingest: --rebuild cannot be combined with --since "
+            f"({args.since!r}): --rebuild DELETEs every row the scan did not "
+            f"reproduce, and --since narrows the scan, so rows outside the "
+            f"window would be deleted without ever being read. Drop --since "
+            f"for a full re-scan, or drop --rebuild (a plain ingest is an "
+            f"idempotent upsert and deletes nothing)."
+        )
+    # Flags that parse fine and then do nothing. Same rule as the cases above:
+    # an invocation that succeeds while ignoring what was typed is worse than
+    # one that stops, and these three are the ones where the operator's mental
+    # model is furthest from what happened — somebody passing --force believes
+    # they have authorised a destructive run.
+    if args.stale_after_days is not None and not args.all_sources:
+        return (
+            "ingest: --stale-after-days only applies to --all (the input "
+            "staleness check runs over the whole registry); drop it or run "
+            "`aggregator ingest --all --stale-after-days "
+            f"{args.stale_after_days}`"
+        )
+    if args.notify and not args.all_sources:
+        return (
+            "ingest: --notify only applies to --all (the run report the "
+            "notifier describes is the runner's); drop it or run "
+            "`aggregator ingest --all --notify`"
+        )
+    unused = [
+        flag
+        for flag, present in (("--force", args.force), ("--yes", args.yes))
+        if present
+    ]
+    if unused and not args.rebuild:
+        return (
+            f"ingest: {' and '.join(unused)} only applies to --rebuild (it "
+            f"overrides the >20% row-drop guard, and nothing is dropped "
+            f"without --rebuild); drop it or add --rebuild"
+        )
+    return None
+
+
+def _silent_notification(report: RunReport) -> None:
+    """The CLI's default notifier: do nothing. Never counts as delivery.
+
+    An interactive ``aggregator ingest --all`` prints its report to a terminal
+    somebody is already looking at, so it should not also pop a desktop toast.
+    An UNATTENDED run is the opposite case — see ``_desktop_notification`` and
+    ``--notify``.
+
+    ``-> None`` for the same reason as ``runner._no_notification``: a hook that
+    does nothing must not be able to declare that a human was told, and the way
+    to guarantee that is to leave it nothing to return. See ``port.Delivery``.
+
+    THAT DOES NOT MAKE THE INTERACTIVE RUN UNDELIVERABLE, which was the round-7
+    MEDIUM. This hook is silent because the CHANNEL IS ELSEWHERE: ``ingest
+    --all`` prints the report itself, after ``run_imports`` has returned, and
+    declares what that print showed a watched terminal. See ``_cmd_ingest_all``.
+    """
+
+
+def _notification_text(report: RunReport) -> tuple[str, str, str] | None:
+    """``(urgency, summary, body)`` for this run, or None to stay quiet.
+
+    The runner fires ``notify`` on every run and leaves it to the hook to
+    decide what is worth telling a human. Two things are:
+
+    * errors — CRITICAL, per the 2026-08-08 fail-loudly constraint.
+    * warnings with no errors — a hand-refreshed export has gone stale or is
+      missing. Nothing failed, so not critical, but this is precisely the run
+      that is invisible everywhere else: exit 0, every count 0, identical to a
+      healthy no-op.
+
+    A wholly clean run says nothing. A toast on every timer tick is how an
+    operator learns to dismiss them without reading, which would cost the two
+    cases above the only channel they have.
+
+    THE BUDGET IS SPENT ON THE GATING LINES FIRST. A toast has to stay readable,
+    so only :data:`NOTIFY_ERROR_LIMIT` error lines go in it — and round 7 was
+    five failures from other sources pushing TickTick's uncovered-project line,
+    the one line whose delivery decides whether that gap re-alarms every 30
+    minutes, off the end. ``Delivery`` now makes eliding it merely loud instead
+    of silent (the receipt cannot be stamped for a line that is not in this
+    text), and ordering by what gates a receipt is what keeps "merely loud" from
+    meaning "loud forever": an adapter without a report barrier repeats its
+    errors next run regardless, so its line is the cheaper one to drop.
+    """
+    if report.errors:
+        gating = set(report.gating_errors)
+        ordered = [
+            *(e for e in report.errors if e in gating),
+            *(e for e in report.errors if e not in gating),
+        ]
+        return (
+            "critical",
+            f"aggregator ingest: {len(report.errors)} error(s)",
+            "\n".join([*ordered[:NOTIFY_ERROR_LIMIT], *report.warnings[:3]]),
+        )
+    if report.warnings:
+        return (
+            "normal",
+            f"aggregator ingest: {len(report.warnings)} warning(s)",
+            "\n".join(report.warnings[:5]),
+        )
+    return None
+
+
+def _desktop_notification(report: RunReport) -> Delivery:
+    """Tell a human, via ``notify-send`` (or ``$AGGREGATOR_NOTIFY_COMMAND``).
+
+    DECLARES WHAT IT SENT, in exactly one place: after the notification program
+    has exited zero, out of the very text that was handed to it. Everywhere else
+    — nothing worth saying, an unresolvable program (which raises), a non-zero
+    exit (which raises) — nothing was delivered, so an adapter holding a report
+    barrier keeps reporting. See ``port.Delivery``.
+
+    ROUND 7 WAS THE GAP BETWEEN "SENT" AND "SENT WHAT". This returned a run-wide
+    ``Delivery.DELIVERED`` while the body was ``report.errors[:5]``, so five
+    failures from other sources bought permanent silence for a line that never
+    left the process. The declaration is now read out of ``body``, which means
+    the truncation above cannot outrun it: they are the same string.
+
+    THE CLI IS WHERE THIS BELONGS. ``imports/runner.py`` refuses to shell out
+    and names this layer as the one that injects a real notifier — but until
+    round 2 nothing could: ``_notify`` is a Python-only seam, the console entry
+    point is ``aggregator.cli:main``, and no argv or env reached it. Every real
+    invocation therefore got ``_silent_notification``, so the round-1 "notify
+    fires on every run" fix moved the silence instead of removing it: on a
+    timer the warnings were stderr text on an exit-0 run, and nothing reads
+    that.
+
+    Still an injected callable — ``run_imports`` takes it as a parameter and
+    the default stays a no-op, so library and test callers shell out to
+    nothing. Only ``main`` installs this one, and only when asked.
+
+    A failure to notify propagates: the runner records it in ``run_errors``,
+    which turns into exit 3. A notifier that cannot notify is a fault in its
+    own right, and on an otherwise-clean run it is the only thing that says so.
+    """
+    # BEFORE the "nothing worth saying" return, deliberately. A misconfigured
+    # notifier that is only checked when there is something to send stays
+    # latent until the first FAILING run — and that run's notify failure then
+    # reaches only the journal, which is the exact channel the notifier exists
+    # to replace. Checked on every run, the config fault surfaces on the next
+    # clean one, while the operator still has a working channel to hear it on.
+    argv = _notify_argv()
+    text = _notification_text(report)
+    if text is None:
+        # Nothing was sent, so nothing was delivered. Saying otherwise would be
+        # the round-6 defect in miniature — "no error occurred" read as "a human
+        # heard it". Costs nothing in practice: a report barrier's receipt only
+        # ever exists alongside the error line that earned it, and an error is
+        # exactly what ``_notification_text`` refuses to stay quiet about.
+        return Delivery()
+    urgency, summary, body = text
+    # No shell=True: the value is operator configuration, split with shlex and
+    # exec'd directly. Timeout because a hung notification daemon must not
+    # wedge the timer's unit forever.
+    #
+    # ``--`` because summary and body are POSITIONAL and their content is not
+    # ours: a body line beginning with ``-`` is an option to notify-send's and
+    # dunstify's GOption parsers, and the notification is then lost to
+    # "option -x not recognized" rather than delivered. Safe today only by the
+    # accident that every line happens to be prefixed "<adapter name>: ", and
+    # adapter names are not validated against a leading dash.
+    subprocess.run(
+        [*argv, "-u", urgency, "-a", "aggregator", "--", summary, body],
+        check=True,
+        timeout=NOTIFY_TIMEOUT_SECONDS,
+    )
+    # ``check=True``, so reaching this line means the notification daemon
+    # accepted it — and ``body`` is verbatim what it accepted, so the lines this
+    # run may now go quiet about are read back out of it rather than asserted.
+    #
+    # ``report.reported``, not ``report.errors``: a staleness warning is now
+    # suppressed once a human has been told, by the same machinery, and a line
+    # that is not offered here can never be in the delivered set — so its marker
+    # could never be earned and it would toast every 30 minutes forever.
+    return Delivery.accepted(body, report.reported)
+
+
+def _notify_argv() -> list[str]:
+    """The notify program and its arguments, or raise saying what is wrong.
+
+    Two config faults, both of which used to be quiet in the wrong direction.
+
+    A SET-BUT-BLANK value. ``AGGREGATOR_NOTIFY_COMMAND=`` is the shape a
+    systemd unit produces from ``Environment=AGGREGATOR_NOTIFY_COMMAND=``, and
+    it was falsy at both gates: it did not install the notifier and it fell
+    back to the default program. So an operator who had written the line
+    believed notifications were on and they were off, while a whitespace-only
+    value — the same intent, one keystroke different — raised loudly. Backwards:
+    a variable that is present is a statement of intent, and a blank one is a
+    broken statement, which is the loud case.
+
+    AN UNRESOLVABLE PROGRAM. ``notify-sned`` is not detectable at any point
+    except by trying, and the only run that used to try was a failing one.
+    Checked here, on every run.
+
+    Raising is the reporting channel: ``run_imports`` records a notify-hook
+    failure in ``run_errors``, so the run exits 3 and the summary says which
+    variable to fix.
+    """
+    raw = os.environ.get(NOTIFY_COMMAND_ENV_VAR)
+    argv = shlex.split(DEFAULT_NOTIFY_COMMAND if raw is None else raw)
+    if not argv:
+        raise ValueError(
+            f"${NOTIFY_COMMAND_ENV_VAR} is set but blank ({raw!r}), so no "
+            f"notifier could be installed; unset it to get the default "
+            f"({DEFAULT_NOTIFY_COMMAND}) or name a program"
+        )
+    if shutil.which(argv[0]) is None:
+        raise ValueError(
+            f"notify command {argv[0]!r} is not executable or not on PATH "
+            f"(from ${NOTIFY_COMMAND_ENV_VAR}"
+            f"{' — unset, so this is the default' if raw is None else ''}); "
+            f"no notification can be delivered until it is fixed"
+        )
+    return argv
+
+
+def _resolve_notify(
+    args: argparse.Namespace, injected: NotifyHook | None
+) -> NotifyHook:
+    """Which notifier this invocation gets.
+
+    Injection wins, so a library or test caller is never surprised by an env
+    var set on the developer's machine. Otherwise ``--notify`` or a set
+    ``$AGGREGATOR_NOTIFY_COMMAND`` installs the real one — the env var alone is
+    enough so a unit file can wire this up without changing anyone's argv.
+
+    PRESENCE, not truthiness. ``AGGREGATOR_NOTIFY_COMMAND=`` — what
+    ``Environment=AGGREGATOR_NOTIFY_COMMAND=`` in a unit file produces — is a
+    statement that the operator wants notifications, spelled wrong. Read as
+    falsy it installed nothing and said nothing, which is the one outcome an
+    operator who wrote that line cannot detect. Installed, ``_notify_argv``
+    refuses it out loud and the run exits 3.
+    """
+    if injected is not None:
+        return injected
+    if getattr(args, "notify", False) or NOTIFY_COMMAND_ENV_VAR in os.environ:
+        return _desktop_notification
+    return _silent_notification
+
+
+def _configure_ingest_logging() -> None:
+    """Send the runner's progress lines somewhere a human can find them.
+
+    NOTHING UNDER ``aggregator/`` CONFIGURED LOGGING, which is why the
+    2026-08-15 run was silent: ``logging.lastResort`` prints WARNING and above,
+    so every INFO-level progress line this pipeline might have emitted would
+    have gone nowhere anyway. pypdf's WARNING-level chatter got through, was
+    the only thing that did, and its absence was then read as a hang.
+
+    stderr, so the report on stdout stays parseable and the journal gets both.
+    ``basicConfig`` no-ops when the root logger already has handlers, so a
+    library embedder's or pytest's configuration wins — which is the correct
+    precedence for a CLI that is also an importable package.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def _cmd_ingest_all(
+    args: argparse.Namespace,
+    store: Store,
+    adapters: Sequence[ImportAdapter],
+    notify: NotifyHook = _silent_notification,
+    watermarks: Watermarks | None = None,
+) -> int:
+    """Drive every adapter through the one runner and report what happened.
+
+    This is the command a single systemd timer runs. Everything it prints has
+    to be legible in a journal entry after the fact, because that is where the
+    operator will read it.
+
+    Per-source failure isolation is the runner's (``_run_one`` contains each
+    adapter's exception and keeps the others going); this function's job is to
+    turn the resulting report into a summary and an exit code.
+
+    ``since`` is already baked into each adapter at construction — the port is
+    a single-verb interface, so acquisition knobs live on the instance.
+
+    ``notify`` is the seam the desktop / systemd layer plugs a real notifier
+    into. It fires on every run, including clean ones, because a run that
+    imported nothing from a month-old export is clean and is still the thing
+    an operator needs told — see ``runner.run_imports``. Defaults to the
+    runner's no-op so library and test callers stay silent.
+
+    THE PRINT BELOW IS ALSO A CHANNEL, and this function is the only place that
+    can say so: the runner's hook has already fired by the time these lines
+    reach stderr. Interactively that stderr is a terminal with a person in front
+    of it, which is exactly as much of an audience as a toast; under the timer
+    it is the journal, which is none. Both answers come out of the same
+    ``_stderr_delivery`` the single-source path uses.
+    """
+    _configure_ingest_logging()
+
+    async def _drive() -> RunReport:
+        # THE SIGNAL HANDLER LIVES HERE, not in the runner: the process owns
+        # its signals and library code merely reads the flag. Installed inside
+        # the coroutine because ``add_signal_handler`` needs the running loop.
+        with graceful_shutdown() as stop:
+            return await run_imports(
+                adapters,
+                StoreSink(store),
+                notify=notify,
+                stale_after_days=(
+                    args.stale_after_days
+                    if args.stale_after_days is not None
+                    else DEFAULT_STALE_AFTER_DAYS
+                ),
+                watermarks=watermarks,
+                poison=PoisonLedger(store) if watermarks is not None else None,
+                stop=stop,
+            )
+
+    report = asyncio.run(_drive())
+    _print_run_report(report)
+    shown_warnings = _print_warnings(report.warnings)
+    shown = _print_errors(report.errors, RUN_ERROR_PRINT_LIMIT)
+    # THE TERMINAL IS A CHANNEL AND THE RUNNER CANNOT SEE IT. Round-7 MEDIUM: an
+    # interactive ``ingest --all`` resolves to ``_silent_notification`` and does
+    # its reporting HERE, after ``run_imports`` has returned — so a person
+    # watching these lines scroll past was told, the runner never heard about
+    # it, and the same TickTick gap re-reported on every single run, forever.
+    # Declared here because this is where the print happens; derived from
+    # ``shown`` because that is what the print actually put on screen.
+    #
+    # NOT A WEAKENING OF THE UNATTENDED CASE: ``_stderr_delivery`` answers
+    # "nothing" unless stderr is a tty, and under the timer it is the journal.
+    # A second call is safe — the barriers cleared whatever the notify hook
+    # already earned — and it can only ever ADD lines a human saw.
+    late = len(report.run_errors)
+    watched = _stderr_delivery([*shown, *shown_warnings], report.reported)
+    commit_report_barriers(adapters, report, watched)
+    # The staleness markers get the same second chance, and need it for the same
+    # reason: an interactive ``ingest --all`` installs no notifier at all, so the
+    # WARNING lines above are the only channel there is, and without this a
+    # person who read them off their own terminal would be told again on every
+    # single run. Under the timer ``_stderr_delivery`` answers "nothing" — the
+    # journal is not an audience — so the unattended case is untouched.
+    commit_staleness_receipts(report, watched)
+    # A barrier that raised lands in ``run_errors`` after the block above has
+    # printed, so it would otherwise change the exit code with nothing on stderr
+    # to explain it. Same treatment as the single-source path's ``late``.
+    _print_errors(report.run_errors[late:], RUN_ERROR_PRINT_LIMIT)
+    if report.errors:
+        # Same 3 as the single-source path, for the same reason: a run that
+        # completed but dropped files is not a success, and a timer that reads
+        # 0 as success lets the index rot unnoticed.
+        return EXIT_COMPLETED_WITH_ERRORS
+    return 0
+
+
+def _print_run_report(report: RunReport) -> None:
+    """One line per source, then the run total.
+
+    Counts come from the sink, which probes the store BEFORE writing. The
+    single-source path used to print ``added=len(records) updated=0`` on every
+    run, so importing 313 new PRs and re-writing the same 313 rows produced
+    identical output; that is not repeated here.
+
+    ``warnings`` rides in the total because it is the only field that
+    distinguishes a healthy no-op from a run that imported nothing off a
+    month-old export. Both print ``added=0 ... errors=0``; only one of them
+    also prints ``warnings=1``, and that is what makes the difference legible
+    in a journal entry read after the fact.
+    """
+    print(f"ingest --all: run={report.run_id}")
+    for name, a in report.adapters.items():
+        # ``unchanged`` and ``window`` are what tell an incremental run from
+        # the doom loop in a journal read after the fact. Both printed a run
+        # that "updated" ~372k rows; only one of them did any work, and only
+        # one of them was given a window.
+        print(
+            f"  {name}: added={a.added} updated={a.updated} "
+            f"unchanged={a.unchanged} skipped={a.skipped} "
+            f"errors={len(a.errors)} window={a.window or 'n/a'}"
+            f"{' INTERRUPTED' if a.interrupted else ''}"
+            f"{' RESTING' if a.skipped_for_backoff else ''}"
+        )
+        for note in a.notes:
+            print(f"    note: {note}")
+    print(
+        f"  total: added={report.added} updated={report.updated} "
+        f"unchanged={report.unchanged} skipped={report.skipped} "
+        f"errors={len(report.errors)} warnings={len(report.warnings)}"
+        f"{' (INTERRUPTED — stopped at a chunk boundary; the next run resumes)' if report.interrupted else ''}"
+    )
 
 
 def _cmd_github_token_status(
@@ -384,6 +1386,9 @@ def _cmd_github_token_status(
             file=sys.stderr,
         )
         return 2
+    if isinstance(src, _UnbuildableSource):
+        print(f"github-token-status: {src}", file=sys.stderr)
+        return 1
     if not hasattr(src, "token_status"):
         print(
             "registered github source does not support token_status()",
@@ -439,15 +1444,52 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="print capabilities / freshness")
     st.add_argument("--json", action="store_true")
 
-    ing = sub.add_parser("ingest", help="run one source's ingest cycle")
+    ing = sub.add_parser(
+        "ingest", help="run one source's ingest cycle, or --all of them"
+    )
     ing.add_argument(
         "source",
+        nargs="?",
         help=(
             "source name: sessions | github | chatgpt | claude-web | "
-            "research | sota-watch | substack"
+            "research | sota-watch | substack | dropbox | ticktick"
+        ),
+    )
+    ing.add_argument(
+        "--all",
+        dest="all_sources",
+        action="store_true",
+        help=(
+            "run every source through the unified runner instead of one "
+            "named source (one timer, one report; per-source failures are "
+            "isolated)"
         ),
     )
     ing.add_argument("--since", help="ISO date to bound the ingest window")
+    ing.add_argument(
+        "--stale-after-days",
+        type=int,
+        # No argparse default: `None` is how "the operator did not type this"
+        # is told apart from "they typed the default", which is what lets the
+        # usage check reject it on a run where it cannot do anything.
+        # ``_cmd_ingest_all`` applies DEFAULT_STALE_AFTER_DAYS.
+        default=None,
+        help=(
+            "with --all: warn when a manually-refreshed input (chat exports, "
+            "the TickTick CSV) is older than this many days "
+            f"(default: {DEFAULT_STALE_AFTER_DAYS})"
+        ),
+    )
+    ing.add_argument(
+        "--notify",
+        action="store_true",
+        help=(
+            "with --all: send a desktop notification when the run ends with "
+            "errors (CRITICAL) or staleness warnings (normal). For unattended "
+            f"runs; ${NOTIFY_COMMAND_ENV_VAR} overrides the program "
+            f"(default: {DEFAULT_NOTIFY_COMMAND}) and enables this on its own"
+        ),
+    )
     ing.add_argument(
         "--rebuild",
         action="store_true",
@@ -487,24 +1529,67 @@ def main(
     argv: list[str] | None = None,
     _store: Store | None = None,
     _sources: dict[str, Any] | None = None,
+    _adapters: Sequence[ImportAdapter] | None = None,
+    _notify: NotifyHook | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     store = _store or Store()
     store.migrate()
-    sources = _sources if _sources is not None else _default_sources()
+
+    def sources() -> dict[str, Any]:
+        """Build the source registry ON THE COMMAND THAT NEEDS IT.
+
+        Not before dispatch. ``query`` and ``status`` consult no source, and
+        ``ingest --all`` drives the ADAPTER registry (which has its own
+        construction isolation); building nine real sources for them meant a
+        single raising constructor aborted those commands with a bare
+        traceback, upstream of every guard downstream of it.
+        """
+        return _sources if _sources is not None else _default_sources()
+
     if args.cmd == "query":
         return _cmd_query(args, store)
     if args.cmd == "status":
         return _cmd_status(args, store)
     if args.cmd == "ingest":
+        usage_error = _ingest_usage_error(args)
+        if usage_error is not None:
+            print(usage_error, file=sys.stderr)
+            return 2
+        if args.all_sources:
+            try:
+                since = _parse_since(args.since)
+            except ValueError:
+                print(f"bad --since: {args.since}", file=sys.stderr)
+                return 2
+            # ONE ``Watermarks`` FOR THE WHOLE RUN, shared by the registry
+            # (which turns each mark into the adapter's ``since``) and the
+            # runner (which describes the window in the report and advances the
+            # mark afterwards). Two instances would be two reads of the same
+            # table and could not disagree today — but they could tomorrow, and
+            # a report describing a different window from the one the adapters
+            # were handed is worse than no report.
+            watermarks = Watermarks(store, override=since)
+            adapters = (
+                _adapters
+                if _adapters is not None
+                else default_adapters(watermarks=watermarks)
+            )
+            return _cmd_ingest_all(
+                args,
+                store,
+                adapters,
+                _resolve_notify(args, _notify),
+                watermarks=watermarks,
+            )
         # Round-2 MEDIUM: the atomic DELETE + upsert lives inside
         # ``_cmd_ingest`` via ``store.rebuild_and_upsert`` when
         # ``args.rebuild`` is set. Do NOT call ``store.rebuild`` here —
         # doing so would commit the DELETE before the transaction and
         # reintroduce the non-atomic gap this fix closes.
-        return _cmd_ingest(args, store, sources)
+        return _cmd_ingest(args, store, sources())
     if args.cmd == "github-token-status":
-        return _cmd_github_token_status(args, store, sources)
+        return _cmd_github_token_status(args, store, sources())
     return 2
 
 
