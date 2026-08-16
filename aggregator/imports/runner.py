@@ -4,29 +4,82 @@ Why this exists: exactly one source auto-imports today (github, via a
 systemd user timer); the rest are hand-run and drift days to weeks stale.
 One runner means one timer can drive every source, and the
 notify-on-failure wiring is written once instead of once per source.
+
+HOW A RUN ADVANCES, AND WHY IT IS SHAPED THIS WAY
+=================================================
+The 2026-08-15 live run had no unit of work that was ever durably
+acknowledged: ``since`` was always ``None``, so every 30-minute tick re-ingested
+all 372k observations from scratch, and being SIGTERMed at 44% threw all of it
+away. Four properties fix that, and each one is load-bearing:
+
+* **Chunked.** Every ``batch_size`` items are written and COMMITTED. A kill at
+  any moment therefore costs at most one chunk of writing, never the run.
+* **Checkpointed at end of stream.** The source's high-water mark rides the
+  FINAL chunk, in the same transaction. It cannot ride an earlier one, because
+  nothing here yields items in cursor order — the sessions source walks a
+  directory tree, a chat export is grouped by conversation — so a mid-stream
+  maximum says nothing about what is still to come, and advancing to it would
+  skip every later record below that value, permanently. See ``port.Checkpoint``.
+* **Cheap to redo.** What makes "lose one chunk, re-read the window" tolerable
+  is that re-writing an unchanged row costs no scrub and no page write
+  (``core/store.py``'s ``src_hash`` guard). Without it, chunking would trade a
+  doom loop for a slow bleed.
+* **Loud.** Every chunk logs, and a heartbeat logs even when no chunk does.
+  The two-hour silence that started this happened because the leg doing all
+  the work said nothing at all.
 """
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Sequence
+import contextlib
+import signal
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from aggregator.imports.ingest_state import STALE_INPUTS, IngestMarkers
+from aggregator.imports.ingest_state import (
+    STALE_INPUTS,
+    HeldRecord,
+    IngestMarkers,
+    PoisonLedger,
+    SourcePlan,
+    Watermarks,
+    full_jitter,
+)
 from aggregator.imports.port import (
+    Checkpoint,
     Delivery,
     ImportAdapter,
     ImportItem,
     ImportSink,
+    SupportsCheckpoint,
     SupportsInputFreshness,
     SupportsNonFatalErrors,
     SupportsWriteBarrier,
+    WriteCounts,
     is_report_gating,
 )
+from aggregator.imports.progress import RunProgress
+from aggregator.sources.base import ObservationRow, Record, SessionRow
 
 # Items buffered before a sink write. Bounded so a 359k-observation source
 # streams through in constant memory instead of materialising.
+#
+# ALSO THE UNIT OF LOSS. A chunk is what a SIGTERM can cost, so it wants to be
+# small; it is also one transaction, so it wants to be big enough that commit
+# overhead is noise. 500 rows of this pipeline's work is well under a second,
+# which is comfortably inside the unit's ``TimeoutStopSec`` and fine-grained
+# enough that the progress log is a pulse rather than an occasional event.
 DEFAULT_BATCH_SIZE = 500
+
+# How many times a chunk write is retried before its items are examined one by
+# one. This covers the TRANSIENT class only — ``database is locked`` under a
+# concurrent writer is the one that actually happens — and the delays are
+# jittered because un-jittered retries re-synchronise into clusters.
+CHUNK_RETRY_ATTEMPTS = 3
+CHUNK_RETRY_BASE = 0.2
+CHUNK_RETRY_CAP = 5.0
 
 
 @dataclass
@@ -38,6 +91,39 @@ class AdapterReport:
     updated: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
+    # How many of ``updated`` were already stored byte-identically, so cost no
+    # scrub and no page write. THE number that tells a re-run from the doom
+    # loop: both report ~372k updates, only one of them did nothing expensive.
+    unchanged: int = 0
+    # Records that could not be written and were set aside rather than allowed
+    # to abort the run. Non-zero is loud (it lands in ``errors``), because a
+    # dropped record that nobody counts is a gap that reads as full coverage.
+    quarantined: int = 0
+    # The window this source was given, in words — "since <ts>", "FULL SCAN
+    # (first run)", "FULL SCAN (no usable cursor): ...". Carried into the report
+    # so a journal entry read six hours later can answer "was this run
+    # incremental?" without anyone opening the code, and so a source that
+    # CANNOT be windowed says so instead of looking like one that can.
+    window: str = ""
+    cursor_kind: str = ""
+    # Where the mark ended up, or None when it did not move. It does not move
+    # after an interrupted or failed pass, ON PURPOSE: the next run re-reads
+    # the same window, which is cheap, and nothing in it can be lost.
+    advanced_to: datetime | None = None
+    # SIGTERM arrived and this source stopped at a chunk boundary. Not an
+    # error — it is the designed behaviour — but it is why the mark did not
+    # move, and a report that did not say so would look like a clean run that
+    # found less than it should have.
+    interrupted: bool = False
+    # The source was not run at all this tick because it is resting after
+    # repeated failures. Distinct from "ran and found nothing", which prints
+    # the same zeros.
+    skipped_for_backoff: bool = False
+    # Operator-facing, non-error notes: the backoff line, a refused watermark
+    # advance. Deliberately not ``errors`` — nothing failed on THIS run — and
+    # deliberately not ``warnings`` either, which are notified and deduplicated
+    # per episode.
+    notes: list[str] = field(default_factory=list)
     # Newest timestamp among the inputs this adapter read, when it can say
     # (``SupportsInputFreshness``). None = didn't offer / doesn't know.
     #
@@ -98,10 +184,27 @@ class RunReport:
     # commit against it too — the same reason ``commit_report_barriers`` is
     # public. See :func:`commit_staleness_receipts`.
     stale_episodes: StalenessEpisodes | None = None
+    # Correlates every progress line in the journal with this run. Cheap, and
+    # the difference between "these two lines are from the same run" being a
+    # fact and being a guess when a timer fires every 30 minutes.
+    run_id: str = ""
+    # SIGTERM arrived and at least one source stopped at a chunk boundary. NOT
+    # a failure — every committed chunk is durable and the next run resumes —
+    # but the run did less than a full pass and the summary must say so, or a
+    # deliberately shortened run reads as a suspiciously quiet one.
+    interrupted: bool = False
 
     @property
     def added(self) -> int:
         return sum(a.added for a in self.adapters.values())
+
+    @property
+    def unchanged(self) -> int:
+        return sum(a.unchanged for a in self.adapters.values())
+
+    @property
+    def quarantined(self) -> int:
+        return sum(a.quarantined for a in self.adapters.values())
 
     @property
     def updated(self) -> int:
@@ -216,35 +319,343 @@ def _no_notification(report: RunReport) -> None:
     """
 
 
+def item_cursor(item: ImportItem) -> datetime | None:
+    """The timestamp a source's ``since`` is compared against, per item shape.
+
+    MUST MATCH WHAT THE SOURCE FILTERS ON, or the mark is measured against one
+    quantity and applied to another and rows are dropped in the gap. Verified
+    per source, not inferred from the shape:
+
+    * ``SessionRow.last_ts`` — sessions, chatgpt and claude-web all skip a
+      conversation whose ``last_ts`` is below ``since``.
+    * ``ObservationRow.ts`` — always <= its session's ``last_ts``, so taking the
+      maximum over a mixed stream is still the maximum ``last_ts``.
+    * ``Record.updated_at`` — every records-shaped source writes the very value
+      it filters on into this field: file mtime for dropbox / research /
+      sota-watch, zip-member mtime for substack, the API's ``updated_at`` for
+      github. TickTick is the exception and is why this had to be checked one
+      source at a time: its ``since`` filters BACKUP FILES by mtime while its
+      records carry the TASK's completion time. It is declared
+      ``CursorKind.NONE`` for exactly that reason and never gets a window.
+
+    ``None`` means "this item cannot be placed on the cursor", which is treated
+    as poison for the WHOLE pass's mark — see ``_run_one``.
+    """
+    if isinstance(item, SessionRow):
+        return item.last_ts
+    if isinstance(item, ObservationRow):
+        return item.ts
+    if isinstance(item, Record):
+        return item.updated_at
+    return None
+
+
+def item_key(item: ImportItem) -> str:
+    """The stable identity a held record is remembered by."""
+    if isinstance(item, SessionRow):
+        return item.session_id
+    if isinstance(item, ObservationRow):
+        return item.obs_id
+    if isinstance(item, Record):
+        return item.stable_id
+    return repr(item)
+
+
+def _sink_write(
+    sink: ImportSink, items: Sequence[ImportItem], checkpoint: Checkpoint | None
+) -> WriteCounts:
+    """One chunk through the sink, with its mark when there is one.
+
+    A sink that cannot checkpoint (a counting stub, a dry-run sink, a test
+    double) gets the plain write and the source simply keeps the mark it had —
+    which costs a re-read and never a dropped row.
+    """
+    if checkpoint is not None and isinstance(sink, SupportsCheckpoint):
+        return sink.write_checkpoint(items, checkpoint)
+    return sink.write(items)
+
+
+async def _write_chunk(
+    sink: ImportSink,
+    items: Sequence[ImportItem],
+    checkpoint: Checkpoint | None,
+    *,
+    source: str,
+    poison: PoisonLedger | None,
+    held: dict[str, HeldRecord],
+    report: AdapterReport,
+) -> WriteCounts:
+    """Commit one chunk: retry the transient, isolate the poisonous, keep going.
+
+    THREE FAILURE CLASSES, THREE ANSWERS, and conflating any two of them is a
+    bug this pipeline has already paid for:
+
+    * **Transient** — ``database is locked`` under a concurrent writer, an
+      fsync that hiccuped. Retried, with capped exponential backoff and full
+      jitter, then re-classified as one of the others.
+    * **One bad record** — a malformed row, an observation whose session never
+      arrived. Isolated: the chunk is retried item by item, the good rows land,
+      the offender is set aside with an attempt count so it is neither lost nor
+      retried forever. One bad row must not cost a 372k-row stream.
+    * **A broken sink** — the disk is full, the schema is wrong, the store will
+      not open. Indistinguishable from poison for ONE record, but not for all
+      of them: if every item in the chunk fails individually, the sink is what
+      is broken, so the original error is re-raised and the adapter reports it.
+      That distinction is the whole reason the isolation pass counts successes.
+
+    THE MARK IS NOT ADVANCED BY AN ISOLATED CHUNK. If anything was set aside,
+    the checkpoint is dropped and this pass ends with the old mark — the next
+    run re-reads the window, and a record that was merely unlucky gets another
+    go from a run that can still advance.
+    """
+    last_error: Exception | None = None
+    for attempt in range(CHUNK_RETRY_ATTEMPTS):
+        try:
+            return _sink_write(sink, items, checkpoint)
+        except Exception as e:  # noqa: BLE001 -- classified below, never swallowed
+            last_error = e
+            if attempt < CHUNK_RETRY_ATTEMPTS - 1:
+                delay = full_jitter(
+                    attempt,
+                    base=_seconds(CHUNK_RETRY_BASE),
+                    cap=_seconds(CHUNK_RETRY_CAP),
+                )
+                await asyncio.sleep(delay.total_seconds())
+
+    counts = WriteCounts()
+    survived = 0
+    # NOTHING IS RECORDED UNTIL THE PASS IS OVER. Whether a failure is "one bad
+    # record" or "a broken sink" is not knowable per item — it is decided by
+    # whether ANYTHING survived — so the verdict is collected first and written
+    # only once it is known. Writing as we went would leave a chunk's worth of
+    # perfectly good rows condemned in the holding table by an outage.
+    failures: list[tuple[ImportItem, Exception]] = []
+    for item in items:
+        try:
+            # No checkpoint on the isolation pass: a chunk that needed
+            # isolating has not been fully stored, so nothing about it may
+            # move the mark.
+            counts = counts + _sink_write(sink, [item], None)
+        except Exception as e:  # noqa: BLE001 -- per-record isolation boundary
+            failures.append((item, e))
+        else:
+            survived += 1
+            if poison is not None and item_key(item) in held:
+                poison.release(source, item_key(item))
+    if survived == 0 and last_error is not None:
+        # Everything failed, so this is not a bad record — it is a bad sink.
+        # The adapter is about to report the real fault; setting the whole
+        # chunk aside would turn a total outage into a quiet "some records
+        # were odd" line, which is the opposite of loud.
+        raise last_error
+    for item, error in failures:
+        key = item_key(item)
+        report.quarantined += 1
+        report.errors.append(
+            f"record {key!r} could not be written and was set aside "
+            f"({type(error).__name__}: {error})"
+        )
+        if poison is not None:
+            poison.hold(source, key, error, previous=held.get(key))
+    return counts
+
+
+def _seconds(value: float) -> timedelta:
+    return timedelta(seconds=value)
+
+
+def _final_checkpoint(
+    report: AdapterReport,
+    *,
+    plan: SourcePlan | None,
+    high: datetime | None,
+    interrupted: bool,
+    unplaceable: str | None,
+    enabled: bool,
+) -> Checkpoint | None:
+    """Where this source's mark ends up, and — when it does not move — why.
+
+    FOUR REASONS THE MARK STAYS PUT, all of which still record a successful
+    pass (stamping the run time and clearing the failure counter), because a
+    pass that ran and simply had nothing to advance to is not a failure:
+
+    * the source declares no usable cursor (``CursorKind.NONE`` — TickTick),
+      so there is nothing to advance and the report says FULL SCAN;
+    * SIGTERM arrived, so the stream is incomplete and the maximum seen is not
+      a high-water mark;
+    * an item carried no cursor timestamp at all, so there is no way to say
+      what "past it" means and advancing would skip it forever;
+    * the sink declined rows (``skipped``), so the mark would describe records
+      no store received.
+
+    The cost of standing still is one re-read of the window, which the
+    ``src_hash`` guard makes almost free. The cost of advancing wrongly is the
+    records in between, permanently. That asymmetry decides every branch here.
+    """
+    if not enabled or plan is None:
+        return None
+    if not plan.cursor.is_incremental:
+        return Checkpoint(source=report.name, cursor_value=None, rows=report.added)
+    reason: str | None = None
+    if interrupted:
+        reason = (
+            "shutdown requested mid-stream, so the watermark was left where it "
+            "was; the next run re-reads this window and re-writing an unchanged "
+            "row costs nothing"
+        )
+    elif unplaceable is not None:
+        reason = (
+            f"item {unplaceable!r} carried no timestamp on this source's cursor "
+            f"({plan.cursor.field}), so the watermark could not be advanced "
+            f"safely and this source full-scans again next run"
+        )
+    elif report.skipped:
+        reason = (
+            f"the sink declined {report.skipped} row(s), so the watermark would "
+            f"describe records no store received"
+        )
+    if reason is not None:
+        report.notes.append(f"{report.name}: {reason}")
+        return Checkpoint(source=report.name, cursor_value=None, rows=report.added)
+    report.advanced_to = high
+    return Checkpoint(source=report.name, cursor_value=high, rows=report.added)
+
+
 async def _run_one(
     adapter: ImportAdapter,
     sink: ImportSink,
     batch_size: int,
+    *,
+    plan: SourcePlan | None = None,
+    watermarks: Watermarks | None = None,
+    poison: PoisonLedger | None = None,
+    stop: Callable[[], bool] | None = None,
+    progress: RunProgress | None = None,
 ) -> AdapterReport:
     report = AdapterReport(name=adapter.name)
-    batch: list[ImportItem] = []
+    tracker = progress or RunProgress()
+    if plan is not None:
+        report.window = plan.window_description
+        report.cursor_kind = plan.cursor.kind
+        if plan.skip_reason is not None:
+            # RESTED, NOT RUN, AND SAID OUT LOUD. A source missing from the
+            # output is indistinguishable from a source with nothing new, and
+            # this is the case where that difference matters most: a source
+            # backing off is a source nobody is watching.
+            report.skipped_for_backoff = True
+            report.notes.append(plan.skip_reason)
+            tracker.skipped(adapter.name, plan.skip_reason)
+            return report
 
-    def flush() -> None:
-        if not batch:
-            return
+    entry = tracker.begin(adapter.name, report.window or "(no watermark policy)")
+    held = poison.held(adapter.name) if poison is not None else {}
+    batch: list[ImportItem] = []
+    high: datetime | None = None
+    unplaceable: str | None = None
+    stop_requested = False
+    held_skipped = 0
+
+    async def flush(checkpoint: Checkpoint | None = None) -> None:
         # Detach before writing: if the sink raises, the batch is already
         # out of the buffer, so the recovery flush below can't retry the
         # same doomed write forever.
-        pending = list(batch)
-        batch.clear()
-        counts = sink.write(pending)
+        pending, batch[:] = list(batch), []
+        if not pending and checkpoint is None:
+            return
+        counts = await _write_chunk(
+            sink,
+            pending,
+            checkpoint,
+            source=adapter.name,
+            poison=poison,
+            held=held,
+            report=report,
+        )
         report.added += counts.added
         report.updated += counts.updated
         report.skipped += counts.skipped
+        report.unchanged += counts.unchanged
+        # THE FALLBACK, AND ITS ORDER IS THE POINT. A sink that cannot
+        # checkpoint has already committed this chunk, so recording the mark
+        # now is the SAFE half of the two-write problem: data first, mark
+        # second, and a crash in between costs a re-read rather than the
+        # records. Without it a run through such a sink would never stamp its
+        # run time or clear its failure counter, and a source that failed once
+        # could rest forever.
+        if (
+            checkpoint is not None
+            and watermarks is not None
+            and not isinstance(sink, SupportsCheckpoint)
+        ):
+            watermarks.advance(
+                adapter.name, checkpoint.cursor_value, rows=checkpoint.rows
+            )
+        tracker.chunk(
+            entry,
+            rows=len(pending),
+            added=counts.added,
+            updated=counts.updated,
+            unchanged=counts.unchanged,
+            quarantined=report.quarantined,
+        )
 
     wrote_everything = False
+    stream_failed = False
     try:
         async for item in adapter.get_data():
+            key = item_key(item)
+            if key in held:
+                # Known bad, not yet due for another attempt. Skipping it is
+                # what stops one poison record from being scrubbed and retried
+                # on every tick forever; it is still counted, still reported,
+                # and still in the holding table where a human can see it.
+                #
+                # A held SESSION row cascades: its observations then reference a
+                # session the sink has never seen, so they fail the foreign-key
+                # check and are set aside too. That is the correct outcome —
+                # they genuinely cannot be written — and it is noisy rather than
+                # wrong, so it is not special-cased.
+                report.quarantined += 1
+                held_skipped += 1
+                continue
+            at = item_cursor(item)
+            if at is None:
+                # An item that cannot be placed on the cursor makes the WHOLE
+                # pass's mark unsafe: advancing past it would skip it forever,
+                # and there is no way to tell where "past it" is. Refuse to
+                # advance and say why. Costs one full re-read; the alternative
+                # costs the record.
+                unplaceable = unplaceable or key
+            elif high is None or at > high:
+                high = at
             batch.append(item)
             if len(batch) >= batch_size:
-                flush()
-        flush()
-        wrote_everything = True
+                await flush()
+            # BETWEEN ITEMS, NEVER INSIDE A CHUNK'S TRANSACTION. Per item
+            # rather than per chunk so a stop is answered promptly even when a
+            # chunk is slow to fill; the buffered remainder is then committed by
+            # the flush below, so the stop still lands on a transaction
+            # boundary and nothing is left half-written.
+            if stop is not None and stop():
+                stop_requested = True
+                break
+        # END OF STREAM — the only flush that may carry the mark. Every earlier
+        # chunk committed its rows and nothing else, because until the stream
+        # is exhausted the maximum cursor seen is not a high-water mark: these
+        # streams are not ordered by cursor, so a later chunk can legitimately
+        # carry an earlier timestamp, and a mark advanced at chunk 3 would skip
+        # it forever. See ``port.Checkpoint``.
+        await flush(
+            _final_checkpoint(
+                report,
+                plan=plan,
+                high=high,
+                interrupted=stop_requested,
+                unplaceable=unplaceable,
+                enabled=watermarks is not None,
+            )
+        )
+        wrote_everything = not stop_requested
     except Exception as e:  # noqa: BLE001 -- isolation boundary, see below
         # PER-ADAPTER FAILURE ISOLATION. One source dying (expired token,
         # unreachable dir, locked DB) must not deny the other seven their
@@ -254,13 +665,36 @@ async def _run_one(
         # BaseException (CancelledError, KeyboardInterrupt) deliberately
         # propagates — those mean the whole run is being torn down.
         report.errors.append(f"{type(e).__name__}: {e}")
+        stream_failed = True
+        # The final flush may have already decided where the mark WOULD go
+        # before raising. It did not get there, so the report must not say it
+        # did — a summary claiming an advance that never committed is exactly
+        # the kind of number that makes the next investigation start from a
+        # false premise.
+        report.advanced_to = None
         try:
             # Partial ingest beats total loss: whatever arrived before the
-            # crash still gets written.
-            flush()
+            # crash still gets written. NEVER with a checkpoint — a failed pass
+            # must leave the mark exactly where it was, so the next run
+            # re-reads the same window and nothing in it can be lost.
+            await flush()
         except Exception as e2:  # noqa: BLE001
             report.errors.append(
                 f"flush after failure: {type(e2).__name__}: {e2}"
+            )
+
+    report.interrupted = stop_requested
+    if watermarks is not None and stream_failed:
+        # Counted, so a source that keeps dying gets rested rather than
+        # hammered every 30 minutes. Deliberately NOT counted for the per-file
+        # errors ``drain_errors`` is about to add: those are by design (partial
+        # ingest beats total loss) and a source that reports one unreadable PDF
+        # per run is healthy, not flapping.
+        try:
+            watermarks.record_failure(adapter.name, report.errors[0])
+        except Exception as e:  # noqa: BLE001 -- bookkeeping must not fail a run
+            report.errors.append(
+                f"ingest state could not be updated: {type(e).__name__}: {e}"
             )
 
     # The write barrier, and it is the ONE optional protocol that must not run
@@ -304,6 +738,32 @@ async def _run_one(
             report.input_newest_at = _as_utc(adapter.input_freshness())
         except Exception as e:  # noqa: BLE001
             report.errors.append(f"input_freshness failed: {type(e).__name__}: {e}")
+    if held_skipped:
+        # LOUD, ONCE, WITH A COUNT. These records produce no per-record line of
+        # their own — they were not attempted — so without this they would be
+        # an invisible gap in the index that looks exactly like full coverage.
+        # One line rather than one per record: a source with 300 bad rows must
+        # not starve the notification budget of everything else in the run.
+        report.errors.append(
+            f"{held_skipped} record(s) were skipped: they failed to write on an "
+            f"earlier run and are not due for another attempt. "
+            f"`aggregator status` lists them"
+        )
+    tracker.end(
+        entry,
+        status=(
+            "failed"
+            if not report.ok
+            else "interrupted"
+            if report.interrupted
+            else "finished"
+        ),
+        mark=(
+            report.advanced_to.isoformat()
+            if report.advanced_to is not None
+            else "unchanged"
+        ),
+    )
     return report
 
 
@@ -663,8 +1123,29 @@ async def run_imports(
     stale_after_days: int | None = None,
     now: datetime | None = None,
     markers: IngestMarkers | None = None,
+    watermarks: Watermarks | None = None,
+    poison: PoisonLedger | None = None,
+    stop: Callable[[], bool] | None = None,
+    progress: RunProgress | None = None,
 ) -> RunReport:
     """Drive every adapter concurrently and return the aggregated report.
+
+    ``watermarks`` is what makes a run INCREMENTAL, and passing ``None`` is a
+    full scan of every source — which is what this command did on every
+    30-minute tick until 2026-08-16 and why it could never finish. It is a
+    parameter rather than a global for the same reason ``markers`` is: the
+    state belongs to a database a caller chose, and a test must be able to
+    point it somewhere else.
+
+    Concurrency is unchanged and deliberately so: the ~9 sources are
+    independent and mostly network- or file-bound, so overlapping their
+    acquisition is the single biggest wall-clock win available and costs
+    nothing in correctness. The WRITE leg is where concurrency would hurt —
+    SQLite allows one write transaction at a time — and it is already
+    serialised by ``ImportSink`` being synchronous, so no coroutine can be
+    suspended holding the write lock.
+
+    ``stop`` is polled at chunk boundaries only. See :func:`graceful_shutdown`.
 
     ``notify`` fires on EVERY run, not only failing ones, and the hook decides
     what is worth telling a human. The runner has no way to know: a clean run
@@ -702,10 +1183,40 @@ async def run_imports(
     """
     adapter_list: Sequence[ImportAdapter] = list(adapters)
     _refuse_duplicate_names(adapter_list)
-    results = await asyncio.gather(
-        *(_run_one(a, sink, batch_size) for a in adapter_list)
+    tracker = progress or RunProgress()
+    plans = (
+        {a.name: watermarks.plan(a.name, now=now) for a in adapter_list}
+        if watermarks is not None
+        else {}
     )
+    # THE HEARTBEAT RUNS BESIDE THE WORK, NOT INSIDE IT, because the condition
+    # it exists to report — a leg producing no chunks — is precisely the one in
+    # which the chunk loop is not running. Two hours of silence is what started
+    # this; a task on a timer is what makes it impossible.
+    beat = asyncio.create_task(tracker.beat())
+    try:
+        results = await asyncio.gather(
+            *(
+                _run_one(
+                    a,
+                    sink,
+                    batch_size,
+                    plan=plans.get(a.name),
+                    watermarks=watermarks,
+                    poison=poison,
+                    stop=stop,
+                    progress=tracker,
+                )
+                for a in adapter_list
+            )
+        )
+    finally:
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
     report = RunReport(adapters={r.name: r for r in results})
+    report.run_id = tracker.run_id
+    report.interrupted = any(r.interrupted for r in results)
     if stale_after_days is not None:
         report.stale_episodes = plan_staleness_report(
             report, max_age_days=stale_after_days, now=now, markers=markers
@@ -790,6 +1301,69 @@ def commit_report_barriers(
             )
 
 
+@contextmanager
+def graceful_shutdown(
+    signals: Sequence[int] = (signal.SIGTERM, signal.SIGINT),
+) -> Iterator[Callable[[], bool]]:
+    """Turn SIGTERM into "stop at the next chunk boundary", not "die".
+
+    THE SHAPE THE UNIT NEEDS. ``TimeoutStartSec`` fires SIGTERM at a fixed wall
+    clock; before this branch that killed a run at ~44% and threw all of it
+    away. Now the flag is set, the chunk in flight finishes and commits, every
+    earlier chunk is already durable, and the process exits cleanly — so the
+    worst a timeout can cost is one chunk of re-work, and the next run picks up
+    from a window it can walk almost for free.
+
+    NO WORK IN THE HANDLER. It runs at an arbitrary point, possibly mid-
+    transaction; all it may do is set a flag that the chunk loop reads at a
+    boundary it chose. ``TimeoutStopSec`` then only has to exceed one chunk's
+    duration — at 500 rows that is well under a second, against the unit's
+    90 seconds.
+
+    ``add_signal_handler`` rather than ``signal.signal`` because it wakes the
+    event loop; the ``signal.signal`` fallback covers a non-Linux loop, and
+    both degrade to "no handler" rather than raising, because a caller that
+    cannot install one (a worker thread, a nested loop) must still be able to
+    run an ingest.
+    """
+    stopped = False
+
+    def request_stop(*_: object) -> None:
+        nonlocal stopped
+        stopped = True
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - called outside a loop
+        loop = None
+    installed: list[int] = []
+    previous: dict[int, object] = {}
+    for sig in signals:
+        installed_here = False
+        if loop is not None:
+            try:
+                loop.add_signal_handler(sig, request_stop)
+            except (NotImplementedError, RuntimeError, ValueError):
+                installed_here = False
+            else:
+                installed.append(sig)
+                installed_here = True
+        if not installed_here:
+            try:
+                previous[sig] = signal.signal(sig, request_stop)
+            except (OSError, ValueError):  # pragma: no cover - not main thread
+                continue
+    try:
+        yield lambda: stopped
+    finally:
+        for sig in installed:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(sig)  # type: ignore[union-attr]
+        for sig, handler in previous.items():
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                signal.signal(sig, handler)  # type: ignore[arg-type]
+
+
 def _refuse_duplicate_names(adapters: Sequence[ImportAdapter]) -> None:
     """The report is keyed by adapter name, so a collision would silently
     drop one source's entire outcome. Refuse before any work is done."""
@@ -801,6 +1375,7 @@ def _refuse_duplicate_names(adapters: Sequence[ImportAdapter]) -> None:
 
 
 __all__ = [
+    "CHUNK_RETRY_ATTEMPTS",
     "DEFAULT_BATCH_SIZE",
     "AdapterReport",
     # Re-exported: a notify hook is written against ``run_imports``, and the
@@ -815,6 +1390,11 @@ __all__ = [
     # run_imports has returned. See ``commit_report_barriers``.
     "commit_report_barriers",
     "commit_staleness_receipts",
+    # The CLI installs this around ``run_imports`` — the process owns its
+    # signals, library code merely reads the flag.
+    "graceful_shutdown",
+    "item_cursor",
+    "item_key",
     "plan_staleness_report",
     "run_imports",
     "staleness_warnings",

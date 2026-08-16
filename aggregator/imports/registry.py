@@ -28,6 +28,7 @@ from aggregator.imports.chatgpt import ChatGPTAdapter
 from aggregator.imports.claude_web import ClaudeWebAdapter
 from aggregator.imports.dropbox import DropboxAdapter
 from aggregator.imports.github import GitHubAdapter
+from aggregator.imports.ingest_state import Watermarks
 from aggregator.imports.port import ImportAdapter
 from aggregator.imports.research import ResearchReportsAdapter
 from aggregator.imports.sessions import SessionsAdapter
@@ -78,12 +79,34 @@ def _build(name: str, factory: Callable[[], ImportAdapter]) -> ImportAdapter:
         return _UnbuildableAdapter(name, e)
 
 
-def default_adapters(since: datetime | None = None) -> list[ImportAdapter]:
+def default_adapters(
+    since: datetime | None = None,
+    *,
+    watermarks: Watermarks | None = None,
+    now: datetime | None = None,
+) -> list[ImportAdapter]:
     """Build one adapter per source, in a stable order.
 
     ``since`` is captured at construction because the port is a single-verb
     interface — per-source acquisition knobs belong to the adapter instance,
     not to ``get_data()``.
+
+    ``watermarks`` IS THE FIX FOR THE DOOM LOOP, and it is why ``since`` is now
+    computed PER SOURCE rather than shared. Until 2026-08-16 this function took
+    one ``since`` that ``cli.py`` set only from an explicit ``--since`` flag, so
+    every unattended run passed ``None`` to all nine sources and re-ingested the
+    entire corpus — 372k observations, ~5 hours, against a 4-hour timeout, every
+    30 minutes, forever. Each source now gets its own window, read from its own
+    high-water mark and widened by its own overlap; a source whose cursor cannot
+    support a window gets ``None`` and the run report says so out loud.
+
+    ``since`` still wins when given: it is a human narrowing this run by hand,
+    and ``Watermarks`` carries the same override so the report describes the
+    window that was actually used rather than the one on file.
+
+    ``watermarks=None`` means no persistence at all — a full scan of everything,
+    which is the right answer for a caller that has no database to record
+    against, and the wrong answer for the timer.
 
     A constructor that raises yields an ``_UnbuildableAdapter`` under the same
     name rather than propagating, so the run-all path keeps the property it
@@ -91,16 +114,22 @@ def default_adapters(since: datetime | None = None) -> list[ImportAdapter]:
     else. The name is spelled here rather than read off the built adapter
     because in the failing case there is no adapter to read it from.
     """
+
+    def window(name: str) -> datetime | None:
+        if watermarks is None:
+            return since
+        return watermarks.plan(name, now=now).since
+
     factories: list[tuple[str, Callable[[], ImportAdapter]]] = [
-        ("sessions", lambda: SessionsAdapter(since=since)),
-        ("github", lambda: GitHubAdapter(since=since)),
-        ("chatgpt", lambda: ChatGPTAdapter(since=since)),
-        ("claude-web", lambda: ClaudeWebAdapter(since=since)),
-        ("research", lambda: ResearchReportsAdapter(since=since)),
-        ("sota-watch", lambda: SotaWatchAdapter(since=since)),
-        ("substack", lambda: SubstackAdapter(since=since)),
-        ("dropbox", lambda: DropboxAdapter(since=since)),
-        ("ticktick", lambda: TickTickAdapter(since=since)),
+        ("sessions", lambda: SessionsAdapter(since=window("sessions"))),
+        ("github", lambda: GitHubAdapter(since=window("github"))),
+        ("chatgpt", lambda: ChatGPTAdapter(since=window("chatgpt"))),
+        ("claude-web", lambda: ClaudeWebAdapter(since=window("claude-web"))),
+        ("research", lambda: ResearchReportsAdapter(since=window("research"))),
+        ("sota-watch", lambda: SotaWatchAdapter(since=window("sota-watch"))),
+        ("substack", lambda: SubstackAdapter(since=window("substack"))),
+        ("dropbox", lambda: DropboxAdapter(since=window("dropbox"))),
+        ("ticktick", lambda: TickTickAdapter(since=window("ticktick"))),
     ]
     return [_build(name, factory) for name, factory in factories]
 

@@ -148,3 +148,80 @@ def test_the_other_sources_still_run(monkeypatch):
 def test_an_unbuildable_entry_still_conforms_to_the_port():
     broken = _UnbuildableAdapter("ticktick", RuntimeError("boom"))
     assert isinstance(broken, ImportAdapter)
+
+
+# -- the per-source window -------------------------------------------------
+
+
+def _since_of(adapter):
+    """The window an adapter was BUILT with.
+
+    Read off the instance because the port has no ``since`` parameter — an
+    adapter that was not constructed with one silently ignores the window, and
+    that is precisely the 2026-08-15 bug: ``cli.py`` computed ``since`` only
+    from ``--since``, so every unattended run built all nine adapters with
+    ``None`` and re-read the whole corpus on every 30-minute tick.
+    """
+    return getattr(adapter, "_since", "MISSING")
+
+
+def test_each_adapter_is_built_with_its_own_source_s_window(tmp_path):
+    """THE WIRING THE DOOM LOOP WAS MISSING, pinned end to end.
+
+    One shared ``since`` was the shape of the bug. Each source's window is
+    read from ITS OWN mark and widened by ITS OWN overlap: one slow source
+    must never hold back or fast-forward another.
+    """
+    from aggregator.core.store import Store
+    from aggregator.imports.ingest_state import (
+        APPEND_ONLY_OVERLAP,
+        MODIFIED_TIME_OVERLAP,
+        Watermarks,
+    )
+
+    store = Store(tmp_path / "cache.db")
+    store.migrate()
+    try:
+        marks = Watermarks(store)
+        mark = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+        marks.advance("dropbox", mark, rows=1)
+        marks.advance("research", mark, rows=1)
+
+        built = {a.name: a for a in default_adapters(watermarks=marks)}
+
+        # A mutable-timestamp source reads back an hour behind its mark...
+        assert _since_of(built["dropbox"]) == mark - MODIFIED_TIME_OVERLAP
+        # ...an append-only one only needs minutes...
+        assert _since_of(built["research"]) == mark - APPEND_ONLY_OVERLAP
+        # ...a source with no mark yet full-scans...
+        assert _since_of(built["github"]) is None
+        # ...and one that cannot be windowed at all never gets one.
+        marks.advance("ticktick", mark, rows=1)
+        assert _since_of(
+            {a.name: a for a in default_adapters(watermarks=marks)}["ticktick"]
+        ) is None
+    finally:
+        store.close()
+
+
+def test_an_explicit_since_overrides_every_mark(tmp_path):
+    """``--since`` is a human narrowing this run by hand, and it wins."""
+    from aggregator.core.store import Store
+    from aggregator.imports.ingest_state import Watermarks
+
+    store = Store(tmp_path / "cache.db")
+    store.migrate()
+    try:
+        typed = datetime(2020, 1, 1, tzinfo=UTC)
+        marks = Watermarks(store, override=typed)
+        marks.advance("dropbox", datetime(2026, 8, 16, tzinfo=UTC), rows=1)
+        built = {a.name: a for a in default_adapters(watermarks=marks)}
+        assert _since_of(built["dropbox"]) == typed
+    finally:
+        store.close()
+
+
+def test_without_watermarks_every_source_full_scans():
+    """The honest default for a caller with no database to record against —
+    and the exact behaviour that must never again be what the timer gets."""
+    assert all(_since_of(a) is None for a in default_adapters())

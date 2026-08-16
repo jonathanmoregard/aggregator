@@ -10,7 +10,30 @@ is an outcome, not an error, so it does not raise. Callers distinguish.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+# SILENCE pypdf's per-object chatter, AT IMPORT OF THE MODULE THAT CALLS IT.
+#
+# ``Ignoring wrong pointing object`` is emitted at WARNING, once per malformed
+# object, and a single ordinary PDF produces dozens. On the 2026-08-15 live run
+# that was 102 lines followed by two hours of nothing — and because this
+# pipeline's own legs logged nothing at all, a library's debug output was the
+# only voice in the journal. Its absence was therefore read as "pypdf is hung",
+# which cost the investigation two hours and a wrong hypothesis (a per-file PDF
+# timeout, since disproven: there is no offending PDF). The dropbox leg had
+# actually finished; the real fault was elsewhere entirely.
+#
+# ERROR rather than CRITICAL or ``disable``: a genuine pypdf error is still
+# worth a line. What is not worth a line is a per-object parse quirk a human
+# cannot act on — those already reach the run's ``errors`` list as an
+# ``ExtractionError`` when they matter.
+#
+# HERE rather than in ``cli.main``: this module owns the pypdf call, so every
+# entry point that can reach pypdf (the timer's ``ingest --all``, a hand-run
+# ``ingest dropbox``, the MCP server, a test) inherits the setting. A
+# ``basicConfig`` at one entry point would have covered exactly that one.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 TEXT_EXTS = {".md", ".markdown", ".txt"}
 DOCX_EXTS = {".docx"}

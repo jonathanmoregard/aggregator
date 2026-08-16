@@ -132,11 +132,25 @@ class WriteCounts:
     """What a write actually did. Addable so the runner can fold batches.
 
     ``added`` — the item's primary key was not in the store before.
-    ``updated`` — it was, and the row was overwritten.
+    ``updated`` — it was, and the row was reconciled against the store.
     ``skipped`` — the sink declined to write it (unknown shape, filtered).
     Load-bearing beyond the summary: a nonzero ``skipped`` withholds the
     ``SupportsWriteBarrier`` call, because an adapter must not advance state
     that implies rows the sink says it did not write.
+
+    ``unchanged`` — a SUB-COUNT OF ``updated``, not a fourth bucket: the row
+    was already stored byte-identically, so it cost no scrub, no page write and
+    no rowid. Deliberately not folded into ``skipped``, which means "the sink
+    declined" and gates the write barrier; an unchanged row was fully
+    reconciled and must not withhold anything. ``added + updated == len(items)``
+    therefore still holds, which is what keeps every existing reading of these
+    numbers correct.
+
+    Why it is worth a field at all: it is the direct evidence that a re-run
+    costs what a re-run should cost. A run reporting ``updated=372450
+    unchanged=372450`` did nothing expensive; the same line without the second
+    number is indistinguishable from the doom loop, which also reported
+    ~372k updates every 30 minutes.
 
     These have to come back FROM the write. ``cli.py`` reports
     ``added=len(records) updated=0`` for every run, so its summary is the
@@ -146,12 +160,14 @@ class WriteCounts:
     added: int = 0
     updated: int = 0
     skipped: int = 0
+    unchanged: int = 0
 
     def __add__(self, other: WriteCounts) -> WriteCounts:
         return WriteCounts(
             added=self.added + other.added,
             updated=self.updated + other.updated,
             skipped=self.skipped + other.skipped,
+            unchanged=self.unchanged + other.unchanged,
         )
 
 
@@ -166,6 +182,63 @@ class ImportSink(Protocol):
     """
 
     def write(self, items: Sequence[ImportItem]) -> WriteCounts: ...
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """One source's high-water mark, handed to the sink WITH the chunk it describes.
+
+    THE UNIT OF LOSS IS THE UNIT OF TRANSACTION. A chunk's rows and the mark
+    that says "everything up to here is stored" have to land together or a
+    crash between them means one of two things, and only one of them is
+    survivable: mark-first leaves the mark ahead of unprocessed records, which
+    is silent permanent loss that nothing ever reports; data-first merely
+    re-reads, which an idempotent apply makes free. Committing both in one
+    transaction removes the choice.
+
+    ``cursor_value`` is ``None`` for a pass that emitted nothing, and that is
+    the normal state of a quiet source rather than an error — it stamps the run
+    time and clears the failure counter WITHOUT writing NULL over a live mark.
+
+    WHY THE MARK ONLY EVER RIDES THE FINAL CHUNK. Nothing in this pipeline
+    yields items in cursor order: the sessions source walks
+    ``~/.claude/projects`` in path order, dropbox walks a directory tree, and a
+    chat export is grouped by conversation. So the maximum timestamp seen after
+    three chunks says nothing about the fourth, and advancing the mark to it
+    mid-stream would skip every record still to come below that value —
+    permanently. A mid-stream checkpoint is only safe for a stream that DECLARES
+    itself sorted by its cursor, which none of these are; the honest version of
+    "checkpoint often" here is that every chunk's DATA is committed as it goes
+    (so a kill loses at most one chunk of work) while the mark waits for the
+    end of the stream, and the ``src_hash`` guard is what makes the re-read
+    after an interrupted run cost almost nothing.
+    """
+
+    source: str
+    cursor_value: datetime | None
+    rows: int = 0
+
+
+@runtime_checkable
+class SupportsCheckpoint(Protocol):
+    """Optional: a sink that can store a chunk and its watermark ATOMICALLY.
+
+    Optional, and matched structurally like the other collect-only protocols,
+    because over-inclusion is harmless: a sink that cannot checkpoint (a
+    counting stub, a dry-run sink, a test double) simply gets ``write`` and the
+    source keeps whatever mark it already had, which costs a re-read and never
+    a dropped row. The real sink — ``store_sink.StoreSink`` — implements it,
+    which is what makes the shipped pipeline incremental.
+
+    Deliberately a SECOND method rather than a keyword on ``write``: ``write``
+    is the one verb every sink in this repo and its tests implements, and
+    growing its signature would make the checkpoint something every sink has to
+    know about in order to keep not caring about it.
+    """
+
+    def write_checkpoint(
+        self, items: Sequence[ImportItem], checkpoint: Checkpoint
+    ) -> WriteCounts: ...
 
 
 @runtime_checkable

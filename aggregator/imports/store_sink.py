@@ -13,9 +13,11 @@ no summary, because it looks like progress on a run that changed nothing.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from aggregator.core.store import Store
-from aggregator.imports.port import ImportItem, WriteCounts
+from aggregator.imports.ingest_state import cursor_for
+from aggregator.imports.port import Checkpoint, ImportItem, WriteCounts
 from aggregator.sources.base import ObservationRow, Record, SessionRow
 
 
@@ -62,7 +64,67 @@ class StoreSink:
     def __init__(self, store: Store) -> None:
         self._store = store
 
-    def write(self, items: Sequence[ImportItem]) -> WriteCounts:
+    def write_checkpoint(
+        self, items: Sequence[ImportItem], checkpoint: Checkpoint
+    ) -> WriteCounts:
+        """Store this chunk AND the watermark that describes it, atomically.
+
+        ONE TRANSACTION, and that is the entire design. A watermark and the
+        data it describes are two artifacts that must agree; updated by two
+        separate commits they cannot be made to agree under SIGTERM, and the
+        two orders fail in opposite directions — mark-first leaves the mark
+        ahead of records nobody processed, which is silent permanent loss,
+        while data-first merely re-reads. Committing them together removes the
+        choice rather than picking the less bad half.
+
+        Both writes go in with ``_commit=False`` and exactly one ``commit``
+        closes them. On any failure the whole thing rolls back, so a chunk
+        cannot land without its mark and a mark cannot land without its chunk.
+
+        ``skipped`` is 0 here for the same reason as in :meth:`write`, and that
+        matters twice over: a nonzero ``skipped`` withholds the write barrier,
+        and it is also what tells the runner not to advance a mark for rows no
+        store accepted.
+        """
+        records, sessions, observations = self._split(items)
+        self._refuse_orphan_observations(sessions, observations)
+        counts = WriteCounts()
+        try:
+            if records:
+                counts = counts + self._write_records(records, commit=False)
+            if sessions or observations:
+                counts = counts + self._write_entities(
+                    sessions, observations, commit=False
+                )
+            self._store.advance_ingest_cursor(
+                checkpoint.source,
+                cursor_kind=cursor_for(checkpoint.source).kind,
+                cursor_value=(
+                    checkpoint.cursor_value.isoformat()
+                    if checkpoint.cursor_value is not None
+                    else None
+                ),
+                rows=checkpoint.rows,
+                at=datetime.now(UTC).isoformat(),
+                _commit=False,
+            )
+        except BaseException:
+            self._store.rollback()
+            raise
+        self._store.commit()
+        return counts
+
+    @staticmethod
+    def _split(
+        items: Sequence[ImportItem],
+    ) -> tuple[list[Record], list[SessionRow], list[ObservationRow]]:
+        """Sort one batch by concrete type. Shared by both write entry points.
+
+        An unsupported shape raises rather than being quietly dropped — a
+        silently discarded item is a gap in the index that reads as full
+        coverage, which is the failure this whole file's counting exists to
+        prevent.
+        """
         records: list[Record] = []
         sessions: list[SessionRow] = []
         observations: list[ObservationRow] = []
@@ -77,6 +139,10 @@ class StoreSink:
                 raise TypeError(
                     f"unsupported import item: {type(item).__name__}"
                 )
+        return records, sessions, observations
+
+    def write(self, items: Sequence[ImportItem]) -> WriteCounts:
+        records, sessions, observations = self._split(items)
 
         # VALIDATE THE WHOLE BATCH BEFORE WRITING ANY OF IT. This used to sit
         # inside the entity path, i.e. after the records had already landed —
@@ -112,19 +178,25 @@ class StoreSink:
             counts = counts + self._write_entities(sessions, observations)
         return counts
 
-    def _write_records(self, records: list[Record]) -> WriteCounts:
+    def _write_records(
+        self, records: list[Record], *, commit: bool = True
+    ) -> WriteCounts:
         # De-duplicates within the batch too: two items with the same id in
         # one batch are one add, not two.
         counts = count_writes(
             self._store, "records", [r.stable_id for r in records]
         )
-        self._store.upsert(records)
-        return counts
+        unchanged = self._store.upsert(records, _commit=commit)
+        return WriteCounts(
+            added=counts.added, updated=counts.updated, unchanged=unchanged
+        )
 
     def _write_entities(
         self,
         sessions: list[SessionRow],
         observations: list[ObservationRow],
+        *,
+        commit: bool = True,
     ) -> WriteCounts:
         # COUNTED EXACTLY LIKE THE RECORDS PATH: every item is one add or one
         # update, so ``added + updated == len(items)`` holds on both paths and
@@ -148,8 +220,12 @@ class StoreSink:
         # sink sees one batch at a time and has no memory between calls. The
         # contract on the adapter is therefore the stronger one, checked in
         # ``write`` before anything at all is written.
-        self._store.upsert_entities([*sessions, *observations])
-        return counts
+        unchanged = self._store.upsert_entities(
+            [*sessions, *observations], _commit=commit
+        )
+        return WriteCounts(
+            added=counts.added, updated=counts.updated, unchanged=unchanged
+        )
 
     def _refuse_orphan_observations(
         self,

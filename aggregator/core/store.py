@@ -47,9 +47,28 @@ duplicating body text.
 Scrub-on-write (spec constraint 3, defense in depth: also runs pre-return at
 MCP/CLI boundary). WAL + busy_timeout=5000 (Codex Phase 2 MEDIUM #2 —
 concurrent-writer safety).
+
+v3→v4 is additive and migrates IN PLACE. It adds:
+
+* ``records.src_hash`` / ``observations.src_hash`` — a fingerprint of the row
+  as the SOURCE produced it, so a re-observed row that did not change is
+  recognised BEFORE it is scrubbed or written. See :func:`_src_hash`.
+* ``ingest_state`` — the per-source high-water mark, in this database rather
+  than in a sidecar file, so it can be advanced in the SAME TRANSACTION as the
+  chunk it describes. Two artifacts updated by two writes cannot be made to
+  agree under SIGTERM; a watermark that gets ahead of its data is silent,
+  permanent loss. See ``imports/ingest_state.py`` for the policy on top.
+* ``quarantine`` — the local analogue of a dead-letter queue. A record that
+  cannot be written must not abort the run and must not be retried forever;
+  it lands here with an attempt count and a terminal state.
+
+Both ALTERs are metadata-only (``ADD COLUMN`` with no default), which matters:
+the live database holds ~372k observations and a rewrite would be exactly the
+kind of hours-long unattended operation this schema change exists to abolish.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -69,7 +88,23 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# WHAT A STORED ``src_hash`` PROMISES ABOUT THE SCRUBBER, and the one-line way
+# to break that promise on purpose.
+#
+# Skipping an unchanged row skips its scrub. That is the entire wall-clock win
+# — at 827 rows/min the 2026-08-15 run was spending essentially all of its time
+# re-running Presidio over text it had already cleaned — but it means a change
+# to ``core/scrub.py`` would never reach the rows already stored: their INPUT
+# did not move, so nothing would ever re-scrub them, and a newly-detectable
+# secret would sit in the index forever.
+#
+# So the fingerprint rides inside the hash. Bump this string in the same commit
+# that changes what ``scrub`` detects, and every scrubbed row re-scrubs on the
+# next ingest — no rebuild, no migration, no flag. Leaving it alone is the
+# statement that the scrubber's output for a given input is unchanged.
+SCRUB_FINGERPRINT = "presidio+gitleaks/v1"
 
 # v3 chat-export origins. ``sessions.origin`` values are these plus the
 # default 'claude-code'. Kept as a module constant so the WHERE builders,
@@ -83,6 +118,70 @@ _PK_BY_TABLE = {
     "sessions": "session_id",
     "observations": "obs_id",
 }
+
+
+# How many items one hash probe covers. The probe is a single indexed
+# ``IN (...)`` per table, so this only bounds how much of the caller's stream is
+# held at once — ``upsert_entities`` is public and may be handed a generator
+# over the whole corpus, and materialising that would give back exactly the
+# memory the streaming pipeline was built to save.
+_HASH_PROBE_CHUNK = 1000
+
+
+def _src_hash(*parts: object) -> str:
+    """Fingerprint a row AS THE SOURCE PRODUCED IT, before any scrubbing.
+
+    The point of computing this over the raw input rather than over the stored
+    row is ordering: it lets an unchanged row be recognised BEFORE Presidio
+    runs, and Presidio is where the wall clock goes. At 827 rows/min the
+    2026-08-15 run was not SQLite-bound, it was scrubber-bound — re-cleaning
+    text it had already cleaned, 372k rows at a time, every 30 minutes.
+
+    ``blake2b`` at 16 bytes: this is a change detector, not a security
+    boundary, and a 128-bit digest makes an accidental collision (which would
+    silently drop an edit) not a thing that happens. NULL is a distinct byte
+    rather than the empty string, and every part is terminated, so
+    ``("ab", "c")`` and ``("a", "bc")`` cannot collide by concatenation.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    for part in parts:
+        h.update(b"\x00" if part is None else str(part).encode("utf-8", "replace"))
+        h.update(b"\x1e")
+    return h.hexdigest()
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _chunked(items: Iterable, size: int) -> Iterable[list]:
+    """Bounded batching over an arbitrary iterable. Consumes lazily."""
+    batch: list = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _stored_hashes(
+    c: sqlite3.Connection, table: str, key: str, ids: Sequence[str]
+) -> dict[str, str | None]:
+    """One indexed lookup of the fingerprints already stored for ``ids``."""
+    if not ids:
+        return {}
+    out: dict[str, str | None] = {}
+    for page in _chunked(ids, 500):
+        placeholders = ",".join("?" * len(page))
+        rows = c.execute(
+            f"SELECT {key}, src_hash FROM {table} WHERE {key} IN ({placeholders})",  # noqa: S608 - allowlisted literals
+            list(page),
+        )
+        for row in rows:
+            out[row[0]] = row[1]
+    return out
 
 
 class EmptyRebuildRefusedError(RuntimeError):
@@ -119,7 +218,10 @@ _DDL: list[str] = [
         first_ts               TEXT NOT NULL,
         last_ts                TEXT NOT NULL,
         jsonl_path             TEXT NOT NULL,
-        origin                 TEXT NOT NULL DEFAULT 'claude-code'
+        origin                 TEXT NOT NULL DEFAULT 'claude-code',
+        -- v4. Nullable and unindexed on purpose: it is only ever read by
+        -- primary key, alongside the row it describes. See ``_src_hash``.
+        src_hash               TEXT
     );
     """,
     "CREATE INDEX IF NOT EXISTS sessions_root ON sessions(root_session_id);",
@@ -140,7 +242,8 @@ _DDL: list[str] = [
         output_tokens    INTEGER,
         tool_name        TEXT,
         tool_use_id      TEXT,
-        body             TEXT
+        body             TEXT,
+        src_hash         TEXT          -- v4; see ``_src_hash``
     );
     """,
     "CREATE INDEX IF NOT EXISTS obs_root_ts ON observations(root_session_id, ts);",
@@ -184,7 +287,8 @@ _DDL: list[str] = [
         tags       TEXT NOT NULL,       -- JSON array
         created_at TEXT,
         updated_at TEXT,
-        extra      TEXT NOT NULL DEFAULT '{}'
+        extra      TEXT NOT NULL DEFAULT '{}',
+        src_hash   TEXT              -- v4; see ``_src_hash``
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_records_source ON records(source);",
@@ -205,10 +309,67 @@ _DDL: list[str] = [
         value TEXT NOT NULL
     );
     """,
+    # --- v4: the per-source high-water mark ----------------------------
+    #
+    # IN THIS DATABASE, NOT IN A SIDECAR FILE, and that is the whole design.
+    # A watermark and the data it describes are two artifacts that must agree.
+    # Updated by two separate writes they cannot be made to agree under
+    # SIGTERM, and the two failure orders are not symmetric: watermark-first
+    # loses records permanently and silently, data-first merely re-reads. Here
+    # they are one row and one batch inside one transaction, so neither order
+    # is reachable.
+    #
+    # ``cursor_kind`` is on the row rather than only in code because a source
+    # that CANNOT support a watermark has to be able to say so out loud (see
+    # ``imports/ingest_state.CursorKind``). Silently full-scanning while
+    # reporting like an incremental source is the failure this whole change
+    # exists to remove.
+    """
+    CREATE TABLE IF NOT EXISTS ingest_state (
+        source               TEXT PRIMARY KEY,
+        cursor_value         TEXT,
+        cursor_kind          TEXT NOT NULL,
+        last_run_at          TEXT,
+        last_ok_at           TEXT,
+        rows_seen            INTEGER NOT NULL DEFAULT 0,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        last_error           TEXT,
+        -- When this source may be tried again, or NULL for "right now".
+        -- STORED rather than recomputed on read, because the delay is
+        -- jittered: recomputing it would let two reads inside one run
+        -- disagree about whether the source runs, which is a decision that
+        -- must be made once and stay made.
+        next_attempt_at      TEXT
+    );
+    """,
+    # --- v4: the poison-record quarantine ------------------------------
+    #
+    # A dead-letter queue collapsed into a table, which for one user on one
+    # machine is strictly better than a broker: it is transactional with the
+    # data writes, which a broker can never be. ``next_retry_at IS NULL`` is
+    # terminal — never retried again, never deleted either, because a row
+    # nobody can count is a gap that reads as full coverage.
+    """
+    CREATE TABLE IF NOT EXISTS quarantine (
+        source        TEXT NOT NULL,
+        record_key    TEXT NOT NULL,
+        error_type    TEXT NOT NULL,
+        error_detail  TEXT,
+        attempts      INTEGER NOT NULL DEFAULT 1,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at  TEXT NOT NULL,
+        next_retry_at TEXT,
+        PRIMARY KEY (source, record_key)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS quarantine_terminal "
+    "ON quarantine(source, next_retry_at);",
 ]
 
 
 _DROP_ALL: list[str] = [
+    "DROP TABLE IF EXISTS quarantine;",
+    "DROP TABLE IF EXISTS ingest_state;",
     "DROP TRIGGER IF EXISTS observations_ai;",
     "DROP TRIGGER IF EXISTS observations_ad;",
     "DROP TRIGGER IF EXISTS observations_au;",
@@ -280,12 +441,33 @@ class Store:
             # rebuilding.
             self._conn.execute("PRAGMA busy_timeout = 30000")
             self._conn.execute("PRAGMA synchronous = NORMAL")
+            # BOUND THE ``-wal`` SIDECAR. A checkpoint does not truncate the
+            # WAL unless this is set — it merely starts overwriting from the
+            # beginning — so a WAL that grew once during a large transaction
+            # stays that size on disk forever. 64 MiB is comfortably more than
+            # a chunk-sized transaction needs and stops the sidecar tracking
+            # the peak of the worst run this database has ever seen.
+            self._conn.execute("PRAGMA journal_size_limit = 67108864")
         return self._conn
 
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def commit(self) -> None:
+        """End the open transaction. For a caller composing SEVERAL writes.
+
+        Every write method here commits on its own by default. This exists for
+        the one caller that must not let them: the chunk write, which passes
+        ``_commit=False`` to the data write AND to the watermark advance so the
+        two land as one atomic unit. See ``imports/store_sink.write_checkpoint``.
+        """
+        self._c().commit()
+
+    def rollback(self) -> None:
+        """Discard the open transaction. The other half of :meth:`commit`."""
+        self._c().rollback()
 
     def _ensure_writable(self) -> None:
         if self.read_only:
@@ -312,6 +494,7 @@ class Store:
         self._ensure_writable()
         c = self._c()
         self._ensure_sessions_origin_column(c)
+        self._ensure_src_hash_columns(c)
         for stmt in _DDL:
             c.executescript(stmt)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -342,6 +525,36 @@ class Store:
                 "TEXT NOT NULL DEFAULT 'claude-code'"
             )
 
+    @staticmethod
+    def _ensure_src_hash_columns(c: sqlite3.Connection) -> None:
+        """v3 → v4 in-place upgrade: add ``src_hash`` to records + observations.
+
+        ``ADD COLUMN`` with no default is metadata-only in SQLite — it does not
+        touch a single existing page. That is not an optimisation detail here:
+        the live database holds ~372k observations, and a rewriting migration
+        would be precisely the hours-long unattended operation this schema
+        change exists to abolish.
+
+        NO BACKFILL, deliberately. Every pre-v4 row arrives with
+        ``src_hash IS NULL``, which never matches a computed hash, so the first
+        ingest after the upgrade re-scrubs and re-writes it once and stamps the
+        hash. Self-healing, spread over exactly one run, and — because the
+        writes are chunked and checkpointed — interruptible.
+
+        Probes ``PRAGMA table_info`` rather than ``user_version`` so a
+        half-applied state cannot run the ALTER twice.
+        """
+        for table in ("records", "observations", "sessions"):
+            exists = c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if not exists:
+                continue
+            cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+            if "src_hash" not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN src_hash TEXT")  # noqa: S608 - fixed literals
+
     def schema_version(self) -> int:
         """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
         c = self._c()
@@ -371,7 +584,7 @@ class Store:
         entities: Iterable[SessionEntity],
         *,
         _commit: bool = True,
-    ) -> None:
+    ) -> int:
         """Write ``SessionRow`` + ``ObservationRow`` items into the v2 tables.
 
         Idempotent per primary key. Scrubs ``ObservationRow.body`` pre-write.
@@ -399,33 +612,99 @@ class Store:
         caller holds a SAVEPOINT and does its own ``ROLLBACK TO SAVEPOINT``; a
         connection-wide rollback here would destroy the savepoint it is about
         to release.
+
+        RETURNS THE NUMBER OF ROWS THAT DID NOT HAVE TO BE WRITTEN — the ones
+        whose ``src_hash`` already matched. It is the number worth watching:
+        direct evidence that a re-run is costing what a re-run should cost, and
+        the difference between "resumable in principle" and "resumable in an
+        amount of time a 30-minute timer can absorb".
         """
         self._ensure_writable()
         c = self._c()
         try:
-            self._do_write_entities(c, entities)
+            unchanged = self._do_write_entities(c, entities)
         except BaseException:
             if _commit:
                 c.rollback()
             raise
         if _commit:
             c.commit()
+        return unchanged
 
     @staticmethod
     def _do_write_entities(
         c: sqlite3.Connection, entities: Iterable[SessionEntity]
-    ) -> None:
-        """The entity write loop. Transaction handling belongs to the caller."""
-        for e in entities:
+    ) -> int:
+        """The entity write loop. Transaction handling belongs to the caller.
+
+        Streamed in bounded groups so the hash probe can be one indexed query
+        per table per group instead of one per row, WITHOUT materialising the
+        caller's iterable — which for the sessions source is ~372k rows.
+        """
+        unchanged = 0
+        for group in _chunked(entities, _HASH_PROBE_CHUNK):
+            unchanged += Store._write_entity_group(c, group)
+        return unchanged
+
+    @staticmethod
+    def _write_entity_group(
+        c: sqlite3.Connection, group: Sequence[SessionEntity]
+    ) -> int:
+        """Write one group, skipping rows whose fingerprint already matches.
+
+        THE SKIP HAPPENS BEFORE THE SCRUB, which is the whole reason the
+        fingerprint is computed over the source's row rather than the stored
+        one. Presidio is the expensive step by an order of magnitude.
+
+        ORDER IS PRESERVED. ``observations.session_id`` is a real foreign key
+        with ``PRAGMA foreign_keys`` ON, so a session row must still be written
+        before its observations. A session skipped as unchanged is by
+        definition already in the table, so the constraint holds either way.
+
+        A REPEATED ID INSIDE ONE GROUP compares against the probe, not against
+        what an earlier item in the same group just wrote. Two identical copies
+        both count as unchanged (correct); two differing copies both write, and
+        the last one wins (correct, at the cost of one extra write).
+        """
+        session_ids = [e.session_id for e in group if isinstance(e, SessionRow)]
+        obs_ids = [e.obs_id for e in group if isinstance(e, ObservationRow)]
+        stored_sessions = _stored_hashes(c, "sessions", "session_id", session_ids)
+        stored_obs = _stored_hashes(c, "observations", "obs_id", obs_ids)
+
+        unchanged = 0
+        for e in group:
             if isinstance(e, SessionRow):
+                # NO ``SCRUB_FINGERPRINT`` here: session rows carry no
+                # user-authored text (cwd and git_branch are structural) and are
+                # never scrubbed, so a change to the scrubber cannot change what
+                # is stored for them and must not cost 8k pointless rewrites.
+                digest = _src_hash(
+                    e.session_id,
+                    e.root_session_id,
+                    e.parent_session_id,
+                    e.kind,
+                    e.agent_id,
+                    e.agent_type,
+                    e.spawned_by_tool_use_id,
+                    e.cwd,
+                    e.git_branch,
+                    _iso(e.first_ts),
+                    _iso(e.last_ts),
+                    e.jsonl_path,
+                    e.origin,
+                )
+                if stored_sessions.get(e.session_id) == digest:
+                    unchanged += 1
+                    continue
                 c.execute(
                     """
                     INSERT INTO sessions(
                         session_id, root_session_id, parent_session_id, kind,
                         agent_id, agent_type, spawned_by_tool_use_id,
-                        cwd, git_branch, first_ts, last_ts, jsonl_path, origin
+                        cwd, git_branch, first_ts, last_ts, jsonl_path, origin,
+                        src_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         root_session_id        = excluded.root_session_id,
                         parent_session_id      = excluded.parent_session_id,
@@ -438,7 +717,8 @@ class Store:
                         first_ts               = excluded.first_ts,
                         last_ts                = excluded.last_ts,
                         jsonl_path             = excluded.jsonl_path,
-                        origin                 = excluded.origin
+                        origin                 = excluded.origin,
+                        src_hash               = excluded.src_hash
                     """,
                     (
                         e.session_id,
@@ -454,21 +734,58 @@ class Store:
                         e.last_ts.isoformat(),
                         e.jsonl_path,
                         e.origin,
+                        digest,
                     ),
                 )
             elif isinstance(e, ObservationRow):
+                digest = _src_hash(
+                    SCRUB_FINGERPRINT,
+                    e.obs_id,
+                    e.session_id,
+                    e.root_session_id,
+                    e.parent_obs_id,
+                    e.type,
+                    _iso(e.ts),
+                    e.model,
+                    e.input_tokens,
+                    e.output_tokens,
+                    e.tool_name,
+                    e.tool_use_id,
+                    e.body,
+                )
+                if stored_obs.get(e.obs_id) == digest:
+                    unchanged += 1
+                    continue
                 scrubbed_body = scrub(e.body).text if e.body else ""
-                # Delete-then-insert simplifies FTS trigger interaction and
-                # keeps upsert idempotent per obs_id.
-                c.execute("DELETE FROM observations WHERE obs_id = ?", (e.obs_id,))
+                # UPSERT, NOT DELETE-THEN-INSERT. The old shape allocated a
+                # fresh rowid and a fresh page for a row whose content had not
+                # moved, and SQLite's default ``auto_vacuum=NONE`` never hands
+                # the freed pages back — measured on the live database as 929 MB
+                # -> 943 MB in 40 minutes at a completely flat row count, with
+                # ``max(rowid)`` climbing 547,998 -> 569,289. The ``_au``
+                # trigger keeps ``obs_fts`` in step on the UPDATE branch exactly
+                # as the ``_ad``/``_ai`` pair did on the delete-insert one.
                 c.execute(
                     """
                     INSERT INTO observations(
                         obs_id, session_id, root_session_id, parent_obs_id,
                         type, ts, model, input_tokens, output_tokens,
-                        tool_name, tool_use_id, body
+                        tool_name, tool_use_id, body, src_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(obs_id) DO UPDATE SET
+                        session_id      = excluded.session_id,
+                        root_session_id = excluded.root_session_id,
+                        parent_obs_id   = excluded.parent_obs_id,
+                        type            = excluded.type,
+                        ts              = excluded.ts,
+                        model           = excluded.model,
+                        input_tokens    = excluded.input_tokens,
+                        output_tokens   = excluded.output_tokens,
+                        tool_name       = excluded.tool_name,
+                        tool_use_id     = excluded.tool_use_id,
+                        body            = excluded.body,
+                        src_hash        = excluded.src_hash
                     """,
                     (
                         e.obs_id,
@@ -483,10 +800,12 @@ class Store:
                         e.tool_name,
                         e.tool_use_id,
                         scrubbed_body,
+                        digest,
                     ),
                 )
             else:
                 raise TypeError(f"unknown entity type: {type(e)!r}")
+        return unchanged
 
     def rebuild_and_upsert_entities(
         self,
@@ -580,27 +899,270 @@ class Store:
         )
         c.execute(f"DELETE FROM sessions WHERE origin IN ({placeholders})", scope)
 
+    # -- ingest state: the per-source high-water mark ----------------------
+
+    def read_ingest_state(self, source: str) -> dict[str, object]:
+        """One source's row from ``ingest_state``, or ``{}`` if it has none.
+
+        ``{}`` is the first-run answer and means "no window" — a full scan,
+        which is what a first run must be. Never raises for a missing row; a
+        watermark that could not be read has to degrade to re-reading, never to
+        skipping.
+        """
+        row = self._c().execute(
+            "SELECT source, cursor_value, cursor_kind, last_run_at, last_ok_at, "
+            "rows_seen, consecutive_failures, last_error, next_attempt_at "
+            "FROM ingest_state WHERE source = ?",
+            (source,),
+        ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def all_ingest_state(self) -> dict[str, dict[str, object]]:
+        """Every source's ingest state, for ``aggregator status``."""
+        rows = self._c().execute(
+            "SELECT source, cursor_value, cursor_kind, last_run_at, last_ok_at, "
+            "rows_seen, consecutive_failures, last_error, next_attempt_at "
+            "FROM ingest_state ORDER BY source"
+        )
+        return {row["source"]: dict(row) for row in rows}
+
+    def advance_ingest_cursor(
+        self,
+        source: str,
+        *,
+        cursor_kind: str,
+        cursor_value: str | None,
+        rows: int,
+        at: str,
+        _commit: bool = True,
+    ) -> None:
+        """Move one source's mark forward. FORWARD ONLY, and never to NULL.
+
+        THE MONOTONICITY GUARD IS IN THE SQL, not in the caller, so no code
+        path can route around it: ``cursor_value`` is only taken when it is
+        strictly greater than what is stored. A retry of an older chunk, a
+        clock that stepped backwards, or two runs racing would otherwise rewind
+        the window — and everything between the two values then gets re-read
+        (harmless) or, if the guard were ever missing on the way up, skipped
+        forever (not).
+
+        ISO-8601 strings compare lexicographically in the same order as the
+        instants they name, as long as they share an offset and a precision.
+        Every value written here comes from ``datetime.isoformat()`` on an
+        aware UTC datetime produced by this codebase, so that holds — and the
+        Python-side ``Watermarks`` never hands over a value it did not parse.
+
+        ``COALESCE(?, cursor_value)`` is the empty-run rule: a pass that found
+        nothing still stamps ``last_run_at`` and clears the failure counter,
+        but must not write NULL over a live mark. The same defect is on record
+        in another implementation of this pattern (an empty sync nuking state
+        to ``{}``); here it would full-scan 372k rows on the very next tick.
+
+        ``_commit=False`` leaves the transaction open, which is the whole point
+        of the mark living in this database: the caller commits it together
+        with the chunk it describes, so no crash can leave one without the
+        other.
+        """
+        self._ensure_writable()
+        c = self._c()
+        try:
+            c.execute(
+                """
+                INSERT INTO ingest_state(
+                    source, cursor_value, cursor_kind, last_run_at, last_ok_at,
+                    rows_seen, consecutive_failures, last_error, next_attempt_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+                ON CONFLICT(source) DO UPDATE SET
+                    cursor_value = CASE
+                        WHEN excluded.cursor_value IS NOT NULL
+                         AND (ingest_state.cursor_value IS NULL
+                              OR excluded.cursor_value > ingest_state.cursor_value)
+                        THEN excluded.cursor_value
+                        ELSE ingest_state.cursor_value
+                    END,
+                    cursor_kind          = excluded.cursor_kind,
+                    last_run_at          = excluded.last_run_at,
+                    last_ok_at           = excluded.last_ok_at,
+                    rows_seen            = ingest_state.rows_seen + excluded.rows_seen,
+                    consecutive_failures = 0,
+                    last_error           = NULL,
+                    next_attempt_at      = NULL
+                """,
+                (source, cursor_value, cursor_kind, at, at, rows),
+            )
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    def record_ingest_failure(
+        self,
+        source: str,
+        *,
+        cursor_kind: str,
+        error: str,
+        at: str,
+        next_attempt_at: str | None,
+        _commit: bool = True,
+    ) -> None:
+        """Count a failed pass. DELIBERATELY LEAVES THE MARK WHERE IT WAS.
+
+        A failed run must not advance anything: the next run re-reads the same
+        window — cheap, because the apply is idempotent — and nothing between
+        the old mark and wherever this run got to can be lost. Advancing on
+        failure is the one ordering that loses records silently.
+
+        ``next_attempt_at`` is computed by the caller (which owns the backoff
+        policy) and STORED, because the delay is jittered: recomputing it on
+        every read would let two reads inside one run disagree about whether
+        the source runs at all.
+        """
+        self._ensure_writable()
+        c = self._c()
+        try:
+            c.execute(
+                """
+                INSERT INTO ingest_state(
+                    source, cursor_value, cursor_kind, last_run_at, last_ok_at,
+                    rows_seen, consecutive_failures, last_error, next_attempt_at
+                )
+                VALUES (?, NULL, ?, ?, NULL, 0, 1, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    cursor_kind          = excluded.cursor_kind,
+                    last_run_at          = excluded.last_run_at,
+                    consecutive_failures = ingest_state.consecutive_failures + 1,
+                    last_error           = excluded.last_error,
+                    next_attempt_at      = excluded.next_attempt_at
+                """,
+                (source, cursor_kind, at, error, next_attempt_at),
+            )
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    # -- ingest state: records that could not be written -------------------
+
+    def read_poison(self, source: str) -> list[dict[str, object]]:
+        """Every held record for one source, due or not. Policy is the caller's."""
+        rows = self._c().execute(
+            "SELECT source, record_key, error_type, error_detail, attempts, "
+            "first_seen_at, last_seen_at, next_retry_at "
+            "FROM quarantine WHERE source = ?",
+            (source,),
+        )
+        return [dict(row) for row in rows]
+
+    def hold_poison(
+        self,
+        source: str,
+        record_key: str,
+        *,
+        error_type: str,
+        error_detail: str,
+        at: str,
+        next_retry_at: str | None,
+        _commit: bool = True,
+    ) -> None:
+        """Record one record that could not be written, or bump its attempt count.
+
+        ``first_seen_at`` is preserved across attempts — how long something has
+        been broken is the number that decides whether a human cares.
+        """
+        self._ensure_writable()
+        c = self._c()
+        try:
+            c.execute(
+                """
+                INSERT INTO quarantine(
+                    source, record_key, error_type, error_detail, attempts,
+                    first_seen_at, last_seen_at, next_retry_at
+                )
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(source, record_key) DO UPDATE SET
+                    error_type    = excluded.error_type,
+                    error_detail  = excluded.error_detail,
+                    attempts      = quarantine.attempts + 1,
+                    last_seen_at  = excluded.last_seen_at,
+                    next_retry_at = excluded.next_retry_at
+                """,
+                (source, record_key, error_type, error_detail, at, at, next_retry_at),
+            )
+        except BaseException:
+            if _commit:
+                c.rollback()
+            raise
+        if _commit:
+            c.commit()
+
+    def release_poison(self, source: str, record_key: str, *, _commit: bool = True) -> None:
+        """A record that used to fail wrote cleanly. Stop holding it."""
+        self._ensure_writable()
+        c = self._c()
+        c.execute(
+            "DELETE FROM quarantine WHERE source = ? AND record_key = ?",
+            (source, record_key),
+        )
+        if _commit:
+            c.commit()
+
+    def poison_summary(self) -> list[dict[str, object]]:
+        """One row per (source, error_type, terminal-or-not) with a count.
+
+        The entire "what is broken" report, and the reason held rows are never
+        deleted: a failure nobody can count is a gap that reads as coverage.
+        """
+        rows = self._c().execute(
+            "SELECT source, error_type, "
+            "       next_retry_at IS NULL AS terminal, count(*) AS n "
+            "FROM quarantine GROUP BY source, error_type, terminal "
+            "ORDER BY source, error_type"
+        )
+        return [
+            {
+                "source": row["source"],
+                "error_type": row["error_type"],
+                "terminal": bool(row["terminal"]),
+                "count": int(row["n"]),
+            }
+            for row in rows
+        ]
+
     # -- writes: legacy records (GitHub) ----------------------------------
 
-    def upsert(self, records: list[Record]) -> None:
+    def upsert(self, records: list[Record], *, _commit: bool = True) -> int:
         """Write records to the store, scrubbing every field pre-write.
 
         Idempotent per ``stable_id``: re-upsert of the same ID overwrites the
         row (INSERT ... ON CONFLICT DO UPDATE); a fresh ID inserts a new row.
+        A row whose ``src_hash`` already matches is not written at all and is
+        counted in the return value — see :meth:`upsert_entities`.
 
         A batch that raises part-way through is ROLLED BACK, for the same
         reason as ``upsert_entities`` — the rows written before the raise
         would otherwise sit in the implicit transaction and be committed by
         the next writer, uncounted by any report.
+
+        ``_commit=False`` leaves the transaction open, so a caller can make
+        this write and the watermark advance that describes it ONE atomic unit.
+        Same escape hatch, and same rollback rule, as ``upsert_entities``.
         """
         self._ensure_writable()
         c = self._c()
         try:
-            self._do_write_records(c, list(records))
+            unchanged = self._do_write_records(c, list(records))
         except BaseException:
-            c.rollback()
+            if _commit:
+                c.rollback()
             raise
-        c.commit()
+        if _commit:
+            c.commit()
+        return unchanged
 
     def rebuild(self, source: str) -> None:
         """Drop all Record-shaped rows for one source; caller re-ingests."""
@@ -643,71 +1205,135 @@ class Store:
         c.commit()
 
     @staticmethod
-    def _do_write_records(c: sqlite3.Connection, records: list[Record]) -> None:
+    def _do_write_records(c: sqlite3.Connection, records: list[Record]) -> int:
         """Shared write body between ``upsert`` and ``rebuild_and_upsert``.
 
         Kept static so the savepoint scope in the atomic path can call it
         without touching module-level state. Body kept in lockstep with
         ``upsert``; if the write path grows a new field, update both.
+
+        Returns how many rows were already stored identically and therefore
+        neither scrubbed nor written.
         """
+        unchanged = 0
+        for group in _chunked(records, _HASH_PROBE_CHUNK):
+            unchanged += Store._write_record_group(c, group)
+        return unchanged
+
+    @staticmethod
+    def _write_record_group(
+        c: sqlite3.Connection, records: Sequence[Record]
+    ) -> int:
+        """Write one group of records, skipping the ones that did not change.
+
+        THE FINGERPRINT IS OVER THE EFFECTIVE ROW, NOT THE INCOMING ONE. Two of
+        the columns below are merged rather than overwritten (``created_at``
+        never moves once known; a dateless re-observation must not erase a
+        stored ``updated_at``), so hashing the payload as it arrived would make
+        every dateless TickTick re-observation of a dated row look like a change
+        and rewrite it on every single tick — the doom loop in miniature. The
+        merge is therefore applied here first, against the stored values, and
+        the hash describes what the row WILL be.
+        """
+        ids = [r.stable_id for r in records]
+        stored: dict[str, tuple[str | None, str | None, str | None]] = {}
+        for page in _chunked(ids, 500):
+            placeholders = ",".join("?" * len(page))
+            rows = c.execute(
+                "SELECT stable_id, src_hash, created_at, updated_at FROM records "
+                f"WHERE stable_id IN ({placeholders})",  # noqa: S608 - fixed literals
+                list(page),
+            )
+            for row in rows:
+                stored[row[0]] = (row[1], row[2], row[3])
+
+        unchanged = 0
         for r in records:
-            scrubbed_body = scrub(r.body).text
-            scrubbed_subject = scrub(r.subject).text
-            c.execute(
-                """
-                INSERT INTO records(
-                    stable_id, source, subject, body, tags,
-                    created_at, updated_at, extra
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(stable_id) DO UPDATE SET
-                    subject    = excluded.subject,
-                    body       = excluded.body,
-                    tags       = excluded.tags,
-                    -- Existing value first, so a creation time never moves
-                    -- once known — that is why created_at was left out of
-                    -- this SET list originally. Omitting it entirely went too
-                    -- far: a row first written dateless kept its NULL forever,
-                    -- including after ticktick's CREATED_FIELD is corrected,
-                    -- which breaks the tripwire's promise that fixing the
-                    -- field names also repairs the records it already wrote.
-                    created_at = COALESCE(records.created_at, excluded.created_at),
-                    -- COALESCE, not a plain overwrite: a re-observation that
-                    -- carries NO timestamp must not erase the one already
-                    -- stored. ticktick is where this bites — a task payload
-                    -- with none of completedTime/modifiedTime/createdTime
-                    -- yields updated_at=None, and the merge lets the fresher
-                    -- API observation win, so a NULL landed on top of the real
-                    -- date the CSV leg parsed. The row then drops out of every
-                    -- date query while looking perfectly healthy, and only a
-                    -- WHOLE batch being dateless trips the API tripwire, so a
-                    -- partially-dated batch degrades in silence.
-                    updated_at = COALESCE(excluded.updated_at, records.updated_at),
-                    extra      = excluded.extra
-                """,
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    json.dumps(r.tags),
-                    r.created_at.isoformat() if r.created_at else None,
-                    r.updated_at.isoformat() if r.updated_at else None,
-                    json.dumps(r.extra, default=str),
-                ),
+            held_hash, held_created, held_updated = stored.get(
+                r.stable_id, (None, None, None)
             )
-            c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
-            c.execute(
-                "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    r.stable_id,
-                    r.source,
-                    scrubbed_subject,
-                    scrubbed_body,
-                    " ".join(r.tags),
-                ),
+            effective_created = held_created or _iso(r.created_at)
+            effective_updated = _iso(r.updated_at) or held_updated
+            digest = _src_hash(
+                SCRUB_FINGERPRINT,
+                r.stable_id,
+                r.source,
+                r.subject,
+                r.body,
+                json.dumps(r.tags),
+                effective_created,
+                effective_updated,
+                json.dumps(r.extra, default=str),
             )
+            if held_hash == digest:
+                unchanged += 1
+                continue
+            Store._write_one_record(c, r, digest)
+        return unchanged
+
+    @staticmethod
+    def _write_one_record(
+        c: sqlite3.Connection, r: Record, digest: str
+    ) -> None:
+        scrubbed_body = scrub(r.body).text
+        scrubbed_subject = scrub(r.subject).text
+        c.execute(
+            """
+            INSERT INTO records(
+                stable_id, source, subject, body, tags,
+                created_at, updated_at, extra, src_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(stable_id) DO UPDATE SET
+                subject    = excluded.subject,
+                body       = excluded.body,
+                tags       = excluded.tags,
+                src_hash   = excluded.src_hash,
+                -- Existing value first, so a creation time never moves
+                -- once known — that is why created_at was left out of
+                -- this SET list originally. Omitting it entirely went too
+                -- far: a row first written dateless kept its NULL forever,
+                -- including after ticktick's CREATED_FIELD is corrected,
+                -- which breaks the tripwire's promise that fixing the
+                -- field names also repairs the records it already wrote.
+                created_at = COALESCE(records.created_at, excluded.created_at),
+                -- COALESCE, not a plain overwrite: a re-observation that
+                -- carries NO timestamp must not erase the one already
+                -- stored. ticktick is where this bites — a task payload
+                -- with none of completedTime/modifiedTime/createdTime
+                -- yields updated_at=None, and the merge lets the fresher
+                -- API observation win, so a NULL landed on top of the real
+                -- date the CSV leg parsed. The row then drops out of every
+                -- date query while looking perfectly healthy, and only a
+                -- WHOLE batch being dateless trips the API tripwire, so a
+                -- partially-dated batch degrades in silence.
+                updated_at = COALESCE(excluded.updated_at, records.updated_at),
+                extra      = excluded.extra
+            """,
+            (
+                r.stable_id,
+                r.source,
+                scrubbed_subject,
+                scrubbed_body,
+                json.dumps(r.tags),
+                r.created_at.isoformat() if r.created_at else None,
+                r.updated_at.isoformat() if r.updated_at else None,
+                json.dumps(r.extra, default=str),
+                digest,
+            ),
+        )
+        c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
+        c.execute(
+            "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                r.stable_id,
+                r.source,
+                scrubbed_subject,
+                scrubbed_body,
+                " ".join(r.tags),
+            ),
+        )
 
     # -- reads: legacy Record-shaped path (GitHub) ------------------------
 
