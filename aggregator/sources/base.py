@@ -13,8 +13,10 @@ records distinction is intentional and documented in ``store.py``.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -120,6 +122,94 @@ class IngestResult:
     updated: int
     skipped: int
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PermanentFault:
+    """Input a source can never parse, named precisely enough to be REMEMBERED.
+
+    THE DISTINCTION THIS TYPE EXISTS TO DRAW. A source's ``errors`` list mixes
+    two populations that look identical in it and are opposites in every way
+    that matters. A locked database, an expired token, an unreachable directory
+    are TRANSIENT: they must be reported on every run until somebody fixes
+    them, because the next run might succeed. Two malformed lines in a JSONL
+    file are PERMANENT: they will never parse, no run will ever succeed on
+    them, and reporting them as a fresh failure every 30 minutes is a
+    permanently-red alarm — which is the alarm an operator learns to dismiss
+    unread, at the cost of the next real failure's audience.
+
+    So a source DECLARES the second kind, one fault at a time, and everything
+    it does not declare stays loud forever. Declaring is affirmative work; the
+    default is loud. That direction is not negotiable — see
+    ``imports/ingest_state.PoisonLedger``.
+
+    THE FIELDS ARE THE IDENTITY, and each one is load-bearing:
+
+    * ``scope`` — the artifact the fault is IN, as a filesystem path. It is what
+      the ledger re-stats to notice that the file was rewritten, so it must name
+      a real file rather than a logical id.
+    * ``stamp`` — that file's identity at the moment the fault was found (see
+      :func:`fault_stamp`). A stored fault whose scope no longer carries this
+      stamp is about a file that has since changed.
+    * ``reason`` — the CLASS of damage, e.g. ``"corrupt line(s)"``. Two
+      different kinds of damage in one file are two faults.
+    * ``detail`` — which records, EXACTLY and UNCAPPED (``"318,328"``). The
+      rendered line caps its examples at five so one wrecked file cannot bury
+      the run report; the identity must not, or a sixth bad line in a file that
+      already has five would inherit the fifth's silence.
+    * ``count`` — how many records this fault costs the index. Reported by
+      ``aggregator status``, because a quarantined record nobody can count is a
+      gap that reads as full coverage.
+    * ``line`` — the exact error text this fault renders as, so the runner can
+      move THAT line out of the run's errors and nothing else.
+    """
+
+    scope: str
+    stamp: str
+    reason: str
+    detail: str
+    count: int
+    line: str
+
+    @property
+    def key(self) -> str:
+        """The stable identity, hashed. What "already known" is decided by.
+
+        Over scope + reason + detail and deliberately NOT over ``count``,
+        ``stamp`` or ``line``: suppressing by count alone is what would let a
+        different bad line inherit a known one's silence, and hashing the
+        rendered text would make every future rewording re-alarm the whole
+        ledger. ``\\x00`` as the separator because it cannot occur in a path,
+        a reason or a line list, so no two different faults can collide by
+        splicing at a delimiter.
+        """
+        raw = f"{self.scope}\x00{self.reason}\x00{self.detail}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def fault_stamp(path: Path | str) -> str:
+    """A file's identity right now: ``"<mtime_ns>:<size>"``, or ``""`` if gone.
+
+    WHAT IT IS FOR. A permanent fault goes quiet, so something has to notice
+    when it stops being true — otherwise ``aggregator status`` reports a
+    quarantine that no longer exists, which is the same lie as reporting none.
+    The rule the ledger applies is "the file changed AND the fault was not
+    re-reported", and this is the "changed" half.
+
+    mtime AND size, because either alone is forgeable by accident: a rewrite
+    within the filesystem's timestamp granularity keeps the mtime, and an edit
+    that swaps one character keeps the size. Nanoseconds because whole seconds
+    are exactly the granularity a fast rewrite hides inside.
+
+    A missing or unreadable file answers ``""``, which never equals a stored
+    stamp — so it reads as "changed", the loud direction: the fault is dropped
+    and re-reported if it ever comes back.
+    """
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return ""
+    return f"{st.st_mtime_ns}:{st.st_size}"
 
 
 @dataclass

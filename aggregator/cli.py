@@ -63,6 +63,7 @@ from aggregator.imports.registry import default_adapters
 from aggregator.imports.runner import (
     NotifyHook,
     RunReport,
+    commit_fault_receipts,
     commit_report_barriers,
     commit_staleness_receipts,
     graceful_shutdown,
@@ -355,11 +356,20 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     # Quiet is only acceptable while it is not the same as forgotten.
     ingest_state = store.all_ingest_state()
     held_records = store.poison_summary()
+    # THE SAME BARGAIN AGAIN, for the noisiest case of all. Input that will
+    # never parse is reported loudly the first time its identity is seen and
+    # never again — which on 2026-08-16 was the difference between four
+    # CRITICAL toasts in six hours and one. The price of that quiet is this
+    # listing: every fault, the file it is in, how many records it costs the
+    # index, and the date a human was first told. Nothing here is a count
+    # summary — a quarantine you cannot name is one you cannot fix.
+    known_faults = store.fault_summary()
     if args.json:
         caps["ticktick_uncovered_projects"] = uncovered
         caps["stale_input_markers"] = stale_inputs
         caps["ingest_state"] = ingest_state
         caps["held_records"] = held_records
+        caps["known_faults"] = known_faults
         print(json.dumps(caps, indent=2, default=str))
         return 0
     print(f"cache_path: {caps['cache_path']}")
@@ -396,6 +406,21 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
             print(
                 f"  {entry['source']}: {entry['count']} x "
                 f"{entry['error_type']} ({when})"
+            )
+    if known_faults:
+        total = sum(int(f["count"]) for f in known_faults)
+        print(
+            f"permanently-bad input (reported once, then held quiet): "
+            f"{len(known_faults)} fault(s), {total} record(s) NOT in the index"
+        )
+        for fault in known_faults:
+            print(
+                f"  {fault['source']}: {fault['count']} record(s) — "
+                f"{fault['reason']} in {fault['scope']}"
+            )
+            print(
+                f"    line(s) {fault['detail']}; first reported "
+                f"{fault['first_seen_at']}, last seen {fault['last_seen_at']}"
             )
     if uncovered:
         print(
@@ -1271,6 +1296,12 @@ def _cmd_ingest_all(
     ``_stderr_delivery`` the single-source path uses.
     """
     _configure_ingest_logging()
+    # ONE LEDGER FOR THE WHOLE COMMAND, for the same reason there is one
+    # ``Watermarks``: the runner reconciles this run's permanent faults against
+    # it, and the receipt commit below writes into it after the print. Two
+    # instances could not disagree today, but a run that decided a fault was
+    # known against one and recorded it into another is a bug nobody would find.
+    ledger = PoisonLedger(store) if watermarks is not None else None
 
     async def _drive() -> RunReport:
         # THE SIGNAL HANDLER LIVES HERE, not in the runner: the process owns
@@ -1287,7 +1318,7 @@ def _cmd_ingest_all(
                     else DEFAULT_STALE_AFTER_DAYS
                 ),
                 watermarks=watermarks,
-                poison=PoisonLedger(store) if watermarks is not None else None,
+                poison=ledger,
                 stop=stop,
             )
 
@@ -1317,6 +1348,12 @@ def _cmd_ingest_all(
     # single run. Under the timer ``_stderr_delivery`` answers "nothing" — the
     # journal is not an audience — so the unattended case is untouched.
     commit_staleness_receipts(report, watched)
+    # And the poison ledger, for the third time on the same declaration. A
+    # person who read a never-seen-before corrupt-line report off their own
+    # terminal has been told; without this the interactive run — which installs
+    # no notifier at all — could never record anything, so every manual
+    # ``ingest --all`` would report the same permanent faults forever.
+    commit_fault_receipts(report, watched, ledger)
     # A barrier that raised lands in ``run_errors`` after the block above has
     # printed, so it would otherwise change the exit code with nothing on stderr
     # to explain it. Same treatment as the single-source path's ``late``.
@@ -1326,6 +1363,14 @@ def _cmd_ingest_all(
         # completed but dropped files is not a success, and a timer that reads
         # 0 as success lets the index rot unnoticed.
         return EXIT_COMPLETED_WITH_ERRORS
+    # KNOWN POISON EXITS 0, AND THAT IS A DECISION, not an oversight. See
+    # ``EXIT_COMPLETED_WITH_ERRORS`` for the argument in full: a third exit code
+    # would still be non-zero, the unit treats every non-zero as a failure and
+    # notifies, so introducing one reproduces the bug this fixes until somebody
+    # hand-edits a systemd unit in another repository. The visibility that a
+    # non-zero code would have bought is bought instead by the ``poison=`` count
+    # in the summary above, the per-fault notes under each source, and
+    # ``aggregator status`` — none of which can be lost to a stale unit file.
     return 0
 
 
@@ -1352,16 +1397,23 @@ def _print_run_report(report: RunReport) -> None:
         print(
             f"  {name}: added={a.added} updated={a.updated} "
             f"unchanged={a.unchanged} skipped={a.skipped} "
-            f"errors={len(a.errors)} window={a.window or 'n/a'}"
+            f"errors={len(a.errors)} poison={len(a.known_faults)} "
+            f"window={a.window or 'n/a'}"
             f"{' INTERRUPTED' if a.interrupted else ''}"
             f"{' RESTING' if a.skipped_for_backoff else ''}"
         )
         for note in a.notes:
             print(f"    note: {note}")
+    # ``poison`` is on the total line for the same reason ``unchanged`` is: it
+    # is the field that distinguishes a genuinely clean run from one that exits
+    # 0 while several records have been missing from the index for months.
+    # Zero-visibility is the failure mode; a number nobody reads is not.
     print(
         f"  total: added={report.added} updated={report.updated} "
         f"unchanged={report.unchanged} skipped={report.skipped} "
-        f"errors={len(report.errors)} warnings={len(report.warnings)}"
+        f"errors={len(report.errors)} warnings={len(report.warnings)} "
+        f"poison={len(report.known_faults)} "
+        f"({report.quarantined_records} record(s) held out of the index)"
         f"{' (INTERRUPTED — stopped at a chunk boundary; the next run resumes)' if report.interrupted else ''}"
     )
 

@@ -33,6 +33,10 @@ reconstruct it from ``runner._run_one``. It is:
                                      skipped nothing
   3. ``SupportsNonFatalErrors``      ``drain_errors`` — always, INCLUDING after
                                      a raise
+  3b. ``SupportsPermanentFaults``    ``drain_faults`` — always, and AFTER
+                                     ``drain_errors``, because every fault it
+                                     returns names a line that list must
+                                     already contain
   4. ``SupportsInputFreshness``      ``input_freshness`` — always
   --- every adapter has now finished; the run's report is assembled ---
   5. some of the report reaches a human, or none of it does (:class:`Delivery`)
@@ -46,6 +50,11 @@ reconstruct it from ``runner._run_one``. It is:
                                      adapter protocol: the warning belongs to
                                      the run (see ``SupportsInputFreshness``),
                                      so no adapter has to implement or call it.
+  7b. the run's own poison ledger  — ``runner.commit_fault_receipts``, against
+                                     the same :class:`Delivery` again, for the
+                                     same reason: a permanent fault may only go
+                                     quiet once a channel carried the line that
+                                     announced it.
 
 Steps 1-4 are matched STRUCTURALLY: having the method is opting in, because
 over-inclusion is free or safe for each of them. Step 6 is the exception and is
@@ -87,7 +96,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from aggregator.sources.base import ObservationRow, Record, SessionRow
+from aggregator.sources.base import (
+    ObservationRow,
+    PermanentFault,
+    Record,
+    SessionRow,
+)
 
 # The store has two intentionally-distinct write paths and the port carries
 # both rather than collapsing them (see ``core/store.py`` module docstring —
@@ -254,6 +268,38 @@ class SupportsNonFatalErrors(Protocol):
     """
 
     def drain_errors(self) -> list[str]: ...
+
+
+@runtime_checkable
+class SupportsPermanentFaults(Protocol):
+    """Optional: which of this adapter's errors will NEVER fix themselves.
+
+    THE SUBSET OF ``drain_errors`` THAT MAY GO QUIET, and the split is the whole
+    point. ``SupportsNonFatalErrors`` carries everything a source survived: a
+    locked database, an expired token, an unreadable directory AND two lines of
+    JSONL that no parser will ever accept. The first three are transient — the
+    next run might succeed, so they must be reported until somebody fixes them.
+    The last one is permanent, and reporting it as a fresh failure on every
+    30-minute tick is a permanently-red alarm, which is the alarm an operator
+    learns to dismiss unread. On 2026-08-16 that was four runs in six hours, the
+    identical eight errors, four CRITICAL toasts, none of them new information.
+
+    So a fault is DECLARED here, one at a time, with an identity the ledger can
+    remember (``sources.base.PermanentFault``); the runner reports a never-seen
+    identity loudly exactly once and quietly thereafter, and everything NOT
+    declared here stays loud on every run forever. Forgetting to declare is
+    therefore the safe direction — it costs noise, never silence — which is
+    what makes structural matching affordable on this protocol where
+    ``SupportsReportBarrier`` had to be an explicit opt-in: over-inclusion buys
+    an adapter nothing, because the declaration is per FAULT and an adapter
+    with none returns an empty list.
+
+    Drained AFTER the stream ends, alongside ``drain_errors``, and every fault
+    it returns must carry the exact ``line`` its ``drain_errors`` reported — the
+    runner moves THAT line out of the run's errors and nothing else.
+    """
+
+    def drain_faults(self) -> list[PermanentFault]: ...
 
 
 @runtime_checkable
