@@ -31,3 +31,21 @@ sync.log
 
 # arftl per-run state (repo-autosync, 2026-08-13)
 tasks/arftl-run.json
+
+# Working notes live in userspace, NOT in this repo (2026-08-16).
+#
+# These are agent/operator notes — mission state, durable user directives,
+# handover primers, blocked-on-a-human items, cron output. They are personal
+# working material, not source, and this repo is public. They were published
+# once by accident; each entry below is a symlink into
+# ~/.claude/tasks/aggregator/ so every existing path still resolves while the
+# content stays out of git.
+#
+# A daily cron runs sync-agent.sh, which auto-commits and pushes anything it
+# finds — so an un-ignored note file here is not a risk of publication, it is
+# a guarantee of it.
+tasks
+tasks/
+HANDOVER.md
+pending_for_human.md
+sync.log
