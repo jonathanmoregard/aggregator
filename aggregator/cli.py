@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -48,8 +49,11 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from aggregator.core.chunk import chunk_body
+from aggregator.core.embed import Embedder
 from aggregator.core.store import EmptyRebuildRefusedError, Store
 from aggregator.imports.ingest_state import (
     SOURCE_CURSORS,
@@ -1418,6 +1422,123 @@ def _print_run_report(report: RunReport) -> None:
     )
 
 
+def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
+    """Background embed worker — fills the v5 vector index.
+
+    ``--catchup`` drains the whole backlog; ``--once`` does one batch and exits
+    (what the systemd timer runs). Both take an OS-level ``flock`` on
+    ``<cache>.embed.lock``, so a slow catchup and a timer tick cannot both
+    consume the same batch. A tick that finds the lock held is a healthy no-op
+    and exits 0.
+
+    REFUSES TO RUN WITHOUT THE VECTOR EXTENSION, loudly and non-zero. With
+    sqlite-vec missing the store's vec writers no-op; embedding the batch
+    anyway would advance ``embedding_state`` past rows that have no vector,
+    and nothing ever looks at a row twice. That is the watermark-ahead-of-data
+    failure the ingest rules forbid, so the whole run is refused and the
+    backlog is left exactly where it was.
+    """
+    store = _store or Store()
+    store.migrate()
+
+    if not store.vector_available:
+        print(
+            "ERROR: aggregator embed cannot run — the sqlite-vec extension "
+            "did not load, so no vector can be written. Refusing rather than "
+            "advancing embedding_state past rows with no vector. FTS5 search "
+            "is unaffected. Reinstall the `sqlite-vec` wheel for this "
+            "interpreter and re-run `aggregator embed --catchup`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    lock_path = Path(str(store.db_path) + ".embed.lock")
+    lock_path.touch(exist_ok=True)
+    lock_fd = os.open(str(lock_path), os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another embed worker is running; exiting")
+            return 0
+
+        embedder = Embedder()
+        kinds = (
+            ["observations", "records"] if args.source == "both" else [args.source]
+        )
+        for kind in kinds:
+            _embed_backlog(store, embedder, kind, args)
+    finally:
+        os.close(lock_fd)
+    return 0
+
+
+def _embed_backlog(
+    store: Store,
+    embedder: Embedder,
+    kind: str,
+    args: argparse.Namespace,
+) -> None:
+    """Drain the backlog in bounded batches (``--catchup``) or do one (``--once``).
+
+    Chunked and checkpointed for the same reason ingest is: each batch commits
+    its vectors and its watermark before the next one starts, so a kill at any
+    moment costs at most one batch and the next run resumes where this stopped.
+    """
+    while True:
+        rows = store.select_unembedded(kind, limit=args.batch_size)
+        if not rows:
+            return
+        _embed_batch(store, embedder, kind, rows)
+        if args.once:
+            return
+
+
+def _embed_batch(
+    store: Store,
+    embedder: Embedder,
+    kind: str,
+    rows: list,
+) -> None:
+    """Embed one batch, then advance the watermark — IN THAT ORDER.
+
+    Vectors are written before ``embedding_state`` moves. The reverse order is
+    the one that loses rows: a crash between the two would leave rows marked
+    embedded that nothing will ever come back for.
+
+    A row with no chunks (empty or whitespace-only body — roughly half the
+    corpus sits in that bucket) is marked ``'skip'`` rather than ``'ok'``. It
+    has to leave the backlog or the worker re-reads it every run forever, but
+    "nothing to embed" and "embedded" are different facts and the table keeps
+    them apart.
+    """
+    ok_ids: list[str] = []
+    skip_ids: list[str] = []
+    all_vecs: list[tuple[str, Any]] = []
+    for row in rows:
+        if kind == "observations":
+            row_id = row["obs_id"]
+            body = row["body"] or ""
+        else:
+            row_id = row["stable_id"]
+            body = f"{row['subject']}\n\n{row['body']}"
+        chunks = chunk_body(body)
+        if not chunks:
+            skip_ids.append(row_id)
+            continue
+        vecs = embedder.embed_documents(chunks)
+        for i, vec in enumerate(vecs):
+            chunk_id = row_id if len(chunks) == 1 else f"{row_id}:{i}"
+            all_vecs.append((chunk_id, vec))
+        ok_ids.append(row_id)
+    if kind == "observations":
+        store.upsert_vec_observations(all_vecs)
+    else:
+        store.upsert_vec_records(all_vecs)
+    store.mark_embedded(kind, ok_ids, state="ok")
+    store.mark_embedded(kind, skip_ids, state="skip")
+
+
 def _cmd_github_token_status(
     args: argparse.Namespace,
     store: Store,
@@ -1561,6 +1682,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="assume 'y' for any --force confirmation (scripted use)",
     )
 
+    p_embed = sub.add_parser(
+        "embed",
+        help="background embed worker (fills the v5 vector index)",
+    )
+    mode = p_embed.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--catchup",
+        action="store_true",
+        help="embed every unembedded row, then exit",
+    )
+    mode.add_argument(
+        "--once",
+        action="store_true",
+        help="embed one batch and exit (what the systemd timer runs)",
+    )
+    p_embed.add_argument(
+        "--source",
+        choices=["observations", "records", "both"],
+        default="observations",
+    )
+    p_embed.add_argument("--batch-size", type=int, default=500, dest="batch_size")
+
     tks = sub.add_parser(
         "github-token-status",
         help=(
@@ -1640,6 +1783,8 @@ def main(
         # doing so would commit the DELETE before the transaction and
         # reintroduce the non-atomic gap this fix closes.
         return _cmd_ingest(args, store, sources())
+    if args.cmd == "embed":
+        return _cmd_embed(args, _store=store)
     if args.cmd == "github-token-status":
         return _cmd_github_token_status(args, store, sources())
     return 2
