@@ -65,6 +65,27 @@ v3→v4 is additive and migrates IN PLACE. It adds:
 Both ALTERs are metadata-only (``ADD COLUMN`` with no default), which matters:
 the live database holds ~372k observations and a rewrite would be exactly the
 kind of hours-long unattended operation this schema change exists to abolish.
+
+v4→v5 is the RAG schema, and is additive on the same terms. It adds:
+
+* ``observations.embedding_state`` / ``records.embedding_state`` — a NULL-vector
+  watermark for the background embed worker. NULL means "not embedded yet", so
+  every pre-v5 row arrives QUEUED FOR BACKFILL. Deliberately not backfilled to
+  a done-looking value: that would mark the whole corpus embedded and leave the
+  vector arm silently returning nothing.
+* ``vec_observations`` / ``vec_records`` — sqlite-vec ``vec0`` virtual tables
+  holding 768-dim MRL-truncated Qwen3 embeddings.
+
+THE VECTOR ARM IS OPTIONAL AND THE STORE TREATS IT THAT WAY. ``sqlite-vec`` is
+a loadable native extension; it can be absent, ABI-mismatched against this
+SQLite, or blocked by a python built without ``enable_load_extension``. Every
+read in this product goes through ``Store`` — including
+``aggregator_search_memory``, which has no vector dependency at all — so
+loading it unconditionally would turn an optional feature into a single point
+of failure for recall. Instead: attempt the load, complain loudly exactly once
+per process, set :attr:`Store.vector_available`, and keep FTS5 serving. Vector
+reads then raise :class:`VectorIndexUnavailableError` by name rather than a
+bare ``no such table: vec_observations``.
 """
 from __future__ import annotations
 
@@ -88,7 +109,71 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+
+class VectorIndexUnavailableError(RuntimeError):
+    """Raised when a vector read is attempted and sqlite-vec did not load.
+
+    Its own type, and raised by name, so a caller can tell "the vector arm is
+    not installed here" apart from "the query was wrong" — which a bare
+    ``sqlite3.OperationalError: no such table: vec_observations`` cannot.
+    """
+
+
+# Set once, per process, the first time the extension fails to load. The
+# warning is worth shouting; shouting it on every connection turns a one-line
+# actionable message into log noise that gets filtered out.
+_VEC_LOAD_WARNED = False
+
+
+def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
+    """Load the sqlite-vec extension onto ``conn``. Raises on any failure.
+
+    Imported lazily rather than at module scope on purpose: a top-level
+    ``import sqlite_vec`` would make an uninstalled or broken extension an
+    ImportError on ``aggregator.core.store``, which is imported by literally
+    every surface including read-only recall. The optional dependency has to
+    stay optional all the way down.
+
+    ``enable_load_extension`` is re-disabled in a ``finally`` so a failed load
+    cannot leave the connection able to side-load native code.
+    """
+    import sqlite_vec
+
+    conn.enable_load_extension(True)
+    try:
+        sqlite_vec.load(conn)
+    finally:
+        conn.enable_load_extension(False)
+
+
+def _try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
+    """Best-effort extension load. Returns whether the vector arm is usable.
+
+    Catches broadly and on purpose. The failure modes are a missing wheel
+    (ImportError), an ABI mismatch or a missing entry point
+    (sqlite3.OperationalError), and a python compiled without extension
+    loading at all (AttributeError) — and none of them is a reason for FTS5
+    recall to stop working.
+    """
+    global _VEC_LOAD_WARNED
+    try:
+        _load_sqlite_vec(conn)
+    except Exception as e:  # noqa: BLE001 - see docstring; degradation is the point
+        if not _VEC_LOAD_WARNED:
+            _VEC_LOAD_WARNED = True
+            log.warning(
+                "sqlite-vec extension failed to load (%s: %s) — the vector "
+                "retrieval arm is DISABLED for this process. FTS5 keyword "
+                "search is unaffected and continues to serve. Fix with "
+                "`uv sync` / reinstall the `sqlite-vec` wheel for this "
+                "interpreter, then re-run `aggregator embed --catchup`.",
+                type(e).__name__,
+                e,
+            )
+        return False
+    return True
 
 # WHAT A STORED ``src_hash`` PROMISES ABOUT THE SCRUBBER, and the one-line way
 # to break that promise on purpose.
@@ -243,7 +328,10 @@ _DDL: list[str] = [
         tool_name        TEXT,
         tool_use_id      TEXT,
         body             TEXT,
-        src_hash         TEXT          -- v4; see ``_src_hash``
+        src_hash         TEXT,         -- v4; see ``_src_hash``
+        -- v5. NULL means "not embedded yet" and is what the background embed
+        -- worker selects on; 'ok' / 'skip' / 'error' are terminal.
+        embedding_state  TEXT
     );
     """,
     "CREATE INDEX IF NOT EXISTS obs_root_ts ON observations(root_session_id, ts);",
@@ -288,7 +376,8 @@ _DDL: list[str] = [
         created_at TEXT,
         updated_at TEXT,
         extra      TEXT NOT NULL DEFAULT '{}',
-        src_hash   TEXT              -- v4; see ``_src_hash``
+        src_hash   TEXT,             -- v4; see ``_src_hash``
+        embedding_state TEXT         -- v5; NULL = not embedded yet
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_records_source ON records(source);",
@@ -403,6 +492,47 @@ _DDL: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS poison_faults_scope "
     "ON poison_faults(source, scope);",
+    # --- v5: the embed worker's backlog probe --------------------------
+    #
+    # ``select_unembedded`` is ``WHERE embedding_state IS NULL ORDER BY ts``
+    # over 372k rows on every worker batch. Without an index that is a full
+    # scan per batch, which is the shape of bug this schema keeps producing.
+    "CREATE INDEX IF NOT EXISTS obs_embedding_state "
+    "ON observations(embedding_state);",
+    "CREATE INDEX IF NOT EXISTS rec_embedding_state "
+    "ON records(embedding_state);",
+]
+
+
+# --- v5: the vector index, kept OUT of ``_DDL`` -----------------------------
+#
+# Separate because it is the only DDL in this file that can fail for a reason
+# that is nobody's bug: a ``vec0`` virtual table cannot be created — or dropped
+# — on a connection where the sqlite-vec extension did not load. Running these
+# from ``_DDL`` would make ``migrate()`` raise on a machine missing the
+# extension, taking the entire schema, and therefore FTS5 recall, down with the
+# optional half of the feature. ``migrate()`` runs them only when
+# ``vector_available``, and re-runs them on every invocation, so a database
+# that migrated without the extension picks the vec tables up on the first
+# command after the extension is fixed. No second migration, no version bump.
+_VEC_DDL: list[str] = [
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_observations USING vec0(
+        obs_id     TEXT PRIMARY KEY,
+        embedding  float[768]
+    );
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_records USING vec0(
+        stable_id  TEXT PRIMARY KEY,
+        embedding  float[768]
+    );
+    """,
+]
+
+_VEC_DROP_ALL: list[str] = [
+    "DROP TABLE IF EXISTS vec_observations;",
+    "DROP TABLE IF EXISTS vec_records;",
 ]
 
 
@@ -450,8 +580,21 @@ class Store:
         self.db_path = Path(db_path) if db_path else _default_db_path()
         self.read_only = read_only
         self._conn: sqlite3.Connection | None = None
+        self._vector_available = False
 
     # -- connection lifecycle ---------------------------------------------
+
+    @property
+    def vector_available(self) -> bool:
+        """Whether sqlite-vec loaded on this store's connection.
+
+        Reading it opens the connection, because the answer is not knowable
+        until the load has been attempted. False means the vector arm is off
+        for this store: vec DDL is skipped, vector writes no-op, and vector
+        reads raise :class:`VectorIndexUnavailableError`. FTS5 is unaffected.
+        """
+        self._c()
+        return self._vector_available
 
     def _c(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -466,6 +609,10 @@ class Store:
                 self._conn = sqlite3.connect(self.db_path)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON;")
+            # BEST-EFFORT, on read-only connections too — the vector arm is a
+            # read feature first. A failure here is not fatal; see
+            # ``_try_load_sqlite_vec`` and the v5 note in the module docstring.
+            self._vector_available = _try_load_sqlite_vec(self._conn)
             if self.read_only:
                 return self._conn
             # Codex Phase 2 MEDIUM #2: concurrent-writer safety. See prior
@@ -530,19 +677,55 @@ class Store:
         ``origin``, which would fail against a v2-shaped table. Guarded by a
         ``PRAGMA table_info`` probe (not user_version) so it only fires when
         the column is genuinely absent; fresh DBs get the column via DDL.
+
+        v4 → v5 upgrades in place on the same terms: two nullable
+        ``embedding_state`` columns, then the vec virtual tables — the latter
+        ONLY when sqlite-vec loaded. A machine without the extension still
+        migrates, still stamps v5, and still serves FTS5; it simply has no vec
+        tables until the extension is fixed, at which point the next
+        ``migrate()`` (one runs on every CLI invocation) creates them. Nothing
+        here touches ``ingest_state``, ``quarantine`` or ``poison_faults``.
         """
         self._ensure_writable()
         c = self._c()
         self._ensure_sessions_origin_column(c)
         self._ensure_src_hash_columns(c)
+        self._ensure_embedding_state_columns(c)
         for stmt in _DDL:
             c.executescript(stmt)
+        if self._vector_available:
+            for stmt in _VEC_DDL:
+                c.executescript(stmt)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
         c.commit()
+
+    @staticmethod
+    def _ensure_column(
+        c: sqlite3.Connection, table: str, column: str, ddl: str
+    ) -> None:
+        """Idempotent ``ALTER TABLE .. ADD COLUMN``.
+
+        Probes ``PRAGMA table_info(<table>)`` rather than ``user_version`` so a
+        half-applied state (column present, version stale) cannot run the ALTER
+        twice. No-op when the table does not exist yet — a fresh database gets
+        the column from the ``CREATE TABLE`` in ``_DDL`` instead.
+
+        ``table``, ``column`` and ``ddl`` are interpolated into SQL and are
+        never caller-supplied: every call site below passes literals.
+        """
+        table_exists = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if not table_exists:
+            return
+        cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")  # noqa: S608 - fixed literals
 
     @staticmethod
     def _ensure_sessions_origin_column(c: sqlite3.Connection) -> None:
@@ -553,17 +736,9 @@ class Store:
         the ALTER twice. No-op on fresh DBs (no sessions table yet — DDL
         creates it with the column) and on already-v3 DBs.
         """
-        table_exists = c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
-        ).fetchone()
-        if not table_exists:
-            return
-        cols = {row[1] for row in c.execute("PRAGMA table_info(sessions)")}
-        if "origin" not in cols:
-            c.execute(
-                "ALTER TABLE sessions ADD COLUMN origin "
-                "TEXT NOT NULL DEFAULT 'claude-code'"
-            )
+        Store._ensure_column(
+            c, "sessions", "origin", "TEXT NOT NULL DEFAULT 'claude-code'"
+        )
 
     @staticmethod
     def _ensure_src_hash_columns(c: sqlite3.Connection) -> None:
@@ -585,15 +760,28 @@ class Store:
         half-applied state cannot run the ALTER twice.
         """
         for table in ("records", "observations", "sessions"):
-            exists = c.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (table,),
-            ).fetchone()
-            if not exists:
-                continue
-            cols = {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
-            if "src_hash" not in cols:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN src_hash TEXT")  # noqa: S608 - fixed literals
+            Store._ensure_column(c, table, "src_hash", "TEXT")
+
+    @staticmethod
+    def _ensure_embedding_state_columns(c: sqlite3.Connection) -> None:
+        """v4 → v5 in-place upgrade: add ``embedding_state`` where absent.
+
+        NULL FOR EVERY EXISTING ROW, and that is the whole contract. NULL is
+        what ``select_unembedded`` selects on, so a pre-v5 corpus comes out of
+        the migration QUEUED FOR BACKFILL. Giving the column a non-NULL default
+        would be the same bug as advancing a watermark past data that was never
+        processed: the embed worker would find nothing to do, the vec tables
+        would stay empty, and hybrid retrieval would degrade to keyword-only
+        while every status surface reported a healthy, fully-embedded index.
+
+        Metadata-only, like the v4 ALTERs above: ``ADD COLUMN`` with no default
+        does not rewrite a single page of the 372k-row observations table.
+
+        Must run BEFORE the ``_DDL`` pass — v5 DDL creates indexes ON
+        ``embedding_state``, which cannot exist against a v4-shaped table.
+        """
+        Store._ensure_column(c, "observations", "embedding_state", "TEXT")
+        Store._ensure_column(c, "records", "embedding_state", "TEXT")
 
     def schema_version(self) -> int:
         """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
@@ -609,6 +797,14 @@ class Store:
         """
         self._ensure_writable()
         c = self._c()
+        # Vec tables first, and only when the module that owns them is loaded:
+        # SQLite runs the vtab's xDestroy to drop one, so ``DROP TABLE IF
+        # EXISTS vec_observations`` raises ``no such module: vec0`` rather than
+        # no-opping when sqlite-vec is missing. Skipping is correct — without
+        # the extension the tables were never created either.
+        if self._vector_available:
+            for stmt in _VEC_DROP_ALL:
+                c.execute(stmt)
         for stmt in _DROP_ALL:
             c.execute(stmt)
         c.commit()

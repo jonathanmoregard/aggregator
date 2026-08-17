@@ -492,10 +492,10 @@ def test_read_only_store_skips_wal_and_refuses_migration(tmp_path):
 # --- v2 sessions + observations -------------------------------------------
 
 
-def test_schema_version_is_4(tmp_data_home):
+def test_schema_version_is_5(tmp_data_home):
     s = Store()
     s.migrate()
-    assert s.schema_version() == SCHEMA_VERSION == 4
+    assert s.schema_version() == SCHEMA_VERSION == 5
 
 
 def test_upsert_entities_writes_sessions_and_observations(tmp_data_home):
@@ -714,7 +714,7 @@ def test_migrate_upgrades_v2_db_in_place_without_data_loss(tmp_data_home):
 
     s2 = Store()
     s2.migrate()
-    assert s2.schema_version() == SCHEMA_VERSION == 4
+    assert s2.schema_version() == SCHEMA_VERSION == 5
     cols = {r[1] for r in s2._c().execute("PRAGMA table_info(sessions)")}
     assert "origin" in cols
     rows = s2.query_sessions(QueryAST(top_session_id="pre-v3"))
