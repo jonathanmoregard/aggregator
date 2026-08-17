@@ -148,9 +148,16 @@ NEVER waits for backfill. Rows with `embedding_state IS NULL` still
 surface via the FTS5 arm of the fusion. Backfill catches up eventually;
 queries degrade gracefully to FTS5-only until then.
 
-## Schema migration (v3 → v4)
+## Schema migration (v4 → v5)
 
-`SCHEMA_VERSION = 4`.
+`SCHEMA_VERSION = 5`.
+
+**Renumbered 2026-08-17.** This spec was written on 2026-08-08 against a
+schema that was then at v3, so the RAG schema was numbered 4. `main` has
+since shipped its own v4 — the incremental-ingest watermarks
+(`ingest_state`), the dead-letter table and `poison_faults` — so the RAG
+schema takes 5. Read every "v3 → v4" below as "v4 → v5"; the migration
+shape is unchanged, and it must not disturb any v4 artefact.
 
 Additive, no rebuild required (parity with v2→v3 pattern):
 - `ALTER TABLE observations ADD COLUMN embedding_state TEXT` (nullable,
@@ -244,8 +251,9 @@ Gate criteria: `pytest` all green + `ruff check .` clean +
 
 ## Acceptance criteria
 
-1. `SCHEMA_VERSION = 4` and v3→v4 migration is idempotent and additive
-   (no rebuild for existing users).
+1. `SCHEMA_VERSION = 5` and v4→v5 migration is idempotent and additive
+   (no rebuild for existing users), and leaves `ingest_state`, the
+   dead-letter table and `poison_faults` untouched.
 2. `aggregator embed --catchup` embeds 100% of unembedded rows on a
    test fixture; second invocation is a no-op.
 3. `aggregator_search_memory("<semantic query>")` returns fused results
