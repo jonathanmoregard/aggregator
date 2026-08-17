@@ -97,6 +97,10 @@ import sqlite3
 from collections.abc import Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from aggregator.core.scrub import scrub
 from aggregator.sources.base import (
@@ -581,6 +585,7 @@ class Store:
         self.read_only = read_only
         self._conn: sqlite3.Connection | None = None
         self._vector_available = False
+        self._vector_write_warned = False
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -1134,6 +1139,178 @@ class Store:
             scope,
         )
         c.execute(f"DELETE FROM sessions WHERE origin IN ({placeholders})", scope)
+
+    # -- v5 vector index: writes, reads, and the embed watermark -----------
+    #
+    # EVERY ENTRY POINT HERE IS GUARDED ON ``vector_available``, and the two
+    # halves are guarded differently on purpose:
+    #
+    # * Writes NO-OP with a warning. The embed worker's job is to make forward
+    #   progress over a 372k-row backlog; a missing extension should stop it
+    #   writing vectors, not abort the run — and crucially it must not advance
+    #   ``embedding_state``, so the backlog is still there to embed once the
+    #   extension is fixed.
+    # * Reads RAISE, by name. A retrieval caller that silently got an empty
+    #   vector arm would degrade to keyword-only while reporting a hybrid
+    #   search, which is the "index rots and nobody finds out" failure this
+    #   project exists to prevent. The caller decides whether to fall back;
+    #   it cannot decide what it is never told.
+    #
+    # ``select_unembedded`` / ``mark_embedded`` are NOT guarded: they are
+    # ordinary reads and writes of a plain column and have no business
+    # depending on a native extension.
+
+    def upsert_vec_observations(
+        self, rows: list[tuple[str, np.ndarray]]
+    ) -> None:
+        """Upsert ``(obs_id, embedding)`` rows into ``vec_observations``.
+
+        Delete-then-insert to keep the upsert idempotent: vec0 virtual tables
+        do not support ``ON CONFLICT``.
+        """
+        self._ensure_writable()
+        if not self._vector_writes_enabled():
+            return
+        c = self._c()
+        for obs_id, embedding in rows:
+            c.execute("DELETE FROM vec_observations WHERE obs_id = ?", (obs_id,))
+            c.execute(
+                "INSERT INTO vec_observations(obs_id, embedding) VALUES (?, ?)",
+                (obs_id, embedding.astype("float32").tobytes()),
+            )
+        c.commit()
+
+    def upsert_vec_records(self, rows: list[tuple[str, np.ndarray]]) -> None:
+        """Upsert ``(stable_id, embedding)`` rows into ``vec_records``."""
+        self._ensure_writable()
+        if not self._vector_writes_enabled():
+            return
+        c = self._c()
+        for stable_id, embedding in rows:
+            c.execute("DELETE FROM vec_records WHERE stable_id = ?", (stable_id,))
+            c.execute(
+                "INSERT INTO vec_records(stable_id, embedding) VALUES (?, ?)",
+                (stable_id, embedding.astype("float32").tobytes()),
+            )
+        c.commit()
+
+    def _vector_writes_enabled(self) -> bool:
+        """Whether a vector write can proceed; warns once per store if not."""
+        if self.vector_available:
+            return True
+        if not self._vector_write_warned:
+            self._vector_write_warned = True
+            log.warning(
+                "vector index unavailable (sqlite-vec did not load) — "
+                "discarding vector writes for this store. embedding_state is "
+                "deliberately NOT advanced, so the backlog survives and "
+                "`aggregator embed --catchup` will fill it once the extension "
+                "is working."
+            )
+        return False
+
+    def _require_vector(self) -> None:
+        if not self.vector_available:
+            raise VectorIndexUnavailableError(
+                "vector retrieval is unavailable: the sqlite-vec extension "
+                "did not load on this connection. FTS5 keyword search still "
+                "works; re-install the `sqlite-vec` wheel for this interpreter "
+                "to restore the vector arm."
+            )
+
+    def select_unembedded(self, kind: str, limit: int = 500) -> list[sqlite3.Row]:
+        """Rows whose ``embedding_state IS NULL`` — the embed worker's backlog.
+
+        Newest first: a fresh observation is the one most likely to be searched
+        for, so a partially-embedded corpus is useful long before it is
+        complete.
+        """
+        c = self._c()
+        if kind == "observations":
+            return list(
+                c.execute(
+                    "SELECT obs_id, body FROM observations "
+                    "WHERE embedding_state IS NULL "
+                    "ORDER BY ts DESC LIMIT ?",
+                    (limit,),
+                )
+            )
+        if kind == "records":
+            return list(
+                c.execute(
+                    "SELECT stable_id, subject, body FROM records "
+                    "WHERE embedding_state IS NULL "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                )
+            )
+        raise ValueError(f"unknown kind: {kind!r}")
+
+    def mark_embedded(self, kind: str, ids: list[str], state: str) -> None:
+        """Batch-advance ``embedding_state`` for ``ids``.
+
+        ``state`` is one of ``'ok'`` / ``'skip'`` / ``'error'``; anything else
+        raises rather than writing a value nothing selects on. An EMPTY ``ids``
+        list is a no-op and not an error — the worker reaches it on any batch
+        that was all-successes or all-skips, and ``IN ()`` is a SQL syntax
+        error, not an empty set.
+        """
+        self._ensure_writable()
+        if state not in ("ok", "skip", "error"):
+            raise ValueError(f"invalid state: {state!r}")
+        if kind == "observations":
+            col, table = "obs_id", "observations"
+        elif kind == "records":
+            col, table = "stable_id", "records"
+        else:
+            raise ValueError(f"unknown kind: {kind!r}")
+        if not ids:
+            return
+        c = self._c()
+        for page in _chunked(ids, 500):
+            placeholders = ",".join("?" * len(page))
+            c.execute(
+                f"UPDATE {table} SET embedding_state = ? "  # noqa: S608 - allowlisted literals
+                f"WHERE {col} IN ({placeholders})",
+                (state, *page),
+            )
+        c.commit()
+
+    def _vec_obs_ids(self, query_embedding: np.ndarray, k: int) -> list[str]:
+        """Vector KNN over ``vec_observations``.
+
+        Returns top-K ``obs_id`` ordered by ascending distance — best match
+        first, which is the order RRF expects.
+        """
+        self._require_vector()
+        c = self._c()
+        rows = c.execute(
+            """
+            SELECT obs_id
+            FROM vec_observations
+            WHERE embedding MATCH ?
+            ORDER BY distance
+            LIMIT ?
+            """,
+            (query_embedding.astype("float32").tobytes(), k),
+        ).fetchall()
+        return [r["obs_id"] for r in rows]
+
+    def _vec_record_ids(self, query_embedding: np.ndarray, k: int) -> list[str]:
+        """Vector KNN over ``vec_records``. Same contract as ``_vec_obs_ids``."""
+        self._require_vector()
+        c = self._c()
+        rows = c.execute(
+            """
+            SELECT stable_id
+            FROM vec_records
+            WHERE embedding MATCH ?
+            ORDER BY distance
+            LIMIT ?
+            """,
+            (query_embedding.astype("float32").tobytes(), k),
+        ).fetchall()
+        return [r["stable_id"] for r in rows]
 
     # -- ingest state: the per-source high-water mark ----------------------
 
