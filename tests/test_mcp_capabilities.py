@@ -234,6 +234,64 @@ def _seeded_store():
     return store
 
 
+# --- the enumeration a caller reads must match what the code emits --------
+#
+# Two docstrings enumerate the ``vector_index`` states: ``aggregator_capabilities``
+# (which IS the MCP tool description a caller reads before acting) and
+# ``Store.vector_index_state`` (which the first one restates). Chunk N added
+# ``degraded`` to the code and neither enumeration noticed, so a caller reading
+# the tool description would conclude the state did not exist. Asserted together
+# and in one place, because they are one invariant with two copies.
+
+
+def _states_the_store_can_report() -> set[str]:
+    """Every literal ``state`` value ``vector_index_state`` can return.
+
+    Read out of the production source, NOT listed here: a hand-maintained list
+    in a test is the same artefact as the hand-maintained list in a docstring.
+    It would go stale in the same way, at the same moment, and for the same
+    reason — which is exactly what happened.
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(Store.vector_index_state)
+    return set(re.findall(r'^\s*state = "([a-z_]+)"$', src, re.MULTILINE))
+
+
+def test_the_state_extraction_itself_has_teeth():
+    """Without this, a refactor that breaks the regex makes the two tests
+    below pass vacuously — a doc guard that guards nothing is worse than none,
+    because it is also believed."""
+    states = _states_the_store_can_report()
+    assert states >= {
+        "unavailable",
+        "empty",
+        "complete",
+        "degraded",
+        "not_started",
+        "backfilling",
+    }, f"state extraction found only {sorted(states)}"
+
+
+def test_capabilities_docstring_documents_every_state_it_can_report():
+    documented = aggregator_capabilities.__doc__ or ""
+    missing = sorted(s for s in _states_the_store_can_report() if s not in documented)
+    assert not missing, (
+        f"aggregator_capabilities' docstring — the MCP tool description a "
+        f"caller reads — does not name these states it can return: {missing}"
+    )
+
+
+def test_vector_index_state_docstring_documents_every_state_it_can_report():
+    documented = Store.vector_index_state.__doc__ or ""
+    missing = sorted(s for s in _states_the_store_can_report() if s not in documented)
+    assert not missing, (
+        f"Store.vector_index_state's docstring does not name these states it "
+        f"returns: {missing}"
+    )
+
+
 def test_capabilities_help_includes_dsl_syntax(tmp_data_home):
     store = Store()
     _seed(store)

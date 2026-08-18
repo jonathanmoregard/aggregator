@@ -2775,7 +2775,7 @@ class Store:
     def vector_index_state(self) -> dict:
         """v5: how much of the corpus hybrid retrieval can actually reach.
 
-        THREE SITUATIONS THAT LOOK ALIKE AND ARE NOT, which is the whole
+        FOUR SITUATIONS THAT LOOK ALIKE AND ARE NOT, which is the whole
         reason this is a structured value rather than a row count:
 
         * **the vector arm is unavailable** — sqlite-vec did not load, or this
@@ -2785,10 +2785,18 @@ class Store:
           worker has not run. Fix: run ``aggregator embed``.
         * **backfill in progress** — the arm works and is partway through.
           Fix: wait. Recall is already better than FTS5 alone and improving.
+        * **backfill drained but incomplete** — nothing is pending and yet
+          rows are missing, because the worker set them aside as ``'error'``.
+          Waiting cannot fix this one, which is exactly why it may not be
+          reported as ``complete``. Fix: ``aggregator status`` names the held
+          rows (ledger sources ``embed:observations`` / ``embed:records``)
+          and says whether each will retry or is terminal; the ones still due
+          come back by themselves, the terminal ones never do.
 
         Reported as ``state`` ∈ ``unavailable`` | ``empty`` | ``not_started`` |
-        ``backfilling`` | ``complete``, with the raw numbers alongside so a
-        caller can render a percentage without re-deriving the verdict.
+        ``backfilling`` | ``degraded`` | ``complete``, with the raw numbers
+        alongside so a caller can render a percentage without re-deriving the
+        verdict.
 
         ``vectors`` is ``None``, never ``0``, when the arm is unavailable:
         the count is genuinely unknown, and a 0 there is precisely the lie

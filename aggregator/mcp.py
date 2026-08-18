@@ -1169,12 +1169,27 @@ def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
     """Read-only inventory of the aggregator cache.
 
     ``vector_index`` (v5) reports whether hybrid retrieval is warm on this
-    cache, and keeps three situations that all look like "0 embedded" apart:
-    ``state='unavailable'`` (sqlite-vec missing — search is FTS5-only and
-    somebody has to fix the install), ``state='not_started'`` (the arm works,
-    nothing embedded yet — run ``aggregator embed``), and
-    ``state='backfilling'`` (partway through — wait; recall is already better
-    than FTS5 alone). Plus ``empty`` (nothing to embed) and ``complete``.
+    cache, and keeps apart the situations that all look like "0 embedded".
+    Every ``state``, and what to do about it:
+
+    * ``unavailable`` — sqlite-vec did not load. Search is FTS5-only and no
+      amount of waiting fixes it; the install has to be repaired.
+    * ``not_started`` — the arm works, nothing embedded yet. Run
+      ``aggregator embed`` (or let its timer do it).
+    * ``backfilling`` — partway through. Wait; recall is already better than
+      FTS5 alone and improving. A first full backfill takes weeks, not hours.
+    * ``degraded`` — nothing pending, but ``errors > 0``: the worker set
+      those rows aside, so they are reachable by keyword only and waiting
+      will NOT bring them in. Kept out of ``complete`` on purpose — a
+      stalled index whose counts all read "fine" is the failure this
+      project exists to prevent. Do: run ``aggregator status``, which names
+      the held rows (ledger sources ``embed:observations`` /
+      ``embed:records``) and says whether each will retry or is terminal.
+      Retryable ones return on their own as the backoff elapses; terminal
+      ones never do, and ``errors`` is then the count of documents the
+      vector arm will never reach.
+    * ``empty`` — nothing in the cache to embed.
+    * ``complete`` — everything embedded, nothing set aside.
 
     Returns:
       ``{ok: True, sources: [...], freshness: {...}, counts: {...},
