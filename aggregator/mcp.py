@@ -122,6 +122,34 @@ _VECTOR_ARM_K = 50
 # the number to shrink if that changes is this one.
 _RERANK_WINDOW = 20
 
+# THE PAGE TOKEN IS CALLER-CONTROLLED INPUT, NOT SERVER STATE. It looks like
+# state because this server minted it, but it arrives back over MCP from
+# whatever is driving the tool, and it is decompressed before it is validated.
+# Deflate reaches ~1000:1, so an unbounded ``zlib.decompress`` here lets a
+# token the caller can type expand into the process's address space — and this
+# process is an in-process child of the user's editor, with no unit and no
+# memory cgroup to absorb it.
+#
+# The bound is DERIVED FROM THE REAL MAXIMUM, not guessed. A legitimate
+# payload is ``{kind: [ids]}`` over the two ontologies, each capped at
+# ``_VECTOR_ARM_K`` hits by the arm that produced them, so:
+#
+#   2 ontologies x _VECTOR_ARM_K ids x the longest id we mint
+#
+# The longest ids are dropbox records, whose source-specific part is a
+# filesystem path; 512 chars is generously past a 255-byte NAME_MAX component
+# and past every other source's shape (``github:<owner>/<repo>:<n>``, a UUID,
+# a chunk suffix). ``test_a_maximum_legitimate_token_still_round_trips``
+# in ``tests/test_mcp_page_token_hardening.py`` packs exactly that worst case
+# and fails if it no longer fits.
+_MAX_FROZEN_ID_CHARS = 512
+_MAX_FROZEN_PAYLOAD_BYTES = 2 * _VECTOR_ARM_K * (_MAX_FROZEN_ID_CHARS + 8) + 256
+# The same budget measured on the wire. Deflate never expands incompressible
+# input by more than ~0.03% + 11 bytes, and base64 is 4/3, so this is a sound
+# ceiling on a legitimate token and lets an over-long one be rejected BEFORE
+# it is base64-decoded — a 50 MB argument must not first cost a 37 MB decode.
+_MAX_FROZEN_PAYLOAD_B64_CHARS = ((_MAX_FROZEN_PAYLOAD_BYTES + 1024) * 4) // 3
+
 # Exposed MCP tool names. The search tool deliberately carries "search" and
 # "memory" in its name: under deferred tool loading the client only sees tool
 # NAMES until it runs a tool-search, so a name with no recall vocabulary is
@@ -526,23 +554,64 @@ class _PageCursor:
         return self.hybrid
 
 
+class _PageTokenError(ValueError):
+    """A page token this server would not have minted.
+
+    Raised rather than absorbed, because the two silent alternatives are both
+    wrong: truncating an over-long payload hands the caller a plausible but
+    WRONG frozen set, and resetting to offset 0 hands back page 1 to a caller
+    that believes it advanced. Both look like success.
+    """
+
+
 def _pack_frozen(frozen: dict[str, list[str]]) -> str:
     payload = json.dumps(frozen, separators=(",", ":"), sort_keys=True).encode()
     return base64.urlsafe_b64encode(zlib.compress(payload, 9)).decode().rstrip("=")
 
 
 def _unpack_frozen(payload: str) -> dict[str, list[str]] | None:
-    """Decode a frozen-set payload, or ``None`` if it is not one.
+    """Decode a frozen-set payload, or ``None`` if it carries no usable hits.
 
-    Every failure resolves to ``None`` — re-run the KNN — because a token the
-    caller cannot decode is a stale or corrupted token, and answering it with
-    a slightly-drifted page beats refusing to answer at all.
+    BOUNDED AT EVERY STEP, because every byte here came from the caller. The
+    order matters — each check is cheaper than the one it guards:
+
+    1. The base64 length, before decoding it. Rejecting a 50 MB argument must
+       not first cost a 37 MB decode of it.
+    2. The inflate, via ``decompressobj(...).decompress(data, max_length)``.
+       ``zlib.decompress`` has no such parameter, which is how ~1000:1
+       expansion of caller input got into an in-process MCP server.
+    3. The id count, against ``_VECTOR_ARM_K`` — the actual ceiling of the arm
+       that mints these — so a well-formed, in-budget token still cannot
+       smuggle in an oversized candidate set.
+
+    A payload that violates any of them raises ``_PageTokenError``; it is not
+    a stale token, it is one no version of this server ever produced.
     """
+    if len(payload) > _MAX_FROZEN_PAYLOAD_B64_CHARS:
+        raise _PageTokenError(
+            f"payload is {len(payload)} characters, over the "
+            f"{_MAX_FROZEN_PAYLOAD_B64_CHARS} this server can mint"
+        )
     try:
         pad = "=" * (-len(payload) % 4)
-        raw = zlib.decompress(base64.urlsafe_b64decode(payload + pad))
+        compressed = base64.urlsafe_b64decode(payload + pad)
+    except Exception:  # noqa: BLE001 — malformed base64 is not a frozen set
+        return None
+    # max_length caps the OUTPUT, so the bomb is never materialised. Anything
+    # left over means the stream wanted to expand past the cap.
+    inflater = zlib.decompressobj()
+    try:
+        raw = inflater.decompress(compressed, _MAX_FROZEN_PAYLOAD_BYTES)
+    except zlib.error:
+        return None
+    if inflater.unconsumed_tail or not inflater.eof:
+        raise _PageTokenError(
+            f"payload expands past the {_MAX_FROZEN_PAYLOAD_BYTES} byte cap "
+            f"derived from {_VECTOR_ARM_K} hits per ontology"
+        )
+    try:
         out = json.loads(raw)
-    except Exception:  # noqa: BLE001 — any malformed token degrades, never raises
+    except Exception:  # noqa: BLE001 — not JSON is not a frozen set
         return None
     if not isinstance(out, dict):
         return None
@@ -552,6 +621,11 @@ def _unpack_frozen(payload: str) -> dict[str, list[str]] | None:
             return None
         if not all(isinstance(i, str) for i in ids):
             return None
+        if len(ids) > _VECTOR_ARM_K:
+            raise _PageTokenError(
+                f"payload claims {len(ids)} {kind} hits; the vector arm "
+                f"returns at most {_VECTOR_ARM_K}"
+            )
         clean[kind] = ids
     return clean
 
@@ -580,6 +654,26 @@ def _parse_page_token(token: str | None) -> _PageCursor:
         hybrid=hybrid,
         frozen=_unpack_frozen(payload) if payload else None,
     )
+
+
+def _page_token_refusal(e: _PageTokenError) -> dict[str, Any]:
+    """The structured refusal for a token this server would not have minted.
+
+    Deliberately NOT a ``notice`` on an otherwise-successful page. A notice is
+    advisory, and the thing being reported is that the caller's position in
+    the result set is unknown — so continuing to serve rows under it is the
+    failure, not the reporting of it.
+    """
+    return {
+        "ok": False,
+        "reason": f"unusable page_token: {e}",
+        "remediation": (
+            "Pass back the exact next_page_token string from the previous "
+            "response, unmodified, or omit page_token to start from the "
+            "first page. Do not hand-build or edit page tokens: they are "
+            "opaque and only meaningful to the query that minted them."
+        ),
+    }
 
 
 def _mint_page_token(
@@ -905,7 +999,10 @@ def aggregator_query(
             else _DEFAULT_PAGE_SIZE_SUMMARY
         )
     page_size = max(1, int(page_size))
-    cursor = _parse_page_token(page_token)
+    try:
+        cursor = _parse_page_token(page_token)
+    except _PageTokenError as e:
+        return _page_token_refusal(e)
 
     mode = _route_mode(ast)
     if mode == "sessions":

@@ -1,0 +1,133 @@
+"""A page token is caller-controlled input, and it was trusted like state.
+
+``page_token`` is the only argument on this surface that the server itself
+minted, so it reads like server state — and it is not. It arrives over MCP
+from whatever is driving the tool, and until this module's fixes it was
+decompressed, decoded and believed with no bound anywhere:
+
+* ``zlib.decompress`` with no ``max_length``. Deflate reaches ~1000:1, and
+  the MCP server is an in-process child of the user's editor, so a token the
+  caller can type expands into the editor's address space until the OOM
+  killer picks a victim. Three separate reviewers flagged this one.
+* No cap on the number of ids inside, even though the arm that mints them
+  returns at most ``_VECTOR_ARM_K``.
+* Every malformation resolved to "offset 0, free arm choice" — a caller that
+  mangled a token silently re-read page 1 while believing it had advanced.
+  That is the exact silent-data-loss shape the project's fail-loudly rule
+  exists to forbid, and the caller has no way to notice.
+* ``"40.<payload>"`` — no ``h``, but frozen hits present — parsed to
+  ``hybrid=False`` while ``pin_for`` pinned the arms ON from ``frozen``. The
+  token said two incompatible things and the code quietly followed one.
+
+The contract these tests pin: a token this server would not have minted is
+refused with a structured error naming the remedy, never truncated, never
+silently restarted.
+"""
+
+from __future__ import annotations
+
+import base64
+import tracemalloc
+import zlib
+
+import pytest
+
+from aggregator.core.store import Store
+from aggregator.mcp import (
+    _MAX_FROZEN_PAYLOAD_BYTES,
+    _VECTOR_ARM_K,
+    _mint_page_token,
+    _pack_frozen,
+    _parse_page_token,
+    aggregator_query,
+)
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = Store(db_path=tmp_path / "cache.db")
+    s.migrate()
+    return s
+
+
+@pytest.fixture(autouse=True)
+def _no_real_model(monkeypatch):
+    """A pinned token engages the vector arm, which would build a real
+    Embedder. Nothing here is about embedding quality, and a test that names
+    a real model is how an earlier round pulled 15 GB off a CDN."""
+
+    class _StubEmbedder:
+        def embed_query(self, query):
+            import numpy as np
+
+            return np.zeros(768, dtype=np.float32)
+
+    monkeypatch.setattr("aggregator.mcp._get_embedder", _StubEmbedder)
+
+
+def _bomb_payload(expanded_bytes: int) -> str:
+    """A token whose compressed form is small and whose expansion is not."""
+    return (
+        base64.urlsafe_b64encode(zlib.compress(b"\0" * expanded_bytes, 9))
+        .decode()
+        .rstrip("=")
+    )
+
+
+# --- M1: unbounded decompress on caller-supplied input ----------------------
+
+
+def test_a_decompression_bomb_token_is_never_expanded(store):
+    """THE REPRO. 64 MB of expansion from a ~90 KB token, and the pre-fix code
+    materialised every byte of it inside the editor's own process."""
+    expanded = 64 * 1024 * 1024
+    token = "h0." + _bomb_payload(expanded)
+
+    tracemalloc.start()
+    try:
+        result = aggregator_query("voting", page_token=token, _store=store)
+        _cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 8 * 1024 * 1024, (
+        f"the caller-supplied token was expanded: {peak / 1e6:.1f} MB of heap "
+        f"for a {len(token)} byte token"
+    )
+    assert result["ok"] is False
+    assert "page_token" in result["reason"]
+
+
+def test_the_bomb_is_refused_loudly_and_not_truncated_into_a_wrong_page(store):
+    """Truncating at the cap would hand back a plausible, wrong frozen set."""
+    token = "h40." + _bomb_payload(8 * 1024 * 1024)
+    result = aggregator_query("voting", page_token=token, _store=store)
+    assert result["ok"] is False
+    assert result["remediation"]
+
+
+def test_an_oversized_payload_is_rejected_before_it_is_decoded(store):
+    """A huge token must cost O(1), not a base64 decode of the whole thing."""
+    token = "h0." + ("A" * (4 * _MAX_FROZEN_PAYLOAD_BYTES))
+    result = aggregator_query("voting", page_token=token, _store=store)
+    assert result["ok"] is False
+
+
+def test_more_ids_than_the_vector_arm_can_ever_return_is_refused(store):
+    """``_VECTOR_ARM_K`` is the real maximum; the token claimed more."""
+    payload = _pack_frozen({"observations": [f"o{i}" for i in range(_VECTOR_ARM_K + 1)]})
+    result = aggregator_query("voting", page_token=f"h0.{payload}", _store=store)
+    assert result["ok"] is False
+    assert "page_token" in result["reason"]
+
+
+def test_a_maximum_legitimate_token_still_round_trips():
+    """The cap is derived from the real maximum, so the real maximum fits."""
+    long_id = "dropbox:" + ("a" * 500)
+    frozen = {
+        "observations": [f"{long_id}:{i}" for i in range(_VECTOR_ARM_K)],
+        "records": [f"{long_id}:{i}" for i in range(_VECTOR_ARM_K)],
+    }
+    cursor = _parse_page_token(_mint_page_token(40, True, frozen))
+    assert cursor.frozen == frozen
+    assert cursor.offset == 40
