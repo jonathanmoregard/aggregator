@@ -364,10 +364,19 @@
               # read HF_HUB_OFFLINE. AF_UNIX stays for journal/dbus,
               # AF_NETLINK for the glibc resolver paths that probe interfaces
               # on startup even when nothing connects.
+              # The directives BOTH torch units carry. Round-2 LOW: the seeder
+              # had none of them at all — `systemd-analyze security
+              # --offline=true --user` rated the rendered files 6.3 MEDIUM for
+              # the worker and 9.2 UNSAFE for the seeder — even though the
+              # seeder is the one that reaches the public internet and then
+              # loads ~2.4 GB of third-party weights into torch. Being
+              # human-triggered bounds how often that happens, not what it can
+              # do when it does. They share one Nix binding now, and this
+              # loop asserts the sharing survived.
+              seed_svc="$units/aggregator-embed-seed.service"
               for directive in \
                 'NoNewPrivileges=true' \
                 'PrivateTmp=true' \
-                'RestrictAddressFamilies=AF_UNIX AF_NETLINK' \
                 'RestrictNamespaces=true' \
                 'RestrictRealtime=true' \
                 'RestrictSUIDSGID=true' \
@@ -375,19 +384,38 @@
                 'SystemCallArchitectures=native' \
                 'ProtectSystem=full' \
                 'ProtectKernelTunables=true' \
-                'ProtectControlGroups=true' \
+                'ProtectControlGroups=true'; do
+                grep -qxF "$directive" "$svc" \
+                  || fail "aggregator-embed.service is missing '$directive'"
+                grep -qxF "$directive" "$seed_svc" \
+                  || fail "aggregator-embed-seed.service is missing '$directive' — it downloads 2.4 GB off the internet and loads it into torch, and it must not be less sandboxed than the offline worker on anything except the network"
+              done
+
+              # The worker's two network directives, which the seeder is the
+              # one unit allowed to relax.
+              for directive in \
+                'RestrictAddressFamilies=AF_UNIX AF_NETLINK' \
                 'IPAddressDeny=any'; do
                 grep -qxF "$directive" "$svc" \
                   || fail "aggregator-embed.service is missing '$directive'"
               done
 
-              # The seeder is the one unit that MUST reach the network, so it
-              # may not inherit the address-family restriction. Asserting the
-              # absence keeps a well-meaning copy-paste from silently turning
-              # the documented download path into a unit that cannot download.
-              if grep -q '^RestrictAddressFamilies=' \
-                   "$units/aggregator-embed-seed.service"; then
-                fail "aggregator-embed-seed.service restricts address families — it exists to download weights"
+              # The seeder MUST still restrict address families — dropping the
+              # directive entirely would re-admit AF_PACKET, AF_BLUETOOTH,
+              # AF_VSOCK and the rest of the exotic families, which is most of
+              # the socket-family kernel attack surface and none of what a
+              # downloader needs. It must simply also permit IP.
+              seed_raf=$(sed -n 's/^RestrictAddressFamilies=//p' "$seed_svc")
+              [ -n "$seed_raf" ] \
+                || fail "aggregator-embed-seed.service sets no RestrictAddressFamilies — a downloader needs TCP over IP, not AF_PACKET and AF_BLUETOOTH"
+              for fam in AF_INET AF_INET6; do
+                case " $seed_raf " in
+                  *" $fam "*) ;;
+                  *) fail "aggregator-embed-seed.service does not permit $fam (RestrictAddressFamilies=$seed_raf) — this is the documented download path and it could not open a socket" ;;
+                esac
+              done
+              if grep -q '^IPAddressDeny=any$' "$seed_svc"; then
+                fail "aggregator-embed-seed.service sets IPAddressDeny=any — that blocks the download this unit exists to perform"
               fi
 
               # ---- 9. The score behind step 8, and why it is not asserted -

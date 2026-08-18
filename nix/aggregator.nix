@@ -331,6 +331,49 @@ let
         + " \"infinity\" to disable the timeout";
     };
 
+  # ---- shared sandbox for the two units that run torch -------------------
+  #
+  # WHAT THESE UNITS ACTUALLY DO: pull ~2.4 GB of third-party weights off the
+  # internet, and feed the corpus — web pages, PDFs, chat exports, GitHub
+  # bodies, none of it authored by the user — through torch and a native
+  # tokenizer. That is a large C++ attack surface chewing on untrusted bytes,
+  # and until round 1 it did so with the user's full ambient authority.
+  #
+  # One binding rather than two copies, so the worker and the seeder cannot
+  # drift apart on everything except the axis they are genuinely supposed to
+  # differ on, which is the network.
+  #
+  # DELIBERATELY ABSENT, and each absence is load-bearing for torch:
+  #
+  #   MemoryDenyWriteExecute — torch's JIT and the OpenMP runtime allocate
+  #     W|X pages. Setting it makes `import torch` die, and it is the single
+  #     most likely directive for a future hardening pass to reach for. There
+  #     is a check asserting it stays absent, precisely because adding it
+  #     looks like an improvement.
+  #   ProtectSystem=strict — would need an explicit ReadWritePaths for the HF
+  #     cache; getting that list wrong fails at runtime, on units this branch
+  #     cannot start on this host. `full` leaves $HOME writable, which is
+  #     where the cache lives, and still makes /usr, /boot and /etc read-only.
+  #   PrivateDevices, ProtectKernelModules, SystemCallFilter — not applied in
+  #     round 1 and not added here. Nothing has ever executed this sandbox
+  #     (see nix/README.md, "what remains unproven"), so widening it further
+  #     on a host that cannot run it would be guesswork dressed as rigour.
+  embedSandboxCommon = {
+    NoNewPrivileges = true;
+    # Its own /tmp. torch and huggingface both scribble there, and a shared
+    # /tmp is a trivial channel between this and everything else the user runs.
+    PrivateTmp = true;
+    RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    SystemCallArchitectures = "native";
+    # `full`, NOT `strict` — see above.
+    ProtectSystem = "full";
+    ProtectKernelTunables = true;
+    ProtectControlGroups = true;
+  };
+
   # user-timer schema notes (verified against `man systemd.timer`, systemd v256):
   #   OnCalendar    — realtime calendar spec (`*:0/30` = every 30min of every hour).
   #   OnBootSec     — offset from boot; triggers once per boot after the delay.
@@ -676,16 +719,11 @@ in {
           StandardOutput = "journal";
           StandardError = "journal";
 
-          # ---- sandbox ----------------------------------------------------
-          # WHAT THIS UNIT ACTUALLY DOES: feed the corpus — web pages, PDFs,
-          # chat exports, GitHub bodies, none of it authored by the user —
-          # through torch and a native tokenizer. That is a large C++ attack
-          # surface chewing on untrusted bytes, and until now it did so with
-          # the user's full ambient authority.
-          #
-          # Its "offline" was two environment variables. An env var is a
-          # request, not a boundary: any library that ignores it, or any
-          # subprocess spawned along the way, had the entire network.
+        } // embedSandboxCommon // {
+          # ---- sandbox: the OFFLINE half ----------------------------------
+          # This unit's "offline" used to be two environment variables. An env
+          # var is a request, not a boundary: any library that ignores it, or
+          # any subprocess spawned along the way, had the entire network.
           #
           # RestrictAddressFamilies is the load-bearing line here. seccomp,
           # supported in a USER manager, and it makes an AF_INET socket()
@@ -700,24 +738,6 @@ in {
           # the case where a future revision has to re-widen the address
           # families above.
           IPAddressDeny = "any";
-
-          NoNewPrivileges = true;
-          # Its own /tmp. torch and huggingface both scribble there, and a
-          # shared /tmp is a trivial channel between this and everything else
-          # the user runs.
-          PrivateTmp = true;
-          RestrictNamespaces = true;
-          RestrictRealtime = true;
-          RestrictSUIDSGID = true;
-          LockPersonality = true;
-          SystemCallArchitectures = "native";
-          # `full`, NOT `strict`: /usr, /boot and /etc go read-only while
-          # $HOME stays writable. `strict` would need an explicit
-          # ReadWritePaths for the cache, and getting that list wrong fails
-          # at runtime on a unit this branch cannot start on this host.
-          ProtectSystem = "full";
-          ProtectKernelTunables = true;
-          ProtectControlGroups = true;
         };
       };
 
@@ -756,6 +776,43 @@ in {
           TimeoutStartSec = "4h";
           StandardOutput = "journal";
           StandardError = "journal";
+        } // embedSandboxCommon // {
+          # ---- sandbox: the ONLINE half -----------------------------------
+          # Round-2 LOW: this unit had ZERO sandbox directives. Measured with
+          # `systemd-analyze security --offline=true --user` on the rendered
+          # files: aggregator-embed.service scored 6.3 MEDIUM after round 1,
+          # this one 9.2 UNSAFE. It is the unit that reaches the public
+          # internet and then loads ~2.4 GB of third-party weights into torch,
+          # so "it only runs when a human starts it" bounds how often that
+          # happens, not what it can do when it does.
+          #
+          # It shares `embedSandboxCommon` with the worker. Exactly two
+          # directives are relaxed, and only because downloading is the
+          # unit's entire purpose:
+          #
+          #   RestrictAddressFamilies gains AF_INET + AF_INET6. It cannot be
+          #     dropped to "no restriction": keeping the directive still bars
+          #     AF_PACKET (raw frames), AF_BLUETOOTH, AF_VSOCK and the rest of
+          #     the exotic families that carry most of the socket-family
+          #     kernel attack surface. A downloader needs TCP over IP and
+          #     nothing else.
+          #
+          #   IPAddressDeny is omitted rather than set. `any` would block the
+          #     download outright; there is no useful allowlist to put here
+          #     either, because huggingface.co resolves to a CDN whose address
+          #     set changes without notice, and an allowlist that goes stale
+          #     turns into a mystery failure on the one unit a human runs by
+          #     hand and watches. `HF_HUB_OFFLINE=0` in Environment above is
+          #     what marks this unit as the network one.
+          #
+          # Everything else in the common set survives unchanged: fetching
+          # weights needs no new privileges, no namespaces, no realtime
+          # scheduling, no setuid, no writable /usr, and no shared /tmp.
+          #
+          # NOT PROVEN BY EXECUTION — see nix/README.md. This host's
+          # aggregator-env lacks torch, so no process has run under these
+          # directives. What is verified is the rendered file and its score.
+          RestrictAddressFamilies = "AF_UNIX AF_NETLINK AF_INET AF_INET6";
         };
       };
 

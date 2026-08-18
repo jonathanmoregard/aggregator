@@ -195,6 +195,61 @@ Fetching weights has no business touching the corpus.
 unit stops naming either model repo, stops running `--seed-models`, drops the
 download opt-in, or starts embedding rows again.
 
+### Sandboxing the two units that run torch
+
+Both `aggregator-embed.service` and `aggregator-embed-seed.service` load
+third-party weights into torch and a native tokenizer — a large C++ attack
+surface. The worker additionally feeds it the corpus (web pages, PDFs, chat
+exports, GitHub bodies), none of which the user wrote. They share one Nix
+binding, `embedSandboxCommon`, so they cannot drift apart on anything except
+the axis they are genuinely meant to differ on: the network.
+
+Measured with `systemd-analyze security --offline=true --user` against the
+rendered files:
+
+| Unit | Before | After |
+|---|---|---|
+| `aggregator-embed.service` | 9.4 UNSAFE | **6.3 MEDIUM** |
+| `aggregator-embed-seed.service` | 9.2 UNSAFE | **6.8 MEDIUM** |
+
+The seeder had *zero* sandbox directives, despite being the one unit that
+reaches the public internet. Being human-triggered bounds how often that
+happens, not what it can do when it does.
+
+Exactly two directives are relaxed for the seeder, and the 0.5 point gap above
+is precisely that relaxation:
+
+- **`RestrictAddressFamilies` gains `AF_INET` + `AF_INET6`.** The directive is
+  not dropped — keeping it still bars `AF_PACKET`, `AF_BLUETOOTH`, `AF_VSOCK`
+  and the other exotic families that carry most of the socket-family kernel
+  attack surface. A downloader needs TCP over IP and nothing else.
+- **`IPAddressDeny` is omitted**, not set. `any` would block the download
+  outright, and there is no useful allowlist to put in its place: huggingface.co
+  resolves to a CDN whose address set changes without notice, and a stale
+  allowlist becomes a mystery failure on the one unit a human runs by hand.
+
+Reproduce either score with:
+
+```bash
+systemd-analyze security --offline=true --user \
+  "$(nix build --no-link --print-out-paths \
+     .#checks.x86_64-linux.aggregator-embed-unit-hygiene)/aggregator-embed-seed.service"
+```
+
+**Deliberately absent, and each absence is load-bearing:**
+
+- **`MemoryDenyWriteExecute`** — torch's JIT and the OpenMP runtime allocate
+  W|X pages; setting it makes `import torch` die. It is the most likely
+  directive for a future hardening pass to reach for, so the check asserts it
+  stays absent from both units.
+- **`ProtectSystem=strict`** — would need an explicit `ReadWritePaths` for the
+  HF cache, and getting that list wrong fails at runtime on units this host
+  cannot start. `full` leaves `$HOME` (and so the cache) writable while `/usr`,
+  `/boot` and `/etc` go read-only.
+- **`PrivateDevices`, `ProtectKernelModules`, `SystemCallFilter`** — not
+  applied, because nothing has ever executed this sandbox (see below), and
+  widening it on a host that cannot run it would be guesswork.
+
 ### Failure is loud, but only once a day
 
 `OnFailure=aggregator-embed-failure-notify.service`, mirroring the ingest
