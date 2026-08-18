@@ -1476,8 +1476,28 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
         _blame_crashed_row(store, ledger, outcome)
         embedder = Embedder()
         try:
-            for kind in kinds:
-                _embed_backlog(store, embedder, kind, args, ledger, outcome)
+            # WHAT MAKES THE CLAIM A CRASH DETECTOR RATHER THAN A REBOOT
+            # DETECTOR. The claim is written before the attempt and can only
+            # be cleared by code that gets to run, so under SIGTERM's default
+            # disposition — no handler, no unwinding — a `systemctl stop`, a
+            # reboot or a deploy left one behind and the NEXT run read it as a
+            # kill: a good row held in the quarantine ledger, marked 'error',
+            # printed to stderr, a non-zero exit and a CRITICAL toast. On a
+            # 25-30 day backfill that is a false alarm every reboot, and the
+            # row it names stays out of the index.
+            #
+            # Same shape ingest already uses (``graceful_shutdown``): the
+            # handler only sets a flag, the row in flight finishes and
+            # releases its claim, and the loop stops at a boundary it chose.
+            # A signal that CANNOT be handled — SIGKILL, an OOM kill, a
+            # segfault — still leaves the claim, so the crash-blame path is
+            # untouched. Which signal the process could handle is exactly the
+            # crash/shutdown distinction, so it is the one being read.
+            with graceful_shutdown() as stop:
+                for kind in kinds:
+                    _embed_backlog(
+                        store, embedder, kind, args, ledger, outcome, stop
+                    )
         except EmbedderUnhealthyError as e:
             # ANNOUNCE FIRST, THEN ABORT. Rows attributed earlier in this run
             # passed their own health probe and have ledger entries already
@@ -1507,6 +1527,15 @@ def _report_embed_outcome(outcome: _EmbedOutcome) -> int:
     Quiet is only defensible while it is not the same as forgotten, so the
     quiet line still carries a number and still names where the detail lives.
     """
+    if outcome.interrupted:
+        # Said out loud on every interrupted run, because "stopped early" and
+        # "drained the backlog" both otherwise print nothing at all, and the
+        # difference is whether the next tick has work left.
+        print(
+            "embed: INTERRUPTED — a stop was requested, the row in flight "
+            "finished and its vectors were committed, and the rest of the "
+            "backlog is untouched. The next run resumes from here."
+        )
     if outcome.new_failures:
         for line in outcome.new_failures:
             print(line, file=sys.stderr)
@@ -1568,6 +1597,11 @@ class _EmbedOutcome:
     known_failures: int = 0
     #: Rows that used to fail and embedded cleanly this time.
     released: int = 0
+    #: A stop was requested (SIGTERM/SIGINT) and the run ended at a boundary
+    #: with backlog still to do. Reported, but NOT a failure: the same event
+    #: ``ingest`` prints as INTERRUPTED. A run that exited non-zero for being
+    #: asked to stop is the false alarm this flag exists to replace.
+    interrupted: bool = False
 
 
 class EmbedderUnhealthyError(RuntimeError):
@@ -1650,12 +1684,21 @@ def _blame_crashed_row(
     hour, forever, and the only external symptom is ``vector_index`` counts
     that stop moving, which is not something a human watches for a month.
 
-    Routed through the SAME ledger as every other per-row failure, so a
-    genuine crash and a SIGTERM during a deploy are told apart by evidence
-    rather than by guessing: the row is held with backoff, comes back when it
-    is due, and only becomes terminal after ``POISON_MAX_ATTEMPTS`` sightings
-    at least fifteen minutes apart. So an unlucky deploy costs one delayed
-    row; a row that reliably kills the worker stops being attempted.
+    A ROUTINE SHUTDOWN NEVER GETS HERE. SIGTERM and SIGINT are handled in
+    ``_cmd_embed``: the row in flight finishes, its claim is released, and the
+    run stops at a boundary. So a claim that survives is one no handler could
+    run for — a SIGKILL, an OOM kill, a segfault — which is what makes the
+    claim evidence of a crash rather than evidence of a reboot. Before that
+    handler existed, every `systemctl stop` condemned whichever good row was
+    in flight, twice an hour on a month-long backfill.
+
+    Routed through the SAME ledger as every other per-row failure, so the
+    residual case — a SIGTERM the worker could not act on before
+    ``TimeoutStopSec`` escalated it to SIGKILL — costs one delayed row rather
+    than a condemned one: the row is held with backoff, comes back when it is
+    due, and only becomes terminal after ``POISON_MAX_ATTEMPTS`` sightings at
+    least fifteen minutes apart. A row that reliably kills the worker stops
+    being attempted.
     """
     claim = store.pending_embed_claim()
     if claim is None:
@@ -1700,6 +1743,7 @@ def _embed_backlog(
     args: argparse.Namespace,
     ledger: PoisonLedger,
     outcome: _EmbedOutcome,
+    stop: Callable[[], bool] | None = None,
 ) -> None:
     """Drain the backlog in bounded batches (``--catchup``) or do one (``--once``).
 
@@ -1719,10 +1763,13 @@ def _embed_backlog(
     if due:
         store.requeue_embedding(kind, sorted(due))
     while True:
+        if stop is not None and stop():
+            outcome.interrupted = True
+            return
         rows = store.select_unembedded(kind, limit=args.batch_size)
         if not rows:
             return
-        _embed_batch(store, embedder, kind, rows, ledger, outcome)
+        _embed_batch(store, embedder, kind, rows, ledger, outcome, stop)
         if args.once:
             return
 
@@ -1734,6 +1781,7 @@ def _embed_batch(
     rows: list,
     ledger: PoisonLedger,
     outcome: _EmbedOutcome,
+    stop: Callable[[], bool] | None = None,
 ) -> None:
     """Embed one batch, then advance the watermark — IN THAT ORDER.
 
@@ -1766,6 +1814,14 @@ def _embed_batch(
     ``except Exception``, never ``BaseException``: a ``KeyboardInterrupt``, a
     ``SystemExit`` or a test's deliberate ``BaseException`` sentinel means stop,
     not "this row is poison".
+
+    THE STOP CHECK IS PER ROW, not per batch, and the granularity is the
+    point. A batch is 500 rows and a ``TimeoutStopSec`` is 90 seconds, so
+    "finish the batch in flight" would still be SIGKILLed partway — leaving
+    the claim that makes the next run condemn a good row, which is the whole
+    thing being fixed. One row is the unit of work here and the unit the claim
+    covers, so it is the boundary. Whatever embedded before the stop is
+    flushed and committed below; the rest stays in the backlog.
     """
     source = _embed_ledger_source(kind)
     entries = ledger.entries(source)
@@ -1775,6 +1831,9 @@ def _embed_batch(
     all_vecs: list[tuple[str, Any]] = []
     unhealthy: EmbedderUnhealthyError | None = None
     for row in rows:
+        if stop is not None and stop():
+            outcome.interrupted = True
+            break
         if kind == "observations":
             row_id = row["obs_id"]
             body = row["body"] or ""
