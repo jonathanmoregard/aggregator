@@ -328,6 +328,55 @@ def _drop_row_vectors(
         i += 1
 
 
+#: ``(vec table, key column, base table, base key)`` for the orphan purge.
+_VEC_OWNERSHIP = {
+    "observations": ("vec_observations", "obs_id", "observations", "obs_id"),
+    "records": ("vec_records", "stable_id", "records", "stable_id"),
+}
+
+
+def _purge_orphan_vectors(c: sqlite3.Connection, kind: str) -> int:
+    """Delete vectors whose row is gone. Returns how many.
+
+    WHY THIS IS AN ANTI-JOIN AND NOT A LIST OF IDS. The scoped delete paths
+    (``rebuild(source)``, ``rebuild_and_upsert_entities(origins=…)``) remove
+    rows by source or origin, and nothing propagates that to the vec tables:
+    there is no foreign key into a virtual table and no trigger can span one.
+    Sweeping for orphans after the fact costs one scan of the vec table (~40 ms
+    at 422k vectors, on an operation that already rewrote the whole corpus) and
+    has the useful property of cleaning up orphans left by any EARLIER
+    rebuild too, rather than only the one that just ran.
+
+    An orphan is not a wrong answer; it is a quietly smaller one. It still
+    occupies one of the ``_VECTOR_ARM_K`` = 50 KNN slots a query gets, then
+    matches no row when the fused id set reaches SQL. Enough of them and the
+    vector arm returns a full 50 neighbours and contributes nothing, while
+    every count still reports the index complete.
+
+    A vector is kept if EITHER reading of its key still has a row: the key
+    itself, or the ``<id>:N`` chunk owner. Both are checked because the two are
+    genuinely ambiguous — ``github:x:1`` is a real record id AND a plausible
+    chunk 1 of ``github:x`` — and keeping a live vector costs one KNN slot
+    while dropping one costs the row its recall.
+    """
+    vec_table, vec_key, base_table, base_key = _VEC_OWNERSHIP[kind]
+    if not _vec_table_present(c, vec_table):
+        return 0
+    # ``rtrim(key,'0-9')`` strips a trailing chunk index; when what remains
+    # ends in ':' the key was ``<owner>:<n>`` and the owner is the rest.
+    owner = (
+        f"CASE WHEN substr(rtrim({vec_key}, '0123456789'), -1) = ':' "
+        f"THEN substr({vec_key}, 1, length(rtrim({vec_key}, '0123456789')) - 1) "
+        f"ELSE {vec_key} END"
+    )
+    cur = c.execute(
+        f"DELETE FROM {vec_table} WHERE "  # noqa: S608 - fixed literals
+        f"{vec_key} NOT IN (SELECT {base_key} FROM {base_table}) "
+        f"AND ({owner}) NOT IN (SELECT {base_key} FROM {base_table})"
+    )
+    return max(0, cur.rowcount)
+
+
 class EmptyRebuildRefusedError(RuntimeError):
     """Raised by ``Store.rebuild_and_upsert`` when the incoming record list is
     smaller than the caller-declared ``min_records`` floor.
@@ -1319,6 +1368,11 @@ class Store:
             # _commit=False: don't COMMIT inside the savepoint (would release
             # it prematurely and break the surrounding RELEASE).
             self.upsert_entities(materialised, _commit=False)
+            # AFTER the re-write, deliberately. A row that came straight back
+            # keeps the vector it already had, so recall survives the rebuild
+            # window instead of going dark until the next backfill catches up.
+            # Only rows that genuinely did not return lose theirs.
+            _purge_orphan_vectors(c, "observations")
         except BaseException:
             c.execute("ROLLBACK TO SAVEPOINT rebuild_entities")
             c.execute("RELEASE SAVEPOINT rebuild_entities")
@@ -2064,6 +2118,7 @@ class Store:
         c = self._c()
         c.execute("DELETE FROM records WHERE source = ?", (source,))
         c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
+        _purge_orphan_vectors(c, "records")
         c.commit()
 
     def rebuild_and_upsert(
@@ -2091,6 +2146,9 @@ class Store:
             c.execute("DELETE FROM records WHERE source = ?", (source,))
             c.execute("DELETE FROM records_fts WHERE source = ?", (source,))
             self._do_write_records(c, record_list)
+            # AFTER the re-write, so a row that came back keeps its vector
+            # instead of being purged and re-embedded for no reason.
+            _purge_orphan_vectors(c, "records")
         except BaseException:
             c.execute("ROLLBACK TO SAVEPOINT rebuild_and_upsert")
             c.execute("RELEASE SAVEPOINT rebuild_and_upsert")
@@ -2162,12 +2220,12 @@ class Store:
             if held_hash == digest:
                 unchanged += 1
                 continue
-            Store._write_one_record(c, r, digest)
+            Store._write_one_record(c, r, digest, r.stable_id in stored)
         return unchanged
 
     @staticmethod
     def _write_one_record(
-        c: sqlite3.Connection, r: Record, digest: str
+        c: sqlite3.Connection, r: Record, digest: str, existed: bool = False
     ) -> None:
         scrubbed_body = scrub(r.body).text
         scrubbed_subject = scrub(r.subject).text
@@ -2222,7 +2280,12 @@ class Store:
                 digest,
             ),
         )
-        if _vec_table_present(c, "vec_records"):
+        # ONLY when the row was already there, matching the observations path.
+        # During a rebuild the row was just DELETEd, so ``existed`` is False and
+        # its vector survives the re-insert — the row is back at
+        # ``embedding_state IS NULL`` and will be re-embedded, but it keeps
+        # serving the vector arm in the meantime instead of going dark.
+        if existed and _vec_table_present(c, "vec_records"):
             _drop_row_vectors(c, "vec_records", "stable_id", r.stable_id)
         c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
         c.execute(
