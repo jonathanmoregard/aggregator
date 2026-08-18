@@ -185,6 +185,11 @@ def _stub_vector(text: str) -> np.ndarray:
     return v
 
 
+#: ``{document name: semantic cluster}``, derived from the bodies rather than
+#: restated, so a corpus edit cannot silently desynchronise the expectations.
+DOC_CLUSTER = {name: int(np.argmax(_stub_vector(body)[:3])) for name, body, _ in CORPUS}
+
+
 class StubEmbedder:
     """Deterministic embedder with a ledger and an injectable failure.
 
@@ -459,12 +464,16 @@ def test_a_half_embedded_corpus_serves_the_built_part_and_loses_nothing(
 
     * a keyword query must still return every keyword match, embedded or not —
       the vector arm may only ADD; and
-    * a semantic query must return the embedded rows and nothing else — no
-      phantom rows from a half-written index.
+    * a semantic query must reach the embedded rows of its own cluster and
+      must not reach anything outside the embedded set — no phantom rows from
+      a half-written index.
 
     The embedded set is read back out of ``embedding_state`` rather than
     hard-coded, so this test states a property and not a snapshot of one
-    particular batch ordering.
+    particular batch ordering. The semantic bound is two-sided rather than an
+    equality for the same reason: a similarity cutoff, if one is ever added,
+    may legitimately shrink the far half of the neighbour list, and it must
+    still be unable to shrink the near half or to invent a row.
     """
     assert ingest(corpus) == 0
     assert run_cli(["embed", "--once", "--batch-size", "6"]) == 0
@@ -479,8 +488,10 @@ def test_a_half_embedded_corpus_serves_the_built_part_and_loses_nothing(
     assert ids(keyword) >= FTS_VOTING, "a warm arm dropped a keyword match"
 
     semantic = aggregator_query(SEMANTIC_ONLY_GOVERNANCE)
-    expected = {f"sess-{i.removeprefix('obs-')}" for i in embedded}
-    assert ids(semantic) == expected
+    reachable = {f"sess-{i.removeprefix('obs-')}" for i in embedded}
+    same_cluster = {f"sess-{n}" for n, c in DOC_CLUSTER.items() if c == 0}
+    assert ids(semantic) <= reachable, "an unembedded row came back from the index"
+    assert ids(semantic) >= reachable & same_cluster, "a built row went missing"
 
 
 def test_the_backfill_finishes_and_the_watermark_says_so(corpus, cache, stub_models):
@@ -562,13 +573,18 @@ def test_a_hybrid_page_token_keeps_paging_the_hybrid_result_set(
 ):
     """The warm-start direction: page 1 minted by the vector arm, page 2
     continues in it. The pages must partition the fused set, not overlap it.
+
+    ``total`` is read off the first page rather than asserted, so this stays a
+    statement about pagination and does not quietly become a second assertion
+    about how many neighbours the vector arm returns — that number belongs to
+    the test below, where changing it is a deliberate act.
     """
     assert ingest(corpus) == 0
     assert run_cli(["embed", "--catchup"]) == 0
 
     page1 = aggregator_query(SEMANTIC_ONLY_GOVERNANCE, page_size=3)
     total = page1["total"]
-    assert total == 8, "8 documents have a vector; the blank body has none"
+    assert total > 3, "precondition: the result must not fit on one page"
     collected = [r["stable_id"] for r in page1["records"]]
     token = page1["next_page_token"]
     while token:
@@ -576,6 +592,33 @@ def test_a_hybrid_page_token_keeps_paging_the_hybrid_result_set(
         collected += [r["stable_id"] for r in page["records"]]
         token = page.get("next_page_token")
     assert len(collected) == len(set(collected)) == total
+
+
+def test_a_warm_index_answers_a_query_that_matches_nothing(corpus, cache, stub_models):
+    """KNOWN, ESCALATED, AND PINNED HERE SO A CHANGE TO IT IS DELIBERATE.
+
+    The KNN is ``ORDER BY distance LIMIT k`` with no similarity cutoff, so once
+    the index is warm every free-text query comes back with up to
+    ``_VECTOR_ARM_K`` neighbours however far away they are. End to end that
+    reads as: a query no document contains returned nothing before the
+    backfill and returns the entire embedded corpus after it. Recall up,
+    precision down — which is the trade hybrid retrieval IS — but the "no
+    results" answer stops existing along the way, and on a recall tool that
+    answer carries information.
+
+    ``test_mcp_hybrid.py`` pins the same decision at the unit level; this is
+    what it looks like from outside, which is the level at which somebody
+    notices. If Task M sets a distance floor from the real-cache measurement,
+    THIS is the test to change: the expected count becomes whatever the floor
+    admits, and the change should be visible in a diff rather than absorbed by
+    a loose bound somewhere else.
+    """
+    assert ingest(corpus) == 0
+    assert aggregator_query(SEMANTIC_ONLY_GOVERNANCE)["total"] == 0
+
+    assert run_cli(["embed", "--catchup"]) == 0
+    warm = aggregator_query(SEMANTIC_ONLY_GOVERNANCE)
+    assert warm["total"] == 8, "every embedded document; only the blank body has none"
 
 
 # --- sad path: no sqlite-vec on this machine ---------------------------------
