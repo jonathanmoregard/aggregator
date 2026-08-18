@@ -33,6 +33,18 @@ _NATIVE_DIM = 1024
 _DEFAULT_MODEL_ST = "Qwen/Qwen3-Embedding-0.6B"
 _DEFAULT_MODEL_GGUF = "Qwen/Qwen3-Embedding-0.6B-GGUF"
 
+#: Commit sha of the weights this build was verified against.
+#:
+#: "PINNED ARTIFACT, NO IN-PLACE UPDATE" HAS TO COVER THE WEIGHTS. Without a
+#: revision every load resolves ``main`` on the hub, so the bytes a
+#: rev-pinned systemd unit executes can change with no commit anywhere in
+#: this repository. A sha rather than a tag, because a tag is repointable by
+#: the repo owner — which is the thing being defended against.
+#:
+#: Only applied to the DEFAULT model: a pin taken from one repository says
+#: nothing about a model name a caller passed in.
+QWEN3_EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+
 
 def configured_model_id() -> str:
     """Which model ``Embedder()`` would load right now, without loading it.
@@ -70,6 +82,11 @@ class Embedder:
             self._st_model = SentenceTransformer(
                 self.model_name or _DEFAULT_MODEL_ST,
                 cache_folder=str(cache_dir) if cache_dir else None,
+                # No revision for a caller-supplied model: this pin was taken
+                # from the default repository and vouches for nothing else.
+                revision=(
+                    QWEN3_EMBEDDING_REVISION if self.model_name is None else None
+                ),
             )
         elif self.backend == "gguf":
             try:
@@ -80,6 +97,14 @@ class Embedder:
                     "'embed-gguf' optional extra: pip install "
                     "'aggregator[embed-gguf]'"
                 ) from e
+            # NOT PINNED, and deliberately not faked. ``Llama.from_pretrained``
+            # forwards ``**kwargs`` to the ``Llama`` constructor rather than to
+            # ``hf_hub_download``, so a ``revision=`` here would raise TypeError
+            # instead of pinning anything. The optional ``embed-gguf`` extra is
+            # not installed on this machine, so a workaround could not be
+            # verified either. The shipped default backend is ``st``, which is
+            # pinned above; anyone opting into gguf is choosing an unpinned
+            # artifact and this comment is where they find that out.
             self._gguf_model = Llama.from_pretrained(
                 repo_id=self.model_name or _DEFAULT_MODEL_GGUF,
                 filename=gguf_filename,

@@ -18,11 +18,18 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 
+#: Commit sha of the weights this build was verified against. Same rule as
+#: ``embed.QWEN3_EMBEDDING_REVISION``, and it binds harder here: this model is
+#: loaded inside the long-lived MCP server, so an unpinned ``main`` is a
+#: moving artifact executing in the process that holds the user's history.
+QWEN3_RERANKER_REVISION = "e61197ed45024b0ed8a2d74b80b4d909f1255473"
+
 
 class Reranker:
     def __init__(self, model_name: str | None = None):
         from sentence_transformers import CrossEncoder
 
+        pinned = model_name is None
         self.model_name = model_name or _DEFAULT_MODEL
         # NO ``trust_remote_code``. This constructor runs lazily inside the MCP
         # server process — the one holding the user's entire personal history —
@@ -35,7 +42,12 @@ class Reranker:
         # and the architecture is in-tree in transformers. Verified offline —
         # loads in 0.4 s as ``transformers.models.qwen3.Qwen3ForCausalLM``, and
         # ranks the relevant document first. Pinned by a test, not by comment.
-        self._model = CrossEncoder(self.model_name)
+        self._model = CrossEncoder(
+            self.model_name,
+            # No revision for a caller-supplied model: the pin was taken from
+            # the default repository and vouches for nothing else.
+            revision=QWEN3_RERANKER_REVISION if pinned else None,
+        )
 
     def score(self, query: str, docs: list[str]) -> np.ndarray:
         """Return one relevance score per doc (higher = more relevant)."""

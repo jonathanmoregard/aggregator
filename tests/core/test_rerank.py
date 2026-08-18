@@ -77,3 +77,63 @@ def test_the_reranker_architecture_is_native_to_transformers(reranker):
     not — it is the in-tree Qwen3 implementation that ships with transformers.
     """
     assert type(reranker._model.model).__module__.startswith("transformers.models")
+
+
+def test_the_reranker_pins_a_revision():
+    """Same rule as the embedder, and it matters more here.
+
+    This model is loaded inside the long-lived MCP server, so an unpinned
+    ``main`` is a moving artifact executing in the process that holds the
+    user's whole history.
+    """
+    import aggregator.core.rerank as rerank_mod
+
+    seen = {}
+
+    class _FakeCrossEncoder:
+        def __init__(self, model_name, **kwargs):
+            seen["kwargs"] = kwargs
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("sentence_transformers.CrossEncoder", _FakeCrossEncoder)
+    try:
+        rerank_mod.Reranker()
+    finally:
+        monkey.undo()
+
+    revision = seen["kwargs"].get("revision")
+    assert revision == rerank_mod.QWEN3_RERANKER_REVISION
+    assert len(revision) == 40
+
+
+def test_a_caller_supplied_reranker_gets_no_borrowed_revision():
+    import aggregator.core.rerank as rerank_mod
+
+    seen = {}
+
+    class _FakeCrossEncoder:
+        def __init__(self, model_name, **kwargs):
+            seen["kwargs"] = kwargs
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("sentence_transformers.CrossEncoder", _FakeCrossEncoder)
+    try:
+        rerank_mod.Reranker(model_name="some/other-reranker")
+    finally:
+        monkey.undo()
+
+    assert seen["kwargs"].get("revision") is None
+
+
+def test_the_pinned_reranker_revision_is_the_one_on_disk():
+    from pathlib import Path
+
+    import aggregator.core.rerank as rerank_mod
+
+    snapshots = (
+        Path.home()
+        / ".cache/huggingface/hub/models--Qwen--Qwen3-Reranker-0.6B/snapshots"
+    )
+    if not snapshots.is_dir():
+        pytest.skip("Qwen3-Reranker weights are not cached on this machine")
+    assert (snapshots / rerank_mod.QWEN3_RERANKER_REVISION).is_dir()
