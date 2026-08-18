@@ -115,6 +115,134 @@ Both timers set `OnBootSec = "5min"` and `Persistent = true`:
 These are the two knobs `systemd.time(7)` gives us for "run soon after
 the machine wakes up". Verified against systemd v256 timer docs.
 
+## Background embed worker (vector index)
+
+`services.aggregator.embed` installs `aggregator-embed.service` +
+`aggregator-embed.timer`, which fill the v5 sqlite-vec index that the hybrid
+retriever's vector arm reads. It is never on the recall path: a query falls
+through to FTS5 for anything not yet embedded, so a cold or half-full index
+costs ranking quality, never availability.
+
+```nix
+services.aggregator.embed = {
+  enable = true;            # default
+  interval = "*:15/30";     # default — :15 and :45, offset from ingest
+  batchSize = 500;          # rows per checkpoint
+  timeoutStartSec = "8h";   # sized for a first full backfill
+};
+```
+
+### Model weights: pre-seeded, never fetched by the timer
+
+The embedder is Qwen3-Embedding-0.6B — about 1.2 GB of safetensors. Three
+ways to get that to an unattended unit, and they fail differently:
+
+| Approach | Upkeep | Manual work | Failure mode |
+|---|---|---|---|
+| Bake into a store path | new hash on every model bump; 1.2 GB in every closure | none | none at runtime, but every CI build pulls 1.2 GB |
+| Fetch at runtime | none | none | an outage, a rate limit or a renamed repo turns a background indexer into a fetcher retrying a 1.2 GB download every 30 min |
+| **Pre-seed a cache (chosen)** | **none** | **one command, once per machine** | **loud, specific, and names its own fix** |
+
+So the timer-driven unit runs with `HF_HUB_OFFLINE=1` and opens no sockets.
+`HF_HOME` is `%C/huggingface` — the systemd cache-directory specifier, which
+for a user manager is `$XDG_CACHE_HOME`, i.e. the same `~/.cache/huggingface`
+the interactive tooling already populates. No second copy, and no home path
+baked into the unit.
+
+If the weights are absent the worker refuses the run, non-zero, and prints
+the one command that fixes it:
+
+```bash
+systemctl --user start aggregator-embed-seed.service
+```
+
+That unit is the only thing here allowed to touch the network. It has no
+`[Install]` section and no timer — it runs when a human starts it, downloads
+the weights, and then embeds exactly one row, so the seeding step also proves
+weights + torch + sqlite-vec + a real database write in one go.
+
+### Failure is loud, but only once a day
+
+`OnFailure=aggregator-embed-failure-notify.service`, mirroring the ingest
+unit: a journal line plus a CRITICAL `notify-send` popup. The popup — not the
+journal line — is debounced to once per 24h, because the two standing failure
+modes (weights absent, sqlite-vec absent) persist until a human acts, and 48
+identical popups a day is how a loud system trains you to ignore it. Same
+reasoning as `60a931d`. The debounce fails open: any error reading the stamp
+results in a notification.
+
+### Why `--catchup`, and why the timeout is hours
+
+The unit runs `aggregator embed --catchup`, not `--once`. `--once` does one
+batch per tick; at 500 rows against a ~376k-observation corpus that is ~380
+ticks — over a week before the index is useful. `--catchup` drains the backlog
+in the same bounded, per-batch-committed chunks and is a fast no-op once warm.
+
+Overlapping runs are already handled by the worker itself: it takes an
+OS-level `flock` on `<cache>.embed.lock`, and a tick that finds a catchup
+still running prints one line and exits 0.
+
+`TimeoutStartSec` defaults to `8h` — a runaway guard, not a deadline the
+backfill has to beat. Being killed at the timeout is safe: each batch commits
+its vectors and *then* advances `embedding_state`, so a kill at any instant
+costs at most one batch and can never leave the watermark ahead of the data.
+The vec writes are delete-then-insert, so a repeated batch is idempotent. Note
+that the worker installs no SIGTERM handler — a stop is immediate, and the
+safety comes from the commit ordering rather than from graceful shutdown.
+
+### Contention with ingest
+
+`interval` defaults to `*:15/30`, deliberately offset from the ingest timers'
+`*:0/30`. That is an optimisation for the common case, not the correctness
+story — an ingest run can last hours, so overlap is inevitable eventually.
+What makes overlap safe is WAL journal mode plus a 30s `busy_timeout` on the
+store, and one short write transaction per batch instead of one long one per
+run. `checks.<system>.aggregator-embed-unit-hygiene` fails the build if the
+embed timer's `OnCalendar` ever collides with an ingest timer's.
+
+### Runtime dependencies
+
+The embed path needs `sentence-transformers`, `torch` and `sqlite-vec` in the
+package's Python closure, on top of the deps listed under "Python deps that
+may need overlays" below. They are **not** in the deployed `aggregator-env`
+today. Until they are, the unit fails loudly on every tick rather than
+degrading quietly — see `tasks/pending_for_human.md`.
+
+## Verifying the units without deploying
+
+```bash
+nix build .#checks.x86_64-linux.aggregator-embed-unit-hygiene
+cat result/aggregator-embed.service
+```
+
+The check instantiates the module through home-manager, renders the real unit
+files, and asserts on them. Its output *is* the rendered units, so `result/`
+is the artifact to read when you want to know what will be installed.
+
+What it enforces, and why each one is there:
+
+- **`ExecStart` is a `/nix/store` path, and so is every script it names.**
+  The 2026-08-16 rule is that a unit executes a deployed artifact pinned to a
+  committed revision, never a developer checkout. The bug that produced that
+  rule was invisible at the unit-file level: `aggregator-ingest.service` had a
+  store-path `ExecStart` whose wrapper script ended in
+  `exec uv run --directory <checkout>`. So the check *follows* `ExecStart`
+  into the script and greps that too, for `/home/` and for `uv run`.
+  Deployment: new revision → new store path → `home-manager switch`. There is
+  no in-place update path, by design.
+- **`SSL_CERT_FILE` and `NIX_SSL_CERT_FILE` are set.** A missing trust store
+  makes every HTTPS host look like it is serving a self-signed certificate,
+  which sends you on exactly the wrong investigation. It cost the TickTick
+  source a day once.
+- **`OnFailure=` is wired.**
+- **`HF_HUB_OFFLINE=1`** on the timer-driven unit.
+- **The embed timer's `OnCalendar` differs from every ingest timer's.**
+- **`aggregator-embed-seed.service` has no `[Install]` section**, so it can
+  never be pulled in by a target and start a 1.2 GB download unattended.
+
+Each assertion has been red-tested by breaking the module on purpose and
+confirming the check fails; `nix flake check` runs it.
+
 ## Register the MCP with Claude Code
 
 Default (`mcp.autoRegister = false`) prints the command in the activation
@@ -143,18 +271,24 @@ still accepted for backward compatibility (maps onto `mcp.autoRegister`).
 systemctl --user list-timers | grep aggregator
 journalctl --user -u aggregator-sessions -n 50
 journalctl --user -u aggregator-github -n 50
+journalctl --user -u aggregator-embed -n 50
 aggregator status
 ```
 
 ## Python deps that may need overlays (follow-up)
 
-`fastmcp`, `presidio-analyzer`, and `presidio-anonymizer` are PyPI-only
-and may not be packaged in nixpkgs. Consequences:
+`fastmcp`, `presidio-analyzer`, `presidio-anonymizer`, `sentence-transformers`
+and `sqlite-vec` are PyPI-only and may not be packaged in nixpkgs.
+Consequences:
 
 - `packages.default` from this flake is intentionally thin
-  (`propagatedBuildInputs` is empty); a plain `nix build .#default` will
-  succeed at build-graph time but the resulting binary will fail at import
-  time until those deps are available.
+  (`propagatedBuildInputs` is empty). Corrected 2026-08-18: `nix build
+  .#default` does **not** succeed — it fails at `pythonRuntimeDepsCheckHook`,
+  which enumerates the gap for you. That is why
+  `checks.<system>.aggregator-embed-unit-hygiene` renders its units against a
+  store-path stub rather than against `packages.default`: the check is about
+  the shape of the generated units, and depending on the real package would
+  make it fail for an unrelated reason.
 - **Production path**: run the CLI/MCP inside a `uv run` shell that
   resolves the PyPI deps at runtime, wrapping via `nix run .#default --
   ...` once an overlay is added; or invoke `uv run aggregator ...` inside
