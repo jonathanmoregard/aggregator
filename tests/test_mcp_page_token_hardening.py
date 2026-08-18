@@ -220,6 +220,32 @@ def test_legacy_tokens_are_not_collateral_damage(store):
         assert page["ok"] is True, f"{token!r} rejected: {page}"
 
 
+# --- M4: a token that says two incompatible things -------------------------
+
+
+def test_a_token_cannot_claim_fts5_only_and_carry_frozen_hits(store):
+    """THE REPRO. ``40.<payload>`` parses to ``hybrid=False`` — "this page
+    came from the FTS5-only arm" — while ``pin_for`` reads ``self.frozen``
+    first and pins the vector arm ON. Two contradictory claims, resolved
+    silently in favour of whichever field the code happened to read first."""
+    payload = _pack_frozen({"observations": ["o1", "o2"]})
+    result = aggregator_query(
+        "voting", page_token=f"40.{payload}", _store=store
+    )
+    assert result["ok"] is False
+    assert "page_token" in result["reason"]
+
+
+def test_the_cursor_cannot_even_represent_the_contradiction():
+    """Closing the instance is not closing the bug: nothing may construct a
+    cursor that pins no arm and freezes one anyway."""
+    from aggregator.mcp import _PageCursor
+
+    _PageCursor(offset=0, hybrid=True, frozen={"records": ["r1"]})  # fine
+    with pytest.raises(ValueError, match="frozen"):
+        _PageCursor(offset=0, hybrid=False, frozen={"records": ["r1"]})
+
+
 def test_a_maximum_legitimate_token_still_round_trips():
     """The cap is derived from the real maximum, so the real maximum fits."""
     long_id = "dropbox:" + ("a" * 500)

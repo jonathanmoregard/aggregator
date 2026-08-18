@@ -576,6 +576,22 @@ class _PageCursor:
     #: ``{kind: [vector arm hit ids]}``, or ``None`` to re-run the KNN.
     frozen: dict[str, list[str]] | None = None
 
+    def __post_init__(self) -> None:
+        """Frozen hits and ``hybrid=False`` are a contradiction, not a state.
+
+        ``pin_for`` reads ``frozen`` before ``hybrid``, so a cursor holding
+        both resolved the disagreement silently, in favour of whichever field
+        happened to be read first — the arms pinned ON from a token that said
+        FTS5-only. Rejecting it in the constructor closes the whole class:
+        ``_parse_page_token`` refuses such a token at the boundary, and no
+        future call site can reconstruct the state from the inside either.
+        """
+        if self.frozen is not None and self.hybrid is not True:
+            raise ValueError(
+                f"a cursor with frozen hits must pin the hybrid arm; "
+                f"got hybrid={self.hybrid!r} with frozen={sorted(self.frozen)}"
+            )
+
     def pin_for(self, kind: str) -> bool | None:
         """The arm pin for ONE ontology.
 
@@ -707,6 +723,14 @@ def _parse_page_token(token: str | None) -> _PageCursor:
         offset = max(0, int(body[1:] if hybrid else body))
     except (TypeError, ValueError) as e:
         raise _PageTokenError(f"{body!r} is not a page offset") from e
+    if payload and not hybrid:
+        # ``_mint_page_token`` returns a bare ``str(offset)`` when the arm was
+        # FTS5-only, so a payload with no ``h`` is a token this server never
+        # produced — it claims the vector arm did not run AND carries that
+        # arm's hits.
+        raise _PageTokenError(
+            "token carries frozen vector hits but does not pin the hybrid arm"
+        )
     return _PageCursor(
         offset=offset,
         hybrid=hybrid,
