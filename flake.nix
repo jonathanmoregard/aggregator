@@ -347,6 +347,27 @@
               grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1' "$seed_script" \
                 || fail "the seed unit does not export AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1 — the loaders pass local_files_only=True without it, so it would download nothing"
 
+              # ...and it is the ONLY rendered artifact that enables it. The
+              # opt-in is what makes a 2.4 GB download consented to, and that
+              # only means anything if the one unit carrying it is the one a
+              # human starts by hand. tests/core/test_model_offline_default.py
+              # asserts this over the Nix source; this asserts it over what
+              # that source actually renders to, including every Environment=
+              # line and every ExecStart script, so the two cannot drift.
+              for u in aggregator-embed.service aggregator-embed.timer \
+                       aggregator-embed-failure-notify.service; do
+                f=$(readlink -f "$units/$u")
+                if grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD' "$f"; then
+                  fail "$u sets AGGREGATOR_ALLOW_MODEL_DOWNLOAD — only the human-triggered seed unit may enable model downloads"
+                fi
+                for s in $(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$f"); do
+                  if grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD' "$s"; then
+                    grep -n 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD' "$s" >&2
+                    fail "$u: ExecStart script $s enables AGGREGATOR_ALLOW_MODEL_DOWNLOAD — an unattended unit must never be able to start a GB-scale download"
+                  fi
+                done
+              done
+
               # ---- 8. Sandbox the unit that eats attacker-influenced text -
               # This unit feeds the corpus — web pages, PDFs, chat exports,
               # GitHub bodies, none of it authored by the user — through
