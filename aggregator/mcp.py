@@ -1072,6 +1072,14 @@ def aggregator_query(
               use. It is a batch/offline facility here, not an interactive
               one.
 
+              THE BATCH SURFACE IS ``aggregator query --rerank``, run from a
+              terminal, which is where a 47-second wait belongs and where the
+              operator can see it happening. That flag also refuses out loud
+              when the cross-encoder's weights cannot be loaded, rather than
+              handing back an unranked page. Its weights come from
+              ``aggregator embed --seed-models``, the only path that fetches
+              them.
+
               Leaving it off costs ORDERING ONLY. The same rows come back
               either way — reranking never changes WHICH results you get,
               only the order of the first few — so the cheap call is the

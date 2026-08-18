@@ -126,3 +126,51 @@ def test_the_mixed_shape_of_a_union_page_is_described(store):
 def test_the_description_the_server_publishes_is_this_docstring():
     """If these ever come apart, the guards above stop guarding anything."""
     assert mcp._tool_aggregator_query.__doc__ == aggregator_query.__doc__
+
+
+# --- the batch facility the docs describe now has somewhere to point -------
+
+
+def _rerank_docs() -> str:
+    _, _, tail = (aggregator_query.__doc__ or "").partition("rerank:")
+    return tail
+
+
+def _cli_help(subcommand: str, capsys) -> str:
+    from aggregator import cli
+
+    with pytest.raises(SystemExit):
+        cli.main([subcommand, "--help"])
+    return capsys.readouterr().out
+
+
+def test_the_rerank_docs_name_the_batch_surface(capsys):
+    """The docs called rerank a batch/offline facility while naming no batch
+    surface, so the only actionable reading of "do not use this interactively"
+    was "do not use this". ``aggregator query --rerank`` now exists."""
+    assert "aggregator query --rerank" in _rerank_docs()
+
+
+def test_the_named_batch_surface_actually_exists(capsys):
+    """A tool description pointing at a command that is not there is worse
+    than one pointing at nothing: it is checkable and wrong."""
+    assert "--rerank" in _cli_help("query", capsys)
+
+
+def test_the_weight_fetch_command_named_in_a_remediation_exists(capsys):
+    """``_maybe_rerank``'s failure notice tells the operator to run this."""
+    from aggregator.mcp import _maybe_rerank
+
+    class Dead:
+        def score(self, q, docs):
+            raise RuntimeError("no weights")
+
+    mcp._get_reranker, saved = (lambda: Dead()), mcp._get_reranker
+    try:
+        _items, applied, notice = _maybe_rerank([{"content": "x"}], "q", True)
+    finally:
+        mcp._get_reranker = saved
+
+    assert applied is False
+    assert "aggregator embed --seed-models" in notice
+    assert "--seed-models" in _cli_help("embed", capsys)
