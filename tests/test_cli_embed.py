@@ -248,3 +248,51 @@ def test_the_source_choices_are_unchanged():
     for source in ("observations", "records", "both"):
         args = build_parser().parse_args(["embed", "--once", "--source", source])
         assert args.source == source
+
+
+def test_a_zero_batch_size_is_refused_at_the_parser():
+    """``--batch-size 0`` made ``--catchup`` a silent exit-0 no-op.
+
+    ``select_unembedded`` renders it as ``LIMIT 0``, which returns nothing, so
+    ``_embed_backlog`` sees an empty batch and concludes the backlog is
+    drained. Measured: a 10-row backlog reports 0 rows and the run exits 0
+    having embedded nothing. Under a timer that is an index that never fills
+    while every run looks successful — the exact failure this project exists
+    to prevent.
+    """
+    from aggregator.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["embed", "--catchup", "--batch-size", "0"])
+
+
+def test_a_negative_batch_size_is_refused_at_the_parser():
+    """A negative size reaches SQLite as ``LIMIT -1``, i.e. NO limit.
+
+    That turns the chunked, checkpointed worker into one unbounded batch over
+    483k rows, which is precisely the shape the chunking exists to abolish.
+    """
+    from aggregator.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["embed", "--catchup", "--batch-size", "-5"])
+
+
+def test_the_refusal_says_what_is_wrong():
+    from aggregator.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["embed", "--catchup", "--batch-size", "0"])
+
+
+def test_a_positive_batch_size_is_accepted():
+    from aggregator.cli import build_parser
+
+    args = build_parser().parse_args(["embed", "--catchup", "--batch-size", "1"])
+    assert args.batch_size == 1
+
+
+def test_the_batch_size_default_is_unchanged():
+    from aggregator.cli import build_parser
+
+    assert build_parser().parse_args(["embed", "--catchup"]).batch_size == 500

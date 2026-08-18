@@ -1524,6 +1524,35 @@ def _report_embed_outcome(outcome: _EmbedOutcome) -> int:
     return 0
 
 
+def _positive_int(raw: str) -> int:
+    """An ``argparse`` type that refuses the two values SQLite reinterprets.
+
+    Both failures are silent, which is why this is a parser-level refusal
+    rather than a runtime check. ``--batch-size 0`` becomes ``LIMIT 0``, so
+    ``select_unembedded`` returns nothing, ``_embed_backlog`` concludes the
+    backlog is drained, and ``--catchup`` exits 0 having embedded nothing —
+    under a timer, an index that never fills while every run looks
+    successful. ``--batch-size -5`` becomes ``LIMIT -1``, which SQLite reads
+    as NO limit, collapsing the chunked and checkpointed worker into one
+    unbounded batch over 483k rows.
+
+    The Nix option already enforces a positive int; the CLI did not, so a
+    hand-run command had no such protection.
+    """
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from e
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be at least 1, got {value}. 0 makes --catchup a silent "
+            f"no-op (LIMIT 0 returns no rows, so the backlog reads as "
+            f"drained); a negative value reaches SQLite as LIMIT -1, i.e. one "
+            f"unbounded batch over the whole corpus."
+        )
+    return value
+
+
 @dataclass
 class _EmbedOutcome:
     """What one ``aggregator embed`` invocation did to the poison ledger."""
@@ -1918,7 +1947,13 @@ def build_parser() -> argparse.ArgumentParser:
             "which ontology to embed (default: both, matching the timer unit)"
         ),
     )
-    p_embed.add_argument("--batch-size", type=int, default=500, dest="batch_size")
+    p_embed.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=500,
+        dest="batch_size",
+        help="rows per checkpointed batch (default: 500, must be >= 1)",
+    )
 
     tks = sub.add_parser(
         "github-token-status",
