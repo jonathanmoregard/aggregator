@@ -58,7 +58,6 @@ from aggregator.core.embed import MODEL_DOWNLOAD_ENV, Embedder, downloads_allowe
 from aggregator.core.store import (
     EmptyRebuildRefusedError,
     Store,
-    _stored_hashes,
 )
 from aggregator.imports.ingest_state import (
     POISON_MAX_ATTEMPTS,
@@ -1854,30 +1853,6 @@ def _blame_crashed_row(
         outcome.known_failures += 1
 
 
-#: Distinguishes "this row's fingerprint is NULL" from "this row is gone".
-#: Both read as ``None`` out of a ``dict.get``, and they mean opposite things:
-#: a NULL ``src_hash`` (a legacy row, or one a test inserted by hand) is
-#: unchanged and must still be marked, while a row that vanished mid-batch
-#: must not be marked or given a vector.
-_ROW_ABSENT = object()
-
-
-def _row_fingerprints(store: Store, kind: str, ids: list[str]) -> dict[str, Any]:
-    """``src_hash`` per id — what the worker compares against to detect a race.
-
-    READS ``store``'s OWN CHANGE DETECTOR rather than inventing a second one.
-    ``src_hash`` is recomputed by ingest over the raw source fields on every
-    write and is what already decides "this row is unchanged, skip it", so a
-    row whose body moved has a different one by construction. The alternative
-    — re-reading and comparing bodies — would double a batch's body I/O to
-    learn the same fact.
-    """
-    if not ids:
-        return {}
-    col, table = store._kind_columns(kind)
-    return _stored_hashes(store._c(), table, col, ids)
-
-
 def _embed_ledger_source(kind: str) -> str:
     """What the embed worker calls itself in the quarantine ledger.
 
@@ -1984,17 +1959,24 @@ def _embed_batch(
     back and marks the row ``'ok'``. ``select_unembedded`` only looks at NULL,
     so nothing comes back for it until the body is edited AGAIN, and until
     then the vector arm answers with text the row no longer contains while the
-    keyword arm (which has a trigger) answers with the text it does. So the
-    fingerprints are re-read before anything is written and only the rows that
-    did not move are given vectors and marked. The rest stay at NULL and the
-    next run embeds them from their current body.
+    keyword arm (which has a trigger) answers with the text it does.
+
+    The fingerprint the batch is judged against therefore comes from
+    ``select_unembedded``'s OWN row set, alongside the body, and the comparison
+    happens inside the writes themselves — see ``Store.commit_embed_batch``.
+    Re-reading it here instead left a window: an edit landing between the
+    SELECT and the re-read makes both snapshots show the new hash, so the row
+    reads as untouched while the text in hand is stale. Rows that moved are
+    counted ``superseded`` rather than failed, because they stay at NULL and
+    the next run embeds them from their current body — it self-heals, and a
+    ledger entry would only make ``aggregator status`` overstate the damage.
     """
     source = _embed_ledger_source(kind)
     entries = ledger.entries(source)
     id_key = "obs_id" if kind == "observations" else "stable_id"
-    # Read as close to ``select_unembedded`` as this function can get: what
-    # the batch looked like when the worker took it.
-    fingerprints = _row_fingerprints(store, kind, [r[id_key] for r in rows])
+    # The body and its fingerprint out of one statement, so "unchanged since
+    # the worker took it" is a claim the SELECT itself can support.
+    expected = {r[id_key]: r["src_hash"] for r in rows}
     ok_ids: list[str] = []
     skip_ids: list[str] = []
     error_ids: list[str] = []
@@ -2056,31 +2038,19 @@ def _embed_batch(
             # have ``aggregator status`` overstating the damage forever.
             ledger.release(source, row_id)
             outcome.released += 1
-    # THE RE-CHECK, immediately before the two writes that assert "this row is
-    # done". ``'error'`` is deliberately not filtered: it is not a claim about
-    # a row's content, and the ledger requeues it either way.
-    current = _row_fingerprints(store, kind, [*ok_ids, *skip_ids])
-
-    def _unmoved(row_id: str) -> bool:
-        return current.get(row_id, _ROW_ABSENT) == fingerprints.get(
-            row_id, _ROW_ABSENT
-        )
-
-    superseded = [i for i in (*ok_ids, *skip_ids) if not _unmoved(i)]
-    if superseded:
-        outcome.superseded += len(superseded)
-        ok_ids = [i for i in ok_ids if _unmoved(i)]
-        skip_ids = [i for i in skip_ids if _unmoved(i)]
-        moved = set(superseded)
-        all_vecs = [v for v in all_vecs if v[0] not in moved]
-    vecs_to_write = [(chunk_id, vec) for _, chunk_id, vec in all_vecs]
-    if kind == "observations":
-        store.upsert_vec_observations(vecs_to_write)
-    else:
-        store.upsert_vec_records(vecs_to_write)
-    store.mark_embedded(kind, ok_ids, state="ok")
-    store.mark_embedded(kind, skip_ids, state="skip")
-    store.mark_embedded(kind, error_ids, state="error")
+    # The vectors and the watermark, in one guarded transaction. Anything the
+    # guard rejected moved underneath the worker and is reported as such.
+    written_ok, written_skip = store.commit_embed_batch(
+        kind,
+        vectors=all_vecs,
+        ok_ids=ok_ids,
+        skip_ids=skip_ids,
+        error_ids=error_ids,
+        expected=expected,
+    )
+    outcome.superseded += (len(ok_ids) - len(written_ok)) + (
+        len(skip_ids) - len(written_skip)
+    )
     if unhealthy is not None:
         # The rows that DID embed before the model died are flushed above and
         # keep their vectors: a run that threw away completed work would be

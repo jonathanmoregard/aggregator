@@ -1692,12 +1692,22 @@ class Store:
         Newest first: a fresh observation is the one most likely to be searched
         for, so a partially-embedded corpus is useful long before it is
         complete.
+
+        ``src_hash`` COMES BACK WITH THE BODY, from the same statement, and
+        that is the whole point of it being here. The worker has to be able to
+        say "the body I embedded was the one carrying this fingerprint", and a
+        fingerprint read by a LATER statement cannot say that: ingest can land
+        in between, so the "before" snapshot already describes the new body and
+        the row reads as unmoved while the text in hand is stale. Reproduced —
+        the old body's vector stored as current with the row marked ``'ok'``,
+        which ``select_unembedded`` never returns again. See
+        ``commit_embed_batch``, which is where the value is spent.
         """
         c = self._c()
         if kind == "observations":
             return list(
                 c.execute(
-                    "SELECT obs_id, body FROM observations "
+                    "SELECT obs_id, body, src_hash FROM observations "
                     "WHERE embedding_state IS NULL "
                     "ORDER BY ts DESC LIMIT ?",
                     (limit,),
@@ -1706,7 +1716,7 @@ class Store:
         if kind == "records":
             return list(
                 c.execute(
-                    "SELECT stable_id, subject, body FROM records "
+                    "SELECT stable_id, subject, body, src_hash FROM records "
                     "WHERE embedding_state IS NULL "
                     "ORDER BY updated_at DESC LIMIT ?",
                     (limit,),
@@ -1714,8 +1724,28 @@ class Store:
             )
         raise ValueError(f"unknown kind: {kind!r}")
 
-    def mark_embedded(self, kind: str, ids: list[str], state: str) -> None:
-        """Batch-advance ``embedding_state`` for ``ids``.
+    def mark_embedded(
+        self,
+        kind: str,
+        ids: list[str],
+        state: str,
+        expected: dict[str, str | None] | None = None,
+        *,
+        _commit: bool = True,
+    ) -> list[str]:
+        """Advance ``embedding_state`` for ``ids``. Returns the ids WRITTEN.
+
+        ``expected`` maps id → the ``src_hash`` the caller read alongside the
+        body, and turns this into a compare-and-set: ``WHERE id = ? AND
+        src_hash IS ?``. A row whose body moved since then does not match, so
+        it is not marked and stays in the backlog for the next pass — which is
+        what makes the return value load-bearing rather than decorative. ``IS``
+        rather than ``=`` on purpose: a legacy row with a NULL ``src_hash``
+        compares equal to an expected NULL and marks normally, where ``=``
+        would silently never match it and strand it in the backlog forever.
+
+        ``expected=None`` is the unguarded form, for callers making no claim
+        about content — see ``'error'`` below — and returns ``ids`` unchanged.
 
         ``state`` is one of ``'ok'`` / ``'skip'`` / ``'error'``; anything else
         raises rather than writing a value nothing selects on. An EMPTY ``ids``
@@ -1738,18 +1768,125 @@ class Store:
             raise ValueError(f"invalid state: {state!r}")
         col, table = self._kind_columns(kind)
         if not ids:
-            return
+            return []
         if state == "ok":
             self._require_vector()
         c = self._c()
-        for page in _chunked(ids, 500):
-            placeholders = ",".join("?" * len(page))
+        if expected is None:
+            for page in _chunked(ids, 500):
+                placeholders = ",".join("?" * len(page))
+                c.execute(
+                    f"UPDATE {table} SET embedding_state = ? "  # noqa: S608 - allowlisted literals
+                    f"WHERE {col} IN ({placeholders})",
+                    (state, *page),
+                )
+            written = list(ids)
+        else:
+            # One primary-key UPDATE per id rather than a clever set-based
+            # statement: a batch is 500 rows, each of these is microseconds,
+            # and ``rowcount`` per statement is how the caller learns WHICH
+            # rows it actually claimed. ``_drop_row_vectors`` loops for the
+            # same reason.
+            written = []
+            for row_id in ids:
+                cur = c.execute(
+                    f"UPDATE {table} SET embedding_state = ? "  # noqa: S608 - allowlisted literals
+                    f"WHERE {col} = ? AND src_hash IS ?",
+                    (state, row_id, expected.get(row_id)),
+                )
+                if cur.rowcount:
+                    written.append(row_id)
+        if _commit:
+            c.commit()
+        return written
+
+    def commit_embed_batch(
+        self,
+        kind: str,
+        *,
+        vectors: list[tuple[str, str, np.ndarray]],
+        ok_ids: list[str],
+        skip_ids: list[str],
+        error_ids: list[str],
+        expected: dict[str, str | None],
+    ) -> tuple[list[str], list[str]]:
+        """The embed worker's commit point. Returns ``(ok written, skip written)``.
+
+        ONE TRANSACTION, ONE GUARD, and both halves are the point.
+
+        THE GUARD closes the last window in the read-embed-write cycle. Ingest
+        sets ``embedding_state`` back to NULL and drops a row's vectors when
+        its body changes — that is the only thing that ever re-embeds an edited
+        row — and the worker used to undo it: it embedded the OLD body and then
+        wrote that vector back and marked the row ``'ok'``, unconditionally.
+        Re-reading the fingerprints just before the writes shrank the window
+        but could not close it, because the "before" value came from a
+        different statement than the body: an edit landing between the SELECT
+        and that re-read makes both reads see the NEW hash, so the row looks
+        untouched while the text in hand is stale. Reproduced exactly that way.
+        Here the "before" value is ``select_unembedded``'s own ``src_hash``, and
+        every write carries ``AND src_hash IS ?`` in the same statement that
+        does the writing, so there is no interval left to land in.
+
+        ONE TRANSACTION removes the second interval, between the vector commit
+        and the watermark commit. Nothing widens the lock: both writes already
+        happened together at the end of a batch. The direction of a crash is
+        unchanged and still the safe one — a death anywhere here rolls the
+        whole batch back to NULL and the next run redoes it, which costs one
+        batch. The mirrored failure, rows marked embedded with no vector, is
+        the one nothing ever comes back for, and it remains impossible.
+
+        ``vectors`` is ``(owner row id, chunk id, embedding)``: a body over the
+        window size becomes ``<id>:0 .. <id>:N-1``, so the guard has to be
+        expressed against the OWNER while the write targets the chunk.
+
+        ``error_ids`` are marked UNGUARDED, deliberately. ``'error'`` is not a
+        claim about a row's content — it says the worker could not embed it —
+        and the quarantine ledger, not this column, decides when it comes back.
+        Guarding it would leave a failed row at NULL, which
+        ``select_unembedded`` re-selects on the very next batch of the same
+        run: the abort loop this whole path exists to prevent.
+        """
+        self._ensure_writable()
+        vec_table = self._VEC_TABLES.get(kind)
+        if vec_table is None:
+            raise ValueError(f"unknown kind: {kind!r}")
+        col, table = self._kind_columns(kind)
+        vec_key = "obs_id" if kind == "observations" else "stable_id"
+        if ok_ids:
+            # Round 1's M4, kept: 'ok' asserts a vector exists, so it may not
+            # be written on a store that cannot hold one.
+            self._require_vector()
+        c = self._c()
+        writes_enabled = self._vector_writes_enabled()
+        for row_id, chunk_id, embedding in vectors:
+            # Unconditional: if the row moved, ingest already dropped its
+            # vectors and this removes nothing. If it did not, this is the
+            # delete half of the idempotent delete-then-insert.
             c.execute(
-                f"UPDATE {table} SET embedding_state = ? "  # noqa: S608 - allowlisted literals
-                f"WHERE {col} IN ({placeholders})",
-                (state, *page),
+                f"DELETE FROM {vec_table} WHERE {vec_key} = ?",  # noqa: S608 - allowlisted literals
+                (chunk_id,),
             )
+            if not writes_enabled:
+                continue
+            c.execute(
+                f"INSERT INTO {vec_table}({vec_key}, embedding) "  # noqa: S608 - allowlisted literals
+                f"SELECT ?, ? WHERE EXISTS ("
+                f"SELECT 1 FROM {table} WHERE {col} = ? AND src_hash IS ?)",
+                (
+                    chunk_id,
+                    embedding.astype("float32").tobytes(),
+                    row_id,
+                    expected.get(row_id),
+                ),
+            )
+        written_ok = self.mark_embedded(kind, ok_ids, "ok", expected, _commit=False)
+        written_skip = self.mark_embedded(
+            kind, skip_ids, "skip", expected, _commit=False
+        )
+        self.mark_embedded(kind, error_ids, "error", _commit=False)
         c.commit()
+        return written_ok, written_skip
 
     def requeue_embedding(self, kind: str, ids: list[str]) -> None:
         """Put rows back INTO the backlog: ``embedding_state`` → NULL.

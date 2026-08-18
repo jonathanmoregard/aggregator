@@ -1052,12 +1052,17 @@ def test_a_crash_between_the_vector_write_and_the_watermark_costs_one_batch(
 ):
     """The narrow window, and the direction it has to fail in.
 
-    ``_embed_batch`` commits the vectors and then advances the watermark. A
-    death in between leaves vectors with no state — so the batch is selected
-    again next run and redone. That costs one batch of embedding and nothing
-    else, because the vec write is delete-then-insert and therefore idempotent.
-    The mirrored ordering would leave rows marked embedded with no vector, and
-    nothing ever looks at those rows again.
+    The vectors and the watermark are now written in ONE transaction
+    (``Store.commit_embed_batch``), so a death between them rolls the batch
+    back whole: no vectors, no state, and the next run redoes it. That costs
+    one batch of embedding and nothing else.
+
+    Before that, the two committed separately and this window left vectors on
+    disk with no state — also safe, because the batch was selected again and
+    the vec write is delete-then-insert and therefore idempotent. Both answers
+    fail in the SAME direction, which is the property being pinned: the
+    mirrored one, rows marked embedded with no vector, is the one nothing ever
+    comes back for.
     """
     stub = StubEmbedder()
     monkeypatch.setattr("aggregator.cli.Embedder", lambda *a, **kw: stub)
@@ -1066,18 +1071,21 @@ def test_a_crash_between_the_vector_write_and_the_watermark_costs_one_batch(
     real_mark = Store.mark_embedded
     crashed: list[int] = []
 
-    def crash_once(self, kind, ids_, state):
+    def crash_once(self, kind, ids_, state, expected=None, *, _commit=True):
         if not crashed:
             crashed.append(1)
             raise RuntimeError("power cut between the vectors and the watermark")
-        return real_mark(self, kind, ids_, state)
+        return real_mark(self, kind, ids_, state, expected, _commit=_commit)
 
     monkeypatch.setattr(Store, "mark_embedded", crash_once)
     with pytest.raises(RuntimeError, match="power cut"):
         run_cli(["embed", "--catchup", "--batch-size", "2"])
 
     assert set(embedding_states(cache).values()) == {None}
-    assert vector_ids(cache) == {"obs-k8s"}, "the vectors of batch 1 are on disk"
+    assert vector_ids(cache) == set(), (
+        "the batch's vectors were committed without their watermark: the two "
+        "must land in one transaction or neither"
+    )
     assert_watermark_not_ahead_of_data(cache)
 
     monkeypatch.setattr(Store, "mark_embedded", real_mark)
