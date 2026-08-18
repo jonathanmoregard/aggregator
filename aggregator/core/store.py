@@ -287,6 +287,23 @@ def _stored_hashes(
     return out
 
 
+def _json_id_clause(column: str) -> str:
+    """``<column> IN (…)`` that binds ANY NUMBER of ids as ONE parameter.
+
+    The obvious ``IN (?,?,?…)`` breaks at ``SQLITE_MAX_VARIABLE_NUMBER`` —
+    32,766 on this build — and every id set in this file that comes from an
+    FTS5 or hybrid hit list is routinely bigger than that: the corpus is
+    483,193 observations and a common word matches tens of thousands of them.
+    ``json_each`` takes the whole list as a single JSON parameter and stays
+    index-driven; the plan keeps the id lookup and carries the scope as a LIST
+    SUBQUERY. JSON1 has been compiled into SQLite by default since 3.38.
+
+    ``column`` is interpolated and is never caller-supplied: every call site
+    passes a literal.
+    """
+    return f"{column} IN (SELECT value FROM json_each(?))"
+
+
 def _vec_table_present(c: sqlite3.Connection, table: str) -> bool:
     """Whether ``table`` exists. Probed once per write group, not per row."""
     return (
@@ -2581,14 +2598,16 @@ class Store:
         still index-driven — the plan stays
         ``SEARCH … USING INDEX (obs_id=?)`` with the scope as a LIST SUBQUERY,
         and 60k ids resolve in ~20 ms. JSON1 has been compiled into SQLite by
-        default since 3.38; this build is 3.53.
+        default since 3.38; this build is 3.53. Shared with the FTS5 arm's
+        three binding sites via :func:`_json_id_clause` — round 2's S2 found
+        the same defect there, and one technique is enough.
         """
         if ast.id_scope is None:
             return
         if not ast.id_scope:
             clauses.append("1=0")
             return
-        clauses.append(f"{column} IN (SELECT value FROM json_each(?))")
+        clauses.append(_json_id_clause(column))
         params.append(json.dumps(sorted(ast.id_scope)))
 
     def _fts_ids(self, text: str) -> set[str]:
@@ -2904,8 +2923,9 @@ class Store:
                 return []
             if not root_ids and not exact_ids:
                 return []
-            where += " AND " + self._fts_scope_clause(root_ids, exact_ids)
-            params = [*params, *sorted(root_ids), *sorted(exact_ids)]
+            clause, scope_params = self._fts_scope_clause(root_ids, exact_ids)
+            where += " AND " + clause
+            params = [*params, *scope_params]
         sql = f"SELECT * FROM sessions WHERE {where} ORDER BY last_ts DESC"
         if limit is not None or offset:
             sql += " LIMIT ? OFFSET ?"
@@ -2939,8 +2959,9 @@ class Store:
                 return 0
             if not root_ids and not exact_ids:
                 return 0
-            where += " AND " + self._fts_scope_clause(root_ids, exact_ids)
-            params = [*params, *sorted(root_ids), *sorted(exact_ids)]
+            clause, scope_params = self._fts_scope_clause(root_ids, exact_ids)
+            where += " AND " + clause
+            params = [*params, *scope_params]
         row = c.execute(
             f"SELECT COUNT(*) AS n FROM sessions WHERE {where}", params
         ).fetchone()
@@ -3001,7 +3022,15 @@ class Store:
         limit: int | None = None,
         offset: int = 0,
     ) -> list[ObservationRow]:
-        """Return observation rows matching the AST, ordered by ``ts``."""
+        """Return observation rows matching the AST, ordered by ``ts``.
+
+        ONE BOUND PARAMETER FOR THE HIT LIST, not one per hit — see
+        :func:`_json_id_clause`. Binding per hit broke above 32,766 matches,
+        which a common word clears easily on a 483k-observation corpus, and it
+        broke silently here: the ``OperationalError`` handler below turned
+        "tens of thousands of hits" into an empty page, so the recall tool
+        answered "nothing found" on precisely the queries most worth running.
+        """
         where, params = self._obs_where(ast)
         c = self._c()
         if ast.text:
@@ -3012,9 +3041,8 @@ class Store:
                 return []
             if not obs_ids:
                 return []
-            placeholders = ",".join("?" * len(obs_ids))
-            where += f" AND obs_id IN ({placeholders})"
-            params = [*params, *obs_ids]
+            where += " AND " + _json_id_clause("obs_id")
+            params = [*params, json.dumps(sorted(obs_ids))]
         sql = f"SELECT * FROM observations WHERE {where} ORDER BY ts ASC"
         if limit is not None or offset:
             sql += " LIMIT ? OFFSET ?"
@@ -3027,6 +3055,13 @@ class Store:
         return [_row_to_observation(row) for row in rows]
 
     def count_observations(self, ast: QueryAST) -> int:
+        """Match count for ``query_observations`` (for MCP ``total``).
+
+        Same one-parameter binding as its twin, and it failed the OTHER way
+        before: the ``COUNT`` below is unwrapped, so an oversized hit list
+        propagated ``too many SQL variables`` to the caller while
+        ``query_observations`` silently returned nothing for the same query.
+        """
         where, params = self._obs_where(ast)
         c = self._c()
         if ast.text:
@@ -3036,9 +3071,8 @@ class Store:
                 return 0
             if not obs_ids:
                 return 0
-            placeholders = ",".join("?" * len(obs_ids))
-            where += f" AND obs_id IN ({placeholders})"
-            params = [*params, *obs_ids]
+            where += " AND " + _json_id_clause("obs_id")
+            params = [*params, json.dumps(sorted(obs_ids))]
         row = c.execute(
             f"SELECT COUNT(*) AS n FROM observations WHERE {where}", params
         ).fetchone()
@@ -3063,27 +3097,39 @@ class Store:
         return [r["root"] for r in rows if r["root"]]
 
     @staticmethod
-    def _fts_scope_clause(root_ids: set[str], exact_ids: set[str]) -> str:
-        """SQL fragment pairing kinds with their FTS hit scope.
+    def _fts_scope_clause(
+        root_ids: set[str], exact_ids: set[str]
+    ) -> tuple[str, list[str]]:
+        """``(SQL fragment, params)`` pairing kinds with their FTS hit scope.
 
-        Top-level cards surface on any hit under their root; subagent
-        cards only on hits in their own stream. Caller appends params in
-        the same order: sorted(root_ids) then sorted(exact_ids). Empty
-        sets render as ``1=0`` (SQL disallows ``IN ()``).
+        Top-level cards surface on any hit under their root; subagent cards
+        only on hits in their own stream. Empty sets render as ``1=0`` (SQL
+        disallows ``IN ()``).
+
+        RETURNS ITS OWN PARAMS rather than documenting an order for the caller
+        to reproduce, because there is now at most one per part and getting
+        the pairing wrong is silent. Each part binds ONE parameter however
+        many ids it holds — see :func:`_json_id_clause`. Per-id binding broke
+        above 32,766 ids, and broke asymmetrically: ``query_sessions``
+        swallowed the ``OperationalError`` into an empty page while
+        ``count_sessions`` raised it at the caller.
         """
-        root_part = (
-            "(kind = 'session' AND root_session_id IN ("
-            + ",".join("?" * len(root_ids)) + "))"
-            if root_ids
-            else "1=0"
-        )
-        exact_part = (
-            "(kind = 'subagent' AND session_id IN ("
-            + ",".join("?" * len(exact_ids)) + "))"
-            if exact_ids
-            else "1=0"
-        )
-        return f"({root_part} OR {exact_part})"
+        params: list[str] = []
+        if root_ids:
+            root_part = (
+                "(kind = 'session' AND " + _json_id_clause("root_session_id") + ")"
+            )
+            params.append(json.dumps(sorted(root_ids)))
+        else:
+            root_part = "1=0"
+        if exact_ids:
+            exact_part = (
+                "(kind = 'subagent' AND " + _json_id_clause("session_id") + ")"
+            )
+            params.append(json.dumps(sorted(exact_ids)))
+        else:
+            exact_part = "1=0"
+        return f"({root_part} OR {exact_part})", params
 
     def _fts_hit_scope(
         self, text: str, obs_type: str | None = None
