@@ -633,6 +633,11 @@ _VEC_DIM = 768
 #: that is not this code, and therefore may not be trusted.
 VECTOR_PROVENANCE_KEY = "vector_provenance"
 
+#: ``meta`` key naming the row the embed worker is attempting right now. Its
+#: presence at STARTUP means the previous worker died on that row without
+#: unwinding — see ``Store.claim_embed_row``.
+EMBED_CLAIM_KEY = "embed_inflight"
+
 _VEC_DDL: list[str] = [
     f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_observations USING vec0(
@@ -1584,6 +1589,58 @@ class Store:
                 tuple(page),
             )
         c.commit()
+
+    # -- the in-flight claim: what a row that KILLED the worker leaves behind -
+    #
+    # Every other failure path in the embed worker starts with an exception.
+    # This one cannot: an OOM kill, a segfault in a native tokenizer or torch
+    # kernel, or a SIGKILL ends the process with no unwinding, so nothing is
+    # caught, nothing is held in the ledger and ``embedding_state`` never
+    # moves. ``select_unembedded`` is ``ORDER BY ts DESC``, so the next tick
+    # picks the same row first and dies identically — twice an hour, forever,
+    # with an empty ledger and no stderr line to say so.
+    #
+    # So the row is written down BEFORE it is attempted, and committed, which
+    # is the only part a kill cannot undo. A run that finds a claim knows the
+    # previous process did not survive that row.
+
+    def claim_embed_row(self, kind: str, row_id: str) -> None:
+        """Record — durably — which row is about to be embedded."""
+        self._ensure_writable()
+        c = self._c()
+        c.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (
+                EMBED_CLAIM_KEY,
+                json.dumps({"kind": kind, "row_id": row_id}, sort_keys=True),
+            ),
+        )
+        # COMMIT IS THE ENTIRE POINT. An uncommitted claim dies with the
+        # process that wrote it, which is precisely the process this is meant
+        # to outlive.
+        c.commit()
+
+    def release_embed_claim(self) -> None:
+        """The claimed row resolved. Clear the claim."""
+        self._ensure_writable()
+        c = self._c()
+        c.execute("DELETE FROM meta WHERE key = ?", (EMBED_CLAIM_KEY,))
+        c.commit()
+
+    def pending_embed_claim(self) -> tuple[str, str] | None:
+        """``(kind, row_id)`` a previous process died on, or ``None``."""
+        row = self._c().execute(
+            "SELECT value FROM meta WHERE key = ?", (EMBED_CLAIM_KEY,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            claim = json.loads(row[0])
+            return str(claim["kind"]), str(claim["row_id"])
+        except (ValueError, KeyError, TypeError):
+            # An unreadable claim names nobody, so it can blame nobody. Say
+            # nothing rather than condemning an arbitrary row.
+            return None
 
     @staticmethod
     def _kind_columns(kind: str) -> tuple[str, str]:

@@ -1025,11 +1025,24 @@ def test_a_sigkilled_catchup_resumes_without_redoing_a_finished_batch(
 
     resumed = StubEmbedder()
     monkeypatch.setattr("aggregator.cli.Embedder", lambda *a, **kw: resumed)
-    assert run_cli(["embed", "--catchup", "--batch-size", "2"]) == 0
+    # EXIT 1, AND THAT IS THE POINT OF THE CLAIM. The worker was killed while
+    # inside ``embed_documents`` for ``obs-long``, so from the cache's side
+    # that row is indistinguishable from one that OOM-killed the process —
+    # nothing was raised, nothing was caught, nothing was written. The resumed
+    # run finds the claim, sets that row aside through the ordinary quarantine
+    # ledger, and reports it once, exactly as it reports any other new
+    # per-row failure. Here the kill came from this test rather than from the
+    # row, which costs that row one delayed attempt: the ledger holds it with
+    # backoff and only calls it terminal after POISON_MAX_ATTEMPTS sightings
+    # fifteen minutes apart. That is the deliberate trade — the alternative is
+    # a row that kills the worker being handed straight back to the next tick,
+    # forever, with an empty ledger.
+    assert run_cli(["embed", "--catchup", "--batch-size", "2"]) == 1
 
-    redone = resumed.document_calls - 7
-    assert redone == 0
-    assert redone <= 2, "more than one batch was redone"
+    # Six, not seven: ``obs-long`` was set aside rather than re-attempted.
+    redone = resumed.document_calls - 6
+    assert redone == 0, "a finished batch was redone"
+    assert embedding_states(cache)["obs-long"] == "error"
     assert all(s is not None for s in embedding_states(cache).values())
     assert_watermark_not_ahead_of_data(cache)
 

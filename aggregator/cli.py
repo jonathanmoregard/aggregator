@@ -1464,12 +1464,17 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
             print("another embed worker is running; exiting")
             return 0
 
-        embedder = Embedder()
         kinds = (
             ["observations", "records"] if args.source == "both" else [args.source]
         )
         outcome = _EmbedOutcome()
         ledger = PoisonLedger(store)
+        # BEFORE the embedder is constructed, and before any row is selected:
+        # a claim left on disk means the previous worker did not survive that
+        # row, and it must be set aside now or the very next select hands it
+        # back and this process dies the same way.
+        _blame_crashed_row(store, ledger, outcome)
+        embedder = Embedder()
         try:
             for kind in kinds:
                 _embed_backlog(store, embedder, kind, args, ledger, outcome)
@@ -1622,6 +1627,61 @@ def _embedder_is_healthy(embedder: Embedder) -> bool:
     return True
 
 
+class EmbedWorkerKilledError(RuntimeError):
+    """A previous worker process died on a row without raising anything.
+
+    Its own type so the ledger entry, and therefore ``aggregator status``,
+    names the failure mode rather than showing a generic RuntimeError next to
+    genuinely different faults.
+    """
+
+
+def _blame_crashed_row(
+    store: Store, ledger: PoisonLedger, outcome: _EmbedOutcome
+) -> None:
+    """Set aside the row a previous process died on, if there is one.
+
+    THE WEDGE THIS EXISTS TO BREAK. Chunk N's isolation depends on catching an
+    exception: the row is held, marked ``'error'``, and the backlog drains
+    past it. A row that OOM-kills the worker, or segfaults inside a native
+    tokenizer, raises nothing at all — no handler runs, no ledger entry is
+    written, ``embedding_state`` stays NULL, and ``select_unembedded``'s
+    ``ORDER BY ts DESC`` hands the identical row to the next tick. Twice an
+    hour, forever, and the only external symptom is ``vector_index`` counts
+    that stop moving, which is not something a human watches for a month.
+
+    Routed through the SAME ledger as every other per-row failure, so a
+    genuine crash and a SIGTERM during a deploy are told apart by evidence
+    rather than by guessing: the row is held with backoff, comes back when it
+    is due, and only becomes terminal after ``POISON_MAX_ATTEMPTS`` sightings
+    at least fifteen minutes apart. So an unlucky deploy costs one delayed
+    row; a row that reliably kills the worker stops being attempted.
+    """
+    claim = store.pending_embed_claim()
+    if claim is None:
+        return
+    kind, row_id = claim
+    source = _embed_ledger_source(kind)
+    error = EmbedWorkerKilledError(
+        f"a previous `aggregator embed` process died while embedding {kind} "
+        f"row {row_id!r} — no exception was raised, so this is a kill "
+        f"(OOM, segfault in a native extension, or an external SIGKILL) "
+        f"rather than bad data the worker could catch. The row is set aside "
+        f"so the backlog can drain past it."
+    )
+    previous = ledger.entries(source).get(row_id)
+    held = ledger.hold(source, row_id, error, previous=previous)
+    store.mark_embedded(kind, [row_id], state="error")
+    store.release_embed_claim()
+    if previous is None:
+        outcome.new_failures.append(
+            f"embed: {kind} row {row_id!r} killed a previous worker process "
+            f"and was set aside — {held.error_detail}"
+        )
+    else:
+        outcome.known_failures += 1
+
+
 def _embed_ledger_source(kind: str) -> str:
     """What the embed worker calls itself in the quarantine ledger.
 
@@ -1726,8 +1786,15 @@ def _embed_batch(
             if not chunks:
                 skip_ids.append(row_id)
                 continue
+            # WRITTEN AND COMMITTED BEFORE THE ATTEMPT. Everything else in this
+            # handler needs an exception; a row that OOM-kills or segfaults the
+            # process raises nothing, so the claim on disk is the only trace
+            # that survives. See ``Store.claim_embed_row``.
+            store.claim_embed_row(kind, row_id)
             vecs = embedder.embed_documents(chunks)
+            store.release_embed_claim()
         except Exception as e:
+            store.release_embed_claim()
             if not _embedder_is_healthy(embedder):
                 unhealthy = EmbedderUnhealthyError(
                     f"aggregator embed stopped after {kind} row {row_id!r} failed "
