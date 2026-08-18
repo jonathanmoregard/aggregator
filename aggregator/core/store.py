@@ -1276,6 +1276,71 @@ class Store:
             )
         c.commit()
 
+    _VEC_TABLES = {
+        "observations": "vec_observations",
+        "records": "vec_records",
+    }
+
+    def count_vec_rows(self, kind: str) -> int:
+        """How many VECTORS the vector arm holds for ``kind``.
+
+        Counts rows in the ``vec_<kind>`` virtual table, which is chunks and
+        not documents: the embed worker writes one row per chunk, keyed
+        ``<id>:<n>`` when a body needed more than one. Document-level progress
+        is ``embedding_state``; this is "how much can KNN actually reach".
+
+        A read of the vector arm, so it RAISES rather than answering 0 when
+        the arm is off — the whole point of the number is telling "nothing
+        embedded yet" apart from "no vector index on this cache", and a 0
+        that means either is worth less than no number at all. Both the
+        extension-missing case and the tables-missing case (a cache migrated
+        on a machine without sqlite-vec, opened later on one with it) come
+        back as :class:`VectorIndexUnavailableError`.
+        """
+        table = self._VEC_TABLES.get(kind)
+        if table is None:
+            raise ValueError(f"unknown kind: {kind!r}")
+        self._require_vector()
+        c = self._c()
+        try:
+            row = c.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()  # noqa: S608 - allowlisted literals
+        except sqlite3.OperationalError as e:
+            raise VectorIndexUnavailableError(
+                f"vector table {table!r} is missing from this cache: {e}. The "
+                "cache was migrated on an interpreter without the sqlite-vec "
+                "extension. Run `aggregator embed --catchup` (or any writable "
+                "aggregator command) on an interpreter that has it to create "
+                "the vector tables and fill them."
+            ) from e
+        return int(row["n"]) if row else 0
+
+    def count_embedding_states(self, kind: str) -> dict[str, int]:
+        """Tally of ``embedding_state`` for ``kind``: the backfill watermark.
+
+        Keys, always all present: ``total``, plus ``pending`` (NULL — still in
+        the backlog), ``ok``, ``skip`` (nothing embeddable in the body) and
+        ``error``. A caller reading ``["pending"]`` must never have to guard
+        for a missing key.
+
+        Plain column arithmetic with NO dependency on the native extension,
+        deliberately — the moment an operator most needs to know how far the
+        backfill got is the moment the vector arm is broken.
+        """
+        if kind not in self._VEC_TABLES:
+            raise ValueError(f"unknown kind: {kind!r}")
+        c = self._c()
+        counts = {"total": 0, "pending": 0, "ok": 0, "skip": 0, "error": 0}
+        rows = c.execute(
+            f"SELECT embedding_state AS s, COUNT(*) AS n FROM {kind} "  # noqa: S608 - allowlisted literals
+            "GROUP BY embedding_state"
+        ).fetchall()
+        for row in rows:
+            n = int(row["n"])
+            counts["total"] += n
+            key = "pending" if row["s"] is None else str(row["s"])
+            counts[key] = counts.get(key, 0) + n
+        return counts
+
     def _vec_obs_ids(self, query_embedding: np.ndarray, k: int) -> list[str]:
         """Vector KNN over ``vec_observations``.
 

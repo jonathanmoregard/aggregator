@@ -206,3 +206,132 @@ def test_backlog_bookkeeping_still_works_when_unavailable(no_vec_store):
     assert len(no_vec_store.select_unembedded("observations", limit=10)) == 2
     no_vec_store.mark_embedded("observations", ["u0"], state="ok")
     assert {r["obs_id"] for r in no_vec_store.select_unembedded("observations", limit=10)} == {"u1"}
+
+
+# --- count_vec_rows: how much of the corpus the vector arm can actually reach -
+
+
+def test_count_vec_rows_is_zero_on_a_fresh_cache(store):
+    assert store.count_vec_rows("observations") == 0
+    assert store.count_vec_rows("records") == 0
+
+
+def test_count_vec_rows_counts_written_vectors(store):
+    _seed_observation(store, "o0")
+    _seed_observation(store, "o1")
+    vecs = np.eye(2, 768, dtype=np.float32)
+    store.upsert_vec_observations([("o0", vecs[0]), ("o1", vecs[1])])
+    assert store.count_vec_rows("observations") == 2
+    assert store.count_vec_rows("records") == 0
+
+
+def test_count_vec_rows_counts_chunks_not_documents(store):
+    """One row can hold several vectors — the embed worker writes ``id:N``
+    chunk ids for a long body. This counts VECTORS, which is what the vector
+    arm can retrieve; document-level progress lives in ``embedding_state``.
+    """
+    _seed_observation(store, "o0")
+    vecs = np.eye(3, 768, dtype=np.float32)
+    store.upsert_vec_observations(
+        [("o0:0", vecs[0]), ("o0:1", vecs[1]), ("o0:2", vecs[2])]
+    )
+    assert store.count_vec_rows("observations") == 3
+
+
+def test_count_vec_rows_counts_records(store):
+    _seed_record(store, "github:1")
+    vec = np.eye(1, 768, dtype=np.float32)[0]
+    store.upsert_vec_records([("github:1", vec)])
+    assert store.count_vec_rows("records") == 1
+
+
+def test_count_vec_rows_rejects_unknown_kind(store):
+    with pytest.raises(ValueError, match="unknown kind"):
+        store.count_vec_rows("nope")
+
+
+def test_count_vec_rows_raises_named_error_when_unavailable(no_vec_store):
+    """A read of the vector arm, so it obeys the reads-RAISE half of the
+    contract: a caller must be able to tell "no vector arm here" apart from
+    "nothing embedded yet". Returning 0 would conflate exactly those two.
+    """
+    with pytest.raises(VectorIndexUnavailableError, match="sqlite-vec"):
+        no_vec_store.count_vec_rows("observations")
+    with pytest.raises(VectorIndexUnavailableError, match="sqlite-vec"):
+        no_vec_store.count_vec_rows("records")
+
+
+def test_count_vec_rows_rejects_unknown_kind_before_touching_the_extension(
+    no_vec_store,
+):
+    """A bad ``kind`` is a programming error either way — it must not be
+    masked by the environment-dependent availability check."""
+    with pytest.raises(ValueError, match="unknown kind"):
+        no_vec_store.count_vec_rows("nope")
+
+
+def test_count_embedding_states_tallies_the_backlog(store):
+    for i in range(4):
+        _seed_observation(store, f"o{i}")
+    store.mark_embedded("observations", ["o0", "o1"], state="ok")
+    store.mark_embedded("observations", ["o2"], state="skip")
+    counts = store.count_embedding_states("observations")
+    assert counts["total"] == 4
+    assert counts["ok"] == 2
+    assert counts["skip"] == 1
+    assert counts["error"] == 0
+    assert counts["pending"] == 1
+
+
+def test_count_embedding_states_zeroes_every_key_on_an_empty_table(store):
+    """Absent states must still be present as 0 — a caller reading
+    ``counts["pending"]`` should not have to guard for a missing key."""
+    assert store.count_embedding_states("records") == {
+        "total": 0,
+        "pending": 0,
+        "ok": 0,
+        "skip": 0,
+        "error": 0,
+    }
+
+
+def test_count_embedding_states_rejects_unknown_kind(store):
+    with pytest.raises(ValueError, match="unknown kind"):
+        store.count_embedding_states("nope")
+
+
+def test_count_embedding_states_works_without_the_extension(no_vec_store):
+    """``embedding_state`` is a plain column. How far the backfill got is
+    exactly what an operator needs when the vector arm is broken, so this
+    read must not depend on the native extension."""
+    _seed_observation(no_vec_store, "o0")
+    _seed_observation(no_vec_store, "o1")
+    no_vec_store.mark_embedded("observations", ["o0"], state="ok")
+    counts = no_vec_store.count_embedding_states("observations")
+    assert counts["total"] == 2
+    assert counts["ok"] == 1
+    assert counts["pending"] == 1
+
+
+def test_count_vec_rows_raises_when_the_vec_table_is_missing(tmp_path, monkeypatch):
+    """Migrated WITHOUT the extension, then opened WITH it: the extension
+    loads but ``vec_observations`` was never created. That is still "no
+    vector arm on this cache", and it must not escape as a bare
+    ``no such table``.
+    """
+
+    def _boom(conn):
+        raise sqlite3.OperationalError("simulated sqlite-vec ABI mismatch")
+
+    monkeypatch.setattr(store_mod, "_load_sqlite_vec", _boom)
+    monkeypatch.setattr(store_mod, "_VEC_LOAD_WARNED", False)
+    degraded = Store(db_path=tmp_path / "cache.db")
+    degraded.migrate()
+    assert degraded.vector_available is False
+    degraded.close()
+
+    monkeypatch.undo()
+    healthy = Store(db_path=tmp_path / "cache.db", read_only=True)
+    assert healthy.vector_available is True
+    with pytest.raises(VectorIndexUnavailableError):
+        healthy.count_vec_rows("observations")
