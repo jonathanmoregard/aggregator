@@ -418,31 +418,93 @@
                 fail "aggregator-embed-seed.service sets IPAddressDeny=any — that blocks the download this unit exists to perform"
               fi
 
+              # ---- 8b. Directives that would BREAK these units -------------
+              # Round-2 advisory. The sandbox above has never executed: this
+              # host's aggregator-env has no torch, so nothing has ever run
+              # under it (see nix/README.md, "what remains unproven"). The
+              # standing risk is therefore not that a directive gets removed —
+              # step 8 catches that — but that a future hardening pass ADDS
+              # one that looks like an improvement and silently makes the unit
+              # unstartable, on a branch where nobody can start it to find out.
+              #
+              # Each absence below is justified from something this module
+              # itself sets, except the first, which is justified from torch's
+              # documented behaviour and is NOT empirically verified here.
+              for u in aggregator-embed.service aggregator-embed-seed.service; do
+                f="$units/$u"
+
+                # torch's JIT and the OpenMP runtime allocate W|X pages, so
+                # this makes `import torch` die. It is the single most likely
+                # directive for a well-meaning hardening pass to reach for.
+                # NOT verified by execution on this host — asserted from
+                # torch's documented behaviour, and recorded as such.
+                if grep -q '^MemoryDenyWriteExecute=' "$f"; then
+                  fail "$u sets MemoryDenyWriteExecute — torch's JIT and the OpenMP runtime allocate W|X pages, so import torch dies and this unit can never start"
+                fi
+
+                # HF_HOME is %C/huggingface, which for a user manager is
+                # $XDG_CACHE_HOME under $HOME. Any ProtectHome= makes the
+                # weights cache unreachable — unwritable for the seeder,
+                # unreadable for the worker.
+                if grep -q '^ProtectHome=' "$f"; then
+                  fail "$u sets ProtectHome — HF_HOME resolves under \$HOME, so the weights cache becomes unreachable"
+                fi
+              done
+
+              # NO assertion here for `ProtectSystem=strict`, which would also
+              # break these units ($HOME read-only, and the HF cache lives
+              # there). One was written and then removed, because it could not
+              # be made to go red: home-manager renders exactly one value per
+              # key, so setting `strict` REPLACES `ProtectSystem=full` rather
+              # than shadowing it, and step 8's "missing ProtectSystem=full"
+              # fires first. Watched: injecting `ProtectSystem = "strict"`
+              # into the seeder's override block failed with
+              #   "aggregator-embed-seed.service is missing 'ProtectSystem=full'"
+              # and the dedicated assertion never ran. Shipping it anyway would
+              # have been dead code that reads like coverage.
+
+              # The seeder exists to download. PrivateNetwork is fine on the
+              # offline worker and fatal here.
+              if grep -q '^PrivateNetwork=' "$seed_svc"; then
+                fail "aggregator-embed-seed.service sets PrivateNetwork — it exists to fetch 2.4 GB of weights over the internet"
+              fi
+
               # ---- 9. The score behind step 8, and why it is not asserted -
-              # `systemd-analyze security --offline=true <unit>` rates the
-              # rendered file without loading it, which is exactly the tool
-              # this wants — and it cannot run in the Nix build sandbox: it
-              # dies with "Failed to create directory '/run/systemd/'" before
-              # printing anything. That was tried, and an assertion that can
-              # never execute is worse than none, because it reads like
-              # coverage.
+              # `systemd-analyze security --offline=true --user <unit>` rates
+              # the rendered file without loading it, and
+              # `systemd-analyze verify --user <unit>` catches directives
+              # systemd would silently ignore (a misspelled `ProtectSytem=`
+              # prints "Unknown key ... ignoring" and is otherwise invisible —
+              # the same failure shape as the timeoutStartSec typo in 6b).
+              # Both are exactly the tools this check wants. NEITHER can run
+              # in the Nix build sandbox. Observed on systemd 261, for both
+              # subcommands:
               #
-              # So the score is a recorded measurement rather than a gate.
-              # Taken on this host against the rendered unit:
+              #     Failed to lookup RuntimeDirectory path: No such device or address
+              #     Failed to initialize manager: No such device or address
               #
-              #     before hardening:  9.4 UNSAFE
-              #     after  hardening:  6.5 MEDIUM
+              # and — worse — both still exit 0 after printing it, so a naive
+              # gate would read as passing coverage while asserting nothing.
+              # That was tried and deliberately not shipped.
+              #
+              # So these are recorded measurements plus a manual step, not
+              # gates. Taken on this host against the rendered units:
+              #
+              #     aggregator-embed.service        9.4 UNSAFE -> 6.3 MEDIUM
+              #     aggregator-embed-seed.service   9.2 UNSAFE -> 6.8 MEDIUM
               #
               # Reproduce with:
               #
-              #     systemd-analyze security --offline=true \
-              #       "$(nix build --no-link --print-out-paths \
-              #          .#checks.x86_64-linux.aggregator-embed-unit-hygiene \
-              #        )/aggregator-embed.service"
+              #     out=$(nix build --no-link --print-out-paths \
+              #       .#checks.x86_64-linux.aggregator-embed-unit-hygiene)
+              #     systemd-analyze security --offline=true --user \
+              #       "$out/aggregator-embed-seed.service"
+              #     systemd-analyze verify --user "$out"/*.service
               #
-              # Step 8 is what actually holds the line in CI: it names every
-              # directive, so removing any one of them fails the build even
-              # though the number itself cannot be checked here.
+              # Steps 8 and 8b are what hold the line in CI: 8 names every
+              # directive that must be present, 8b every one that must not be,
+              # so drift in either direction fails the build even though the
+              # number itself cannot be checked here.
 
               echo "aggregator-embed unit hygiene: OK"
 

@@ -250,6 +250,67 @@ systemd-analyze security --offline=true --user \
   applied, because nothing has ever executed this sandbox (see below), and
   widening it on a host that cannot run it would be guesswork.
 
+The check asserts the first two absences directly, so a future hardening pass
+that adds them fails the build with a reason instead of producing a unit that
+cannot start.
+
+### What remains unproven about the sandbox
+
+**No process has ever run under these directives.** This is a known gap, not an
+oversight, and it is stated here so nobody reads the table above as an
+all-clear.
+
+The deployed `aggregator-env` on this host has no `sentence-transformers`,
+`torch-bin`, `transformers` or `sqlite-vec`, so neither unit can start here at
+all; closing that lives in a different repo. "Start the unit and see" was
+therefore never available while this was written.
+
+What **is** verified:
+
+- The rendered unit text — every directive that must be present, and the three
+  that must be absent, are asserted at eval time by
+  `checks.<system>.aggregator-embed-unit-hygiene`, and every one of those
+  assertions was watched to fail against a deliberately-broken module before
+  being trusted.
+- The exposure scores in the table, measured with `systemd-analyze security
+  --offline=true --user` against the rendered files on systemd 261.
+- `systemd-analyze verify --user` is silent on both rendered units, i.e.
+  systemd recognises every key and would not silently ignore one.
+- The generated shell scripts, executed directly with stubbed binaries across
+  every cache state that matters.
+
+What is **not** verified, and what would settle it:
+
+| Claim | Status | How to settle it |
+|---|---|---|
+| torch imports and runs under this directive set | **UNPROVEN** | run `aggregator-embed.service` on a host whose closure has torch, and read the journal |
+| the seeder can actually reach huggingface.co through `RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6` | **UNPROVEN** | `systemctl --user start aggregator-embed-seed.service` on such a host |
+| `MemoryDenyWriteExecute` would break torch | **asserted from documented behaviour, not measured here** | as above, plus one run with the directive added |
+
+Neither `systemd-analyze security` nor `systemd-analyze verify` can run inside
+the Nix build sandbox — on systemd 261 both print
+
+```
+Failed to lookup RuntimeDirectory path: No such device or address
+Failed to initialize manager: No such device or address
+```
+
+and then **exit 0**, so wiring either into the check would have produced a gate
+that always passes while asserting nothing. Both are documented as manual steps
+instead:
+
+```bash
+out=$(nix build --no-link --print-out-paths \
+  .#checks.x86_64-linux.aggregator-embed-unit-hygiene)
+systemd-analyze security --offline=true --user "$out/aggregator-embed-seed.service"
+systemd-analyze verify --user "$out"/*.service
+```
+
+**First person to run either unit on a host with torch: watch the journal for
+an early exit before any aggregator output.** That is what a sandbox
+incompatibility looks like, and it is the one failure mode nothing above can
+rule out.
+
 ### Failure is loud, but only once a day
 
 `OnFailure=aggregator-embed-failure-notify.service`, mirroring the ingest
@@ -398,10 +459,21 @@ What it enforces, and why each one is there:
 - **`HF_HUB_OFFLINE=1`** on the timer-driven unit.
 - **The embed timer's `OnCalendar` differs from every ingest timer's.**
 - **`aggregator-embed-seed.service` has no `[Install]` section**, so it can
-  never be pulled in by a target and start a 1.2 GB download unattended.
+  never be pulled in by a target and start a 2.4 GB download unattended.
+- **The seed unit names both model repos, runs `embed --seed-models`, exports
+  the download opt-in, and embeds no rows.**
+- **`timeoutStartSec` accepts exactly the time spans `systemd-analyze timespan`
+  accepts** — checked in both directions against 14 cases.
+- **The failure-notify debounce arms only on a delivered popup** — asserted by
+  executing the generated script with a stubbed `notify-send`.
+- **Both torch units carry the shared sandbox set**, the seeder can still open
+  an IP socket, and neither unit sets `MemoryDenyWriteExecute` or
+  `ProtectHome`.
 
 Each assertion has been red-tested by breaking the module on purpose and
-confirming the check fails; `nix flake check` runs it.
+confirming the check fails; `nix flake check` runs it. An assertion that could
+not be made to go red was removed rather than shipped — see the
+`ProtectSystem=strict` note in `flake.nix`.
 
 ## Register the MCP with Claude Code
 
