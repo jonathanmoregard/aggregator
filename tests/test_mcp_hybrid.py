@@ -445,7 +445,10 @@ def test_a_dead_reranker_returns_the_unreranked_page_rather_than_an_error(
     Losing it must cost the ordering, never the answer."""
     _seed_sessions(store, [("o1", "voting alpha", 1), ("o2", "voting beta", 2)])
     monkeypatch.setattr("aggregator.mcp._get_reranker", ExplodingReranker)
-    result = aggregator_query("voting", rerank=True, _store=store)
+    # fields='full' because rerank now requires it — the cross-encoder scores
+    # bodies and summary mode does not return any. Orthogonal to what this
+    # test is about; see tests/test_mcp_rerank_contract.py.
+    result = aggregator_query("voting", fields="full", rerank=True, _store=store)
     assert result["ok"] is True
     assert result["total"] == 2
 
@@ -463,7 +466,9 @@ def test_rerank_on_a_filter_only_query_loads_neither_model(
         "aggregator.mcp._get_reranker",
         lambda: loaded.append(1) or StubReranker("x"),
     )
-    result = aggregator_query("source:sessions", rerank=True, _store=store)
+    result = aggregator_query(
+        "source:sessions", fields="full", rerank=True, _store=store
+    )
     assert result["ok"] is True
     assert loaded == []
     assert embedder.query_calls == 0
@@ -504,7 +509,9 @@ def test_rerank_on_an_empty_page_does_not_call_the_model(
     _seed_sessions(store, [("o1", "voting alpha", 1)])
     reranker = StubReranker(prefer="alpha")
     monkeypatch.setattr("aggregator.mcp._get_reranker", lambda: reranker)
-    result = aggregator_query("nonexistentterm", rerank=True, _store=store)
+    result = aggregator_query(
+        "nonexistentterm", fields="full", rerank=True, _store=store
+    )
     assert result["ok"] is True
     assert reranker.calls == 0
 

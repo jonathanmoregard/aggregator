@@ -1011,6 +1011,12 @@ def aggregator_query(
       rerank: ``True`` re-orders the head of the page by cross-encoder
               relevance instead of recency. Off by default.
 
+              REQUIRES ``fields='full'``, and is refused without it. The
+              cross-encoder scores the bodies, and summary mode does not
+              return bodies — so under the default it would rank documents
+              that are empty below their subject line, and still charge the
+              full cost for that ordering.
+
               EXPENSIVE — DO NOT SET THIS IN AN INTERACTIVE TURN. Measured
               against real corpus bodies on this machine (CPU, no GPU):
               **47 s median, 59 s worst case per call**, versus 0.65 s for
@@ -1079,6 +1085,36 @@ def aggregator_query(
             "ok": False,
             "reason": f"unknown fields mode: {fields!r}",
             "remediation": "Use fields='summary' (default) or fields='full'.",
+        }
+    # RERANK NEEDS THE BODIES, AND SUMMARY MODE DOES NOT RETURN THEM.
+    # ``_rerank_doc`` scores the result ITEM, and an item's ``content`` is
+    # empty unless ``fields='full'`` — so under the default this handed the
+    # cross-encoder bodiless documents. Measured per route by spying on
+    # ``score()``: on the drilldown route all 3 documents were the single
+    # literal string ``'user\n\n'``, an ordering over nothing; on the other
+    # routes the documents differed but carried only ``subject``, which the
+    # response already returns to the caller. Either way the 47 s median buys
+    # nothing.
+    #
+    # REFUSED RATHER THAN AUTO-UPGRADED TO ``fields='full'``. Auto-upgrading
+    # would change the payload shape behind the caller's back — full items
+    # carry wrapped bodies that summary items do not — and would still spend
+    # the 47 s the caller has not been told about. Refusing spends nothing:
+    # this runs before any retrieval.
+    if rerank and fields != "full":
+        return {
+            "ok": False,
+            "reason": (
+                f"rerank=True needs document bodies to score, and "
+                f"fields={fields!r} does not return them — the cross-encoder "
+                f"would rank on an empty body, at ~47 s per call"
+            ),
+            "remediation": (
+                "Re-call with fields='full' (CLI: --fields full) to rerank "
+                "the real bodies, or drop rerank=True to keep the default "
+                "recency ordering. Leaving rerank off costs ordering only: "
+                "the same rows come back either way."
+            ),
         }
     if page_size is None:
         page_size = (
