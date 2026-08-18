@@ -395,6 +395,55 @@ def cmd_sample(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
+def _embed_batch_fast(store, embedder, kind: str, rows: list) -> None:
+    """Same vectors, same watermarks as ``cli._embed_batch``, one encode call.
+
+    ``cli._embed_batch`` calls ``embed_documents`` once per ROW. Most rows
+    produce a single chunk, so the model runs at batch size 1 and the CPU
+    spends its time on per-call overhead and an unfilled GEMM. Encoding every
+    chunk of the batch in one call lets sentence-transformers length-sort and
+    pad properly.
+
+    Used by the smoke only, and labelled as such: it exists to (a) make the
+    measurement affordable and (b) put a number on the headroom the shipped
+    worker leaves behind. It is NOT a proposed edit to the worker — that is a
+    separate decision, with its own memory-footprint question, for whoever
+    owns the backfill.
+    """
+    from aggregator.core.chunk import chunk_body
+
+    ok_ids: list[str] = []
+    skip_ids: list[str] = []
+    texts: list[str] = []
+    owners: list[tuple[str, int, int]] = []  # row_id, chunk_index, n_chunks
+    for row in rows:
+        if kind == "observations":
+            row_id, body = row["obs_id"], row["body"] or ""
+        else:
+            row_id = row["stable_id"]
+            body = f"{row['subject']}\n\n{row['body']}"
+        chunks = chunk_body(body)
+        if not chunks:
+            skip_ids.append(row_id)
+            continue
+        for i, ch in enumerate(chunks):
+            texts.append(ch)
+            owners.append((row_id, i, len(chunks)))
+        ok_ids.append(row_id)
+
+    all_vecs: list[tuple[str, Any]] = []
+    if texts:
+        vecs = embedder.embed_documents(texts)
+        for (row_id, i, n), vec in zip(owners, vecs, strict=True):
+            all_vecs.append((row_id if n == 1 else f"{row_id}:{i}", vec))
+    if kind == "observations":
+        store.upsert_vec_observations(all_vecs)
+    else:
+        store.upsert_vec_records(all_vecs)
+    store.mark_embedded(kind, ok_ids, "ok")
+    store.mark_embedded(kind, skip_ids, "skip")
+
+
 def cmd_embed(args: argparse.Namespace) -> int:
     """Embed the sampled observations plus every record, on the real code path.
 
@@ -471,7 +520,10 @@ def cmd_embed(args: argparse.Namespace) -> int:
                     if r.get("body"):
                         r["body"] = r["body"][: args.max_body_chars]
             chars += sum(len(r["body"] or "") for r in rows)
-            _embed_batch(store, embedder, kind, rows)
+            if args.fast_batch:
+                _embed_batch_fast(store, embedder, kind, rows)
+            else:
+                _embed_batch(store, embedder, kind, rows)
             done += len(rows)
             if args.progress and (i // args.batch_size) % 5 == 0:
                 el = time.monotonic() - t0
@@ -859,6 +911,96 @@ def _summary(xs: list[float]) -> dict[str, Any]:
     }
 
 
+def self_referential_obs(conn: sqlite3.Connection) -> set[str]:
+    """Observations that are RECORDS OF AGGREGATOR SEARCHES, not content.
+
+    The query set is mined from the user's own recorded ``search_memory``
+    calls, which means every query in it appears verbatim inside an
+    observation in the very corpus being searched — the tool_use row that
+    logged the call. BM25 ranks that row first for its own query, every
+    time, because it is an exact lexical copy.
+
+    Leaving those in would flatter both arms with a match that answers
+    nothing: FTS5 looks precise, the vector arm looks like it found the
+    topic, and neither told the user anything they did not just type. They
+    are excluded from the relevance labels. They are left in the INDEX,
+    where they are ordinary background text — removing them there would be
+    a different distortion, since production will certainly contain them.
+
+    The invented no-answer queries are unaffected either way: they were
+    never run, so no log entry of them exists.
+    """
+    return {
+        r[0]
+        for r in conn.execute(
+            "SELECT obs_id FROM observations WHERE tool_name LIKE '%aggregator%'"
+        )
+    }
+
+
+def _scale_extrapolation(negatives: list[float], full_chunks: int) -> dict[str, Any]:
+    """What the NEAREST irrelevant chunk looks like once the index is full.
+
+    THE SMOKE INDEX IS ~2000 CHUNKS AND PRODUCTION IS ~422000, AND THAT GAP
+    IS NOT A DETAIL — it is the whole reason a floor measured naively here
+    would be wrong. The closest of N random documents gets closer as N grows,
+    so a threshold that cleanly rejects every irrelevant neighbour in a small
+    index will start admitting them once the backfill finishes. Any floor has
+    to be judged against the distance an irrelevant chunk reaches at FULL
+    corpus size, not at smoke size.
+
+    Two estimates, deliberately both:
+
+    * **empirical** — negatives pooled across queries give tens of thousands
+      of (query, irrelevant-chunk) draws, so the far-left quantiles can just
+      be read off. This needs no distributional assumption but runs out of
+      resolution around ``1/len(negatives)``.
+    * **gaussian** — random pairs in a high-dimensional embedding space
+      concentrate, and a normal fit lets the tail be pushed past the
+      empirical resolution to ``1/N``. Reported alongside the empirical
+      value so the two can be checked against each other where they overlap;
+      if they disagree there, distrust the extrapolation.
+    """
+    import math
+
+    if not negatives:
+        return {}
+    n = len(negatives)
+    mean = sum(negatives) / n
+    var = sum((x - mean) ** 2 for x in negatives) / max(1, n - 1)
+    sd = math.sqrt(var)
+
+    def gaussian_min(draws: int) -> float:
+        # Inverse normal CDF at p = 1/(draws+1), Acklam-style approximation
+        # is overkill here; a bisection on math.erf is exact enough.
+        p = 1.0 / (draws + 1)
+        lo, hi = -12.0, 0.0
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            if 0.5 * (1 + math.erf(mid / math.sqrt(2))) < p:
+                lo = mid
+            else:
+                hi = mid
+        return mean + sd * (lo + hi) / 2
+
+    return {
+        "negative_pairs_measured": n,
+        "mean": round(mean, 4),
+        "sd": round(sd, 4),
+        "empirical_left_tail": {
+            "p1e-2": _pct(negatives, 1),
+            "p1e-3": _pct(negatives, 0.1),
+            "p1e-4": _pct(negatives, 0.01),
+            "observed_min": round(min(negatives), 4),
+        },
+        "expected_nearest_irrelevant_at_scale": {
+            str(k): round(gaussian_min(k), 4)
+            for k in (n, 10_000, 100_000, full_chunks)
+        },
+        "full_corpus_chunks": full_chunks,
+    }
+
+
 def _load_vectors(db: Path) -> dict[str, dict[str, np.ndarray]]:
     """Every stored vector, keyed by chunk id, per ontology.
 
@@ -961,6 +1103,10 @@ def cmd_distances(args: argparse.Namespace) -> int:
     per_query_best_neg: list[float] = []
     per_query: dict[str, Any] = {}
 
+    conn = sqlite3.connect(str(db))
+    selfref = self_referential_obs(conn)
+    conn.close()
+
     for q in queries:
         qv = qvecs[q]
         pos = [
@@ -969,7 +1115,7 @@ def cmd_distances(args: argparse.Namespace) -> int:
             for doc in pool["per_query"][q]["obs" if kind == "observations" else "rec"][
                 : args.top_k
             ]
-            if (d := dist_to(qv, kind, doc)) is not None
+            if doc not in selfref and (d := dist_to(qv, kind, doc)) is not None
         ]
         neg = [
             d
@@ -1008,6 +1154,8 @@ def cmd_distances(args: argparse.Namespace) -> int:
             "obs_docs": len(by_doc["observations"]),
             "rec_docs": len(by_doc["records"]),
         },
+        "self_referential_obs_excluded_from_labels": len(selfref),
+        "scale_extrapolation": _scale_extrapolation(negatives, args.full_corpus_chunks),
         "cosine_distance": {
             "positives_relevant": _summary(positives),
             "negatives_random": _summary(negatives),
@@ -1056,6 +1204,7 @@ def cmd_measure(args: argparse.Namespace) -> int:
     embedder = Embedder()
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
+    selfref = self_referential_obs(conn)
 
     def snippet(kind: str, doc: str) -> str:
         if kind == "observations":
@@ -1098,9 +1247,15 @@ def cmd_measure(args: argparse.Namespace) -> int:
                     "query": q,
                     "fts_error": fts_err,
                     "n_fts": len(fts),
+                    # FTS5 hit count with the query's own tool_use log removed
+                    # — see ``self_referential_obs``. This is the number that
+                    # says whether FTS5 answered the QUESTION, rather than
+                    # echoing the text the user typed.
+                    "n_fts_real": len(fts - selfref),
                     "n_vec": len(vec_raw),
                     "n_hybrid": len(hybrid),
                     "n_vector_only": len(extra),
+                    "n_vector_only_real": len(extra - selfref),
                 }
             )
             if group == "no_answer" or fts_err or args.label_all:
@@ -1127,6 +1282,10 @@ def cmd_measure(args: argparse.Namespace) -> int:
             "median_fts_hits": _pct([r["n_fts"] for r in sel], 50),
             "median_vector_hits": _pct([r["n_vec"] for r in sel], 50),
             "median_vector_only": _pct([r["n_vector_only"] for r in sel], 50),
+            "median_fts_hits_excl_selfref": _pct([r["n_fts_real"] for r in sel], 50),
+            "queries_with_zero_fts_excl_selfref": sum(
+                1 for r in sel if r["n_fts_real"] == 0
+            ),
             "queries_where_vector_added_nothing": sum(
                 1 for r in sel if r["n_vector_only"] == 0
             ),
@@ -1137,6 +1296,7 @@ def cmd_measure(args: argparse.Namespace) -> int:
         "fts5_syntax_errors": sum(
             1 for r in rows if r["group"] == "real" and r["fts_error"]
         ),
+        "self_referential_obs_in_corpus": len(selfref),
         "fts5_zero_hits_no_error": sum(
             1
             for r in rows
@@ -1270,6 +1430,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="records,observations",
         type=lambda s: tuple(x.strip() for x in s.split(",")),
     )
+    e.add_argument(
+        "--fast-batch",
+        action="store_true",
+        help="one encode call per batch; identical index, measures batching headroom",
+    )
     e.add_argument("--obs-ids", help="json id list under the scratch root")
     e.add_argument("--rec-ids", help="json id list under the scratch root")
     e.add_argument(
@@ -1303,6 +1468,7 @@ def build_parser() -> argparse.ArgumentParser:
         "distances", parents=[common], help="cosine distance distributions"
     )
     di.add_argument("--top-k", type=int, default=5)
+    di.add_argument("--full-corpus-chunks", type=int, default=422261)
     di.set_defaults(func=cmd_distances)
 
     me = sub.add_parser("measure", parents=[common], help="hybrid vs FTS5-only")
