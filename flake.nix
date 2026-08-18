@@ -199,6 +199,75 @@
                 fail "aggregator-embed-seed.service must not be wanted by any target"
               fi
 
+              # ---- 8. Sandbox the unit that eats attacker-influenced text -
+              # This unit feeds the corpus — web pages, PDFs, chat exports,
+              # GitHub bodies, none of it authored by the user — through
+              # torch and a native tokenizer, i.e. a large C++ attack surface
+              # processing untrusted bytes. Until now it ran with the user's
+              # full ambient authority and its "offline" was a pair of
+              # environment variables, which is a request rather than a
+              # boundary: anything that spawns a subprocess, or any library
+              # that ignores them, had the whole network.
+              #
+              # RestrictAddressFamilies is the load-bearing line. It is
+              # enforced by seccomp, works in a USER manager, and makes an
+              # AF_INET socket() fail outright — so "this unit does not talk
+              # to the network" stops depending on every library agreeing to
+              # read HF_HUB_OFFLINE. AF_UNIX stays for journal/dbus,
+              # AF_NETLINK for the glibc resolver paths that probe interfaces
+              # on startup even when nothing connects.
+              for directive in \
+                'NoNewPrivileges=true' \
+                'PrivateTmp=true' \
+                'RestrictAddressFamilies=AF_UNIX AF_NETLINK' \
+                'RestrictNamespaces=true' \
+                'RestrictRealtime=true' \
+                'RestrictSUIDSGID=true' \
+                'LockPersonality=true' \
+                'SystemCallArchitectures=native' \
+                'ProtectSystem=full' \
+                'ProtectKernelTunables=true' \
+                'ProtectControlGroups=true' \
+                'IPAddressDeny=any'; do
+                grep -qxF "$directive" "$svc" \
+                  || fail "aggregator-embed.service is missing '$directive'"
+              done
+
+              # The seeder is the one unit that MUST reach the network, so it
+              # may not inherit the address-family restriction. Asserting the
+              # absence keeps a well-meaning copy-paste from silently turning
+              # the documented download path into a unit that cannot download.
+              if grep -q '^RestrictAddressFamilies=' \
+                   "$units/aggregator-embed-seed.service"; then
+                fail "aggregator-embed-seed.service restricts address families — it exists to download weights"
+              fi
+
+              # ---- 9. The score behind step 8, and why it is not asserted -
+              # `systemd-analyze security --offline=true <unit>` rates the
+              # rendered file without loading it, which is exactly the tool
+              # this wants — and it cannot run in the Nix build sandbox: it
+              # dies with "Failed to create directory '/run/systemd/'" before
+              # printing anything. That was tried, and an assertion that can
+              # never execute is worse than none, because it reads like
+              # coverage.
+              #
+              # So the score is a recorded measurement rather than a gate.
+              # Taken on this host against the rendered unit:
+              #
+              #     before hardening:  9.4 UNSAFE
+              #     after  hardening:  6.5 MEDIUM
+              #
+              # Reproduce with:
+              #
+              #     systemd-analyze security --offline=true \
+              #       "$(nix build --no-link --print-out-paths \
+              #          .#checks.x86_64-linux.aggregator-embed-unit-hygiene \
+              #        )/aggregator-embed.service"
+              #
+              # Step 8 is what actually holds the line in CI: it names every
+              # directive, so removing any one of them fails the build even
+              # though the number itself cannot be checked here.
+
               echo "aggregator-embed unit hygiene: OK"
 
               # Keep the rendered units as the check's output, so a human can

@@ -561,6 +561,49 @@ in {
           TimeoutStopSec = "5min";
           StandardOutput = "journal";
           StandardError = "journal";
+
+          # ---- sandbox ----------------------------------------------------
+          # WHAT THIS UNIT ACTUALLY DOES: feed the corpus — web pages, PDFs,
+          # chat exports, GitHub bodies, none of it authored by the user —
+          # through torch and a native tokenizer. That is a large C++ attack
+          # surface chewing on untrusted bytes, and until now it did so with
+          # the user's full ambient authority.
+          #
+          # Its "offline" was two environment variables. An env var is a
+          # request, not a boundary: any library that ignores it, or any
+          # subprocess spawned along the way, had the entire network.
+          #
+          # RestrictAddressFamilies is the load-bearing line here. seccomp,
+          # supported in a USER manager, and it makes an AF_INET socket()
+          # fail outright — so "does not talk to the network" stops resting
+          # on every library agreeing to read HF_HUB_OFFLINE. AF_UNIX stays
+          # for journal and dbus; AF_NETLINK because glibc probes interfaces
+          # during resolver setup even when nothing ever connects.
+          RestrictAddressFamilies = "AF_UNIX AF_NETLINK";
+          # Belt to that brace, and deliberately second: IP filtering is BPF
+          # and a user manager only gets it with cgroup delegation, so this
+          # may be a no-op here. It costs nothing when unsupported and covers
+          # the case where a future revision has to re-widen the address
+          # families above.
+          IPAddressDeny = "any";
+
+          NoNewPrivileges = true;
+          # Its own /tmp. torch and huggingface both scribble there, and a
+          # shared /tmp is a trivial channel between this and everything else
+          # the user runs.
+          PrivateTmp = true;
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          SystemCallArchitectures = "native";
+          # `full`, NOT `strict`: /usr, /boot and /etc go read-only while
+          # $HOME stays writable. `strict` would need an explicit
+          # ReadWritePaths for the cache, and getting that list wrong fails
+          # at runtime on a unit this branch cannot start on this host.
+          ProtectSystem = "full";
+          ProtectKernelTunables = true;
+          ProtectControlGroups = true;
         };
       };
 
