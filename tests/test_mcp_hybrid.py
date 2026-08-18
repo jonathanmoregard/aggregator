@@ -318,14 +318,41 @@ def test_a_warm_vector_arm_returns_neighbours_even_for_an_unrelated_query(
     zero. Recall goes up and precision goes down, which is the trade hybrid
     retrieval IS, but the floor of "no results" disappears with it.
 
-    Deliberately not "fixed" here. A similarity cutoff is a tuned constant,
-    the spec defers tuning until there are labelled query pairs, and a
-    threshold picked to make a synthetic test go green would be worse than
-    none — with real Qwen3 embeddings almost every pair has positive cosine,
-    so any cutoff chosen against stub vectors would filter nothing in
-    production while looking principled. Task M measures the real
-    precision/recall delta against a copy of the live cache; that measurement
-    is what should set a cutoff, if one is wanted.
+    TASK M MEASURED IT AND SETTLED IT: NO FIXED FLOOR. The measurement ran
+    real Qwen3 embeddings against a copy of the live cache
+    (``scripts/rag_rollout_smoke.py``), 88 queries mined from the user's own
+    recorded ``search_memory`` calls plus 10 queries on subjects verified
+    absent from the corpus. Cosine distances:
+
+    ==================================  =====  =====  =====  =====
+    population                             p5    p25    p50    p95
+    ==================================  =====  =====  =====  =====
+    relevant, reachable ONLY by vector   0.25   0.41   0.54   0.80
+    relevant, also reachable by FTS5     0.29   0.43   0.57   0.78
+    no-answer query, nearest neighbour   0.56   0.61   0.66   0.74
+    ==================================  =====  =====  =====  =====
+
+    At the smoke index's ~500 chunks those look separable. They are not, and
+    the reason is scale: the nearest IRRELEVANT chunk moves closer as the
+    corpus grows — 0.61 at 5k chunks, 0.60 at 10k, 0.57 at 100k, and **0.55
+    at the 422k chunks the full backfill produces**. That lands at the median
+    of the documents only the vector arm can reach. So any floor low enough
+    to suppress a no-answer query at production scale also discards more than
+    half of the vector arm's entire unique contribution, and the margin keeps
+    shrinking as the corpus grows.
+
+    The asymmetry decides the rest: on a personal recall tool a false
+    "nothing found" is worse than a few weak extra hits, so a filter that
+    trades >50% of the vector arm's unique recall for a partial reduction in
+    noise is the wrong trade in the wrong direction. Shipping without a floor
+    is therefore deliberate, not deferred.
+
+    What the floor would have bought is instead bounded by two properties
+    that already hold: the FTS5 arm is uncapped into RRF, so hybrid results
+    are a strict superset of keyword results and no floor is needed to
+    protect them; and the noise a no-answer query returns is concentrated in
+    a handful of hub documents (the same rows recur across unrelated
+    no-answer queries), which is a hubness problem, not a threshold problem.
     """
     _seed_sessions(store, [("o1", "quadratic voting", 1)])
     _embed(store, "observations", [("o1", "quadratic voting")])

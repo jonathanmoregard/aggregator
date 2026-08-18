@@ -938,6 +938,28 @@ def self_referential_obs(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+def store_fts_all(db: Path, text: str) -> list[str]:
+    """Every FTS5 hit for ``text`` across both ontologies, uncapped.
+
+    Uncapped on purpose: this is used to decide whether FTS5 can reach a
+    document at all, and a top-K view would call a document unreachable
+    merely because it ranked 11th.
+    """
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        out: list[str] = []
+        for sql in (
+            "SELECT o.obs_id AS i FROM obs_fts f "
+            "JOIN observations o ON o.rowid = f.rowid WHERE obs_fts MATCH ?",
+            "SELECT stable_id AS i FROM records_fts WHERE records_fts MATCH ?",
+        ):
+            out.extend(r["i"] for r in conn.execute(sql, (text,)))
+        return out
+    finally:
+        conn.close()
+
+
 def _scale_extrapolation(negatives: list[float], full_chunks: int) -> dict[str, Any]:
     """What the NEAREST irrelevant chunk looks like once the index is full.
 
@@ -1147,6 +1169,53 @@ def cmd_distances(args: argparse.Namespace) -> int:
     no_answer_nearest = {q: round(nearest(qvecs[q]), 4) for q in no_answer}
     real_query_nearest = {q: round(nearest(qvecs[q]), 4) for q in queries}
 
+    # THE UNCONTAMINATED NEGATIVE SAMPLE. The background-vs-real-query pairs
+    # above are *mostly* irrelevant, but a random document occasionally does
+    # answer a real query, and those accidental positives sit in the left
+    # tail — exactly the region the floor decision reads. Pairing the
+    # verified-absent queries against every chunk gives negatives that cannot
+    # be contaminated that way, because there is nothing in the corpus for
+    # them to accidentally match.
+    clean_negatives = [
+        float(d) for q in no_answer for d in (1.0 - (matrix @ qvecs[q]))
+    ]
+
+    # THE DISTRIBUTION THE FLOOR DECISION ACTUALLY TURNS ON.
+    #
+    # Everything above labels relevance with BM25, so every "positive" is a
+    # document FTS5 already returns. Filtering those out of the vector arm
+    # costs nothing — the FTS5 arm is uncapped and still carries them. The
+    # vector arm's only real contribution is documents FTS5 CANNOT reach, and
+    # a floor is only dangerous if it cuts into those.
+    #
+    # Those documents are found without inventing queries: the user reformulates.
+    # The log contains pairs like "context reset" / "context handoff fresh
+    # session compaction" — same intent, different words. A document FTS5
+    # returns for one and not the other is, for the other, exactly a relevant
+    # document with no lexical handle. Their distances are the population a
+    # floor would be cutting into, and they are labelled by the user's own
+    # behaviour rather than by our guess about what is similar.
+    qmat = np.stack([qvecs[q] for q in queries])
+    qq = 1.0 - (qmat @ qmat.T)
+    vector_only: list[float] = []
+    vector_only_pairs = 0
+    for i, b in enumerate(queries):
+        try:
+            fts_b = set(store_fts_all(db, b))
+        except sqlite3.OperationalError:
+            fts_b = set()
+        for j, a in enumerate(queries):
+            if i == j or float(qq[i, j]) > args.paraphrase_max:
+                continue
+            vector_only_pairs += 1
+            for kind, key in (("observations", "obs"), ("records", "rec")):
+                for doc in pool["per_query"][a][key][: args.top_k]:
+                    if doc in fts_b or doc in selfref:
+                        continue
+                    d = dist_to(qvecs[b], kind, doc)
+                    if d is not None:
+                        vector_only.append(d)
+
     report = {
         "index": {
             "obs_chunks": len(vecs["observations"]),
@@ -1154,12 +1223,20 @@ def cmd_distances(args: argparse.Namespace) -> int:
             "obs_docs": len(by_doc["observations"]),
             "rec_docs": len(by_doc["records"]),
         },
+        "reformulation_pairs_used": vector_only_pairs,
         "self_referential_obs_excluded_from_labels": len(selfref),
-        "scale_extrapolation": _scale_extrapolation(negatives, args.full_corpus_chunks),
+        "scale_extrapolation_contaminated": _scale_extrapolation(
+            negatives, args.full_corpus_chunks
+        ),
+        "scale_extrapolation_clean": _scale_extrapolation(
+            clean_negatives, args.full_corpus_chunks
+        ),
         "cosine_distance": {
             "positives_relevant": _summary(positives),
             "negatives_random": _summary(negatives),
             "per_query_nearest_negative": _summary(per_query_best_neg),
+            "vector_only_relevant": _summary(vector_only),
+            "no_answer_vs_all_chunks": _summary(clean_negatives),
             "no_answer_nearest_neighbour": _summary(list(no_answer_nearest.values())),
             "real_query_nearest_neighbour": _summary(
                 list(real_query_nearest.values())
@@ -1469,6 +1546,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     di.add_argument("--top-k", type=int, default=5)
     di.add_argument("--full-corpus-chunks", type=int, default=422261)
+    di.add_argument(
+        "--paraphrase-max",
+        type=float,
+        default=0.35,
+        help="max query-query cosine distance to count two queries as the same intent",
+    )
     di.set_defaults(func=cmd_distances)
 
     me = sub.add_parser("measure", parents=[common], help="hybrid vs FTS5-only")

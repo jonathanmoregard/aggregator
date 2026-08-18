@@ -92,11 +92,31 @@ _DEFAULT_PAGE_SIZE_FULL = 40
 
 # How many neighbours the vector arm contributes per query. The FTS5 arm is
 # NOT capped — see ``_fused_id_scope`` for why that asymmetry is deliberate.
+#
+# A COUNT IS THE ONLY LIMIT: there is no distance floor, on purpose. Task M
+# measured the cosine-distance distributions on a copy of the live cache and
+# found the two populations inseparable at production scale — the nearest
+# IRRELEVANT chunk sits at ~0.55 once the index holds the full corpus's 422k
+# chunks, which is the median distance of the documents only the vector arm
+# can reach. Any cutoff that suppresses a no-answer query there also throws
+# away more than half the vector arm's unique recall, and on a personal
+# recall tool a false "nothing found" is the worse failure. The measured
+# distributions and the reasoning are in
+# ``tests/test_mcp_hybrid.py::test_a_warm_vector_arm_returns_neighbours_even_for_an_unrelated_query``;
+# the harness that produced them is ``scripts/rag_rollout_smoke.py``.
 _VECTOR_ARM_K = 50
 
 # How many hits of a page the cross-encoder reorders when ``rerank=True``.
-# Each pair costs roughly 300 ms, so this is a latency budget, not a quality
-# knob: 20 keeps the worst case near 6 s.
+# A latency budget, not a quality knob.
+#
+# MEASURED, AND THE ORIGINAL ESTIMATE WAS OPTIMISTIC BY ROUGHLY 8x. The
+# 300 ms/pair figure this constant was sized against holds for short pairs;
+# on real corpus rows — a whole observation or record body against the query
+# — Task M measured ``rerank=True`` at 47 s median and 59 s worst case per
+# query on this CPU (20 pairs, Qwen3-Reranker-0.6B, no GPU), against 0.65 s
+# for the same query without it. So the flag is a background/batch facility
+# on this hardware, not something to hold an interactive turn open for, and
+# the number to shrink if that changes is this one.
 _RERANK_WINDOW = 20
 
 # Exposed MCP tool names. The search tool deliberately carries "search" and
