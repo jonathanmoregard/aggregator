@@ -134,8 +134,23 @@ services.aggregator.embed = {
 
 ### Model weights: pre-seeded, never fetched by the timer
 
-The embedder is Qwen3-Embedding-0.6B — about 1.2 GB of safetensors. Three
-ways to get that to an unattended unit, and they fail differently:
+Two models, about 1.2 GB of safetensors each:
+
+| Model | Loaded by | Used for |
+|---|---|---|
+| `Qwen/Qwen3-Embedding-0.6B` | `aggregator-embed.service` | filling the vector index |
+| `Qwen/Qwen3-Reranker-0.6B` | the MCP server, lazily | `rerank=True` on a search |
+
+**Both** are seeded by `aggregator-embed-seed.service`. That is not a detail:
+the seed unit used to run `embed --once`, which constructs only the `Embedder`.
+`Reranker()` is built in exactly one place — the MCP server — and it passes
+`local_files_only=not downloads_allowed()`, while that server is registered
+bare so downloads are never permitted there. So nothing anywhere fetched the
+reranker weights, every `rerank=True` raised inside the constructor, and
+`_maybe_rerank` caught it and returned the page in its original order. The
+feature was dead on arrival and the response said nothing about it.
+
+Three ways to get weights to an unattended unit, and they fail differently:
 
 | Approach | Upkeep | Manual work | Failure mode |
 |---|---|---|---|
@@ -157,9 +172,28 @@ systemctl --user start aggregator-embed-seed.service
 ```
 
 That unit is the only thing here allowed to touch the network. It has no
-`[Install]` section and no timer — it runs when a human starts it, downloads
-the weights, and then embeds exactly one row, so the seeding step also proves
-weights + torch + sqlite-vec + a real database write in one go.
+`[Install]` section and no timer — it runs when a human starts it, exports
+`AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1` (the opt-in the Python loaders gate on),
+and runs:
+
+```
+aggregator embed --seed-models
+```
+
+which constructs **both** the `Embedder` and the `Reranker`, touches no
+database rows, and exits non-zero naming the remedy if weights are absent and
+downloads are disallowed. Constructing both models is still a live proof that
+the weights are complete and loadable by torch.
+
+It deliberately does **not** embed a corpus row any more. The old
+`embed --once --batch-size 1` warmed the cache by running a real, untrusted
+corpus row through torch, opened the database — contending with a concurrent
+ingest — and advanced `embedding_state` as a side effect of a download.
+Fetching weights has no business touching the corpus.
+
+`checks.<system>.aggregator-embed-unit-hygiene` fails the build if the seed
+unit stops naming either model repo, stops running `--seed-models`, drops the
+download opt-in, or starts embedding rows again.
 
 ### Failure is loud, but only once a day
 

@@ -79,6 +79,24 @@ let
   embedModelRepo = "Qwen/Qwen3-Embedding-0.6B";
   embedModelDir = "models--Qwen--Qwen3-Embedding-0.6B";
 
+  # The cross-encoder the MCP server loads on `rerank=True`
+  # (aggregator/core/rerank.py::_DEFAULT_MODEL).
+  #
+  # Round-2 MEDIUM: nothing, anywhere, used to fetch these weights. The seed
+  # unit ran `embed --once`, which constructs only the Embedder;
+  # `Reranker()` is built in exactly one place (aggregator/mcp.py), and it
+  # passes `local_files_only=not downloads_allowed()` while the MCP server is
+  # registered bare — no `AGGREGATOR_ALLOW_MODEL_DOWNLOAD`, by design, since
+  # a query must never start a GB-scale download inside the editor's process.
+  # So the cache was never populated by any path, every `rerank=True` raised
+  # inside the constructor, and `_maybe_rerank` caught it and returned the
+  # page in its original order. `rerank=True` degraded to unranked FOREVER,
+  # and the response carried no notice saying so.
+  #
+  # Naming the repo here is what gives the weights a fetch path at all.
+  rerankModelRepo = "Qwen/Qwen3-Reranker-0.6B";
+  rerankModelDir = "models--Qwen--Qwen3-Reranker-0.6B";
+
   # Environment shared by the embed worker and its one-shot seeding sibling.
   # `AGGREGATOR_EMBED_BACKEND=st` pins the safetensors loader; the `gguf`
   # backend needs an optional extra that is not in the deployed closure, and a
@@ -90,19 +108,26 @@ let
     "AGGREGATOR_EMBED_BACKEND=st"
   ];
 
-  # Shell fragment resolving the model snapshot dir from whatever HF_HOME the
-  # unit actually got, falling back to huggingface_hub's own default so a
-  # hand-run of the script outside systemd reports the same diagnosis.
-  # POSIX-only: no coreutils on PATH is assumed.
+  # Shell fragment resolving the HF cache root from whatever HF_HOME the unit
+  # actually got, falling back to huggingface_hub's own default so a hand-run
+  # of the script outside systemd reports the same diagnosis, plus a
+  # `have_model <cache-dir-name>` predicate over it. Two units and two models
+  # ask this question now, so it is one helper rather than four copies of a
+  # glob. POSIX-only: no coreutils on PATH is assumed.
   modelPresenceCheck = ''
     hf_home="''${HF_HOME:-''${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
-    snapshots="$hf_home/hub/${embedModelDir}/snapshots"
-    set -- "$snapshots"/*
-    if [ ! -d "$snapshots" ] || [ ! -e "$1" ]; then
-      have_weights=0
-    else
-      have_weights=1
-    fi
+    # 0 when the named repo has at least one materialised snapshot in the
+    # cache, 1 otherwise. A bare `snapshots/` with nothing under it is what an
+    # interrupted download leaves behind, so the directory existing is not
+    # enough — hence the glob.
+    have_model() {
+      _snapshots="$hf_home/hub/$1/snapshots"
+      [ -d "$_snapshots" ] || return 1
+      for _entry in "$_snapshots"/*; do
+        [ -e "$_entry" ] && return 0
+      done
+      return 1
+    }
   '';
 
   # ExecStart for the timer-driven worker.
@@ -135,7 +160,11 @@ let
     fi
 
     ${modelPresenceCheck}
-    if [ "$have_weights" -ne 1 ]; then
+    # Only the EMBEDDING weights gate this unit. It never reranks — the
+    # cross-encoder is loaded lazily by the MCP server — so a missing
+    # reranker must not stop the index from filling.
+    if ! have_model "${embedModelDir}"; then
+      snapshots="$hf_home/hub/${embedModelDir}/snapshots"
       echo "aggregator-embed: ${embedModelRepo} weights are not in the Hugging Face cache (looked in $snapshots)." >&2
       echo "aggregator-embed: this unit runs OFFLINE by design (HF_HUB_OFFLINE=1) and will NOT pull ~1.2 GB unattended." >&2
       echo "aggregator-embed: seed the cache once, then this timer takes over:" >&2
@@ -154,11 +183,29 @@ let
   # One-shot, human-triggered, never on a timer. The only place in this module
   # that is allowed to touch the network for model weights.
   #
-  # `embed --once --batch-size 1` is deliberate: `_cmd_embed` constructs the
-  # Embedder before it looks at the backlog, so this downloads the weights
-  # even on an already-embedded corpus, and then does exactly one batch — a
-  # live end-to-end proof of weights + torch + sqlite-vec + a real DB write,
-  # rather than a download that is only proven when the timer next fires.
+  # `embed --seed-models`, NOT the previous `embed --once --source
+  # observations --batch-size 1`. Round-2 MEDIUM, three problems with that
+  # command and one of them was load-bearing:
+  #
+  #   1. It constructed only the `Embedder`. The `Reranker` weights were
+  #      fetched by nothing, anywhere, so `rerank=True` degraded to unranked
+  #      forever and said nothing about it. Seeding has to cover every model
+  #      the product actually loads, or "seeded" is a claim about one of them.
+  #   2. It embedded a REAL, UNTRUSTED CORPUS ROW purely to warm a cache —
+  #      running attacker-influenced text through torch as a side effect of a
+  #      download.
+  #   3. It touched the database at all. A weight-seeding step that opens the
+  #      cache can contend with an ingest run and can advance
+  #      `embedding_state`, which is state that a download has no business
+  #      moving.
+  #
+  # The contract `--seed-models` is written against: construct BOTH the
+  # Embedder and the Reranker, touch no database rows, permit downloads only
+  # under the `AGGREGATOR_ALLOW_MODEL_DOWNLOAD` opt-in exported below, and
+  # exit non-zero naming the remedy when weights are absent and downloads are
+  # disallowed. Constructing both models is still a live proof that the
+  # weights are complete and loadable by torch — it just no longer proves it
+  # by writing to the corpus.
   embedSeeder = pkgs.writeShellScript "aggregator-embed-seed" ''
     set -uo pipefail
 
@@ -169,23 +216,30 @@ let
     fi
 
     ${modelPresenceCheck}
-    if [ "$have_weights" -eq 1 ]; then
-      echo "aggregator-embed-seed: ${embedModelRepo} already present under $snapshots — nothing to download; running one batch as a live check."
-    else
-      echo "aggregator-embed-seed: downloading ${embedModelRepo} (~1.2 GB) into $hf_home. This is a one-time cost."
-    fi
+    for spec in "${embedModelRepo}|${embedModelDir}|the embed worker's vector index" \
+                "${rerankModelRepo}|${rerankModelDir}|the MCP server's rerank=True path"; do
+      repo="''${spec%%|*}"
+      rest="''${spec#*|}"
+      dir="''${rest%%|*}"
+      what="''${rest#*|}"
+      if have_model "$dir"; then
+        echo "aggregator-embed-seed: $repo already present under $hf_home/hub/$dir/snapshots — nothing to download."
+      else
+        echo "aggregator-embed-seed: downloading $repo (~1.2 GB) into $hf_home — feeds $what. One-time cost."
+      fi
+    done
 
     # THE ONLY OPT-IN IN THIS MODULE. The Python loaders pass
     # `local_files_only=True` unless this is set, so every other caller — the
     # timer, the MCP server, an ad-hoc CLI run — refuses to fetch weights
-    # rather than pulling 1.2 GB from wherever it happens to be running.
+    # rather than pulling GBs from wherever it happens to be running.
     # HF_HUB_OFFLINE cannot express that on its own: huggingface_hub reads it
     # into a constant at import time, and the MCP server has already imported
     # it (via the scrubber's spaCy probe) before any aggregator code could set
     # it. This unit is human-triggered and never timer-driven, which is
     # exactly the property that makes the download consented to.
     export AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1
-    exec ${aggregatorBin} embed --once --source observations --batch-size 1
+    exec ${aggregatorBin} embed --seed-models
   '';
 
   # OnFailure target. Mirrors the deployed aggregator-ingest-failure-notify
@@ -687,15 +741,19 @@ in {
       # embed worker's failure message names it verbatim.
       systemd.user.services.aggregator-embed-seed = lib.mkIf cfg.embed.enable {
         Unit = {
-          Description = "Aggregator: one-time download of the Qwen3 embedding weights (~1.2 GB)";
+          Description = "Aggregator: one-time download of the Qwen3 embedding + reranker weights (~2.4 GB)";
           OnFailure = "aggregator-embed-failure-notify.service";
         };
         Service = {
           Type = "oneshot";
           ExecStart = "${embedSeeder}";
           Environment = embedBaseEnvironment ++ [ "HF_HUB_OFFLINE=0" ];
-          # A 1.2 GB download on a slow link, plus one batch.
-          TimeoutStartSec = "2h";
+          # Two ~1.2 GB downloads on a slow link. Was `2h` when this unit
+          # fetched one model; the payload doubled with the reranker, so the
+          # budget does too. A timeout here throws away a partial download
+          # that would restart from scratch, and the unit is human-triggered
+          # and one-shot — there is nothing to protect by cutting it short.
+          TimeoutStartSec = "4h";
           StandardOutput = "journal";
           StandardError = "journal";
         };

@@ -307,6 +307,46 @@
                 fail "aggregator-embed-seed.service must not be wanted by any target"
               fi
 
+              # ---- 7b. Seeding covers EVERY model the product loads -------
+              # Round-2 MEDIUM. The seed unit used to run
+              # `embed --once --source observations --batch-size 1`, which
+              # constructs only the Embedder. `Reranker()` is built in exactly
+              # one place — the MCP server — with
+              # `local_files_only=not downloads_allowed()`, and that server is
+              # registered bare so downloads are never allowed there. Net
+              # effect: nothing anywhere fetched the reranker weights, every
+              # `rerank=True` raised inside the constructor, and
+              # `_maybe_rerank` swallowed it and returned the page unranked
+              # with no notice. The feature was dead on arrival and silent
+              # about it.
+              #
+              # A seeding step that covers one of the two models is a claim
+              # about one of the two models, so this asserts both are named
+              # and that the entry point is the dedicated one.
+              seed_script=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' \
+                              "$units/aggregator-embed-seed.service")
+              grep -q 'embed --seed-models' "$seed_script" \
+                || fail "aggregator-embed-seed.service does not run 'aggregator embed --seed-models' — that is the only entry point that constructs both the Embedder and the Reranker"
+              for repo in 'Qwen/Qwen3-Embedding-0.6B' 'Qwen/Qwen3-Reranker-0.6B'; do
+                grep -qF "$repo" "$seed_script" \
+                  || fail "the seed unit never mentions $repo — a model the product loads at runtime has no fetch path, so it degrades forever the first time it is asked for"
+              done
+
+              # The seeder is a DOWNLOAD, not a workload. It used to embed a
+              # real corpus row to warm the cache, which ran untrusted text
+              # through torch and advanced embedding_state as a side effect of
+              # a download. Nothing about fetching weights needs the database.
+              if grep -qE 'embed .*(--once|--catchup)' "$seed_script"; then
+                grep -nE 'embed .*(--once|--catchup)' "$seed_script" >&2
+                fail "the seed unit embeds real corpus rows — a weight download must not touch the database, contend with an ingest run, or feed untrusted text to torch as a side effect"
+              fi
+
+              # The opt-in the Python loaders gate downloads on. Without it
+              # this unit fetches nothing and the whole seeding story is a
+              # no-op that exits 0.
+              grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1' "$seed_script" \
+                || fail "the seed unit does not export AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1 — the loaders pass local_files_only=True without it, so it would download nothing"
+
               # ---- 8. Sandbox the unit that eats attacker-influenced text -
               # This unit feeds the corpus — web pages, PDFs, chat exports,
               # GitHub bodies, none of it authored by the user — through
