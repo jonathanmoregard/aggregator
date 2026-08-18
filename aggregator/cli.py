@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from aggregator.core.chunk import chunk_body
-from aggregator.core.embed import MODEL_DOWNLOAD_ENV, Embedder
+from aggregator.core.embed import MODEL_DOWNLOAD_ENV, Embedder, downloads_allowed
 from aggregator.core.store import (
     EmptyRebuildRefusedError,
     Store,
@@ -1572,6 +1572,66 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     return _report_embed_outcome(outcome)
 
 
+def _cmd_seed_models() -> int:
+    """Fetch/verify the model weights. NO DATABASE, NO ROWS, NO LOCK.
+
+    WHY THIS IS ITS OWN COMMAND. The seed unit ran ``embed --once --source
+    observations``, which builds only the ``Embedder``. Nothing anywhere else
+    builds the ``Reranker`` outside a live ``rerank=True`` call, and every
+    model load is offline unless a human opts in — so the reranker's weights
+    were never fetched by ANY path, and ``rerank`` was guaranteed to fail on
+    this machine forever no matter how often the seed unit ran.
+
+    The second half is what it was doing instead: opening the index,
+    migrating it, taking the embed lock, claiming a row of an untrusted
+    corpus and advancing a watermark, all as a side effect of "make sure the
+    model is downloaded". This command is dispatched before ``main`` builds a
+    ``Store`` at all, so warming a model cache cannot write to the index.
+
+    BOTH ARE ATTEMPTED EVEN IF THE FIRST FAILS. The operator is doing this to
+    find out what is missing; reporting one model per invocation would make
+    them run it twice to learn something one run already knew.
+    """
+    from aggregator.core.rerank import Reranker
+
+    allowed = downloads_allowed()
+    failures: list[tuple[str, BaseException]] = []
+    for label, build in (("embedder", Embedder), ("reranker", Reranker)):
+        try:
+            build()
+        except Exception as e:  # noqa: BLE001 - reported per model, not handled
+            failures.append((label, e))
+        else:
+            print(f"embed --seed-models: {label} ready")
+    if not failures:
+        return 0
+    for label, error in failures:
+        print(
+            f"ERROR: the {label} weights could not be loaded "
+            f"({type(error).__name__}: {error})",
+            file=sys.stderr,
+        )
+    if allowed:
+        print(
+            f"Downloads were permitted ({MODEL_DOWNLOAD_ENV} is set), so this "
+            f"is not the offline guard — the hub, the network or the disk is "
+            f"the problem. Re-run `{SEED_MODELS_COMMAND}` once it is fixed.",
+            file=sys.stderr,
+        )
+    else:
+        # NAMED IN FULL, because the whole failure mode this command exists
+        # for is weights nothing was ever going to fetch. "Enable downloads"
+        # would leave the operator to work out how.
+        print(
+            f"Model loads are offline unless a human asks for them, and "
+            f"{MODEL_DOWNLOAD_ENV} is not set, so nothing was fetched. Run "
+            f"this once, with network access:\n"
+            f"    {SEED_MODELS_COMMAND}",
+            file=sys.stderr,
+        )
+    return 1
+
+
 def _report_embed_outcome(outcome: _EmbedOutcome) -> int:
     """Say what was set aside, and decide whether this run failed.
 
@@ -2214,6 +2274,19 @@ def build_parser() -> argparse.ArgumentParser:
             "unit as a live check, not by the timer"
         ),
     )
+    mode.add_argument(
+        "--seed-models",
+        dest="seed_models",
+        action="store_true",
+        help=(
+            "load the embedder AND the cross-encoder reranker, then exit — no "
+            "database is opened and no row is read or written. This is the "
+            "only path that fetches the reranker's weights, and it is what "
+            f"the human-triggered seed unit runs. Set {MODEL_DOWNLOAD_ENV}=1 "
+            "to permit the download; without it this reports what is missing "
+            "and exits non-zero"
+        ),
+    )
     p_embed.add_argument(
         "--source",
         choices=["observations", "records", "both"],
@@ -2260,6 +2333,11 @@ def main(
     _notify: NotifyHook | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
+    # BEFORE ANY STORE IS BUILT. Seeding a model cache must not open, create
+    # or migrate the index — see ``_cmd_seed_models``. Every other subcommand
+    # needs the store, so it stays eagerly built for them.
+    if args.cmd == "embed" and args.seed_models:
+        return _cmd_seed_models()
     store = _store or Store()
     store.migrate()
 
