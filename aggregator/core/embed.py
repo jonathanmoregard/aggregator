@@ -124,17 +124,38 @@ class Embedder:
                     "'embed-gguf' optional extra: pip install "
                     "'aggregator[embed-gguf]'"
                 ) from e
-            # NOT PINNED, and deliberately not faked. ``Llama.from_pretrained``
-            # forwards ``**kwargs`` to the ``Llama`` constructor rather than to
-            # ``hf_hub_download``, so a ``revision=`` here would raise TypeError
-            # instead of pinning anything. The optional ``embed-gguf`` extra is
-            # not installed on this machine, so a workaround could not be
-            # verified either. The shipped default backend is ``st``, which is
+            # RESOLVE THE FILE FIRST, THEN LOAD IT. Not
+            # ``Llama.from_pretrained``: it forwards ``**kwargs`` to the
+            # ``Llama`` constructor rather than to ``hf_hub_download``, so
+            # there is no argument that can carry ``local_files_only`` through
+            # it — which is how this became the ONE model-construction path
+            # with no offline gate while the other three had one. That gap is
+            # not cosmetic: ``AGGREGATOR_EMBED_BACKEND=gguf`` is read inside
+            # the MCP server too, and that process is registered bare, so a
+            # single query could have started a hub fetch from a tool that
+            # advertises ``openWorldHint=False``.
+            #
+            # ``hf_hub_download`` takes the flag by name, so the guard is
+            # explicit and no import order can defeat it — the same reasoning
+            # as ``downloads_allowed``. It resolves into the same hub cache
+            # ``from_pretrained`` used, so an already-seeded machine loads
+            # exactly the file it loaded before.
+            #
+            # STILL NOT PINNED: ``QWEN3_EMBEDDING_REVISION`` was taken from the
+            # safetensors repository and says nothing about the separate
+            # ``-GGUF`` one. The shipped default backend is ``st``, which is
             # pinned above; anyone opting into gguf is choosing an unpinned
             # artifact and this comment is where they find that out.
-            self._gguf_model = Llama.from_pretrained(
+            from huggingface_hub import hf_hub_download
+
+            model_path = hf_hub_download(
                 repo_id=self.model_name or _DEFAULT_MODEL_GGUF,
                 filename=gguf_filename,
+                cache_dir=str(cache_dir) if cache_dir else None,
+                local_files_only=not downloads_allowed(),
+            )
+            self._gguf_model = Llama(
+                model_path=model_path,
                 embedding=True,
                 n_ctx=8192,
                 verbose=False,
