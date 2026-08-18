@@ -273,6 +273,47 @@ def _stored_hashes(
     return out
 
 
+def _vec_table_present(c: sqlite3.Connection, table: str) -> bool:
+    """Whether ``table`` exists. Probed once per write group, not per row."""
+    return (
+        c.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone()
+        is not None
+    )
+
+
+def _drop_row_vectors(
+    c: sqlite3.Connection, table: str, key: str, row_id: str
+) -> None:
+    """Delete every vector belonging to ``row_id``, by EXACT KEY ONLY.
+
+    A body is stored either as one vector under the row's own id, or — when it
+    chunked — as ``<id>:0 .. <id>:N-1``, written contiguously by
+    ``cli._embed_batch``. So walking the indices from 0 and stopping at the
+    first miss removes exactly the set that was written, and every statement is
+    a primary-key lookup on the vec0 shadow index.
+
+    NOT the obvious ``substr(key, 1, length(id)+1) = id || ':'``. That is
+    correct (it spares ``o10`` while removing ``o1:0``) but it is a full table
+    scan: measured at 50k vectors it is 500x slower per row than the key
+    lookups, and unlike them it gets worse as the index grows — against the
+    422k vectors the backfill produces it would put a ~300 ms scan on every
+    edited row of every ingest tick.
+
+    ``rowcount <= 0`` rather than ``== 0`` ends the walk: a virtual table that
+    reported -1 would otherwise spin forever.
+    """
+    c.execute(f"DELETE FROM {table} WHERE {key} = ?", (row_id,))  # noqa: S608 - fixed literals
+    i = 0
+    while True:
+        cur = c.execute(
+            f"DELETE FROM {table} WHERE {key} = ?",  # noqa: S608 - fixed literals
+            (f"{row_id}:{i}",),
+        )
+        if cur.rowcount <= 0:
+            return
+        i += 1
+
+
 class EmptyRebuildRefusedError(RuntimeError):
     """Raised by ``Store.rebuild_and_upsert`` when the incoming record list is
     smaller than the caller-declared ``min_records`` floor.
@@ -1040,6 +1081,9 @@ class Store:
         obs_ids = [e.obs_id for e in group if isinstance(e, ObservationRow)]
         stored_sessions = _stored_hashes(c, "sessions", "session_id", session_ids)
         stored_obs = _stored_hashes(c, "observations", "obs_id", obs_ids)
+        # Probed ONCE per group. A cache migrated without sqlite-vec has no vec
+        # tables at all, and the watermark reset below must still happen there.
+        vec_present = _vec_table_present(c, "vec_observations")
 
         unchanged = 0
         for e in group:
@@ -1155,7 +1199,16 @@ class Store:
                         tool_name       = excluded.tool_name,
                         tool_use_id     = excluded.tool_use_id,
                         body            = excluded.body,
-                        src_hash        = excluded.src_hash
+                        src_hash        = excluded.src_hash,
+                        -- BACK INTO THE EMBED BACKLOG. The body just changed,
+                        -- so any vector held for this row describes text that
+                        -- is no longer here. ``observations_au`` keeps obs_fts
+                        -- in step for the keyword arm; the vector arm has no
+                        -- trigger, and ``select_unembedded`` only ever looks at
+                        -- NULL, so without this the row keeps the embedding of
+                        -- its OLD body permanently and the two arms of the same
+                        -- hybrid query disagree about what it says.
+                        embedding_state = NULL
                     """,
                     (
                         e.obs_id,
@@ -1173,6 +1226,10 @@ class Store:
                         digest,
                     ),
                 )
+                # ONLY for a row that already existed. A brand-new obs_id has
+                # no vector to drop, and this sits in the ingest hot loop.
+                if vec_present and e.obs_id in stored_obs:
+                    _drop_row_vectors(c, "vec_observations", "obs_id", e.obs_id)
             else:
                 raise TypeError(f"unknown entity type: {type(e)!r}")
         return unchanged
@@ -2102,7 +2159,13 @@ class Store:
                 -- WHOLE batch being dateless trips the API tripwire, so a
                 -- partially-dated batch degrades in silence.
                 updated_at = COALESCE(excluded.updated_at, records.updated_at),
-                extra      = excluded.extra
+                extra      = excluded.extra,
+                -- BACK INTO THE EMBED BACKLOG, for the same reason as
+                -- observations: subject and body just changed, so a vector
+                -- held for this row describes text that is no longer here.
+                -- records_fts is rebuilt three lines down; this is the vector
+                -- arm's half of the same refresh.
+                embedding_state = NULL
             """,
             (
                 r.stable_id,
@@ -2116,6 +2179,8 @@ class Store:
                 digest,
             ),
         )
+        if _vec_table_present(c, "vec_records"):
+            _drop_row_vectors(c, "vec_records", "stable_id", r.stable_id)
         c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
         c.execute(
             "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
