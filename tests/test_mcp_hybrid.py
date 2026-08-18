@@ -505,6 +505,26 @@ def test_hybrid_runs_on_the_union_path(store, embedder):
     assert {"github:1", "s-o1"} <= _ids(result)
 
 
+def test_routing_does_not_run_the_linear_vec_row_count(store, embedder):
+    """``count_vec_rows`` is O(n) over the vec0 table — ~70 ms at the live
+    cache's 400k vectors. Deciding hybrid-vs-FTS5 happens on every text query
+    and on both ontologies, so it must not be the thing that asks. Booby-trap
+    the expensive call and require the query to succeed anyway.
+    """
+    _seed_sessions(store, [("o1", "quadratic voting", 1)])
+    _embed(store, "observations", [("o1", "quadratic voting")])
+
+    def _too_slow(kind):
+        raise AssertionError(
+            f"routing called the linear count_vec_rows({kind!r})"
+        )
+
+    store.count_vec_rows = _too_slow
+    result = aggregator_query("governance", _store=store)
+    assert result["ok"] is True
+    assert "s-o1" in _ids(result)
+
+
 def test_the_union_path_embeds_the_query_exactly_once(store, embedder):
     """Union is the DEFAULT path — a bare text query with no ``source:`` key
     lands here — and it drives two ontologies with two separate vector

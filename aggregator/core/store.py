@@ -1314,6 +1314,36 @@ class Store:
             ) from e
         return int(row["n"]) if row else 0
 
+    def has_embedded_rows(self, kind: str) -> bool:
+        """Is there anything for the vector arm to find? The ROUTING probe.
+
+        Deliberately not ``count_vec_rows(kind) > 0``, and the reason is
+        measured rather than assumed: ``COUNT(*)`` on a ``vec0`` virtual table
+        is O(n) — about 4 ms at 20k vectors, 13 ms at 100k and 70 ms at 400k,
+        which is the size of the live cache. Retrieval asks this question on
+        every free-text query and on up to two ontologies, so a linear probe
+        would put a tenth of a second of pure overhead on the recall path and
+        make it worse every time the corpus grows.
+
+        ``embedding_state`` is a plain column with an index on it, so the same
+        question costs microseconds. It is also the more honest predicate:
+        the worker writes vectors BEFORE it marks a row ``'ok'``, so ``'ok'``
+        implies a retrievable vector, while ``'skip'`` (nothing embeddable)
+        and ``'error'`` correctly do not.
+
+        Raises when the extension is missing, like every other vector read —
+        routing has to be able to tell "nothing embedded yet" from "this
+        machine cannot run the vector arm at all".
+        """
+        if kind not in self._VEC_TABLES:
+            raise ValueError(f"unknown kind: {kind!r}")
+        self._require_vector()
+        c = self._c()
+        row = c.execute(
+            f"SELECT 1 FROM {kind} WHERE embedding_state = 'ok' LIMIT 1"  # noqa: S608 - allowlisted literals
+        ).fetchone()
+        return row is not None
+
     def count_embedding_states(self, kind: str) -> dict[str, int]:
         """Tally of ``embedding_state`` for ``kind``: the backfill watermark.
 

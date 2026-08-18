@@ -313,6 +313,75 @@ def test_count_embedding_states_works_without_the_extension(no_vec_store):
     assert counts["pending"] == 1
 
 
+# --- has_embedded_rows: the routing probe, and why it is not count_vec_rows --
+#
+# MEASURED, NOT ASSUMED. ``SELECT COUNT(*)`` on a vec0 virtual table is O(n):
+# 4 ms at 20k vectors, 13 ms at 100k, 70-83 ms at 400k — and 400k is the size
+# of the live cache. Retrieval asks "is there anything for the vector arm to
+# find" on every text query, on up to two ontologies, so a linear probe puts a
+# tenth of a second of pure overhead on the recall path and grows with the
+# corpus. ``embedding_state`` is a plain indexed column and answers the same
+# question in microseconds. count_vec_rows keeps its exact count for
+# capabilities, where being slow and precise is the right trade.
+
+
+def test_has_embedded_rows_is_false_on_a_fresh_cache(store):
+    assert store.has_embedded_rows("observations") is False
+    assert store.has_embedded_rows("records") is False
+
+
+def test_has_embedded_rows_is_true_once_a_row_is_embedded(store):
+    _seed_observation(store, "o0")
+    store.upsert_vec_observations([("o0", np.eye(1, 768, dtype=np.float32)[0])])
+    store.mark_embedded("observations", ["o0"], state="ok")
+    assert store.has_embedded_rows("observations") is True
+
+
+def test_has_embedded_rows_ignores_skipped_and_failed_rows(store):
+    """'skip' means the body had nothing embeddable and 'error' means the
+    attempt failed — neither put a vector in the index, so neither gives the
+    vector arm anything to return."""
+    _seed_observation(store, "o0")
+    _seed_observation(store, "o1")
+    store.mark_embedded("observations", ["o0"], state="skip")
+    store.mark_embedded("observations", ["o1"], state="error")
+    assert store.has_embedded_rows("observations") is False
+
+
+def test_has_embedded_rows_is_per_ontology(store):
+    _seed_record(store, "github:1")
+    store.upsert_vec_records([("github:1", np.eye(1, 768, dtype=np.float32)[0])])
+    store.mark_embedded("records", ["github:1"], state="ok")
+    assert store.has_embedded_rows("records") is True
+    assert store.has_embedded_rows("observations") is False
+
+
+def test_has_embedded_rows_rejects_unknown_kind(store):
+    with pytest.raises(ValueError, match="unknown kind"):
+        store.has_embedded_rows("nope")
+
+
+def test_has_embedded_rows_raises_when_the_extension_is_missing(no_vec_store):
+    """Routing must not engage the vector arm on a machine that cannot run
+    it, and the caller has to be told which of the two it is."""
+    with pytest.raises(VectorIndexUnavailableError, match="sqlite-vec"):
+        no_vec_store.has_embedded_rows("observations")
+
+
+def test_has_embedded_rows_uses_the_indexed_column_not_a_vec_table_scan(store):
+    """Pins the implementation choice, since the reason for it is a
+    performance property no assertion about the return value can see."""
+    _seed_observation(store, "o0")
+    store.mark_embedded("observations", ["o0"], state="ok")
+    plan = store._c().execute(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM observations "
+        "WHERE embedding_state = 'ok' LIMIT 1"
+    ).fetchall()
+    rendered = " ".join(str(r["detail"]) for r in plan)
+    assert "obs_embedding_state" in rendered, rendered
+    assert "vec_observations" not in rendered
+
+
 # --- capabilities()["vector_index"]: three situations, three answers ---------
 #
 # "backfill in progress", "vector arm unavailable" and "nothing embedded yet"

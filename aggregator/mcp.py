@@ -265,13 +265,17 @@ def _vector_arm_engaged(
     3. **Otherwise, is there anything to search?** An empty vector index means
        the pre-v5 FTS5 path, unchanged and with no model loaded. A missing
        extension answers the same way.
+
+    Step 3 asks ``has_embedded_rows`` and NOT ``count_vec_rows``: the exact
+    count is a linear scan of the vec0 table (~70 ms at the live cache's 400k
+    vectors) and this runs on every text query. See the store method.
     """
     if not ast.text:
         return False
     if pinned is not None:
         return pinned
     try:
-        return store.count_vec_rows(kind) > 0
+        return store.has_embedded_rows(kind)
     except VectorIndexUnavailableError:
         return False
 
