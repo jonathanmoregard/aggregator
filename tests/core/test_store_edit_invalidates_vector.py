@@ -232,7 +232,12 @@ def test_invalidation_works_without_sqlite_vec(tmp_path, monkeypatch):
     s.migrate()
     assert s.vector_available is False
     s.upsert_entities([session(), observation(body="original")])
-    s.mark_embedded("observations", ["o1"], "ok")
+    # Written directly: this stages a row embedded BEFORE the extension broke.
+    # ``mark_embedded(state='ok')`` refuses here by design, since as an API
+    # call it asserts a vector was just written.
+    c = s._c()
+    c.execute("UPDATE observations SET embedding_state = 'ok' WHERE obs_id = 'o1'")
+    c.commit()
 
     s.upsert_entities([session(), observation(body="edited")])
 

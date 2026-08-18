@@ -1348,15 +1348,19 @@ class Store:
 
     def upsert_vec_observations(
         self, rows: list[tuple[str, np.ndarray]]
-    ) -> None:
-        """Upsert ``(obs_id, embedding)`` rows into ``vec_observations``.
+    ) -> int:
+        """Upsert ``(obs_id, embedding)`` rows. Returns how many were WRITTEN.
 
         Delete-then-insert to keep the upsert idempotent: vec0 virtual tables
         do not support ``ON CONFLICT``.
+
+        The return value is what makes the degrade path checkable from outside:
+        0 means the vectors were discarded because the extension is missing,
+        which is otherwise indistinguishable from success.
         """
         self._ensure_writable()
         if not self._vector_writes_enabled():
-            return
+            return 0
         c = self._c()
         for obs_id, embedding in rows:
             c.execute("DELETE FROM vec_observations WHERE obs_id = ?", (obs_id,))
@@ -1365,12 +1369,13 @@ class Store:
                 (obs_id, embedding.astype("float32").tobytes()),
             )
         c.commit()
+        return len(rows)
 
-    def upsert_vec_records(self, rows: list[tuple[str, np.ndarray]]) -> None:
-        """Upsert ``(stable_id, embedding)`` rows into ``vec_records``."""
+    def upsert_vec_records(self, rows: list[tuple[str, np.ndarray]]) -> int:
+        """Upsert ``(stable_id, embedding)`` rows. Returns how many were written."""
         self._ensure_writable()
         if not self._vector_writes_enabled():
-            return
+            return 0
         c = self._c()
         for stable_id, embedding in rows:
             c.execute("DELETE FROM vec_records WHERE stable_id = ?", (stable_id,))
@@ -1379,6 +1384,7 @@ class Store:
                 (stable_id, embedding.astype("float32").tobytes()),
             )
         c.commit()
+        return len(rows)
 
     def _vector_writes_enabled(self) -> bool:
         """Whether a vector write can proceed; warns once per store if not."""
@@ -1440,6 +1446,16 @@ class Store:
         list is a no-op and not an error — the worker reaches it on any batch
         that was all-successes or all-skips, and ``IN ()`` is a SQL syntax
         error, not an empty set.
+
+        ``'ok'`` REFUSES WHEN THE VECTOR ARM IS UNAVAILABLE, because it is the
+        only one of the three that asserts a vector exists. ``upsert_vec_*``
+        no-ops without the extension, so the obvious composition — write the
+        vectors, then advance the watermark — otherwise marks rows embedded
+        that have no vector and that ``select_unembedded`` will never return
+        again. Until now the only thing preventing that was a guard in
+        ``cli._cmd_embed``: one caller's discipline, protecting nothing from
+        the second caller. ``'skip'`` and ``'error'`` are both true with no
+        vector, so they stay writable and the backlog still drains.
         """
         self._ensure_writable()
         if state not in ("ok", "skip", "error"):
@@ -1447,6 +1463,8 @@ class Store:
         col, table = self._kind_columns(kind)
         if not ids:
             return
+        if state == "ok":
+            self._require_vector()
         c = self._c()
         for page in _chunked(ids, 500):
             placeholders = ",".join("?" * len(page))

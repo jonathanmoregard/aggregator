@@ -56,6 +56,24 @@ def _seed_observation(s, obs_id, body="hello"):
     c.commit()
 
 
+def _force_state(s, kind, ids, state):
+    """Write ``embedding_state`` directly, bypassing ``mark_embedded``.
+
+    For the cache that WAS embedded and whose extension broke afterwards — a
+    real and unremarkable state, and the one an operator most needs reported.
+    ``mark_embedded(state='ok')`` deliberately refuses without the extension,
+    because as an API call it asserts a vector was just written; it is the
+    wrong tool for staging history that already happened.
+    """
+    col = "obs_id" if kind == "observations" else "stable_id"
+    c = s._c()
+    c.executemany(
+        f"UPDATE {kind} SET embedding_state = ? WHERE {col} = ?",  # noqa: S608 - test literals
+        [(state, i) for i in ids],
+    )
+    c.commit()
+
+
 def _seed_record(s, stable_id, body="hello"):
     c = s._c()
     c.execute(
@@ -200,11 +218,18 @@ def test_vec_write_is_a_noop_when_unavailable(no_vec_store, caplog):
 
 
 def test_backlog_bookkeeping_still_works_when_unavailable(no_vec_store):
-    """``embedding_state`` is a plain column — it must not need the extension."""
+    """``embedding_state`` is a plain column — it must not need the extension.
+
+    Marked ``'skip'`` rather than ``'ok'``: ``'ok'`` asserts that a vector was
+    written, which is exactly what cannot have happened here, and it now
+    refuses. ``'skip'`` and ``'error'`` are the two states that remain TRUE
+    with no extension, and draining the backlog past them is the property this
+    test is about.
+    """
     _seed_observation(no_vec_store, "u0")
     _seed_observation(no_vec_store, "u1")
     assert len(no_vec_store.select_unembedded("observations", limit=10)) == 2
-    no_vec_store.mark_embedded("observations", ["u0"], state="ok")
+    no_vec_store.mark_embedded("observations", ["u0"], state="skip")
     assert {r["obs_id"] for r in no_vec_store.select_unembedded("observations", limit=10)} == {"u1"}
 
 
@@ -306,7 +331,7 @@ def test_count_embedding_states_works_without_the_extension(no_vec_store):
     read must not depend on the native extension."""
     _seed_observation(no_vec_store, "o0")
     _seed_observation(no_vec_store, "o1")
-    no_vec_store.mark_embedded("observations", ["o0"], state="ok")
+    _force_state(no_vec_store, "observations", ["o0"], "ok")
     counts = no_vec_store.count_embedding_states("observations")
     assert counts["total"] == 2
     assert counts["ok"] == 1
@@ -519,3 +544,68 @@ def test_count_vec_rows_raises_when_the_vec_table_is_missing(tmp_path, monkeypat
     assert healthy.vector_available is True
     with pytest.raises(VectorIndexUnavailableError):
         healthy.count_vec_rows("observations")
+
+
+# --- the API refuses the unsafe composition, rather than trusting its caller -
+#
+# ``upsert_vec_*`` no-ops when sqlite-vec is absent, and ``mark_embedded``
+# was callable regardless, so the obvious composition —
+#
+#     store.upsert_vec_observations(vectors)   # silently writes nothing
+#     store.mark_embedded(kind, ids, "ok")     # happily advances anyway
+#
+# marked rows as embedded that have no vector and that nothing will ever come
+# back for: ``select_unembedded`` only sees NULL. Today the only thing standing
+# between that and the corpus is a guard in ``cli._cmd_embed``, i.e. one
+# caller's discipline. A second caller — a script, a test, a future worker —
+# gets no such protection.
+#
+# 'ok' is the only state that ASSERTS a vector exists. 'skip' (nothing to
+# embed) and 'error' (it failed) are both true without one, so they stay
+# available: the backlog bookkeeping is a plain column and must keep working
+# with the extension broken.
+
+
+def test_marking_a_row_ok_refuses_when_no_vector_could_have_been_written(
+    no_vec_store,
+):
+    _seed_observation(no_vec_store, "u0")
+    with pytest.raises(VectorIndexUnavailableError):
+        no_vec_store.mark_embedded("observations", ["u0"], state="ok")
+    assert {
+        r["obs_id"] for r in no_vec_store.select_unembedded("observations")
+    } == {"u0"}
+
+
+def test_marking_records_ok_refuses_on_the_same_terms(no_vec_store):
+    _seed_record(no_vec_store, "github:1")
+    with pytest.raises(VectorIndexUnavailableError):
+        no_vec_store.mark_embedded("records", ["github:1"], state="ok")
+
+
+def test_skip_and_error_are_still_writable_without_the_extension(no_vec_store):
+    """Both are TRUE with no vector, and the backlog has to drain past them."""
+    _seed_observation(no_vec_store, "u0")
+    _seed_observation(no_vec_store, "u1")
+    no_vec_store.mark_embedded("observations", ["u0"], state="skip")
+    no_vec_store.mark_embedded("observations", ["u1"], state="error")
+    assert no_vec_store.select_unembedded("observations") == []
+
+
+def test_marking_an_empty_id_list_ok_is_still_a_noop(no_vec_store):
+    """A healthy run reaches this on every all-skip batch; it asserts nothing."""
+    no_vec_store.mark_embedded("observations", [], state="ok")
+
+
+def test_vec_writes_report_how_many_vectors_they_wrote(store):
+    _seed_observation(store, "o1")
+    _seed_observation(store, "o2")
+    vecs = np.eye(2, 768, dtype=np.float32)
+    assert store.upsert_vec_observations([("o1", vecs[0]), ("o2", vecs[1])]) == 2
+
+
+def test_vec_writes_report_zero_when_they_were_discarded(no_vec_store):
+    """The count is what makes the no-op checkable from the outside."""
+    vec = np.eye(1, 768, dtype=np.float32)[0]
+    assert no_vec_store.upsert_vec_observations([("o1", vec)]) == 0
+    assert no_vec_store.upsert_vec_records([("github:1", vec)]) == 0
