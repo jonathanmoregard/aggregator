@@ -34,6 +34,22 @@ _DEFAULT_MODEL_ST = "Qwen/Qwen3-Embedding-0.6B"
 _DEFAULT_MODEL_GGUF = "Qwen/Qwen3-Embedding-0.6B-GGUF"
 
 
+def configured_model_id() -> str:
+    """Which model ``Embedder()`` would load right now, without loading it.
+
+    The vector index is only valid for the model that wrote it, so this is
+    what ``Store.migrate()`` stamps into the cache and compares against on
+    every later run. It mirrors ``Embedder.__init__``'s default selection
+    exactly — if the two ever disagree, the stamp starts vouching for vectors
+    a different model produced, which is the failure the stamp exists to
+    prevent. Kept next to those defaults for that reason.
+    """
+    backend = os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
+    if backend == "gguf":
+        return _DEFAULT_MODEL_GGUF
+    return _DEFAULT_MODEL_ST
+
+
 class Embedder:
     """Single-model embedder. Load once per process, share across writes."""
 

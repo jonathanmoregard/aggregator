@@ -519,20 +519,45 @@ _DDL: list[str] = [
 # ``vector_available``, and re-runs them on every invocation, so a database
 # that migrated without the extension picks the vec tables up on the first
 # command after the extension is fixed. No second migration, no version bump.
+#: Width of a stored vector. Must equal ``embed._EMBED_DIM``; the equality is
+#: asserted by a test rather than by an import, because ``store`` is on the MCP
+#: cold-start path and ``embed`` must not be dragged onto it.
+_VEC_DIM = 768
+
+#: ``meta`` key holding ``{"model": ..., "dim": ...}`` for the vectors on disk.
+#: Its ABSENCE is meaningful: it means the vec tables were written by something
+#: that is not this code, and therefore may not be trusted.
+VECTOR_PROVENANCE_KEY = "vector_provenance"
+
 _VEC_DDL: list[str] = [
-    """
+    f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_observations USING vec0(
         obs_id     TEXT PRIMARY KEY,
-        embedding  float[768]
+        embedding  float[{_VEC_DIM}]
     );
     """,
-    """
+    f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_records USING vec0(
         stable_id  TEXT PRIMARY KEY,
-        embedding  float[768]
+        embedding  float[{_VEC_DIM}]
     );
     """,
 ]
+
+
+def vector_provenance() -> tuple[str, int]:
+    """``(model id, dimension)`` the vectors in this cache are supposed to be.
+
+    Imported from ``aggregator.core.embed`` LAZILY and deliberately. That
+    module owns which model the worker loads, so reading the answer from
+    anywhere else is how the stamp ends up naming a model nobody uses — but
+    ``store`` is imported by ``aggregator.mcp`` on every editor cold start, so
+    the import may not happen at module scope. Importing the module is cheap;
+    ``sentence_transformers`` lives inside ``Embedder.__init__``.
+    """
+    from aggregator.core.embed import configured_model_id
+
+    return configured_model_id(), _VEC_DIM
 
 _VEC_DROP_ALL: list[str] = [
     "DROP TABLE IF EXISTS vec_observations;",
@@ -715,6 +740,10 @@ class Store:
         for stmt in _DDL:
             c.executescript(stmt)
         if self._vector_available:
+            # BEFORE the vec DDL: a foreign table of the wrong width survives
+            # ``CREATE VIRTUAL TABLE IF NOT EXISTS`` untouched, so the check
+            # that might drop it has to run first.
+            self._reconcile_vector_provenance(c)
             for stmt in _VEC_DDL:
                 c.executescript(stmt)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -723,6 +752,90 @@ class Store:
             (str(SCHEMA_VERSION),),
         )
         c.commit()
+
+    @staticmethod
+    def _reconcile_vector_provenance(c: sqlite3.Connection) -> None:
+        """Adopt the vector index only if this build is what produced it.
+
+        WHY EXISTENCE IS NOT ENOUGH. Every other probe in ``migrate()`` asks
+        "is this column/table there?", and for a plain column that is a
+        complete question. For the vector index it is not: a ``vec0`` table is
+        only meaningful together with the model and the width that filled it,
+        and neither of those is recoverable from the table itself. So a
+        migration that probes existence alone will adopt whatever it finds.
+
+        That is not a hypothetical here. The live cache carries ``vec_*``
+        tables and both ``embedding_state`` columns *while stamped v4*, because
+        an abandoned 2026-08-08 branch numbered its schema 4 too and ran. The
+        three ways that goes wrong, all reproduced:
+
+        * a foreign ``float[1024]`` table survives ``IF NOT EXISTS``, so
+          ``migrate()`` succeeds and stamps v5, and then every vector write and
+          every KNN read raises ``Dimension mismatch`` — on a 30-minute timer,
+          a crash loop;
+        * right-width vectors from another model are served as current, with
+          nothing on disk saying otherwise;
+        * rows pre-marked ``embedding_state='ok'`` over an empty index drain
+          the backlog to nothing, so ``vector_index_state`` reports
+          ``complete`` while ``vectors`` is 0 and no row is ever re-embedded.
+
+        The stamp closes all three with one comparison. When it matches, this
+        is a no-op and the index is kept. When it is absent or disagrees, the
+        vectors are DISCARDED and every row goes back into the backlog: that
+        costs a re-embed, and it is the only outcome that cannot serve a
+        silently wrong answer. Discarding is announced, because throwing away
+        an index is expensive news.
+
+        Runs only when sqlite-vec loaded — see the caller. Without the
+        extension there is no way to inspect or drop the tables, and stamping
+        anyway would tell the next migration, the one that CAN see them, that
+        this state had already been vouched for.
+        """
+        model, dim = vector_provenance()
+        expected = json.dumps({"dim": dim, "model": model}, sort_keys=True)
+        row = c.execute(
+            "SELECT value FROM meta WHERE key = ?", (VECTOR_PROVENANCE_KEY,)
+        ).fetchone()
+        if row is not None and row[0] == expected:
+            return
+
+        discarded = 0
+        for table in ("vec_observations", "vec_records"):
+            exists = c.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = ?", (table,)
+            ).fetchone()
+            if exists:
+                discarded += c.execute(
+                    f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed literals
+                ).fetchone()[0]
+        for stmt in _VEC_DROP_ALL:
+            c.execute(stmt)
+
+        requeued = 0
+        for table in ("observations", "records"):
+            cur = c.execute(
+                f"UPDATE {table} SET embedding_state = NULL "  # noqa: S608 - fixed literals
+                "WHERE embedding_state IS NOT NULL"
+            )
+            requeued += cur.rowcount or 0
+
+        if discarded or requeued:
+            log.warning(
+                "discarding a vector index this build did not write "
+                "(%s): %d vector(s) dropped and %d row(s) returned to the "
+                "backlog to re-embed. The index on disk carried no provenance "
+                "stamp, or named a different model or dimension, and vectors "
+                "whose model is unknown cannot be told apart from correct ones "
+                "at query time. Run `aggregator embed --catchup --source both` "
+                "to refill it; FTS5 keyword search is unaffected meanwhile.",
+                "no stamp" if row is None else f"stamped {row[0]}",
+                discarded,
+                requeued,
+            )
+        c.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (VECTOR_PROVENANCE_KEY, expected),
+        )
 
     @staticmethod
     def _ensure_column(
