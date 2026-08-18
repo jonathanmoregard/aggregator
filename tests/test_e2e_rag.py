@@ -12,10 +12,13 @@ and then asks the MCP tool functions — ``aggregator_query`` /
 THE THREE SEAMS, and why they are the only ones:
 
 * ``XDG_DATA_HOME`` is redirected at a ``tmp_path`` (the ``tmp_data_home``
-  fixture), so the CLI and the MCP surface each resolve their OWN cache path.
-  No test passes ``_store=``: a wrong path resolution is a bug this file
-  should catch, and the live 1.2 GB cache must be unreachable even from a
-  mistake.
+  fixture), and every ``Store`` in this file is built with NO ``db_path``, so
+  the CLI and the MCP surface each resolve their own cache exactly as they do
+  in production. A wrong path resolution is a bug this file should catch, and
+  the live 1.2 GB cache has to be unreachable even from a mistake. The one
+  place a store is handed to ``cli.main`` is ``run_cli``, and it is handed in
+  only so the helper can close it afterwards — see there for why that close is
+  load-bearing.
 * ``SessionsSource(projects_root=...)`` is pointed at a fixture corpus. It is
   the source's own documented constructor argument, not a test hook.
 * ``Embedder`` is replaced by a deterministic stub, in ``aggregator.cli`` for
