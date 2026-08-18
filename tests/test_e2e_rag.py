@@ -330,6 +330,38 @@ def embedding_states(cache: Path, kind: str = "observations") -> dict[str, str |
         store.close()
 
 
+def _set_embed_backoff(cache: Path, when: str) -> int:
+    """Move every retryable embed-quarantine row's retry time. Returns how many.
+
+    Drives the clock by editing the STORED decision rather than by patching
+    ``datetime``, because the stored decision is exactly what the worker
+    honours — the same reason ``ingest_state`` writes a jittered
+    ``next_attempt_at`` down instead of re-deriving it on every read. Setting
+    it explicitly also keeps the "not due yet" assertion off the jitter, which
+    rolls ``uniform(0, 30min)`` and would otherwise fail about one run in two
+    thousand.
+    """
+    store = Store(db_path=cache)
+    try:
+        cur = store._c().execute(
+            "UPDATE quarantine SET next_retry_at = ? "
+            "WHERE source LIKE 'embed:%' AND next_retry_at IS NOT NULL",
+            (when,),
+        )
+        store._c().commit()
+        return cur.rowcount
+    finally:
+        store.close()
+
+
+def expire_embed_backoff(cache: Path) -> int:
+    return _set_embed_backoff(cache, "2000-01-01T00:00:00+00:00")
+
+
+def defer_embed_backoff(cache: Path) -> int:
+    return _set_embed_backoff(cache, "2999-01-01T00:00:00+00:00")
+
+
 def vector_ids(cache: Path, kind: str = "observations") -> set[str]:
     """The ids the vector arm can actually reach, chunk suffixes stripped."""
     store = Store(db_path=cache)
@@ -702,50 +734,71 @@ def test_without_the_extension_the_worker_refuses_and_marks_nothing(
 # --- sad path: the embedder dies mid-run -------------------------------------
 
 
-def test_an_embedder_that_dies_mid_batch_fails_loudly_and_strands_nothing(
-    corpus, cache, monkeypatch
+def test_an_embedder_that_dies_on_one_row_costs_that_row_and_not_the_run(
+    corpus, cache, monkeypatch, capsys
 ):
-    """A run that cannot finish must not look like one that did.
+    """One bad row costs one row.
 
-    The failure is raised out of the CLI — non-zero exit with the traceback on
-    stderr, which is what "fail loudly" means for an unattended timer — and the
-    watermark stops where the vectors stop. The batch that was in flight when
-    the model died wrote neither a vector nor a state, so the next run picks it
-    up whole.
+    REWRITTEN 2026-08-18, AND THE OLD VERSION IS WORTH RECORDING: it asserted
+    ``pytest.raises(RuntimeError)`` out of ``aggregator embed --catchup`` and
+    called that "fail loudly". It was really the 2026-08-15 ingest doom loop
+    one layer down — ``select_unembedded`` orders ``ts DESC``, so the row that
+    aborted the run was the first row of the NEXT run too, forever, at two
+    tracebacks an hour with nothing anywhere naming the row responsible.
+
+    The loudness it was protecting is intact and sharper: still a non-zero
+    exit, and stderr now NAMES the row and the error instead of printing a
+    traceback. What changed is that the other rows are embedded rather than
+    abandoned, and the bad one is held in the quarantine ledger.
     """
     stub = StubEmbedder(fail_on_document_call=3)
     monkeypatch.setattr("aggregator.cli.Embedder", lambda *a, **kw: stub)
     assert ingest(corpus) == 0
 
-    with pytest.raises(RuntimeError, match="died mid-batch"):
-        run_cli(["embed", "--catchup", "--batch-size", "2"])
+    assert run_cli(["embed", "--catchup", "--batch-size", "2"]) != 0
+
+    err = capsys.readouterr().err
+    assert "embedder died mid-batch" in err, "the operator must be told why"
 
     states = embedding_states(cache)
-    ok = {i for i, s in states.items() if s == "ok"}
-    assert ok == {"obs-k8s"}, "the watermark advanced past a row with no vector"
+    assert len({i for i, s in states.items() if s == "error"}) == 1
     assert states["obs-blank"] == "skip"
-    assert vector_ids(cache) == ok
-    assert sum(1 for s in states.values() if s is None) == 7
+    assert None not in states.values(), "the backlog drained past the bad row"
+    assert vector_ids(cache) == {i for i, s in states.items() if s == "ok"}
 
 
-def test_the_run_after_the_embedder_failure_drains_the_rest_of_the_backlog(
+def test_the_row_that_was_set_aside_is_retried_only_once_its_backoff_expires(
     corpus, cache, monkeypatch
 ):
-    """The failure must be recoverable by re-running, with no row stranded and
-    none embedded twice."""
+    """Rewritten 2026-08-18 alongside the test above, which it used to follow.
+
+    It asserted that re-running redid the whole aborted batch. Nothing is
+    aborted any more, so what has to be proved instead is the shape of the
+    hold: the one row that failed is neither lost nor retried on the very next
+    tick. It is invisible to the backlog until its backoff expires — otherwise
+    a deterministically-bad row burns all three of its attempts inside one
+    ``--catchup`` and reaches terminal in seconds — and it is embedded on the
+    first run after that, with no completed row touched twice.
+    """
     dying = StubEmbedder(fail_on_document_call=3)
     monkeypatch.setattr("aggregator.cli.Embedder", lambda *a, **kw: dying)
     assert ingest(corpus) == 0
-    with pytest.raises(RuntimeError):
-        run_cli(["embed", "--catchup", "--batch-size", "2"])
+    assert run_cli(["embed", "--catchup", "--batch-size", "2"]) != 0
+    held = {i for i, s in embedding_states(cache).items() if s == "error"}
+    assert defer_embed_backoff(cache) == 1
 
     healthy = StubEmbedder()
     monkeypatch.setattr("aggregator.cli.Embedder", lambda *a, **kw: healthy)
     assert run_cli(["embed", "--catchup", "--batch-size", "2"]) == 0
+    assert healthy.document_calls == 0, "a held row was retried before its time"
 
-    assert healthy.document_calls == 7, "a completed row was embedded again"
+    assert expire_embed_backoff(cache) == 1
+    assert run_cli(["embed", "--catchup", "--batch-size", "2"]) == 0
+
+    assert healthy.document_calls == 1, "only the held row was re-embedded"
     states = embedding_states(cache)
     assert all(s is not None for s in states.values())
+    assert held <= {i for i, s in states.items() if s == "ok"}
     assert vector_ids(cache) == {i for i, s in states.items() if s == "ok"}
 
 

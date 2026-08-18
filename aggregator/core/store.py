@@ -1258,12 +1258,7 @@ class Store:
         self._ensure_writable()
         if state not in ("ok", "skip", "error"):
             raise ValueError(f"invalid state: {state!r}")
-        if kind == "observations":
-            col, table = "obs_id", "observations"
-        elif kind == "records":
-            col, table = "stable_id", "records"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
+        col, table = self._kind_columns(kind)
         if not ids:
             return
         c = self._c()
@@ -1275,6 +1270,51 @@ class Store:
                 (state, *page),
             )
         c.commit()
+
+    def requeue_embedding(self, kind: str, ids: list[str]) -> None:
+        """Put rows back INTO the backlog: ``embedding_state`` → NULL.
+
+        The other half of ``mark_embedded(state='error')``, and the reason that
+        state exists at all. ``select_unembedded`` is ``WHERE embedding_state
+        IS NULL ORDER BY ts DESC``, so a row left NULL after it failed is
+        re-selected by the very next batch of the same ``--catchup`` — the old
+        abort loop converted into an in-process spin. ``'error'`` therefore
+        means "out of the backlog RIGHT NOW", and the quarantine ledger, not
+        this column, owns the question of when it comes back. This is how it
+        comes back.
+
+        Unguarded on ``vector_available`` like its two neighbours: a plain
+        column has no business depending on a native extension. An empty
+        ``ids`` is a no-op, not an error — the caller reaches it on every
+        healthy run, and ``IN ()`` is a syntax error rather than an empty set.
+        """
+        self._ensure_writable()
+        col, table = self._kind_columns(kind)
+        if not ids:
+            return
+        c = self._c()
+        for page in _chunked(ids, 500):
+            placeholders = ",".join("?" * len(page))
+            c.execute(
+                f"UPDATE {table} SET embedding_state = NULL "  # noqa: S608 - allowlisted literals
+                f"WHERE {col} IN ({placeholders})",
+                tuple(page),
+            )
+        c.commit()
+
+    @staticmethod
+    def _kind_columns(kind: str) -> tuple[str, str]:
+        """``(id column, table)`` for an ontology name, or raise.
+
+        One mapping for the three ``embedding_state`` writers, so a new
+        ontology cannot be half-added — the allowlist that makes their f-string
+        SQL safe is the same allowlist in every one of them.
+        """
+        if kind == "observations":
+            return "obs_id", "observations"
+        if kind == "records":
+            return "stable_id", "records"
+        raise ValueError(f"unknown kind: {kind!r}")
 
     _VEC_TABLES = {
         "observations": "vec_observations",
@@ -2779,6 +2819,7 @@ class Store:
 
         total = sum(t["total"] for t in per_kind.values())
         pending = sum(t["pending"] for t in per_kind.values())
+        errors = sum(t["error"] for t in per_kind.values())
         vectors_total = (
             None if not available else sum(t["vectors"] for t in per_kind.values())
         )
@@ -2786,8 +2827,17 @@ class Store:
             state = "unavailable"
         elif total == 0:
             state = "empty"
-        elif pending == 0:
+        elif pending == 0 and errors == 0:
             state = "complete"
+        elif pending == 0:
+            # DRAINED, BUT NOT WHOLE. ``'error'`` rows leave ``pending``, so
+            # without this branch a cache whose only unembedded rows are ones
+            # the worker gave up on reports ``complete`` — the index rotting
+            # while every count says it is fine, which is the exact failure
+            # this project exists to prevent. ``degraded`` is the honest
+            # verdict: the backfill has gone as far as it can and did not
+            # reach everything. ``aggregator status`` names the rows.
+            state = "degraded"
         elif vectors_total == 0:
             state = "not_started"
         else:
@@ -2796,6 +2846,9 @@ class Store:
             "available": available,
             "reason": reason,
             "state": state,
+            # Summed here so a caller can render "n unreachable" without
+            # re-deriving it per ontology and getting the sum wrong.
+            "errors": errors,
             **per_kind,
         }
 

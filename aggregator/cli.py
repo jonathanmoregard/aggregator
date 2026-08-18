@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,7 @@ from aggregator.core.chunk import chunk_body
 from aggregator.core.embed import Embedder
 from aggregator.core.store import EmptyRebuildRefusedError, Store
 from aggregator.imports.ingest_state import (
+    POISON_MAX_ATTEMPTS,
     SOURCE_CURSORS,
     PoisonLedger,
     Watermarks,
@@ -1466,11 +1468,140 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
         kinds = (
             ["observations", "records"] if args.source == "both" else [args.source]
         )
-        for kind in kinds:
-            _embed_backlog(store, embedder, kind, args)
+        outcome = _EmbedOutcome()
+        ledger = PoisonLedger(store)
+        try:
+            for kind in kinds:
+                _embed_backlog(store, embedder, kind, args, ledger, outcome)
+        except EmbedderUnhealthyError as e:
+            # ANNOUNCE FIRST, THEN ABORT. Rows attributed earlier in this run
+            # passed their own health probe and have ledger entries already
+            # written; swallowing their lines here would leave each one
+            # known-but-never-reported, i.e. quiet on this run and quiet on
+            # every run after it. Exactly the silence the ledger's bargain
+            # forbids.
+            _report_embed_outcome(outcome)
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
     finally:
         os.close(lock_fd)
+    return _report_embed_outcome(outcome)
+
+
+def _report_embed_outcome(outcome: _EmbedOutcome) -> int:
+    """Say what was set aside, and decide whether this run failed.
+
+    THE KNOWN-POISON BARGAIN, one layer below where PR #5 struck it. A row the
+    worker has never failed on before is NEWS: its id and its error go to
+    stderr and the run exits non-zero, because "fail loudly" means an operator
+    learns of each new problem exactly once. A row already in the ledger is
+    NOT news: it becomes a count on stdout and the run exits 0, because the
+    same permanent problem shouting twice an hour is how an operator learns to
+    ignore the notifier, and that costs the next real failure its audience.
+
+    Quiet is only defensible while it is not the same as forgotten, so the
+    quiet line still carries a number and still names where the detail lives.
+    """
+    if outcome.new_failures:
+        for line in outcome.new_failures:
+            print(line, file=sys.stderr)
+        print(
+            f"embed: {len(outcome.new_failures)} row(s) set aside this run and "
+            f"recorded in the quarantine ledger. Each is retried with backoff "
+            f"and given up on after {POISON_MAX_ATTEMPTS} attempts; the rest of "
+            f"the backlog was embedded. `aggregator status` lists them. This is "
+            f"reported once per row — later runs stay quiet.",
+            file=sys.stderr,
+        )
+        return 1
+    if outcome.known_failures:
+        print(
+            f"embed: {outcome.known_failures} known-bad row(s) failed again "
+            f"(already reported once; see `aggregator status`)"
+        )
+    if outcome.released:
+        print(f"embed: {outcome.released} previously-bad row(s) embedded cleanly")
     return 0
+
+
+@dataclass
+class _EmbedOutcome:
+    """What one ``aggregator embed`` invocation did to the poison ledger."""
+
+    #: Ready-to-print stderr lines, one per row failing for the FIRST time.
+    new_failures: list[str] = field(default_factory=list)
+    #: Rows that failed again having already been reported. Counted, not named.
+    known_failures: int = 0
+    #: Rows that used to fail and embedded cleanly this time.
+    released: int = 0
+
+
+class EmbedderUnhealthyError(RuntimeError):
+    """The embedder could not embed a known-good probe. Not a bad row.
+
+    Raised out of the batch loop so the whole run stops without attributing
+    anything to a record. See :func:`_embedder_is_healthy`.
+    """
+
+
+#: A body the model must be able to embed if it is working at all: short,
+#: plain ASCII, nothing a chunker or tokenizer has any reason to choke on.
+_EMBED_HEALTH_PROBE = "aggregator embed health probe"
+
+
+def _embedder_is_healthy(embedder: Embedder) -> bool:
+    """THE TRANSIENT/PERMANENT DISCRIMINATOR, asked at the moment of failure.
+
+    "Was that the row's fault or the machine's?" cannot be answered from the
+    exception: a model that has not finished loading, an allocator that ran out
+    of memory, and a body that deterministically kills the tokenizer all arrive
+    as ``RuntimeError`` from ``sentence-transformers``. Sniffing types would be
+    a guess, and a wrong guess in either direction is expensive — condemn a
+    transient and the row is lost from the index, excuse a permanent and the
+    backlog never drains.
+
+    So ask the question directly, by re-running the same call on input that is
+    known to be fine. If the probe embeds, the embedder works and the failure
+    discriminated between two bodies, which makes it a property of the ROW. If
+    the probe fails too, the failure discriminates between nothing, so nothing
+    may be blamed on a record: the caller aborts, marks no row, holds no row,
+    and leaves the backlog exactly where it was.
+
+    That covers each named transient exactly. A cold model fails the probe. An
+    OOM fails the probe. An I/O blip on the model files fails the probe. A body
+    that kills the tokenizer does not.
+
+    It is not asked to cover everything, and it does not have to: the second
+    axis is reproducibility. A row that passes this test is HELD with backoff,
+    not condemned — a large row that OOMed while the small probe fit is
+    attempted again later and released the moment it succeeds. Only failing
+    ``POISON_MAX_ATTEMPTS`` times across separate runs, minimum fifteen minutes
+    apart, makes a row terminal, and by then "deterministic" is evidence rather
+    than inference.
+
+    Costs one short embed per FAILING row and nothing at all on a healthy run.
+    Deliberately not memoised across a batch: an embedder that dies partway
+    through must be caught then, not excused by a probe that passed earlier.
+    """
+    try:
+        embedder.embed_documents([_EMBED_HEALTH_PROBE])
+    except Exception:
+        # Including the probe's own unexpected failures. Every unknown here
+        # resolves to "do not attribute", which is the direction that costs a
+        # re-read rather than a permanently dropped row.
+        return False
+    return True
+
+
+def _embed_ledger_source(kind: str) -> str:
+    """What the embed worker calls itself in the quarantine ledger.
+
+    Namespaced per ontology so an ``obs_id`` and a ``stable_id`` that happen to
+    collide cannot inherit each other's attempt count, and so the line
+    ``aggregator status`` prints says which worker set the row aside rather
+    than colliding with an ingest source of the same name.
+    """
+    return f"embed:{kind}"
 
 
 def _embed_backlog(
@@ -1478,18 +1609,31 @@ def _embed_backlog(
     embedder: Embedder,
     kind: str,
     args: argparse.Namespace,
+    ledger: PoisonLedger,
+    outcome: _EmbedOutcome,
 ) -> None:
     """Drain the backlog in bounded batches (``--catchup``) or do one (``--once``).
 
     Chunked and checkpointed for the same reason ingest is: each batch commits
     its vectors and its watermark before the next one starts, so a kill at any
     moment costs at most one batch and the next run resumes where this stopped.
+
+    FIRST, THE ROWS WHOSE BACKOFF HAS EXPIRED. A row that failed left the
+    backlog under ``embedding_state = 'error'``, so ``select_unembedded``
+    cannot see it and no amount of draining would ever try it again. Putting
+    the due ones back is what makes the hold a RETRY rather than a deletion,
+    and it happens once per run rather than per batch so a row cannot be
+    requeued into the same run that just set it aside.
     """
+    source = _embed_ledger_source(kind)
+    due = ledger.due(source)
+    if due:
+        store.requeue_embedding(kind, sorted(due))
     while True:
         rows = store.select_unembedded(kind, limit=args.batch_size)
         if not rows:
             return
-        _embed_batch(store, embedder, kind, rows)
+        _embed_batch(store, embedder, kind, rows, ledger, outcome)
         if args.once:
             return
 
@@ -1499,6 +1643,8 @@ def _embed_batch(
     embedder: Embedder,
     kind: str,
     rows: list,
+    ledger: PoisonLedger,
+    outcome: _EmbedOutcome,
 ) -> None:
     """Embed one batch, then advance the watermark — IN THAT ORDER.
 
@@ -1511,10 +1657,34 @@ def _embed_batch(
     has to leave the backlog or the worker re-reads it every run forever, but
     "nothing to embed" and "embedded" are different facts and the table keeps
     them apart.
+
+    ONE BAD ROW COSTS ONE ROW. Every per-row failure is caught here, and the
+    reason it must be is the 30-minute timer: ``select_unembedded`` orders
+    ``ts DESC``, so a row that aborted the run was the first row of the next
+    run too, forever. That is the 2026-08-15 ingest doom loop with a different
+    query at the bottom of it. A caught failure is held in the quarantine
+    ledger, marked ``'error'`` so the backlog can drain past it, and — if this
+    is the first time — named on stderr.
+
+    THE LEDGER IS WRITTEN BEFORE THE MARK, and that order is the safe one. A
+    kill in between leaves a ledger entry for a row still sitting at NULL: it
+    is attempted again next run and its attempt count runs one high, which
+    costs one embed. The reverse leaves a row marked ``'error'`` with nothing
+    holding it, which no ``due`` set would ever requeue — a row silently gone
+    from the index with no record of why, i.e. the failure this whole file is
+    about.
+
+    ``except Exception``, never ``BaseException``: a ``KeyboardInterrupt``, a
+    ``SystemExit`` or a test's deliberate ``BaseException`` sentinel means stop,
+    not "this row is poison".
     """
+    source = _embed_ledger_source(kind)
+    entries = ledger.entries(source)
     ok_ids: list[str] = []
     skip_ids: list[str] = []
+    error_ids: list[str] = []
     all_vecs: list[tuple[str, Any]] = []
+    unhealthy: EmbedderUnhealthyError | None = None
     for row in rows:
         if kind == "observations":
             row_id = row["obs_id"]
@@ -1522,21 +1692,58 @@ def _embed_batch(
         else:
             row_id = row["stable_id"]
             body = f"{row['subject']}\n\n{row['body']}"
-        chunks = chunk_body(body)
-        if not chunks:
-            skip_ids.append(row_id)
+        try:
+            chunks = chunk_body(body)
+            if not chunks:
+                skip_ids.append(row_id)
+                continue
+            vecs = embedder.embed_documents(chunks)
+        except Exception as e:
+            if not _embedder_is_healthy(embedder):
+                unhealthy = EmbedderUnhealthyError(
+                    f"aggregator embed stopped after {kind} row {row_id!r} failed "
+                    f"({type(e).__name__}: {e}) and the embedder then could not "
+                    f"embed a known-good probe string either. That is an "
+                    f"environment fault — a model that has not loaded, an OOM, "
+                    f"an I/O blip — and not bad data, so that row was NOT "
+                    f"blamed for it and every row still unembedded stays in "
+                    f"the backlog. Fix the model and re-run "
+                    f"`aggregator embed --catchup`."
+                )
+                break
+            held = ledger.hold(source, row_id, e, previous=entries.get(row_id))
+            error_ids.append(row_id)
+            if row_id in entries:
+                outcome.known_failures += 1
+            else:
+                outcome.new_failures.append(
+                    f"embed: {kind} row {row_id!r} could not be embedded and was "
+                    f"set aside — {held.error_detail}"
+                )
             continue
-        vecs = embedder.embed_documents(chunks)
         for i, vec in enumerate(vecs):
             chunk_id = row_id if len(chunks) == 1 else f"{row_id}:{i}"
             all_vecs.append((chunk_id, vec))
         ok_ids.append(row_id)
+        if row_id in entries:
+            # It used to fail and does not any more. A fault that no longer
+            # reproduces describes no gap, and leaving the row behind would
+            # have ``aggregator status`` overstating the damage forever.
+            ledger.release(source, row_id)
+            outcome.released += 1
     if kind == "observations":
         store.upsert_vec_observations(all_vecs)
     else:
         store.upsert_vec_records(all_vecs)
     store.mark_embedded(kind, ok_ids, state="ok")
     store.mark_embedded(kind, skip_ids, state="skip")
+    store.mark_embedded(kind, error_ids, state="error")
+    if unhealthy is not None:
+        # The rows that DID embed before the model died are flushed above and
+        # keep their vectors: a run that threw away completed work would be
+        # re-doing it on the next tick, which the ingest rules call a bug even
+        # when the answer comes out right.
+        raise unhealthy
 
 
 def _cmd_github_token_status(
