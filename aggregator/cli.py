@@ -304,6 +304,11 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         dsl=args.dsl,
         fields=args.fields,
         page_size=args.page_size,
+        # THREADED, because this command PRINTS one. Without it the token at
+        # the bottom of every long result set addressed a page the CLI then
+        # refused as an unrecognised argument, so page 2 was unreachable from
+        # here and the only evidence of that was an argparse usage error.
+        page_token=args.page_token,
         drilldown=args.drilldown,
         _store=store,
     )
@@ -2037,6 +2042,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     q.add_argument("--fields", choices=["summary", "full"], default="summary")
     q.add_argument("--page-size", type=int, default=50)
+    q.add_argument(
+        "--page-token",
+        default=None,
+        help=(
+            "continue from a previous page: pass back the value this command "
+            "printed as '# next_page_token:' (or the JSON field of the same "
+            "name)"
+        ),
+    )
     q.add_argument(
         "--json", action="store_true", help="emit machine-readable JSON"
     )
