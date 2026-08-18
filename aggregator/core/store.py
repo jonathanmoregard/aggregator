@@ -2227,16 +2227,31 @@ class Store:
         means the retriever fused to nothing, and it renders as ``1=0`` because
         SQL ``IN ()`` is a syntax error, not an empty set. Getting that
         backwards turns "no results" into a 500 at the tool boundary.
+
+        ONE BOUND PARAMETER, NOT ONE PER ID. The obvious
+        ``IN (?,?,?…)`` breaks at ``SQLITE_MAX_VARIABLE_NUMBER`` — 32,766 here
+        — and this scope is routinely bigger than that: it is the FTS5 arm
+        UNION the vector arm, and the FTS5 arm is deliberately uncapped (see
+        ``mcp._fused_id_scope``), so it holds one id per row the term matched.
+        On a 483k-observation corpus a common word clears the limit easily, so
+        the binding failed on precisely the queries most worth running — and
+        failed two different ways: ``query_observations`` swallowed the
+        ``OperationalError`` and returned an empty page, while
+        ``count_observations`` let it propagate.
+
+        ``json_each`` takes the whole list as a single JSON parameter and is
+        still index-driven — the plan stays
+        ``SEARCH … USING INDEX (obs_id=?)`` with the scope as a LIST SUBQUERY,
+        and 60k ids resolve in ~20 ms. JSON1 has been compiled into SQLite by
+        default since 3.38; this build is 3.53.
         """
         if ast.id_scope is None:
             return
         if not ast.id_scope:
             clauses.append("1=0")
             return
-        clauses.append(
-            f"{column} IN ({','.join('?' * len(ast.id_scope))})"
-        )
-        params.extend(sorted(ast.id_scope))
+        clauses.append(f"{column} IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(sorted(ast.id_scope)))
 
     def _fts_ids(self, text: str) -> set[str]:
         c = self._c()

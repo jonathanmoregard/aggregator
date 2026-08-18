@@ -255,3 +255,81 @@ def test_sessions_id_scope_survives_a_scope_bigger_than_one_sql_page(store):
         "s1"
     }
     assert store.count_observations(QueryAST(id_scope=scope)) == 1200
+
+
+# --- a scope larger than SQLITE_MAX_VARIABLE_NUMBER -------------------------
+#
+# THE SHAPE OF THIS BUG, and why the number is not academic. The fused scope is
+# the FTS5 arm UNION the vector arm, and the FTS5 arm is passed to RRF
+# UNCAPPED, on purpose — capping it would let a warm vector index remove
+# keyword matches. So the scope is as large as the number of rows a term
+# matches, and on a 483k-observation corpus a common word matches far more than
+# the 32,766 host parameters SQLite allows.
+#
+# Binding one parameter per id therefore fails on exactly the queries a user is
+# most likely to run. Worse, it failed in two different directions:
+# ``query_observations`` swallowed the OperationalError and returned ``[]`` — a
+# silently empty page for a popular query — while ``count_observations`` let it
+# propagate. Neither is acceptable, and "the more common the search term, the
+# more likely it returns nothing" is the worst possible shape for a recall
+# tool.
+#
+# The scopes below deliberately straddle the real limit rather than lowering it
+# with ``setlimit``: the thing under test is that the production code no longer
+# binds one parameter per id, and a test that moves the ceiling could pass
+# against code that still does.
+
+_OVER_LIMIT = 40000
+
+
+def test_observations_id_scope_far_larger_than_the_sql_variable_limit(store):
+    store.upsert_entities([_session("s1"), _obs("o0000", "s1")])
+    scope = frozenset({"o0000"} | {f"filler{i}" for i in range(_OVER_LIMIT)})
+    ast = QueryAST(id_scope=scope)
+
+    rows = store.query_observations(ast, limit=10, offset=0)
+
+    assert [o.obs_id for o in rows] == ["o0000"]
+
+
+def test_observations_count_with_a_scope_over_the_variable_limit(store):
+    store.upsert_entities([_session("s1"), _obs("o0000", "s1")])
+    scope = frozenset({"o0000"} | {f"filler{i}" for i in range(_OVER_LIMIT)})
+
+    assert store.count_observations(QueryAST(id_scope=scope)) == 1
+
+
+def test_records_id_scope_over_the_variable_limit(store):
+    store.upsert([_rec("github:x:1")])
+    scope = frozenset({"github:x:1"} | {f"filler{i}" for i in range(_OVER_LIMIT)})
+    ast = QueryAST(id_scope=scope)
+
+    assert [r.stable_id for r in store.query(ast)] == ["github:x:1"]
+    assert store.count(ast) == 1
+
+
+def test_sessions_id_scope_over_the_variable_limit(store):
+    store.upsert_entities([_session("s1"), _obs("o0000", "s1")])
+    scope = frozenset({"o0000"} | {f"filler{i}" for i in range(_OVER_LIMIT)})
+
+    sessions = store.query_sessions(QueryAST(id_scope=scope))
+
+    assert {s.session_id for s in sessions} == {"s1"}
+
+
+def test_an_over_limit_scope_still_intersects_other_filters(store):
+    """The scope must narrow, never widen — even on the chunked path."""
+    store.upsert_entities(
+        [
+            _session("s1"),
+            _obs("o0000", "s1"),
+            _obs("o0001", "s1", obs_type="assistant"),
+        ]
+    )
+    scope = frozenset(
+        {"o0000", "o0001"} | {f"filler{i}" for i in range(_OVER_LIMIT)}
+    )
+
+    rows = store.query_observations(QueryAST(id_scope=scope, obs_type="assistant"))
+
+    assert [o.obs_id for o in rows] == ["o0001"]
