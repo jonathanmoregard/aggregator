@@ -638,6 +638,25 @@ VECTOR_PROVENANCE_KEY = "vector_provenance"
 #: unwinding — see ``Store.claim_embed_row``.
 EMBED_CLAIM_KEY = "embed_inflight"
 
+#: The ONE opt-in that lets a provenance mismatch DELETE computed vectors.
+#:
+#: Deliberately not inferred from anything. ``AGGREGATOR_EMBED_BACKEND`` names a
+#: loader; it is not consent to discard a month of CPU, and round 2's S1 is
+#: exactly that conflation — a stray ``export`` in one shell turning
+#: ``aggregator query`` into a demolition, then the pinned timer demolishing
+#: what got rebuilt. This variable does nothing at all when the stamp matches,
+#: and its name says what it costs.
+VECTOR_REINDEX_ENV = "AGGREGATOR_VECTOR_REINDEX"
+
+
+def reindex_consented() -> bool:
+    """Whether this process was explicitly told it may rebuild the index."""
+    return os.environ.get(VECTOR_REINDEX_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
 _VEC_DDL: list[str] = [
     f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_observations USING vec0(
@@ -690,6 +709,34 @@ _DROP_ALL: list[str] = [
 ]
 
 
+def _provenance_refusal(stamped: str, expected: str, vectors: int | None) -> str:
+    """The one message an operator gets when the index and the build disagree.
+
+    It has to carry three things, because a mismatch is silent otherwise and
+    the two ways out are opposite actions: what disagreed, that NOTHING was
+    deleted, and the exact command for each intent. ``vectors`` is ``None`` on
+    the read path, which declines to pay an O(n) ``COUNT(*)`` to decorate an
+    error it has already decided to raise.
+    """
+    held = (
+        "the vectors on disk are intact"
+        if vectors is None
+        else f"the {vectors} vector(s) on disk are intact"
+    )
+    return (
+        f"refusing to use the vector index on this cache: it is {stamped}, and "
+        f"this process is configured for {expected}. NOTHING WAS DELETED — "
+        f"{held}. The vector arm is switched "
+        f"off for this process instead, so no vector whose model is unknown is "
+        f"served; FTS5 keyword search is unaffected. If "
+        f"AGGREGATOR_EMBED_BACKEND is exported in this shell then that is the "
+        f"cause and `unset AGGREGATOR_EMBED_BACKEND` is the whole fix. If the "
+        f"model change is intended, the index cannot be converted and has to "
+        f"be rebuilt from scratch (weeks of CPU) — say so once, explicitly: "
+        f"`{VECTOR_REINDEX_ENV}=1 aggregator embed --catchup --source both`."
+    )
+
+
 def _default_db_path() -> Path:
     """Resolve ``$XDG_DATA_HOME/aggregator/cache.db`` (creating parents)."""
     root = Path(
@@ -720,6 +767,10 @@ class Store:
         self._conn: sqlite3.Connection | None = None
         self._vector_available = False
         self._vector_write_warned = False
+        #: Why the vector arm is refusing, or ``None`` when it is trusted.
+        self._vector_quarantine: str | None = None
+        #: Whether the question above has been answered for this connection.
+        self._vector_quarantine_decided = False
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -807,6 +858,10 @@ class Store:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+            # The provenance verdict describes the FILE, which another process
+            # may have re-stamped meanwhile. Re-open, re-decide.
+            self._vector_quarantine = None
+            self._vector_quarantine_decided = False
 
     def commit(self) -> None:
         """End the open transaction. For a caller composing SEVERAL writes.
@@ -864,8 +919,9 @@ class Store:
             # ``CREATE VIRTUAL TABLE IF NOT EXISTS`` untouched, so the check
             # that might drop it has to run first.
             self._reconcile_vector_provenance(c)
-            for stmt in _VEC_DDL:
-                c.executescript(stmt)
+            if self._vector_quarantine is None:
+                for stmt in _VEC_DDL:
+                    c.executescript(stmt)
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
@@ -873,8 +929,7 @@ class Store:
         )
         c.commit()
 
-    @staticmethod
-    def _reconcile_vector_provenance(c: sqlite3.Connection) -> None:
+    def _reconcile_vector_provenance(self, c: sqlite3.Connection) -> None:
         """Adopt the vector index only if this build is what produced it.
 
         WHY EXISTENCE IS NOT ENOUGH. Every other probe in ``migrate()`` asks
@@ -900,11 +955,48 @@ class Store:
           ``complete`` while ``vectors`` is 0 and no row is ever re-embedded.
 
         The stamp closes all three with one comparison. When it matches, this
-        is a no-op and the index is kept. When it is absent or disagrees, the
-        vectors are DISCARDED and every row goes back into the backlog: that
-        costs a re-embed, and it is the only outcome that cannot serve a
-        silently wrong answer. Discarding is announced, because throwing away
-        an index is expensive news.
+        is a no-op and the index is kept.
+
+        WHEN IT DOES NOT MATCH, THE ANSWER DEPENDS ON WHAT IS AT STAKE — and
+        that distinction is the round-2 S1 fix, because the first version of
+        this method always answered "discard". ``migrate()`` runs on EVERY CLI
+        invocation, and the stamp is derived from ``AGGREGATOR_EMBED_BACKEND``,
+        so a shell that happened to export ``gguf`` turned a read-only
+        ``aggregator query`` into an operation that deleted the whole vector
+        index — 1.33 GB and 25-30 days of continuous CPU — on a log line, and
+        the sentence-transformers-pinned timer then deleted the rebuild on its
+        next tick. Nothing about reading implies consent to that. Two cases:
+
+        * **No vectors on disk.** Nothing computed exists, so adopting costs
+          nothing and destroys nothing: drop and recreate the vec tables (this
+          is what fixes a foreign table of the wrong WIDTH), return every
+          non-NULL ``embedding_state`` to the backlog, stamp. This branch is
+          not an optimisation — a fresh database reaches this method with no
+          stamp and no tables, and refusing there would mean no cache could
+          ever bootstrap the arm.
+        * **Vectors on disk.** REFUSE. Nothing is dropped, nothing is
+          requeued, nothing is stamped. The vector arm is switched off for
+          this Store (``_vector_quarantine``), which is the degrade path this
+          file already has: vector reads raise
+          :class:`VectorIndexUnavailableError`, vector writes no-op,
+          ``mark_embedded('ok')`` refuses, ``vector_index_state`` reports
+          ``unavailable`` with the reason, and FTS5 keyword search is
+          untouched. So a genuine mismatch still cannot serve a vector whose
+          model is unknown — it just says so instead of billing a month of CPU
+          for the discovery.
+
+        The refusal names both fixes, because they are opposite actions and
+        only the operator knows which one is meant: unset the stray env var,
+        or — if the model change is real — consent to the rebuild explicitly
+        via ``AGGREGATOR_VECTOR_REINDEX=1``, which is the only thing in this
+        codebase that may delete computed vectors WHOLESALE.
+
+        Not wholesale: ingest's per-row invalidation (``_drop_row_vectors``
+        when a body is edited, ``_purge_orphan_vectors`` after a rebuild) still
+        runs while quarantined, and should. Those delete vectors that are stale
+        or ownerless by definition — never because of the stamp — so they
+        cannot turn a mismatch into a mass deletion, and stopping them would
+        leave the index pointing at bodies that no longer exist.
 
         Runs only when sqlite-vec loaded — see the caller. Without the
         extension there is no way to inspect or drop the tables, and stamping
@@ -917,20 +1009,31 @@ class Store:
             "SELECT value FROM meta WHERE key = ?", (VECTOR_PROVENANCE_KEY,)
         ).fetchone()
         if row is not None and row[0] == expected:
+            self._adopt_vectors()
             return
 
-        discarded = 0
+        stamped = "no stamp" if row is None else f"stamped {row[0]}"
+        # O(n) on a vec0 table, and deliberately paid only here: the matching
+        # stamp returns above, so this runs once, on the mismatch path.
+        on_disk = 0
         for table in ("vec_observations", "vec_records"):
             exists = c.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = ?", (table,)
             ).fetchone()
             if exists:
-                discarded += c.execute(
+                on_disk += c.execute(
                     f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed literals
                 ).fetchone()[0]
+
+        if on_disk and not reindex_consented():
+            self._quarantine_vectors(
+                _provenance_refusal(stamped, expected, on_disk)
+            )
+            log.error("%s", self._vector_quarantine)
+            return
+
         for stmt in _VEC_DROP_ALL:
             c.execute(stmt)
-
         requeued = 0
         for table in ("observations", "records"):
             cur = c.execute(
@@ -939,7 +1042,7 @@ class Store:
             )
             requeued += cur.rowcount or 0
 
-        if discarded or requeued:
+        if on_disk or requeued:
             log.warning(
                 "discarding a vector index this build did not write "
                 "(%s): %d vector(s) dropped and %d row(s) returned to the "
@@ -948,14 +1051,73 @@ class Store:
                 "whose model is unknown cannot be told apart from correct ones "
                 "at query time. Run `aggregator embed --catchup --source both` "
                 "to refill it; FTS5 keyword search is unaffected meanwhile.",
-                "no stamp" if row is None else f"stamped {row[0]}",
-                discarded,
+                stamped,
+                on_disk,
                 requeued,
             )
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
             (VECTOR_PROVENANCE_KEY, expected),
         )
+        self._adopt_vectors()
+
+    def _adopt_vectors(self) -> None:
+        """The vector state on disk is this build's. Trust it."""
+        self._vector_quarantine = None
+        self._vector_quarantine_decided = True
+
+    def _quarantine_vectors(self, reason: str) -> None:
+        """Switch the vector arm off for this Store, keeping the vectors."""
+        self._vector_quarantine = reason
+        self._vector_quarantine_decided = True
+
+    def _vector_quarantine_reason(self) -> str | None:
+        """Why the vector arm must refuse on THIS connection, or ``None``.
+
+        THE READ PATH NEEDS ITS OWN ANSWER, and that is new in round 2. While a
+        mismatch was resolved by deleting the vectors, ``migrate()`` was enough:
+        the wrong vectors were gone before anything could read them. Refusing
+        instead leaves them on disk, so a Store that never migrates — and the
+        MCP server is exactly that, ``Store(read_only=True)``, the surface the
+        user actually queries through — would go on serving them. Checking here
+        is what keeps H1's protection intact under the new answer.
+
+        Cached per connection. The cost is one indexed ``meta`` lookup plus the
+        import of ``aggregator.core.embed`` (numpy, not torch — see
+        ``vector_provenance``), paid on the first vector operation and never on
+        the FTS5-only path.
+
+        An ABSENT stamp over a cache with no vec tables is not a refusal: that
+        is a cache migrated on an interpreter without sqlite-vec, and
+        ``count_vec_rows`` already has a better message for it. An absent stamp
+        with vec tables present IS a refusal — that is precisely the foreign
+        state the stamp exists to catch.
+        """
+        if self._vector_quarantine_decided:
+            return self._vector_quarantine
+        c = self._c()
+        try:
+            row = c.execute(
+                "SELECT value FROM meta WHERE key = ?", (VECTOR_PROVENANCE_KEY,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # No ``meta`` table: nothing has ever migrated this file.
+            row = None
+        model, dim = vector_provenance()
+        expected = json.dumps({"dim": dim, "model": model}, sort_keys=True)
+        if row is not None and row[0] == expected:
+            self._adopt_vectors()
+            return None
+        present = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE name IN "
+            "('vec_observations', 'vec_records')"
+        ).fetchone()
+        if row is None and present is None:
+            self._adopt_vectors()
+            return None
+        stamped = "no stamp" if row is None else f"stamped {row[0]}"
+        self._quarantine_vectors(_provenance_refusal(stamped, expected, None))
+        return self._vector_quarantine
 
     @staticmethod
     def _ensure_column(
@@ -1471,17 +1633,24 @@ class Store:
         return len(rows)
 
     def _vector_writes_enabled(self) -> bool:
-        """Whether a vector write can proceed; warns once per store if not."""
-        if self.vector_available:
+        """Whether a vector write can proceed; warns once per store if not.
+
+        A quarantined index blocks writes as firmly as a missing extension, and
+        for a sharper reason: the writes would be THIS build's vectors landing
+        in a table filled by a different model, producing a silently mixed
+        index that no later check could untangle. Refusing keeps the two apart.
+        """
+        if self.vector_available and self._vector_quarantine_reason() is None:
             return True
         if not self._vector_write_warned:
             self._vector_write_warned = True
             log.warning(
-                "vector index unavailable (sqlite-vec did not load) — "
-                "discarding vector writes for this store. embedding_state is "
-                "deliberately NOT advanced, so the backlog survives and "
-                "`aggregator embed --catchup` will fill it once the extension "
-                "is working."
+                "%s — discarding vector writes for this store. "
+                "embedding_state is deliberately NOT advanced, so the backlog "
+                "survives and `aggregator embed --catchup` will fill it once "
+                "the arm is working.",
+                self._vector_quarantine
+                or "vector index unavailable (sqlite-vec did not load)",
             )
         return False
 
@@ -1493,6 +1662,12 @@ class Store:
                 "works; re-install the `sqlite-vec` wheel for this interpreter "
                 "to restore the vector arm."
             )
+        # The extension loaded, but the index may not be this build's. Same
+        # exception type on purpose: "the arm is off" is one fact with two
+        # causes, and every caller already degrades to FTS5 on it.
+        quarantine = self._vector_quarantine_reason()
+        if quarantine is not None:
+            raise VectorIndexUnavailableError(quarantine)
 
     def select_unembedded(self, kind: str, limit: int = 500) -> list[sqlite3.Row]:
         """Rows whose ``embedding_state IS NULL`` — the embed worker's backlog.

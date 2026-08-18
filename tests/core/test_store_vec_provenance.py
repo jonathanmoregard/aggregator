@@ -23,9 +23,27 @@ code, and each test below was watched to fail:
   index is empty, permanently, and every count says it is finished.
 
 The rule this pins: vector state is adopted only when the stamp on disk
-matches the model and dimension this build would produce. Otherwise it is
-discarded and the rows go back into the backlog to be re-embedded — which
-costs CPU and is the only outcome that cannot serve a wrong answer.
+matches the model and dimension this build would produce.
+
+WHAT "OTHERWISE" MEANS CHANGED IN ROUND 2, and the tests below moved with it.
+The first answer was "discard, always". But ``migrate()`` runs on EVERY CLI
+invocation and the stamp is derived from ``AGGREGATOR_EMBED_BACKEND``, so a
+shell that happened to export ``gguf`` turned ``aggregator query`` — a read —
+into an operation that deleted 1.33 GB and 25-30 days of CPU on a log line,
+and the sentence-transformers-pinned timer then deleted the rebuild on its
+next tick. The protection was right; the price was not consented to.
+
+So the answer is now proportional to what is at stake:
+
+* **nothing computed on disk** — adopt for free: recreate the vec tables (this
+  is what repairs a foreign table of the wrong WIDTH) and requeue the rows. A
+  fresh cache takes this branch, which is why it is not optional.
+* **vectors on disk** — REFUSE. Nothing is deleted, nothing is stamped, and
+  the vector arm switches off for the process: reads raise
+  ``VectorIndexUnavailableError``, writes no-op, ``vector_index_state`` says
+  ``unavailable``, FTS5 is untouched. A mismatch still cannot serve a vector
+  whose model is unknown. Deleting requires saying so:
+  ``AGGREGATOR_VECTOR_REINDEX=1``.
 """
 
 import sqlite3
@@ -34,7 +52,13 @@ import numpy as np
 import pytest
 import sqlite_vec
 
-from aggregator.core.store import _VEC_DIM, Store, vector_provenance
+from aggregator.core.store import (
+    _VEC_DIM,
+    VECTOR_REINDEX_ENV,
+    Store,
+    VectorIndexUnavailableError,
+    vector_provenance,
+)
 
 
 def _unit(dim, seed=0):
@@ -86,11 +110,57 @@ def _meta(store, key):
     return None if row is None else row[0]
 
 
+# --- round 2, S1: what a stray env var may and may not cost -----------------
+
+
+def test_a_shell_env_var_cannot_destroy_the_index(tmp_path, monkeypatch):
+    """The regression this file's second revision exists for.
+
+    ``migrate()`` runs on every CLI command, ``aggregator query`` included, and
+    the stamp is derived from ``AGGREGATOR_EMBED_BACKEND``. So exporting
+    ``gguf`` in any shell used to make a READ delete the entire vector index —
+    weeks of CPU — after which the sentence-transformers-pinned timer deleted
+    the rebuild on its next tick. Env ping-pong, unbounded.
+    """
+    db = tmp_path / "cache.db"
+    monkeypatch.delenv("AGGREGATOR_EMBED_BACKEND", raising=False)
+    store = Store(db_path=db)
+    store.migrate()
+    for i in range(5):
+        _seed_obs(store, f"o{i}")
+    store.upsert_vec_observations(
+        [(f"o{i}", _unit(_VEC_DIM, seed=i)) for i in range(5)]
+    )
+    store.mark_embedded("observations", [f"o{i}" for i in range(5)], "ok")
+    store.close()
+
+    monkeypatch.setenv("AGGREGATOR_EMBED_BACKEND", "gguf")
+    Store(db_path=db).migrate()
+
+    raw = _raw_vec_conn(db)
+    assert raw.execute("SELECT COUNT(*) FROM vec_observations").fetchone()[0] == 5
+    raw.close()
+    # …and the backlog was not re-opened either, so the timer has nothing to
+    # re-do once the variable goes away.
+    monkeypatch.delenv("AGGREGATOR_EMBED_BACKEND")
+    healthy = Store(db_path=db)
+    healthy.migrate()
+    assert healthy.count_vec_rows("observations") == 5
+    assert healthy.select_unembedded("observations") == []
+
+
 # --- the three reproduced harms --------------------------------------------
 
 
-def test_a_foreign_vec_table_of_the_wrong_dimension_is_rebuilt(tmp_path):
-    """Otherwise every write and every KNN read raises, forever."""
+def test_a_foreign_vec_table_of_the_wrong_dimension_never_serves_a_query(tmp_path):
+    """Otherwise every write and every KNN read raises ``Dimension mismatch``.
+
+    The harm was the CRASH LOOP, not the table's continued existence: on a
+    30-minute timer an unhandled dimension error is a permanent failure with
+    no recovery. Switching the arm off converts it into the degrade this
+    codebase already handles everywhere — a typed refusal, and FTS5 keeps
+    answering.
+    """
     db = tmp_path / "cache.db"
     _plant_foreign_vec_table(db, dim=1024)
 
@@ -98,18 +168,59 @@ def test_a_foreign_vec_table_of_the_wrong_dimension_is_rebuilt(tmp_path):
     store.migrate()
 
     _seed_obs(store, "o1")
-    store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
-    assert store._vec_obs_ids(_unit(_VEC_DIM), k=5) == ["o1"]
+    # No ``Dimension mismatch`` escapes: the write is refused, not attempted.
+    assert store.upsert_vec_observations([("o1", _unit(_VEC_DIM))]) == 0
+    with pytest.raises(VectorIndexUnavailableError):
+        store._vec_obs_ids(_unit(_VEC_DIM), k=5)
+    # And the row stays in the backlog rather than being marked embedded.
+    assert {r["obs_id"] for r in store.select_unembedded("observations")} == {"o1"}
+
+
+def test_a_wrong_width_table_is_repaired_once_consent_is_given(
+    tmp_path, monkeypatch
+):
+    """The rebuild still exists — it is just no longer implicit."""
+    db = tmp_path / "cache.db"
+    _plant_foreign_vec_table(db, dim=1024)
+
+    store = Store(db_path=db)
+    store.migrate()  # refuses; the foreign table survives
+    store.close()
+
+    monkeypatch.setenv(VECTOR_REINDEX_ENV, "1")
+    again = Store(db_path=db)
+    again.migrate()
+
+    _seed_obs(again, "o1")
+    assert again.upsert_vec_observations([("o1", _unit(_VEC_DIM))]) == 1
+    assert again._vec_obs_ids(_unit(_VEC_DIM), k=5) == ["o1"]
 
 
 def test_b_foreign_vectors_of_the_right_dimension_are_not_adopted(tmp_path):
+    """Right width, unknown model: the arm must not answer from them."""
     db = tmp_path / "cache.db"
     _plant_foreign_vec_table(db, dim=_VEC_DIM, n=5)
 
     store = Store(db_path=db)
     store.migrate()
 
-    assert store.count_vec_rows("observations") == 0
+    with pytest.raises(VectorIndexUnavailableError):
+        store.count_vec_rows("observations")
+    with pytest.raises(VectorIndexUnavailableError):
+        store._vec_obs_ids(_unit(_VEC_DIM), k=5)
+    assert store.vector_index_state()["state"] == "unavailable"
+
+
+def test_a_mismatch_keeps_every_vector_it_found(tmp_path):
+    """The whole point of round 2's S1: a read may not bill weeks of CPU."""
+    db = tmp_path / "cache.db"
+    _plant_foreign_vec_table(db, dim=_VEC_DIM, n=5)
+
+    Store(db_path=db).migrate()
+
+    raw = _raw_vec_conn(db)
+    assert raw.execute("SELECT COUNT(*) FROM vec_observations").fetchone()[0] == 5
+    raw.close()
 
 
 def test_c_pre_set_embedding_state_goes_back_into_the_backlog(tmp_path):
@@ -168,21 +279,54 @@ def test_a_matching_stamp_leaves_real_vectors_alone(tmp_path):
     assert again.select_unembedded("observations") == []
 
 
-def test_a_changed_model_discards_the_index_it_no_longer_matches(tmp_path):
-    db = tmp_path / "cache.db"
-    store = Store(db_path=db)
-    store.migrate()
-    _seed_obs(store, "o1")
-    store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
-    store.mark_embedded("observations", ["o1"], "ok")
+def _stamp_a_different_model(store):
     store._c().execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES "
         "('vector_provenance', ?)",
         (f'{{"model": "some/other-embedding-model", "dim": {_VEC_DIM}}}',),
     )
     store._c().commit()
+
+
+def test_a_changed_model_refuses_the_index_it_no_longer_matches(tmp_path):
+    """Refuse, keep, and say so — the reads must not be answered from it."""
+    db = tmp_path / "cache.db"
+    store = Store(db_path=db)
+    store.migrate()
+    _seed_obs(store, "o1")
+    store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
+    store.mark_embedded("observations", ["o1"], "ok")
+    _stamp_a_different_model(store)
     store.close()
 
+    again = Store(db_path=db)
+    again.migrate()
+
+    with pytest.raises(VectorIndexUnavailableError):
+        again.count_vec_rows("observations")
+    with pytest.raises(VectorIndexUnavailableError):
+        again.has_embedded_rows("observations")
+    # Kept: the stamp is not overwritten either, so the next process reaches
+    # the same verdict instead of quietly adopting on the second run.
+    assert "some/other-embedding-model" in _meta(again, "vector_provenance")
+    raw = _raw_vec_conn(db)
+    assert raw.execute("SELECT COUNT(*) FROM vec_observations").fetchone()[0] == 1
+    raw.close()
+
+
+def test_a_changed_model_discards_the_index_when_consent_is_given(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "cache.db"
+    store = Store(db_path=db)
+    store.migrate()
+    _seed_obs(store, "o1")
+    store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
+    store.mark_embedded("observations", ["o1"], "ok")
+    _stamp_a_different_model(store)
+    store.close()
+
+    monkeypatch.setenv(VECTOR_REINDEX_ENV, "1")
     again = Store(db_path=db)
     again.migrate()
 
@@ -190,7 +334,7 @@ def test_a_changed_model_discards_the_index_it_no_longer_matches(tmp_path):
     assert {r["obs_id"] for r in again.select_unembedded("observations")} == {"o1"}
 
 
-def test_records_are_reset_on_the_same_terms_as_observations(tmp_path):
+def test_records_are_judged_on_the_same_terms_as_observations(tmp_path):
     db = tmp_path / "cache.db"
     _plant_foreign_vec_table(
         db, dim=1024, n=2, table="vec_records", col="stable_id"
@@ -209,9 +353,27 @@ def test_records_are_reset_on_the_same_terms_as_observations(tmp_path):
     store = Store(db_path=db)
     store.migrate()
 
-    assert {r["stable_id"] for r in store.select_unembedded("records")} == {"r1"}
-    store.upsert_vec_records([("r1", _unit(_VEC_DIM))])
-    assert store.count_vec_rows("records") == 1
+    with pytest.raises(VectorIndexUnavailableError):
+        store.count_vec_rows("records")
+    assert store.upsert_vec_records([("r1", _unit(_VEC_DIM))]) == 0
+
+
+def test_an_empty_foreign_table_is_repaired_without_consent(tmp_path):
+    """Nothing computed is at stake, so nothing has to be asked.
+
+    This branch is load-bearing rather than an optimisation: a fresh cache
+    reaches ``_reconcile_vector_provenance`` with no stamp, and if that
+    refused, no machine could ever bootstrap the vector arm.
+    """
+    db = tmp_path / "cache.db"
+    _plant_foreign_vec_table(db, dim=1024, n=0)
+
+    store = Store(db_path=db)
+    store.migrate()
+
+    _seed_obs(store, "o1")
+    assert store.upsert_vec_observations([("o1", _unit(_VEC_DIM))]) == 1
+    assert store._vec_obs_ids(_unit(_VEC_DIM), k=5) == ["o1"]
 
 
 def test_migration_without_sqlite_vec_stamps_nothing_and_still_serves_fts(
@@ -268,8 +430,13 @@ def test_resolving_provenance_does_not_import_the_model_stack():
 
 
 @pytest.mark.parametrize("kind", ["observations", "records"])
-def test_reset_is_announced_not_silent(tmp_path, caplog, kind):
-    """Discarding an index is expensive news; it may not happen quietly."""
+def test_a_refusal_is_announced_and_names_both_ways_out(tmp_path, caplog, kind):
+    """Silence is the failure mode: the arm switches off with no other signal.
+
+    And it must name BOTH commands, because they are opposite actions and only
+    the operator knows which was meant — unset a stray env var, or consent to
+    a rebuild that costs weeks.
+    """
     db = tmp_path / "cache.db"
     table = "vec_observations" if kind == "observations" else "vec_records"
     col = "obs_id" if kind == "observations" else "stable_id"
@@ -278,7 +445,67 @@ def test_reset_is_announced_not_silent(tmp_path, caplog, kind):
     with caplog.at_level("WARNING"):
         Store(db_path=db).migrate()
 
+    said = "\n".join(r.message for r in caplog.records)
+    assert "unset AGGREGATOR_EMBED_BACKEND" in said, caplog.text
+    assert VECTOR_REINDEX_ENV in said, caplog.text
+    assert "NOTHING WAS DELETED" in said, caplog.text
+
+
+@pytest.mark.parametrize("kind", ["observations", "records"])
+def test_a_consented_discard_is_announced_not_silent(tmp_path, caplog, kind, monkeypatch):
+    """Throwing away an index is expensive news even when it was asked for."""
+    db = tmp_path / "cache.db"
+    table = "vec_observations" if kind == "observations" else "vec_records"
+    col = "obs_id" if kind == "observations" else "stable_id"
+    _plant_foreign_vec_table(db, dim=_VEC_DIM, n=2, table=table, col=col)
+    monkeypatch.setenv(VECTOR_REINDEX_ENV, "1")
+
+    with caplog.at_level("WARNING"):
+        Store(db_path=db).migrate()
+
     assert any(
         "vector" in r.message.lower() and "re-embed" in r.message.lower()
         for r in caplog.records
     ), caplog.text
+
+
+# --- the read path, which never migrates ------------------------------------
+
+
+def test_a_read_only_store_refuses_a_mismatched_index_too(tmp_path):
+    """``Store(read_only=True)`` is the MCP server — the surface most queried.
+
+    Under the old answer this needed no check: the mismatched vectors had
+    already been deleted by whichever writable command ran first. Refusing
+    leaves them on disk, so the read path has to reach the same verdict on its
+    own or H1's protection is gone exactly where it matters most.
+    """
+    db = tmp_path / "cache.db"
+    store = Store(db_path=db)
+    store.migrate()
+    _seed_obs(store, "o1")
+    store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
+    store.mark_embedded("observations", ["o1"], "ok")
+    _stamp_a_different_model(store)
+    store.close()
+
+    ro = Store(db_path=db, read_only=True)
+    with pytest.raises(VectorIndexUnavailableError):
+        ro.has_embedded_rows("observations")
+    with pytest.raises(VectorIndexUnavailableError):
+        ro._vec_obs_ids(_unit(_VEC_DIM), k=5)
+
+
+def test_a_read_only_store_serves_a_matching_index(tmp_path):
+    """The guard above must not cost the healthy case its vector arm."""
+    db = tmp_path / "cache.db"
+    store = Store(db_path=db)
+    store.migrate()
+    _seed_obs(store, "o1")
+    store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
+    store.mark_embedded("observations", ["o1"], "ok")
+    store.close()
+
+    ro = Store(db_path=db, read_only=True)
+    assert ro.has_embedded_rows("observations") is True
+    assert ro._vec_obs_ids(_unit(_VEC_DIM), k=5) == ["o1"]
