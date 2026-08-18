@@ -66,8 +66,22 @@ from typing import Any
 from fastmcp import FastMCP
 
 from aggregator.core.dsl import DSLError, format_help, parse
+
+# NOT imported here: ``aggregator.core.embed`` / ``aggregator.core.rerank``.
+# Both pull sentence-transformers, and this module is imported by an MCP
+# server the editor starts on demand, so a module-scope import would put a
+# multi-second model-stack load on the cold start of every session — including
+# the ones that never run a vector query. They are imported inside
+# ``_get_embedder`` / ``_get_reranker``; ``tests/test_mcp_cold_start.py``
+# fails if that ever regresses. ``hybrid`` is pure Python and free.
+from aggregator.core.hybrid import rrf_fuse
 from aggregator.core.scrub import scrub
-from aggregator.core.store import CHAT_ORIGINS, SCHEMA_VERSION, Store
+from aggregator.core.store import (
+    CHAT_ORIGINS,
+    SCHEMA_VERSION,
+    Store,
+    VectorIndexUnavailableError,
+)
 from aggregator.core.wrap import wrap_record
 from aggregator.sources.base import ObservationRow, QueryAST, Record, SessionRow
 
@@ -75,6 +89,15 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_PAGE_SIZE_SUMMARY = 200
 _DEFAULT_PAGE_SIZE_FULL = 40
+
+# How many neighbours the vector arm contributes per query. The FTS5 arm is
+# NOT capped — see ``_fused_id_scope`` for why that asymmetry is deliberate.
+_VECTOR_ARM_K = 50
+
+# How many hits of a page the cross-encoder reorders when ``rerank=True``.
+# Each pair costs roughly 300 ms, so this is a latency budget, not a quality
+# knob: 20 keeps the worst case near 6 s.
+_RERANK_WINDOW = 20
 
 # Exposed MCP tool names. The search tool deliberately carries "search" and
 # "memory" in its name: under deferred tool loading the client only sees tool
@@ -151,13 +174,279 @@ def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
     return None
 
 
-def _parse_page_token(token: str | None) -> int:
-    if not token:
-        return 0
+# --- hybrid retrieval -------------------------------------------------------
+#
+# THE DECISION LIVES IN ``_vector_arm_engaged`` AND NOWHERE ELSE. Three
+# routing paths (records, sessions, union) plus the drilldown variant all ask
+# the same function the same question, so "when does hybrid run" is one
+# readable predicate rather than a condition copied four times and drifting.
+
+_embedder: object | None = None
+_reranker: object | None = None
+
+
+def _get_embedder() -> object:
+    """Lazy singleton for the query embedder.
+
+    The import is INSIDE the function on purpose. ``aggregator.mcp`` is
+    imported by an MCP server the editor starts on demand, so anything at
+    module scope is paid by every session — including the overwhelming
+    majority that never run a vector query. Guarded by
+    ``tests/test_mcp_cold_start.py``.
+    """
+    global _embedder
+    if _embedder is None:
+        from aggregator.core.embed import Embedder
+
+        _embedder = Embedder()
+    return _embedder
+
+
+def _get_reranker() -> object:
+    """Lazy singleton for the cross-encoder — only ever built on ``rerank=True``.
+
+    Costs roughly 2 GB RSS, so a caller who never opts in must not pay even
+    the import. Same discipline and same guard as ``_get_embedder``.
+    """
+    global _reranker
+    if _reranker is None:
+        from aggregator.core.rerank import Reranker
+
+        _reranker = Reranker()
+    return _reranker
+
+
+def _strip_chunk_suffix(doc_id: str) -> str | None:
+    """Base id for a ``<id>:<n>`` chunk id, or ``None`` if it isn't one.
+
+    Only ever a GUESS, which is why callers keep both readings. The embed
+    worker suffixes a row's vectors ``<id>:0``, ``<id>:1`` … but ONLY when the
+    body needed more than one chunk, and ``stable_id_for`` mints record ids
+    shaped ``github:<owner>/<repo>:<number>`` that already end in
+    ``:<digits>``. So ``github:acme/api:42`` is indistinguishable, by shape,
+    from chunk 42 of ``github:acme/api``. Choosing either reading loses rows.
+    """
+    base, sep, tail = doc_id.rpartition(":")
+    if sep and base and tail.isdigit():
+        return base
+    return None
+
+
+def _widen_chunk_ids(vec_ids: list[str]) -> list[str]:
+    """Both readings of every vector hit, order preserved, deduplicated.
+
+    Resolves the ambiguity in ``_strip_chunk_suffix`` by refusing to resolve
+    it: emit the raw id AND the de-suffixed candidate, and let the SQL
+    ``IN`` filter decide. The wrong reading matches no row, which costs one
+    unused host parameter; guessing wrong would instead cost the row.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in vec_ids:
+        for candidate in (raw, _strip_chunk_suffix(raw)):
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                out.append(candidate)
+    return out
+
+
+def _vector_arm_engaged(
+    store: Store, kind: str, ast: QueryAST, pinned: bool | None
+) -> bool:
+    """The single hybrid-vs-FTS5 decision, for every path.
+
+    Three inputs, in priority order:
+
+    1. **No free text → never.** A pure-filter query (``source:``, ``from:``,
+       ``session:``) has nothing to embed, so it must not construct the model
+       or touch the vector tables.
+    2. **A page token pins the arm.** A continuation reproduces whichever arm
+       minted the page the caller is continuing — see ``_parse_page_token``.
+    3. **Otherwise, is there anything to search?** An empty vector index means
+       the pre-v5 FTS5 path, unchanged and with no model loaded. A missing
+       extension answers the same way.
+    """
+    if not ast.text:
+        return False
+    if pinned is not None:
+        return pinned
     try:
-        return max(0, int(token))
+        return store.count_vec_rows(kind) > 0
+    except VectorIndexUnavailableError:
+        return False
+
+
+def _query_embedding(text: str) -> object | None:
+    """Embed the query once, or ``None`` if the model cannot answer.
+
+    Separated from the KNN lookup so the union path — which drives two
+    ontologies from one query string — pays for one embedding rather than
+    two. Returning ``None`` rather than raising keeps the degrade-to-FTS5
+    decision in one place.
+    """
+    try:
+        return _get_embedder().embed_query(text)
+    except Exception:  # noqa: BLE001 — the vector arm degrades, never fails
+        log.exception("query embedding failed; answering from FTS5 alone")
+        return None
+
+
+def _fused_id_scope(
+    store: Store, kind: str, text: str, embedding: object
+) -> frozenset[str] | None:
+    """RRF-fuse the two arms into a candidate id set, or ``None`` for FTS5-only.
+
+    THE FTS5 ARM IS PASSED IN WHOLE AND THE VECTOR ARM IS CAPPED AT
+    ``_VECTOR_ARM_K``. That asymmetry is the point. Truncating the keyword arm
+    to a top-K — the obvious symmetric thing to do — would make a warm vector
+    index REMOVE keyword matches that the same query returned yesterday, and
+    "search got smarter and stopped finding the thing I know is in there" is
+    the one failure that ends a recall tool's usefulness. Fusing an uncapped
+    arm with a capped one keeps the result a strict superset of FTS5's.
+
+    ``None`` means "the vector arm contributed nothing" — no extension, no
+    model, no neighbours, or a failure — and the caller then leaves the AST
+    alone so the query runs down the untouched pre-v5 path. Degrading is
+    always to FTS5 and never to an error: ``VectorIndexUnavailableError`` must
+    not reach the tool boundary.
+    """
+    try:
+        vec_hits = (
+            store._vec_obs_ids(embedding, _VECTOR_ARM_K)
+            if kind == "observations"
+            else store._vec_record_ids(embedding, _VECTOR_ARM_K)
+        )
+    except VectorIndexUnavailableError:
+        log.info(
+            "vector arm unavailable for %r; answering from FTS5 alone", kind
+        )
+        return None
+    except Exception:  # noqa: BLE001 — the vector arm degrades, never fails
+        log.exception("vector arm failed for %r; answering from FTS5 alone", kind)
+        return None
+    vec_ids = _widen_chunk_ids(vec_hits)
+    if not vec_ids:
+        return None
+    try:
+        fts_ids = (
+            store._fts_obs_ids(text)
+            if kind == "observations"
+            else sorted(store._fts_ids(text))
+        )
+    except sqlite3.OperationalError:
+        # Already surfaced to the caller by the probe in ``aggregator_query``;
+        # here it just means the keyword arm contributes nothing.
+        fts_ids = []
+    return frozenset(doc_id for doc_id, _ in rrf_fuse(fts_ids, vec_ids))
+
+
+def _apply_hybrid(
+    store: Store,
+    kind: str,
+    ast: QueryAST,
+    pinned: bool | None,
+    embedding: object | None = None,
+) -> tuple[QueryAST, bool]:
+    """Return ``(ast, engaged)`` — the AST the store should actually run.
+
+    When the vector arm engages, the free text is replaced by the fused id
+    set: the arms have already been evaluated and RRF has already merged them,
+    so re-running FTS5 underneath would only narrow the union back down.
+    ``engaged`` is what the page token records.
+
+    ``embedding`` lets a caller driving two ontologies from one query string
+    supply the vector it already computed. Omitted, it is computed here.
+    """
+    if not _vector_arm_engaged(store, kind, ast, pinned):
+        return ast, False
+    if embedding is None:
+        embedding = _query_embedding(ast.text or "")
+    if embedding is None:
+        return ast, False
+    scope = _fused_id_scope(store, kind, ast.text or "", embedding)
+    if scope is None:
+        return ast, False
+    return replace(ast, text=None, id_scope=scope), True
+
+
+# --- rerank -----------------------------------------------------------------
+
+
+def _rerank_doc(item: dict[str, Any]) -> str:
+    """The text the cross-encoder scores for one result item.
+
+    Ontology-agnostic on purpose: records carry ``subject``, session cards
+    carry ``subject``, observation rows carry ``type``. Whatever is present
+    gets concatenated with the body, so one reranking helper serves all four
+    result shapes instead of three near-identical ones.
+    """
+    head = item.get("subject") or item.get("type") or ""
+    return f"{head}\n\n{item.get('content') or ''}"
+
+
+def _maybe_rerank(
+    items: list[dict[str, Any]], query: str | None, rerank: bool
+) -> list[dict[str, Any]]:
+    """Reorder the head of a page by cross-encoder relevance.
+
+    Reorders at most ``_RERANK_WINDOW`` items and never changes WHICH items
+    are on the page, so pagination is untouched: a page token still addresses
+    the same rows whether or not the caller asked for reranking. Callers who
+    want the whole page ranked should request a page no larger than the
+    window.
+
+    A rerank failure costs the ordering and never the answer — the caller
+    already has a usable result, and turning that into an error to report a
+    lost nicety is the wrong trade.
+    """
+    if not rerank or not items or not query:
+        return items
+    window = items[:_RERANK_WINDOW]
+    try:
+        scores = _get_reranker().score(query, [_rerank_doc(it) for it in window])
+    except Exception:  # noqa: BLE001 — rerank degrades to the fused order
+        log.exception("rerank failed; returning the page in its original order")
+        return items
+    order = sorted(
+        range(len(window)), key=lambda i: scores[i], reverse=True
+    )
+    return [window[i] for i in order] + items[_RERANK_WINDOW:]
+
+
+# --- pagination -------------------------------------------------------------
+#
+# THE HAZARD HYBRID INTRODUCES, AND THE FIX. The surface is stateless: a page
+# token is an offset, and it is only meaningful against the result set the
+# previous page was computed from. Hybrid makes that set MOVE — the embed
+# worker is on a timer, so a vector index that was empty when page 1 was
+# served can be non-empty by the time page 2 is asked for, and page 2 would
+# then be an offset into a strictly larger candidate set. Rows shift, the
+# caller re-reads some and can miss others, and nothing anywhere says so.
+#
+# So the token carries the arm that minted it, and a continuation reproduces
+# that arm. Plain integers keep their pre-v5 meaning (FTS5 / no text), so
+# every token already in flight still works.
+
+
+def _parse_page_token(token: str | None) -> tuple[int, bool | None]:
+    """``(offset, pinned_arm)``. ``pinned_arm`` is ``None`` for a fresh query.
+
+    ``"h40"`` — page 40 of a hybrid result set. ``"40"`` — page 40 of an
+    FTS5 one, which is also every token minted before v5. Anything
+    unparseable resets to the first page with a free choice of arm, which is
+    the pre-v5 behaviour for garbage input.
+    """
+    if not token:
+        return 0, None
+    hybrid = token.startswith("h")
+    try:
+        return max(0, int(token[1:] if hybrid else token)), hybrid
     except (TypeError, ValueError):
-        return 0
+        return 0, None
+
+
+def _mint_page_token(offset: int, hybrid: bool) -> str:
+    return f"h{offset}" if hybrid else str(offset)
 
 
 def _scrub_record(r: Record) -> Record:
@@ -358,6 +647,7 @@ def aggregator_query(
     page_size: int | None = None,
     page_token: str | None = None,
     drilldown: bool = False,
+    rerank: bool = False,
     _store: Store | None = None,
 ) -> dict[str, Any]:
     """Search the user's own history — past Claude Code sessions, subagent
@@ -399,6 +689,17 @@ def aggregator_query(
       drilldown: for session-shaped queries, ``True`` returns observation
                  rows for the matching sessions; ``False`` (default) returns
                  one card per matching session with ``matching_observations``.
+      rerank: ``True`` re-orders the head of the page by cross-encoder
+              relevance instead of recency. Costs a model load on first use
+              and roughly 300 ms per hit, so pair it with a small
+              ``page_size``. Off by default.
+
+    Free text is answered by a hybrid retriever — keyword (FTS5) and semantic
+    (vector) arms fused with RRF — whenever the vector index has been built on
+    this cache, and by FTS5 alone otherwise. Either way the results are a
+    superset of what keyword search returns, and the ordering, filters and
+    pagination are identical. ``aggregator_capabilities()['vector_index']``
+    says which of the two is answering.
 
     Returns:
       Success: ``{ok: True, records: [...], total: int, mode: str, notice?,
@@ -450,15 +751,17 @@ def aggregator_query(
             else _DEFAULT_PAGE_SIZE_SUMMARY
         )
     page_size = max(1, int(page_size))
-    offset = _parse_page_token(page_token)
+    offset, pinned_arm = _parse_page_token(page_token)
 
     mode = _route_mode(ast)
     if mode == "sessions":
         return _query_sessions_path(
-            store, ast, fields, page_size, offset, drilldown
+            store, ast, fields, page_size, offset, drilldown, rerank, pinned_arm
         )
     if mode == "records":
-        return _query_records_path(store, ast, fields, page_size, offset)
+        return _query_records_path(
+            store, ast, fields, page_size, offset, rerank, pinned_arm
+        )
     if mode == "mismatch_sessions_on_records":
         return _mismatch_response(
             mode="records",
@@ -482,7 +785,9 @@ def aggregator_query(
             ),
         )
     # mode == "union"
-    return _query_union_path(store, ast, fields, page_size, offset)
+    return _query_union_path(
+        store, ast, fields, page_size, offset, rerank, pinned_arm
+    )
 
 
 def _mismatch_response(mode: str, notice: str) -> dict[str, Any]:
@@ -502,7 +807,11 @@ def _query_records_path(
     fields: str,
     page_size: int,
     offset: int,
+    rerank: bool = False,
+    pinned_arm: bool | None = None,
 ) -> dict[str, Any]:
+    query_text = ast.text
+    ast, hybrid = _apply_hybrid(store, "records", ast, pinned_arm)
     try:
         page_plus_one = store.query(ast, limit=page_size + 1, offset=offset)
         total = store.count(ast)
@@ -519,6 +828,7 @@ def _query_records_path(
     has_more = len(page_plus_one) > page_size
     page_records = page_plus_one[:page_size]
     items = [_record_to_item(_scrub_record(r), fields) for r in page_records]
+    items = _maybe_rerank(items, query_text, rerank)
     result: dict[str, Any] = {
         "ok": True,
         "mode": "records",
@@ -526,7 +836,7 @@ def _query_records_path(
         "total": total,
     }
     if has_more:
-        result["next_page_token"] = str(offset + page_size)
+        result["next_page_token"] = _mint_page_token(offset + page_size, hybrid)
     if fields != "full":
         result["notice"] = (
             "Content bodies omitted (fields='summary'). "
@@ -542,7 +852,11 @@ def _query_sessions_path(
     page_size: int,
     offset: int,
     drilldown: bool,
+    rerank: bool = False,
+    pinned_arm: bool | None = None,
 ) -> dict[str, Any]:
+    query_text = ast.text
+    ast, hybrid = _apply_hybrid(store, "observations", ast, pinned_arm)
     if drilldown:
         try:
             page_plus_one = store.query_observations(
@@ -562,6 +876,7 @@ def _query_sessions_path(
         has_more = len(page_plus_one) > page_size
         page_obs = page_plus_one[:page_size]
         items = [_observation_to_item(o, fields) for o in page_obs]
+        items = _maybe_rerank(items, query_text, rerank)
         result: dict[str, Any] = {
             "ok": True,
             "mode": "observations",
@@ -569,7 +884,9 @@ def _query_sessions_path(
             "total": total,
         }
         if has_more:
-            result["next_page_token"] = str(offset + page_size)
+            result["next_page_token"] = _mint_page_token(
+                offset + page_size, hybrid
+            )
         if fields != "full":
             result["notice"] = (
                 "Observation bodies omitted (fields='summary'). "
@@ -610,6 +927,7 @@ def _query_sessions_path(
         session_scoped = _count_scope_for(ast, s)
         match_count = store.count_observations(session_scoped)
         items.append(_session_to_item(s, fields, subject, match_count, subject))
+    items = _maybe_rerank(items, query_text, rerank)
     result = {
         "ok": True,
         "mode": "sessions",
@@ -617,7 +935,7 @@ def _query_sessions_path(
         "total": total,
     }
     if has_more:
-        result["next_page_token"] = str(offset + page_size)
+        result["next_page_token"] = _mint_page_token(offset + page_size, hybrid)
     if fields != "full":
         result["notice"] = (
             "Session subject only (fields='summary'). "
@@ -633,6 +951,8 @@ def _query_union_path(
     fields: str,
     page_size: int,
     offset: int,
+    rerank: bool = False,
+    pinned_arm: bool | None = None,
 ) -> dict[str, Any]:
     """UNION mode: no source hint, no ontology-specific keys.
 
@@ -660,10 +980,33 @@ def _query_union_path(
 
     Records-side fetch skips FTS if the caller passed no text — parity
     with ``store.query`` behaviour. Sessions side likewise.
+
+    v5: each ontology gets its OWN vector arm, because they have separate vec
+    tables that backfill independently — records finish in minutes and
+    observations take hours, so insisting both be warm before either is used
+    would waste the half that is ready. The page token records hybrid when
+    either side engaged, which is the conservative direction: it pins a
+    continuation to the same arms rather than letting the slower table's
+    backfill land underneath an in-flight pagination.
     """
+    # One embedding for both ontologies — same query string, same vector, and
+    # embedding is the expensive half of the vector arm.
+    embedding = None
+    if _vector_arm_engaged(store, "records", ast, pinned_arm) or (
+        _vector_arm_engaged(store, "observations", ast, pinned_arm)
+    ):
+        embedding = _query_embedding(ast.text or "")
+    rec_ast, rec_hybrid = _apply_hybrid(
+        store, "records", ast, pinned_arm, embedding
+    )
+    sess_ast, sess_hybrid = _apply_hybrid(
+        store, "observations", ast, pinned_arm, embedding
+    )
+    query_text = ast.text
+    hybrid = rec_hybrid or sess_hybrid
     try:
-        rec_rows = store.query(ast, limit=None, offset=0)
-        rec_total = store.count(ast)
+        rec_rows = store.query(rec_ast, limit=None, offset=0)
+        rec_total = store.count(rec_ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: records-side query failed for ast=%r", ast)
         return {
@@ -675,8 +1018,8 @@ def _query_union_path(
             ),
         }
     try:
-        sess_rows = store.query_sessions(ast, limit=None, offset=0)
-        sess_total = store.count_sessions(ast)
+        sess_rows = store.query_sessions(sess_ast, limit=None, offset=0)
+        sess_total = store.count_sessions(sess_ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: sessions-side query failed for ast=%r", ast)
         return {
@@ -712,11 +1055,12 @@ def _query_union_path(
             # (subject = first user prompt, matching_observations count).
             # Kind-aware scope (see round-1 BLOCKER fix in the sessions path).
             subject = _first_user_prompt(store, obj)
-            session_scoped = _count_scope_for(ast, obj)
+            session_scoped = _count_scope_for(sess_ast, obj)
             match_count = store.count_observations(session_scoped)
             items.append(
                 _session_to_item(obj, fields, subject, match_count, subject)
             )
+    items = _maybe_rerank(items, query_text, rerank)
 
     result: dict[str, Any] = {
         "ok": True,
@@ -725,7 +1069,7 @@ def _query_union_path(
         "total": total,
     }
     if has_more:
-        result["next_page_token"] = str(offset + page_size)
+        result["next_page_token"] = _mint_page_token(offset + page_size, hybrid)
     if fields != "full":
         result["notice"] = (
             "Cross-source union (records + sessions). Content bodies "
@@ -855,6 +1199,7 @@ async def _tool_aggregator_query(
     page_size: int | None = None,
     page_token: str | None = None,
     drilldown: bool = False,
+    rerank: bool = False,
 ) -> dict[str, Any]:
     return aggregator_query(
         dsl=dsl,
@@ -862,6 +1207,7 @@ async def _tool_aggregator_query(
         page_size=page_size,
         page_token=page_token,
         drilldown=drilldown,
+        rerank=rerank,
     )
 
 
