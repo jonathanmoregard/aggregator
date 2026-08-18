@@ -210,10 +210,48 @@ def _cache_unavailable_response(reason: str) -> dict[str, Any]:
     }
 
 
+#: Free text that is unambiguously valid FTS5 and matches nothing. Used to ask
+#: the index a question whose only interesting answer is whether it can be
+#: asked at all.
+_FTS_HEALTH_PROBE = "aggregatorftshealthprobe"
+
+
+def _fts_probe_is_healthy(store: Store) -> bool:
+    """Did the FTS probe fail because of the TEXT, or because of the STORE?
+
+    Asked by re-running the probe with text that is known-good, rather than by
+    pattern-matching the SQLite message. Message sniffing would have to
+    enumerate every string FTS5 can emit and stay correct as SQLite changes
+    them; this asks the database the question directly and takes its answer.
+
+    It matters because the two answers are opposite instructions to the
+    caller. "Your query text is malformed" tells an LLM to rewrite a perfectly
+    good query, over and over, while the real cause — a locked or corrupt
+    cache — goes unmentioned and unfixed. A locked database read as a syntax
+    error is a wrong answer, not a missing one.
+
+    Note this cannot lean on ``schema_version()``: ``PRAGMA user_version``
+    reads page 1 of the file, so a cache whose CONTENT pages are shredded
+    still reports a healthy schema version. The probe has to touch the same
+    tables the real query would.
+    """
+    try:
+        store.probe_fts(_FTS_HEALTH_PROBE)
+    except sqlite3.DatabaseError:
+        return False
+    return True
+
+
 def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
     try:
         version = store.schema_version()
-    except sqlite3.OperationalError as e:
+    # DatabaseError, NOT OperationalError. SQLITE_CORRUPT ("database disk
+    # image is malformed") raises plain ``sqlite3.DatabaseError``, which is the
+    # PARENT of OperationalError — so the narrower clause that used to be here
+    # did not catch the single most important thing it looked like it caught.
+    # ``CacheUnavailableError`` still lands here; it subclasses OperationalError
+    # which subclasses DatabaseError.
+    except sqlite3.DatabaseError as e:
         return _cache_unavailable_response(
             f"cache unavailable: {type(e).__name__}: {e}"
         )
@@ -975,7 +1013,12 @@ def aggregator_query(
     if ast.text:
         try:
             store.probe_fts(ast.text)
-        except sqlite3.OperationalError as e:
+        except sqlite3.DatabaseError as e:
+            if not _fts_probe_is_healthy(store):
+                return _cache_unavailable_response(
+                    f"cache unavailable: the index could not be read at all "
+                    f"({type(e).__name__}: {e})"
+                )
             return {
                 "ok": False,
                 "reason": f"FTS5 syntax error in freeform text: {e}",
@@ -1005,6 +1048,38 @@ def aggregator_query(
         return _page_token_refusal(e)
 
     mode = _route_mode(ast)
+    try:
+        return _dispatch(
+            store, ast, mode, fields, page_size, cursor, drilldown, rerank
+        )
+    # THE LAST STRUCTURED-ERROR BACKSTOP. Every per-path handler below guards
+    # the store call it wraps, and the routing that runs BEFORE those handlers
+    # — ``_apply_hybrid`` -> ``_vector_arm_engaged`` -> ``has_embedded_rows``
+    # — was guarded by nothing broader than ``VectorIndexUnavailableError``.
+    # So a cache that went unreadable between the health check and the probe
+    # (the ingest timer takes the write lock every 30 minutes, so that window
+    # is a scheduled event) put a raw SQLite exception through the tool
+    # boundary. One clause here, rather than a try around each of the four
+    # routing paths, because they all share the same failure and the same
+    # answer.
+    except sqlite3.DatabaseError as e:
+        log.exception("cache read failed during %s routing", mode)
+        return _cache_unavailable_response(
+            f"cache unavailable: {type(e).__name__}: {e}"
+        )
+
+
+def _dispatch(
+    store: Store,
+    ast: QueryAST,
+    mode: str,
+    fields: str,
+    page_size: int,
+    cursor: _PageCursor,
+    drilldown: bool,
+    rerank: bool,
+) -> dict[str, Any]:
+    """Route a parsed, validated query to the path that answers it."""
     if mode == "sessions":
         return _query_sessions_path(
             store, ast, fields, page_size, cursor, drilldown, rerank
@@ -1456,7 +1531,17 @@ def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
     store = _store or _default_store()
     if cache_error := _ensure_cache_ready(store):
         return cache_error
-    caps = store.capabilities()
+    # ``_ensure_cache_ready`` reads PRAGMA user_version, which lives in page 1
+    # of the file — so it passes a cache whose content pages are unreadable,
+    # and this call was the one that then raised out of the tool. Same
+    # backstop and same response shape as the query path.
+    try:
+        caps = store.capabilities()
+    except sqlite3.DatabaseError as e:
+        log.exception("capabilities read failed")
+        return _cache_unavailable_response(
+            f"cache unavailable: {type(e).__name__}: {e}"
+        )
     return {
         "ok": True,
         "sources": caps["sources"],
