@@ -398,17 +398,20 @@ def cmd_sample(args: argparse.Namespace) -> int:
 def _embed_batch_fast(store, embedder, kind: str, rows: list) -> None:
     """Same vectors, same watermarks as ``cli._embed_batch``, one encode call.
 
-    ``cli._embed_batch`` calls ``embed_documents`` once per ROW. Most rows
-    produce a single chunk, so the model runs at batch size 1 and the CPU
-    spends its time on per-call overhead and an unfilled GEMM. Encoding every
-    chunk of the batch in one call lets sentence-transformers length-sort and
-    pad properly.
+    WRITTEN ON A HYPOTHESIS THAT THE MEASUREMENT THEN KILLED. ``cli._embed_batch``
+    calls ``embed_documents`` once per ROW, so the model usually runs at batch
+    size 1; that looked like obvious waste. ``bench`` says otherwise on this
+    hardware — over an identical 47-chunk set, batch 1 ran at 249.6 chars/s
+    (28.7 chars per CPU-second) and batch 32 at 73.3 chars/s (9.0 per
+    CPU-second). Batching is **3.4x slower**, and the CPU-second figures show
+    it is more work done, not merely worse parallelism: padding a batch to its
+    longest member costs more than the per-call overhead it saves, because
+    chunk lengths here span two orders of magnitude (p50 98 chars, max 4000).
 
-    Used by the smoke only, and labelled as such: it exists to (a) make the
-    measurement affordable and (b) put a number on the headroom the shipped
-    worker leaves behind. It is NOT a proposed edit to the worker — that is a
-    separate decision, with its own memory-footprint question, for whoever
-    owns the backfill.
+    Kept, still off by default, for exactly two reasons: it is the evidence
+    for that claim, and it lets the comparison be re-run when the hardware or
+    the chunker changes. THE SHIPPED PER-ROW LOOP IS THE FAST ONE — do not
+    "optimise" it into a batched encode without re-running ``bench`` first.
     """
     from aggregator.core.chunk import chunk_body
 
