@@ -226,6 +226,16 @@ class QueryAST:
     * ``active_from``/``active_to`` — activity-window overlap:
       ``first_ts <= active_to AND last_ts >= active_from``. Different from
       ``from_date``/``to_date`` which are point-in-time-created.
+
+    v5 adds ``id_scope``, and it is the one field with NO DSL key. The hybrid
+    retriever fuses an FTS5 arm and a vector arm into a ranked id list that no
+    FTS5 MATCH expression can express, so the MCP layer computes those ids and
+    hands them down here while every other filter still applies normally. The
+    DSL surface is unchanged: nothing parses this, and no caller can set it.
+
+    ``None`` means "no id filter". The EMPTY frozenset means "nothing
+    matched" and is a real, different value — it renders as a no-match clause,
+    because SQL ``IN ()`` is a syntax error rather than an empty result.
     """
 
     source: str | None = None
@@ -241,6 +251,8 @@ class QueryAST:
     obs_type: str | None = None
     active_from: datetime | None = None
     active_to: datetime | None = None
+    # v5 hybrid retrieval: internal-only id filter. See the class docstring.
+    id_scope: frozenset[str] | None = None
 
 
 @runtime_checkable

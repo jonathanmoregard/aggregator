@@ -1950,7 +1950,29 @@ class Store:
         for tag in ast.tags:
             clauses.append("tags LIKE ?")
             params.append(f'%"{tag}"%')
+        self._apply_id_scope(ast, "stable_id", clauses, params)
         return " AND ".join(clauses), params
+
+    @staticmethod
+    def _apply_id_scope(
+        ast: QueryAST, column: str, clauses: list[str], params: list
+    ) -> None:
+        """Append the v5 hybrid ``id_scope`` filter, if the caller set one.
+
+        ``None`` is no filter at all. An EMPTY scope is not the same thing: it
+        means the retriever fused to nothing, and it renders as ``1=0`` because
+        SQL ``IN ()`` is a syntax error, not an empty set. Getting that
+        backwards turns "no results" into a 500 at the tool boundary.
+        """
+        if ast.id_scope is None:
+            return
+        if not ast.id_scope:
+            clauses.append("1=0")
+            return
+        clauses.append(
+            f"{column} IN ({','.join('?' * len(ast.id_scope))})"
+        )
+        params.extend(sorted(ast.id_scope))
 
     def _fts_ids(self, text: str) -> set[str]:
         c = self._c()
@@ -2231,6 +2253,7 @@ class Store:
         if ast.to_date:
             clauses.append("ts <= ?")
             params.append(ast.to_date.isoformat())
+        self._apply_id_scope(ast, "obs_id", clauses, params)
         return " AND ".join(clauses), params
 
     def query_sessions(
@@ -2256,11 +2279,9 @@ class Store:
         """
         where, params = self._sessions_where(ast)
         c = self._c()
-        if ast.text:
+        if ast.text or ast.id_scope is not None:
             try:
-                root_ids, exact_ids = self._fts_hit_scope(
-                    ast.text, ast.obs_type
-                )
+                root_ids, exact_ids = self._hit_scope(ast)
             except sqlite3.OperationalError as e:
                 log.warning("query_sessions FTS5 syntax %r: %s", ast.text, e)
                 return []
@@ -2282,6 +2303,7 @@ class Store:
             ast.top_session_id
             and not sessions
             and not ast.text
+            and ast.id_scope is None
             and offset == 0
         ):
             orphan = self._synthesise_orphan_root(ast.top_session_id)
@@ -2293,11 +2315,9 @@ class Store:
         """Match count for ``query_sessions`` (for MCP ``total``)."""
         where, params = self._sessions_where(ast)
         c = self._c()
-        if ast.text:
+        if ast.text or ast.id_scope is not None:
             try:
-                root_ids, exact_ids = self._fts_hit_scope(
-                    ast.text, ast.obs_type
-                )
+                root_ids, exact_ids = self._hit_scope(ast)
             except sqlite3.OperationalError:
                 return 0
             if not root_ids and not exact_ids:
@@ -2312,6 +2332,7 @@ class Store:
             n == 0
             and ast.top_session_id
             and not ast.text
+            and ast.id_scope is None
             and self._synthesise_orphan_root(ast.top_session_id) is not None
         ):
             # Orphan-root synth: count 1 when only subagents exist.
@@ -2476,6 +2497,58 @@ class Store:
         rows = c.execute(sql, params).fetchall()
         roots = {r["root"] for r in rows if r["root"]}
         exacts = {r["sid"] for r in rows if r["sid"]}
+        return roots, exacts
+
+    def _obs_id_hit_scope(
+        self, obs_ids: Iterable[str], obs_type: str | None = None
+    ) -> tuple[set[str], set[str]]:
+        """``(root_ids, exact_ids)`` for a set of obs ids — the v5 twin of
+        :meth:`_fts_hit_scope`, and it must stay behaviourally identical to it.
+
+        The hybrid retriever fuses obs ids, but the hit list this feeds is
+        session CARDS, so the ids have to be projected up the same way FTS
+        hits are: a hit anywhere under a root surfaces the top-level card,
+        while a subagent card surfaces only on a hit in its own stream.
+        Diverging here would make hybrid and FTS5 answer the same question
+        with differently-shaped hit lists.
+
+        Parameters are chunked because a fused scope can carry thousands of
+        ids and SQLite caps host parameters per statement.
+        """
+        roots: set[str] = set()
+        exacts: set[str] = set()
+        c = self._c()
+        for page in _chunked(sorted(obs_ids), 500):
+            sql = (
+                "SELECT DISTINCT root_session_id AS root, session_id AS sid "  # noqa: S608 - placeholders only
+                "FROM observations "
+                f"WHERE obs_id IN ({','.join('?' * len(page))})"
+            )
+            params: list = list(page)
+            if obs_type:
+                sql += " AND type = ?"
+                params.append(obs_type)
+            for row in c.execute(sql, params):
+                if row["root"]:
+                    roots.add(row["root"])
+                if row["sid"]:
+                    exacts.add(row["sid"])
+        return roots, exacts
+
+    def _hit_scope(self, ast: QueryAST) -> tuple[set[str], set[str]]:
+        """Session-card hit scope for whichever arm(s) the AST carries.
+
+        ``text`` alone is the FTS5 arm; ``id_scope`` alone is the hybrid arm.
+        Both set means both must hold, so the scopes INTERSECT — a narrowing
+        filter never widens the result, whichever order the arms arrive in.
+        """
+        if ast.id_scope is None:
+            return self._fts_hit_scope(ast.text or "", ast.obs_type)
+        roots, exacts = self._obs_id_hit_scope(ast.id_scope, ast.obs_type)
+        if ast.text:
+            fts_roots, fts_exacts = self._fts_hit_scope(ast.text, ast.obs_type)
+            roots &= fts_roots
+            exacts &= fts_exacts
         return roots, exacts
 
     def _fts_obs_ids(self, text: str) -> list[str]:
