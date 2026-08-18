@@ -329,7 +329,53 @@ def _reranker_load_failure(error: BaseException) -> str:
     )
 
 
+#: ``--fields`` was not typed. argparse cannot otherwise tell "the operator
+#: left this off" from "the operator typed the default value on purpose", and
+#: the two must diverge under ``--rerank``: one gets the bodies it needs, the
+#: other gets refused.
+_FIELDS_UNSET = None
+
+
+def _rerank_needs_full_fields() -> str:
+    """What to print when ``--rerank`` and ``--fields summary`` are both typed."""
+    return (
+        "ERROR: --rerank and --fields summary ask for incompatible things.\n"
+        "--rerank ranks document BODIES with a cross-encoder, and "
+        "--fields summary does not return any — the ranking would be computed "
+        "over empty documents, at ~47 s per query, for an ordering over "
+        "nothing.\n"
+        "Re-run with --fields full, or omit --fields entirely (--rerank "
+        "supplies --fields full for you), or drop --rerank to keep the "
+        "default recency ordering over summaries.\n"
+        "Nothing was spent: no model was loaded and no query was run."
+    )
+
+
 def _cmd_query(args: argparse.Namespace, store: Store) -> int:
+    # WHAT ``--rerank`` ON ITS OWN MEANS. The cross-encoder scores an item's
+    # ``content``, and summary items have none — so under the ``--fields``
+    # default, ``aggregator query "..." --rerank`` refused itself. That is the
+    # batch surface's most obvious invocation, and the one the MCP tool
+    # description sends callers here for. So the flag now supplies the mode it
+    # needs.
+    #
+    # NOT the auto-upgrade the MCP layer deliberately refuses. There, ``fields``
+    # is a function parameter with a real default and no unset state, so
+    # promoting it would change the payload shape behind a caller that had said
+    # nothing — invisible. Here the promotion is attached to a flag the operator
+    # typed, is documented on that flag in ``--help``, and applies ONLY when
+    # ``--fields`` was left off. Typed explicitly, ``--fields summary`` still
+    # reaches the refusal below.
+    fields = args.fields
+    if fields is _FIELDS_UNSET:
+        fields = "full" if args.rerank else "summary"
+    elif args.rerank and fields != "full":
+        # BEFORE THE MODEL LOAD, because this outcome is knowable from argv.
+        # The MCP layer refuses the same pair, but only after the CLI has paid
+        # ~2 GB RSS and a cross-encoder load to reach a query that was already
+        # doomed — spending the thing the refusal exists to save.
+        print(_rerank_needs_full_fields(), file=sys.stderr)
+        return 1
     if args.rerank:
         # BEFORE THE QUERY, and loudly. ``_maybe_rerank`` catches a rerank
         # failure and returns the page in its fused order — right for the MCP
@@ -350,7 +396,7 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         )
     result = _mcp_query(
         dsl=args.dsl,
-        fields=args.fields,
+        fields=fields,
         page_size=args.page_size,
         # THREADED, because this command PRINTS one. Without it the token at
         # the bottom of every long result set addressed a page the CLI then
@@ -2120,7 +2166,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument(
         "dsl", help='DSL string, e.g. "source:sessions from:2026-07-25"'
     )
-    q.add_argument("--fields", choices=["summary", "full"], default="summary")
+    q.add_argument(
+        "--fields",
+        choices=["summary", "full"],
+        # Sentinel, not "summary": ``_cmd_query`` has to tell an omitted
+        # --fields from one typed with the default value, because --rerank
+        # supplies the former and refuses the latter.
+        default=_FIELDS_UNSET,
+        help=(
+            "how much of each hit to print: 'summary' (subject and metadata "
+            "only — the default) or 'full' (document bodies too). Left off, "
+            "--rerank raises this to 'full'"
+        ),
+    )
     q.add_argument("--page-size", type=int, default=50)
     q.add_argument(
         "--page-token",
@@ -2151,7 +2209,11 @@ def build_parser() -> argparse.ArgumentParser:
             "0.65 s without, plus a one-off model load; this command is the "
             "batch surface that cost is documented for. Refuses out loud if "
             "the weights cannot be loaded rather than returning an unranked "
-            "page"
+            "page. IMPLIES --fields full when --fields is not given, because "
+            "the cross-encoder ranks document bodies and summary mode returns "
+            "none — so this also CHANGES THE OUTPUT: full bodies are printed "
+            "under each hit, not subject lines alone. Passing --fields summary "
+            "explicitly is refused rather than silently overridden"
         ),
     )
 
