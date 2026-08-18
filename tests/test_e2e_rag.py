@@ -292,12 +292,12 @@ def stub_models(monkeypatch):
 def run_cli(argv: list[str], sources: dict | None = None) -> int:
     """Run one CLI command against the ``XDG_DATA_HOME`` cache, then close it.
 
-    THE CLOSE IS NOT TIDINESS. The writable connection runs in WAL mode and the
-    MCP recall path opens its cache with ``immutable=1``, which by design does
-    not read the ``-wal`` sidecar. A real deployment gets the checkpoint for
-    free because the CLI is a process that exits; in-process, the store has to
-    be closed or the next query reads a database that is missing everything
-    this command just wrote.
+    THE CLOSE IS NOT TIDINESS. It ends the writable connection's transaction
+    and releases its lock, which is what a real deployment gets for free
+    because the CLI is a process that exits. Recall now opens ``mode=ro``
+    (never ``immutable=1``) and so does read the ``-wal``, but an unclosed
+    writer still leaves the last statement's transaction open, and every
+    assertion below is about what a *finished* command wrote.
     """
     store = Store()
     try:

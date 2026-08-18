@@ -604,11 +604,27 @@ class Store:
     def _c(self) -> sqlite3.Connection:
         if self._conn is None:
             if self.read_only:
-                # Codex MCP runs under a filesystem sandbox that can read the
-                # cache but cannot create SQLite WAL/SHM sidecars. immutable=1
-                # keeps recall truly read-only; writable ingest paths use the
-                # default Store() connection below.
-                uri = f"file:{self.db_path}?mode=ro&immutable=1"
+                # ``mode=ro`` ONLY. Not ``immutable=1`` — that is a promise to
+                # SQLite that the file cannot change, and this file changes
+                # constantly: the ingest timer rewrites it every 30 minutes and
+                # the embed backfill writes for weeks. Under that promise SQLite
+                # skips all locking, ignores the ``-wal`` outright, and holds its
+                # page cache across statements forever. Measured consequences on
+                # this exact URI, not theory:
+                #   * WAL-committed rows invisible, so ``has_embedded_rows`` —
+                #     the v5 hybrid routing predicate — calls a warm vector index
+                #     cold and silently drops the vector arm;
+                #   * after a checkpoint, ``SELECT COUNT(*)`` returned 19,991
+                #     where the truth was 40,000, with NO error raised;
+                #   * after a VACUUM, ``database disk image is malformed``.
+                # ``mode=ro`` is correct in every one of those cases. The single
+                # case it cannot serve — a dirty ``-wal`` whose ``-shm`` is absent
+                # and whose directory is unwritable — it refuses loudly with
+                # "unable to open database file", where ``immutable=1`` answers
+                # confidently and wrongly. Loud beats silently wrong here.
+                # Read-only is still enforced by ``mode=ro`` plus
+                # ``_ensure_writable``; dropping the flag grants no write rights.
+                uri = f"file:{self.db_path}?mode=ro"
                 self._conn = sqlite3.connect(uri, uri=True)
             else:
                 self._conn = sqlite3.connect(self.db_path)
