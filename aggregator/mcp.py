@@ -607,8 +607,15 @@ def _pack_frozen(frozen: dict[str, list[str]]) -> str:
     return base64.urlsafe_b64encode(zlib.compress(payload, 9)).decode().rstrip("=")
 
 
-def _unpack_frozen(payload: str) -> dict[str, list[str]] | None:
-    """Decode a frozen-set payload, or ``None`` if it carries no usable hits.
+def _unpack_frozen(payload: str) -> dict[str, list[str]]:
+    """Decode a frozen-set payload, or raise ``_PageTokenError``.
+
+    NO FAILURE HERE IS SURVIVABLE, which is why none of them return quietly.
+    ``_pack_frozen`` is the only thing that mints these, and it always
+    produces a bounded, well-formed, base64'd JSON object. A payload that is
+    not one did not come from this server, so "decode what you can and re-run
+    the KNN for the rest" is answering a question the caller did not ask, at
+    an offset cut from a set that no longer exists.
 
     BOUNDED AT EVERY STEP, because every byte here came from the caller. The
     order matters — each check is cheaper than the one it guards:
@@ -633,15 +640,15 @@ def _unpack_frozen(payload: str) -> dict[str, list[str]] | None:
     try:
         pad = "=" * (-len(payload) % 4)
         compressed = base64.urlsafe_b64decode(payload + pad)
-    except Exception:  # noqa: BLE001 — malformed base64 is not a frozen set
-        return None
+    except Exception as e:  # noqa: BLE001 — malformed base64 is not a frozen set
+        raise _PageTokenError("payload is not valid base64") from e
     # max_length caps the OUTPUT, so the bomb is never materialised. Anything
     # left over means the stream wanted to expand past the cap.
     inflater = zlib.decompressobj()
     try:
         raw = inflater.decompress(compressed, _MAX_FROZEN_PAYLOAD_BYTES)
-    except zlib.error:
-        return None
+    except zlib.error as e:
+        raise _PageTokenError("payload is not a valid compressed stream") from e
     if inflater.unconsumed_tail or not inflater.eof:
         raise _PageTokenError(
             f"payload expands past the {_MAX_FROZEN_PAYLOAD_BYTES} byte cap "
@@ -649,16 +656,18 @@ def _unpack_frozen(payload: str) -> dict[str, list[str]] | None:
         )
     try:
         out = json.loads(raw)
-    except Exception:  # noqa: BLE001 — not JSON is not a frozen set
-        return None
+    except Exception as e:  # noqa: BLE001 — not JSON is not a frozen set
+        raise _PageTokenError("payload does not decode to JSON") from e
     if not isinstance(out, dict):
-        return None
+        raise _PageTokenError(
+            f"payload decodes to {type(out).__name__}, not a frozen-hit map"
+        )
     clean: dict[str, list[str]] = {}
     for kind, ids in out.items():
         if kind not in ("observations", "records") or not isinstance(ids, list):
-            return None
+            raise _PageTokenError(f"payload carries an unknown entry {kind!r}")
         if not all(isinstance(i, str) for i in ids):
-            return None
+            raise _PageTokenError(f"payload's {kind} hits are not all strings")
         if len(ids) > _VECTOR_ARM_K:
             raise _PageTokenError(
                 f"payload claims {len(ids)} {kind} hits; the vector arm "
@@ -669,15 +678,26 @@ def _unpack_frozen(payload: str) -> dict[str, list[str]] | None:
 
 
 def _parse_page_token(token: str | None) -> _PageCursor:
-    """Decode a page token into a cursor.
+    """Decode a page token into a cursor, or raise ``_PageTokenError``.
 
     ``"h40.<payload>"`` — page 40 of a hybrid set, with that set's vector hits
     carried inline. ``"h40"`` — a hybrid page minted before the payload
     existed; the arm is still pinned and the KNN is re-run, which is the old
     behaviour and the reason tokens already in flight keep working. ``"40"`` —
-    an FTS5 page, which is also every token minted before v5. Anything
-    unparseable resets to the first page with a free choice of arm, the pre-v5
-    behaviour for garbage input.
+    an FTS5 page, which is also every token minted before v5.
+
+    ANYTHING ELSE IS REFUSED, and it used to reset to offset 0 with a free
+    choice of arm. That looked like graceful degradation and was silent data
+    loss: a caller whose token got mangled in transit received page 1 again,
+    with ``ok: True`` and no notice, and every row between there and where it
+    actually was went unread. The caller cannot detect that — page 1 is a
+    perfectly plausible page — so the loop terminates on a duplicate or never
+    terminates at all. A refusal it can see beats a wrong page it cannot.
+
+    Refusing costs nothing real: the only tokens that exist are the ones this
+    server minted, and the remedy for an unreadable one is to drop it, which
+    is exactly what the old code did silently and the caller can now do
+    knowingly.
     """
     if not token:
         return _PageCursor()
@@ -685,8 +705,8 @@ def _parse_page_token(token: str | None) -> _PageCursor:
     body, _, payload = token.partition(".")
     try:
         offset = max(0, int(body[1:] if hybrid else body))
-    except (TypeError, ValueError):
-        return _PageCursor()
+    except (TypeError, ValueError) as e:
+        raise _PageTokenError(f"{body!r} is not a page offset") from e
     return _PageCursor(
         offset=offset,
         hybrid=hybrid,

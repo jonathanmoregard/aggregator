@@ -75,14 +75,38 @@ def test_the_printed_token_is_accepted_back(tmp_data_home, capsys):
     )
 
 
-def test_a_bad_token_degrades_to_the_first_page(tmp_data_home, capsys):
+def test_a_bad_token_is_refused_rather_than_restarting_at_page_one(
+    tmp_data_home, capsys
+):
     """The CLI inherits the MCP path's contract for a token it cannot read.
 
-    ``_parse_page_token`` resets an unparseable token to the first page rather
-    than raising — deliberately, so tokens minted by older builds keep
-    working. The CLI passes the value straight through, so it must behave the
-    same way and not crash; asserted here so the two surfaces cannot drift.
+    That contract CHANGED, and this test changed with it. It used to assert
+    the CLI degraded to page 1 with rc 0 — pinning the MCP path's old
+    behaviour, where an unreadable token reset to offset 0 and said nothing.
+    In a shell loop that is invisible data loss: the operator pipes the
+    printed token back in, gets page 1 again, and the only evidence is that
+    the loop never ends.
+
+    Now both surfaces refuse. The CLI's existing error branch does the work —
+    reason and remediation on stderr, exit 1 — so this asserts the two
+    surfaces still cannot drift, at the new contract.
     """
+    store = Store()
+    _seed(store)
+
+    rc = cli.main(
+        ["query", "source:github", "--page-token", "not-a-real-token"],
+        _store=store,
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "page_token" in err
+    assert "remediation" in err
+
+
+def test_the_refusal_is_machine_readable_too(tmp_data_home, capsys):
+    """``--json`` callers get the same refusal in the documented shape."""
     store = Store()
     _seed(store)
 
@@ -92,8 +116,9 @@ def test_a_bad_token_degrades_to_the_first_page(tmp_data_home, capsys):
         store,
     )
 
-    assert rc == 0
-    assert page["ok"] is True
+    assert rc == 1
+    assert page["ok"] is False
+    assert page["remediation"]
 
 
 def test_the_flag_appears_in_help(tmp_data_home, capsys):

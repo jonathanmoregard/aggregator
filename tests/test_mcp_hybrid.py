@@ -705,10 +705,12 @@ def test_legacy_integer_page_tokens_are_still_accepted(store, embedder):
     assert len(page2["records"]) == 2
 
 
-def test_a_garbage_page_token_still_falls_back_to_the_first_page(
-    store, embedder
-):
+def test_a_garbage_page_token_is_refused_instead_of_restarting(store, embedder):
+    """Contract change, deliberate. Falling back to the first page returned
+    ``ok: True`` and page 1 to a caller that believed it had advanced, which
+    is silent data loss in the caller's iteration. Detail and rationale live
+    in ``tests/test_mcp_page_token_hardening.py``."""
     _seed_sessions(store, [("o1", "quadratic voting", 1)])
     result = aggregator_query("voting", page_token="not-a-token", _store=store)
-    assert result["ok"] is True
-    assert result["total"] == 1
+    assert result["ok"] is False
+    assert "page_token" in result["reason"]

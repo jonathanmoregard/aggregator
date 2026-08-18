@@ -121,6 +121,105 @@ def test_more_ids_than_the_vector_arm_can_ever_return_is_refused(store):
     assert "page_token" in result["reason"]
 
 
+# --- M3: a token the server cannot read must not look like progress --------
+
+
+def _seed_records(store, n=3):
+    from datetime import UTC, datetime
+
+    from aggregator.sources.base import Record
+
+    store.upsert(
+        [
+            Record(
+                stable_id=f"github:acme/api:{i}",
+                source="github",
+                subject=f"pr {i}",
+                body=f"body of pull request {i}",
+                tags=["pr"],
+                created_at=datetime(2026, 7, 20 + i, tzinfo=UTC),
+                updated_at=datetime(2026, 7, 20 + i, tzinfo=UTC),
+            )
+            for i in range(n)
+        ]
+    )
+
+
+def test_a_mangled_token_is_refused_not_silently_restarted(store):
+    """THE REPRO. A caller that corrupts a token in transit re-read page 1
+    while believing it had advanced — and nothing in the response said so."""
+    _seed_records(store)
+    page1 = aggregator_query(
+        "source:github", page_size=1, _store=store
+    )
+    token = page1["next_page_token"]
+    assert token
+
+    result = aggregator_query(
+        "source:github", page_size=1, page_token=token + "junk", _store=store
+    )
+
+    assert result["ok"] is False, (
+        f"page 1 served again as if it were page 2: {result.get('records')}"
+    )
+    assert "page_token" in result["reason"]
+    assert result["remediation"]
+
+
+def test_a_token_that_is_not_a_number_is_refused(store):
+    result = aggregator_query(
+        "source:github", page_token="not-a-real-token", _store=store
+    )
+    assert result["ok"] is False
+    assert "page_token" in result["reason"]
+
+
+def test_an_undecodable_payload_is_refused(store):
+    result = aggregator_query(
+        "source:github", page_token="h0.!!!not-base64!!!", _store=store
+    )
+    assert result["ok"] is False
+
+
+def test_a_payload_that_is_not_a_frozen_set_is_refused(store):
+    payload = (
+        base64.urlsafe_b64encode(zlib.compress(b'["not", "a", "dict"]', 9))
+        .decode()
+        .rstrip("=")
+    )
+    result = aggregator_query(
+        "source:github", page_token=f"h0.{payload}", _store=store
+    )
+    assert result["ok"] is False
+
+
+def test_the_tokens_this_server_mints_still_page_normally(store):
+    """The refusal must not cost the feature it protects."""
+    _seed_records(store)
+    seen: list[str] = []
+    token = None
+    for _ in range(5):
+        page = aggregator_query(
+            "source:github", page_size=1, page_token=token, _store=store
+        )
+        assert page["ok"] is True, page
+        seen += [r["stable_id"] for r in page["records"]]
+        token = page.get("next_page_token")
+        if not token:
+            break
+    assert sorted(seen) == [f"github:acme/api:{i}" for i in range(3)]
+
+
+def test_legacy_tokens_are_not_collateral_damage(store):
+    """``40`` and ``h40`` predate the frozen payload and are still valid."""
+    _seed_records(store)
+    for token in ("0", "h0"):
+        page = aggregator_query(
+            "source:github", page_size=1, page_token=token, _store=store
+        )
+        assert page["ok"] is True, f"{token!r} rejected: {page}"
+
+
 def test_a_maximum_legitimate_token_still_round_trips():
     """The cap is derived from the real maximum, so the real maximum fits."""
     long_id = "dropbox:" + ("a" * 500)

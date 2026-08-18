@@ -217,13 +217,23 @@ def test_legacy_tokens_keep_working(store, embedder):
         assert cursor.frozen is None
 
 
-def test_a_garbage_payload_falls_back_rather_than_raising(store, embedder):
+def test_a_garbage_payload_is_refused_rather_than_raising(store, embedder):
+    """Still no traceback — but no longer a silent fallback either.
+
+    This used to assert ``ok is True``: an unreadable payload dropped the
+    frozen set, re-ran the KNN and answered from offset 0. That is the failure
+    the freeze exists to prevent, arrived at by a different route, and the
+    caller had no way to see it. The contract now is a structured refusal;
+    ``tests/test_mcp_page_token_hardening.py`` owns the detail.
+    """
     _seed(store, [("o1", "quadratic voting", 1)])
     _embed(store, [("o1", "quadratic voting")])
     result = aggregator_query(
         "governance", page_token="h0.!!!not-base64!!!", _store=store
     )
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert "page_token" in result["reason"]
+    assert result["remediation"]
 
 
 def test_a_fresh_query_still_gets_the_current_index(store, embedder):
