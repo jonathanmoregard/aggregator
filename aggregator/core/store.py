@@ -125,6 +125,20 @@ class VectorIndexUnavailableError(RuntimeError):
     """
 
 
+class CacheUnavailableError(sqlite3.OperationalError):
+    """The cache file could not be opened at all — usually it is not there yet.
+
+    SUBCLASSES ``sqlite3.OperationalError`` DELIBERATELY. That is the type
+    every existing handler on the read path already catches, so widening the
+    vocabulary here cannot break one; callers that want to distinguish "there
+    is no cache yet" from "that query was malformed" — which are the same
+    exception type otherwise — now can.
+
+    Raised only on the read-only path. A writable ``Store`` is allowed to
+    create its database: ingest is what brings a cache into existence.
+    """
+
+
 # Set once, per process, the first time the extension fails to load. The
 # warning is worth shouting; shouting it on every connection turns a one-line
 # actionable message into log noise that gets filtered out.
@@ -691,7 +705,18 @@ class Store:
                 # Read-only is still enforced by ``mode=ro`` plus
                 # ``_ensure_writable``; dropping the flag grants no write rights.
                 uri = f"file:{self.db_path}?mode=ro"
-                self._conn = sqlite3.connect(uri, uri=True)
+                try:
+                    self._conn = sqlite3.connect(uri, uri=True)
+                except sqlite3.OperationalError as e:
+                    # Named, because the bare message is
+                    # "unable to open database file" — the same type a
+                    # malformed query raises, and the commonest cause is
+                    # simply that nothing has been ingested yet.
+                    raise CacheUnavailableError(
+                        f"no readable cache at {self.db_path}: {e}. Run "
+                        f"`aggregator ingest --all` to create it; on a fresh "
+                        f"machine that is expected rather than a fault."
+                    ) from e
             else:
                 self._conn = sqlite3.connect(self.db_path)
             self._conn.row_factory = sqlite3.Row
