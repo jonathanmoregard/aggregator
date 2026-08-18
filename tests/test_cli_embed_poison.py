@@ -462,6 +462,24 @@ def test_a_clean_backlog_is_still_reported_complete(cache, monkeypatch):
         s.close()
 
 
+def test_the_timer_invocation_isolates_and_retries_too(cache, monkeypatch):
+    """``--once`` is what the 30-minute timer runs, so it is where the defect lived.
+
+    Every other test here drives ``--catchup``. They share ``_embed_batch``, but
+    "shared today" is not a contract, and the entry point that actually runs
+    unattended is the one whose isolation has to be pinned.
+    """
+    once = {"catchup": False, "once": True, "batch_size": 10}
+    assert run_embed(cache, PoisonEmbedder(), monkeypatch, **once) != 0
+    assert states(cache)["bad"] == "error"
+    assert states(cache)["good-a"] == "ok", "one batch, and it drained past the bad row"
+    assert make_retry_due(cache) == 1
+
+    healed = PoisonEmbedder(poison="never-appears")
+    assert run_embed(cache, healed, monkeypatch, **once) == 0
+    assert states(cache)["bad"] == "ok"
+
+
 # --- records, not just observations ------------------------------------------
 
 
