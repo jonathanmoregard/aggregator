@@ -2626,6 +2626,74 @@ class Store:
             "cache_path": str(self.db_path),
             "schema_version": SCHEMA_VERSION,
             "counts": counts,
+            "vector_index": self.vector_index_state(),
+        }
+
+    def vector_index_state(self) -> dict:
+        """v5: how much of the corpus hybrid retrieval can actually reach.
+
+        THREE SITUATIONS THAT LOOK ALIKE AND ARE NOT, which is the whole
+        reason this is a structured value rather than a row count:
+
+        * **the vector arm is unavailable** — sqlite-vec did not load, or this
+          cache has no vec tables. Hybrid is off and no amount of waiting
+          fixes it; somebody has to repair the install.
+        * **nothing embedded yet** — the arm works, the backlog is full, the
+          worker has not run. Fix: run ``aggregator embed``.
+        * **backfill in progress** — the arm works and is partway through.
+          Fix: wait. Recall is already better than FTS5 alone and improving.
+
+        Reported as ``state`` ∈ ``unavailable`` | ``empty`` | ``not_started`` |
+        ``backfilling`` | ``complete``, with the raw numbers alongside so a
+        caller can render a percentage without re-deriving the verdict.
+
+        ``vectors`` is ``None``, never ``0``, when the arm is unavailable:
+        the count is genuinely unknown, and a 0 there is precisely the lie
+        that would make "broken" read as "not started yet". The
+        ``embedding_state`` tallies stay populated in every case — they are
+        plain columns, and the backlog size is exactly what an operator
+        needs when the arm is broken.
+        """
+        available = True
+        reason: str | None = None
+        per_kind: dict[str, dict] = {}
+        for kind in ("observations", "records"):
+            tally = dict(self.count_embedding_states(kind))
+            vectors: int | None = None
+            if available:
+                try:
+                    vectors = self.count_vec_rows(kind)
+                except VectorIndexUnavailableError as e:
+                    available = False
+                    reason = str(e)
+            tally["vectors"] = vectors
+            per_kind[kind] = tally
+        if not available:
+            # The first kind may have answered before the second one failed;
+            # an arm is available for both ontologies or neither.
+            for tally in per_kind.values():
+                tally["vectors"] = None
+
+        total = sum(t["total"] for t in per_kind.values())
+        pending = sum(t["pending"] for t in per_kind.values())
+        vectors_total = (
+            None if not available else sum(t["vectors"] for t in per_kind.values())
+        )
+        if not available:
+            state = "unavailable"
+        elif total == 0:
+            state = "empty"
+        elif pending == 0:
+            state = "complete"
+        elif vectors_total == 0:
+            state = "not_started"
+        else:
+            state = "backfilling"
+        return {
+            "available": available,
+            "reason": reason,
+            "state": state,
+            **per_kind,
         }
 
 

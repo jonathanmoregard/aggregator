@@ -189,6 +189,51 @@ def test_capabilities_registers_sota_watch_like_github(tmp_data_home):
     assert caps["counts"]["sota-watch"] == 2
 
 
+# --- v5: vector-index state reaches the MCP surface -----------------------
+
+
+def test_capabilities_exposes_vector_index(tmp_data_home):
+    """Task L: a caller must be able to see, from the tool surface alone,
+    whether hybrid retrieval is warm on this cache."""
+    store = Store()
+    _seed(store)
+    caps = aggregator_capabilities(_store=store)
+    assert "vector_index" in caps
+    vi = caps["vector_index"]
+    assert vi["available"] is True
+    assert vi["state"] == "not_started"
+    assert vi["observations"]["pending"] == 1
+    assert vi["observations"]["vectors"] == 0
+
+
+def test_capabilities_vector_index_distinguishes_unavailable_from_unembedded(
+    tmp_data_home, monkeypatch
+):
+    """The two situations that would otherwise both render as "0 embedded"."""
+    import sqlite3
+
+    from aggregator.core import store as store_mod
+
+    unembedded = aggregator_capabilities(_store=_seeded_store())["vector_index"]
+
+    def _boom(conn):
+        raise sqlite3.OperationalError("simulated sqlite-vec ABI mismatch")
+
+    monkeypatch.setattr(store_mod, "_load_sqlite_vec", _boom)
+    monkeypatch.setattr(store_mod, "_VEC_LOAD_WARNED", False)
+    broken = aggregator_capabilities(_store=_seeded_store())["vector_index"]
+
+    assert unembedded["state"] == "not_started"
+    assert broken["state"] == "unavailable"
+    assert unembedded != broken
+
+
+def _seeded_store():
+    store = Store()
+    _seed(store)
+    return store
+
+
 def test_capabilities_help_includes_dsl_syntax(tmp_data_home):
     store = Store()
     _seed(store)

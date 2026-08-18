@@ -313,6 +313,121 @@ def test_count_embedding_states_works_without_the_extension(no_vec_store):
     assert counts["pending"] == 1
 
 
+# --- capabilities()["vector_index"]: three situations, three answers ---------
+#
+# "backfill in progress", "vector arm unavailable" and "nothing embedded yet"
+# are three different facts with three different remedies (wait / fix the
+# install / start the worker). Any output that renders two of them identically
+# is a bug, so each gets its own test.
+
+
+def test_capabilities_vector_index_reports_nothing_embedded_yet(store):
+    for i in range(3):
+        _seed_observation(store, f"o{i}")
+    vi = store.capabilities()["vector_index"]
+    assert vi["available"] is True
+    assert vi["state"] == "not_started"
+    assert vi["observations"]["pending"] == 3
+    assert vi["observations"]["vectors"] == 0
+
+
+def test_capabilities_vector_index_reports_backfill_in_progress(store):
+    for i in range(3):
+        _seed_observation(store, f"o{i}")
+    vec = np.eye(1, 768, dtype=np.float32)[0]
+    store.upsert_vec_observations([("o0", vec)])
+    store.mark_embedded("observations", ["o0"], state="ok")
+    vi = store.capabilities()["vector_index"]
+    assert vi["available"] is True
+    assert vi["state"] == "backfilling"
+    assert vi["observations"]["ok"] == 1
+    assert vi["observations"]["pending"] == 2
+    assert vi["observations"]["vectors"] == 1
+
+
+def test_capabilities_vector_index_reports_unavailable_arm(no_vec_store):
+    """The distinguishing test: the corpus here is IDENTICAL to the
+    nothing-embedded-yet case, and the two must not read the same."""
+    for i in range(3):
+        _seed_observation(no_vec_store, f"o{i}")
+    vi = no_vec_store.capabilities()["vector_index"]
+    assert vi["available"] is False
+    assert vi["state"] == "unavailable"
+    assert vi["reason"]
+    assert "sqlite-vec" in vi["reason"]
+    # The backlog is still reportable — it is plain column arithmetic.
+    assert vi["observations"]["pending"] == 3
+    # But the vector count is unknown, NOT zero.
+    assert vi["observations"]["vectors"] is None
+
+
+def test_capabilities_vector_index_three_states_are_all_distinguishable(
+    tmp_path, monkeypatch
+):
+    """Belt and braces over the three tests above: render each situation and
+    assert no two of them produce equal output."""
+    rendered = []
+
+    fresh = Store(db_path=tmp_path / "a.db")
+    fresh.migrate()
+    _seed_observation(fresh, "o0")
+    rendered.append(fresh.capabilities()["vector_index"])
+
+    partial = Store(db_path=tmp_path / "b.db")
+    partial.migrate()
+    _seed_observation(partial, "o0")
+    _seed_observation(partial, "o1")
+    partial.upsert_vec_observations([("o0", np.eye(1, 768, dtype=np.float32)[0])])
+    partial.mark_embedded("observations", ["o0"], state="ok")
+    rendered.append(partial.capabilities()["vector_index"])
+
+    def _boom(conn):
+        raise sqlite3.OperationalError("simulated sqlite-vec ABI mismatch")
+
+    monkeypatch.setattr(store_mod, "_load_sqlite_vec", _boom)
+    monkeypatch.setattr(store_mod, "_VEC_LOAD_WARNED", False)
+    broken = Store(db_path=tmp_path / "c.db")
+    broken.migrate()
+    _seed_observation(broken, "o0")
+    rendered.append(broken.capabilities()["vector_index"])
+
+    states = [vi["state"] for vi in rendered]
+    assert len(set(states)) == 3, f"states collapsed: {states}"
+
+
+def test_capabilities_vector_index_reports_complete_when_backlog_is_drained(store):
+    _seed_observation(store, "o0")
+    store.upsert_vec_observations([("o0", np.eye(1, 768, dtype=np.float32)[0])])
+    store.mark_embedded("observations", ["o0"], state="ok")
+    vi = store.capabilities()["vector_index"]
+    assert vi["state"] == "complete"
+
+
+def test_capabilities_vector_index_reports_empty_corpus(store):
+    """Nothing to embed is not the same as nothing embedded — a fresh cache
+    with no rows must not read as an idle backfill worker."""
+    vi = store.capabilities()["vector_index"]
+    assert vi["available"] is True
+    assert vi["state"] == "empty"
+
+
+def test_capabilities_vector_index_covers_both_ontologies(store):
+    _seed_observation(store, "o0")
+    _seed_record(store, "github:1")
+    vi = store.capabilities()["vector_index"]
+    assert vi["observations"]["total"] == 1
+    assert vi["records"]["total"] == 1
+
+
+def test_capabilities_still_works_when_the_vector_arm_is_broken(no_vec_store):
+    """Regression guard: capabilities is the tool a caller reaches for WHEN
+    something is wrong. It must not be the thing that breaks."""
+    _seed_observation(no_vec_store, "o0")
+    caps = no_vec_store.capabilities()
+    assert caps["schema_version"] == store_mod.SCHEMA_VERSION
+    assert caps["counts"]["observations"] == 1
+
+
 def test_count_vec_rows_raises_when_the_vec_table_is_missing(tmp_path, monkeypatch):
     """Migrated WITHOUT the extension, then opened WITH it: the extension
     loads but ``vec_observations`` was never created. That is still "no

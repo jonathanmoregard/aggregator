@@ -791,9 +791,18 @@ def _first_user_prompt(store: Store, s: SessionRow) -> str:
 def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
     """Read-only inventory of the aggregator cache.
 
+    ``vector_index`` (v5) reports whether hybrid retrieval is warm on this
+    cache, and keeps three situations that all look like "0 embedded" apart:
+    ``state='unavailable'`` (sqlite-vec missing — search is FTS5-only and
+    somebody has to fix the install), ``state='not_started'`` (the arm works,
+    nothing embedded yet — run ``aggregator embed``), and
+    ``state='backfilling'`` (partway through — wait; recall is already better
+    than FTS5 alone). Plus ``empty`` (nothing to embed) and ``complete``.
+
     Returns:
       ``{ok: True, sources: [...], freshness: {...}, counts: {...},
-      cache_path, schema_version, tool_tier: 'read-only', help: str}``
+      vector_index: {...}, cache_path, schema_version,
+      tool_tier: 'read-only', help: str}``
     """
     store = _store or _default_store()
     if cache_error := _ensure_cache_ready(store):
@@ -805,6 +814,7 @@ def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
         "freshness": caps["freshness"],
         "tags_by_source": caps["tags_by_source"],
         "counts": caps.get("counts", {}),
+        "vector_index": caps.get("vector_index", {}),
         "date_range": caps["date_range"],
         "cache_path": caps["cache_path"],
         "schema_version": caps["schema_version"],
