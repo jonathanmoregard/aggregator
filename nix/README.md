@@ -128,7 +128,7 @@ services.aggregator.embed = {
   enable = true;            # default
   interval = "*:15/30";     # default — :15 and :45, offset from ingest
   batchSize = 500;          # rows per checkpoint
-  timeoutStartSec = "8h";   # sized for a first full backfill
+  timeoutStartSec = "infinity";  # default — see "Why there is no start timeout"
 };
 ```
 
@@ -171,24 +171,59 @@ identical popups a day is how a loud system trains you to ignore it. Same
 reasoning as `60a931d`. The debounce fails open: any error reading the stamp
 results in a notification.
 
-### Why `--catchup`, and why the timeout is hours
+### Why `--catchup`
 
 The unit runs `aggregator embed --catchup`, not `--once`. `--once` does one
-batch per tick; at 500 rows against a ~376k-observation corpus that is ~380
-ticks — over a week before the index is useful. `--catchup` drains the backlog
-in the same bounded, per-batch-committed chunks and is a fast no-op once warm.
+batch per tick; at 500 rows against the measured 483k-observation corpus that
+is ~970 ticks — roughly three weeks before the last row is even attempted.
+`--catchup` drains the backlog in the same bounded, per-batch-committed chunks
+and is a fast no-op once warm.
 
 Overlapping runs are already handled by the worker itself: it takes an
 OS-level `flock` on `<cache>.embed.lock`, and a tick that finds a catchup
 still running prints one line and exits 0.
 
-`TimeoutStartSec` defaults to `8h` — a runaway guard, not a deadline the
-backfill has to beat. Being killed at the timeout is safe: each batch commits
-its vectors and *then* advances `embedding_state`, so a kill at any instant
-costs at most one batch and can never leave the watermark ahead of the data.
-The vec writes are delete-then-insert, so a repeated batch is idempotent. Note
-that the worker installs no SIGTERM handler — a stop is immediate, and the
-safety comes from the commit ordering rather than from graceful shutdown.
+### Why there is no start timeout
+
+`timeoutStartSec` defaults to `infinity`. The reason is measurement, not
+optimism: the real corpus is 483,193 observations / 422,261 chunks / 609M
+chars, and the worker embeds at 249.6 chars per wall-second on CPU, so a first
+full backfill is **25-30 days of continuous work** — not the ~3.5h the design
+assumed.
+
+Being SIGTERMed is safe. Each batch commits its vectors and *then* advances
+`embedding_state`, so a kill at any instant costs at most one batch and can
+never leave the watermark ahead of the data; the vec writes are
+delete-then-insert, so a repeated batch is idempotent. The worker installs no
+SIGTERM handler — a stop is immediate, and the safety comes from the commit
+ordering, not from graceful shutdown.
+
+Safe is not the same as free. A timeout puts the unit in `failed`, which fires
+`OnFailure=`. At the old `8h` a *correctly progressing* backfill needed ~85
+consecutive runs, so it would have raised ~28 CRITICAL popups over a month
+(debounced to one a day), each announcing that the vector index is not being
+filled and naming two causes that did not apply. An alarm that fires on
+success is how you learn to ignore the alarm — the same failure the debounce
+above exists to prevent.
+
+**What guards a genuinely wedged worker, then?** Not a clock: no wall-clock
+value can separate "wedged" from "working" when working legitimately takes a
+month. Instead —
+
+- `Nice=19` and `IOSchedulingClass=idle` bound a spinning worker to
+  otherwise-idle capacity.
+- Batch-sized write transactions plus the per-batch checkpoint bound what a
+  wedge can lose to one batch; it can never park a long transaction on the
+  cache.
+- The `flock` means later ticks exit 0 as no-ops instead of stacking workers.
+- `TimeoutStopSec=5min` stays finite, so
+  `systemctl --user stop aggregator-embed.service` is always a bounded kill.
+- Detection is by **progress**: `aggregator status` and
+  `aggregator_capabilities()['vector_index']` report embedded / pending /
+  error counts, and a wedged worker is one whose counts stop moving.
+
+`checks.<system>.aggregator-embed-unit-hygiene` asserts both halves — that the
+start timeout is disabled, and that the stop timeout is not.
 
 ### Contention with ingest
 

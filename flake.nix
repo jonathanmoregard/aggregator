@@ -162,9 +162,37 @@
                 fi
               done
 
-              # ---- 6. Backfill-sized timeout, safe to kill ---------------
-              grep -q '^TimeoutStartSec=' "$svc" \
+              # ---- 6. The start timeout must not fire on a healthy run ----
+              # Task M measured the real corpus: 483,193 observations /
+              # 422,261 chunks / 609M chars at 249.6 chars per wall-second,
+              # CPU-only. A full backfill is ~25-30 days of continuous work.
+              # Any finite TimeoutStartSec therefore SIGTERMs a *correctly
+              # progressing* run, and each kill is a systemd failure that
+              # fires OnFailure= — a CRITICAL popup saying the vector index
+              # is not being filled while it is being filled. The previous
+              # `8h` would have produced ~85 such kills over one backfill.
+              #
+              # A wall clock cannot separate a wedged worker from a working
+              # one when the honest working time is a month, so the start
+              # timeout was never the wedge guard and is disabled outright.
+              # What bounds a wedge instead: Nice/idle-IO cap the blast
+              # radius, the per-batch checkpoint caps the loss, the flock
+              # stops workers piling up, and progress (aggregator status /
+              # vector_index) is what a human actually reads to spot one.
+              start_timeout=$(sed -n 's/^TimeoutStartSec=//p' "$svc")
+              [ -n "$start_timeout" ] \
                 || fail "aggregator-embed.service has no TimeoutStartSec"
+              [ "$start_timeout" = "infinity" ] \
+                || fail "aggregator-embed.service sets TimeoutStartSec=$start_timeout — a finite start timeout kills a healthy multi-week backfill and reports it as a failure"
+
+              # With no start timeout, the only remaining bound on a wedged
+              # worker is a human running `systemctl --user stop`. That path
+              # must itself complete, so the STOP timeout stays finite.
+              stop_timeout=$(sed -n 's/^TimeoutStopSec=//p' "$svc")
+              [ -n "$stop_timeout" ] \
+                || fail "aggregator-embed.service has no TimeoutStopSec"
+              [ "$stop_timeout" != "infinity" ] \
+                || fail "aggregator-embed.service sets TimeoutStopSec=infinity — the manual stop is the last bound on a wedged worker and must not hang"
 
               # ---- 7. The seeding unit is human-triggered only ------------
               if grep -q '^\[Install\]' "$units/aggregator-embed-seed.service"; then

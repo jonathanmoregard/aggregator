@@ -108,13 +108,19 @@ let
   # ExecStart for the timer-driven worker.
   #
   # `--catchup`, not the plan's `--once`. `--once` does a single batch per
-  # tick; at batch-size 500 against a ~376k-observation corpus that is ~380
-  # ticks, i.e. over a week of wall time to reach a usable index, which is a
-  # backfill that never finishes for any practical purpose. `--catchup`
-  # drains the backlog in the same bounded, per-batch-committed chunks and is
-  # a fast no-op once the index is warm. Overlap is already handled by the
-  # worker's own flock on `<cache>.embed.lock`: a tick that finds a catchup
-  # still running prints one line and exits 0.
+  # tick; at batch-size 500 against the measured 483k-observation corpus that
+  # is ~970 ticks, i.e. ~3 weeks of wall time before the last row is even
+  # attempted, which is a backfill that never finishes for any practical
+  # purpose. `--catchup` drains the backlog in the same bounded,
+  # per-batch-committed chunks and is a fast no-op once the index is warm.
+  # Overlap is already handled by the worker's own flock on
+  # `<cache>.embed.lock`: a tick that finds a catchup still running prints one
+  # line and exits 0.
+  #
+  # A catchup does NOT finish inside one tick, and is not meant to: Task M
+  # measured the first full backfill at 25-30 days of continuous CPU. It runs
+  # to completion across ticks because `timeoutStartSec` no longer cuts it
+  # off — see that option's description for why a finite one had to go.
   embedRunner = pkgs.writeShellScript "aggregator-embed" ''
     set -uo pipefail
 
@@ -351,15 +357,52 @@ in {
 
       timeoutStartSec = lib.mkOption {
         type = lib.types.str;
-        default = "8h";
-        example = "infinity";
+        default = "infinity";
+        example = "8h";
         description = ''
-          `TimeoutStartSec` for the embed service. Sized for a first full
-          backfill of a ~376k-observation corpus on CPU, which is hours,
-          not minutes. Being SIGTERMed at the timeout is safe and
-          expected — the worker checkpoints per batch and the next tick
-          resumes from the watermark — so this is a runaway guard, not a
-          deadline the backfill must beat.
+          `TimeoutStartSec` for the embed service. Disabled by default,
+          because on this corpus no finite value can distinguish a healthy
+          run from a broken one.
+
+          Measured 2026-08-17 against the real cache: 483,193 observations
+          / 422,261 chunks / 609M chars, embedding at 249.6 chars per
+          wall-second on CPU. A first full backfill is therefore **25-30
+          days of continuous work**, not the ~3.5h the design assumed.
+
+          Being SIGTERMed is safe — the worker checkpoints per batch and
+          the next tick resumes from the watermark — but it is not free:
+          a timeout puts the unit in `failed`, which fires
+          `OnFailure=aggregator-embed-failure-notify.service`. At the
+          previous `8h` a *correctly progressing* backfill needed ~85
+          consecutive runs and would have raised ~28 CRITICAL desktop
+          notifications over a month (the popup is debounced to one a
+          day), each saying the vector index is not being filled and
+          naming two causes that did not apply. An alarm that fires on
+          success is how a human learns to ignore the alarm, which costs
+          the next real failure its audience.
+
+          What guards a genuinely wedged worker instead, since this no
+          longer does — a wall clock cannot tell "wedged" from "working"
+          when working legitimately takes a month:
+
+          - `Nice=19` + `IOSchedulingClass=idle` bound the cost of a
+            spinning worker to otherwise-idle capacity.
+          - Batch-sized write transactions plus the per-batch checkpoint
+            bound what a wedge can lose or corrupt to one batch; it can
+            never park a long transaction on the cache.
+          - The worker's `flock` on `<cache>.embed.lock` means later timer
+            ticks exit 0 as no-ops instead of stacking workers up.
+          - `TimeoutStopSec` stays finite, so
+            `systemctl --user stop aggregator-embed.service` is always a
+            bounded kill.
+          - Detection is by PROGRESS, not by clock: `aggregator status`
+            and `aggregator_capabilities()['vector_index']` report
+            embedded / pending / error counts, and a wedged worker is one
+            whose counts stop moving. That is the only signal that can
+            actually tell the two apart.
+
+          Set a finite value (e.g. `"8h"`) only if you would rather cap
+          the wall time than keep the notifier truthful.
         '';
       };
     };

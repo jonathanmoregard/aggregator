@@ -916,9 +916,13 @@ def test_a_filter_only_query_constructs_no_embedder_on_a_warm_index(
 
 # --- sad path: the worker is killed mid-run ----------------------------------
 #
-# The embed timer carries ``TimeoutStartSec``, the machine reboots, and a
-# 372k-row backfill runs for days. Being killed partway through is not an
-# exotic failure for this worker; it is a weekly event. Two windows matter and
+# A 483k-row backfill runs for weeks (Task M measured 25-30 days of CPU), so
+# it will be interrupted: a reboot, a suspend, `systemctl --user stop`, the OOM
+# killer. Being killed partway through is not an exotic failure for this
+# worker; it is a weekly event. (It is no longer a *timeout*: the unit runs
+# with ``TimeoutStartSec=infinity`` precisely because a run this long cannot be
+# distinguished from a wedged one by a clock. The kill sources above remain.)
+# Two windows matter and
 # they are not the same window, so each gets its own test:
 #
 #   1. killed BETWEEN batches — batch n is committed whole, batch n+1 has
