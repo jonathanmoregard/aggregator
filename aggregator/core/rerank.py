@@ -24,7 +24,18 @@ class Reranker:
         from sentence_transformers import CrossEncoder
 
         self.model_name = model_name or _DEFAULT_MODEL
-        self._model = CrossEncoder(self.model_name, trust_remote_code=True)
+        # NO ``trust_remote_code``. This constructor runs lazily inside the MCP
+        # server process — the one holding the user's entire personal history —
+        # and that server is registered bare, with no ``HF_HUB_OFFLINE`` wrapper
+        # (only the timer-driven embed unit sets it). The flag would therefore
+        # let a single ``rerank=True`` query fetch and execute
+        # repository-controlled Python right there, while the tool advertises
+        # ``openWorldHint=False``.
+        # Nothing is given up: the Qwen3-Reranker repo ships no modeling code,
+        # and the architecture is in-tree in transformers. Verified offline —
+        # loads in 0.4 s as ``transformers.models.qwen3.Qwen3ForCausalLM``, and
+        # ranks the relevant document first. Pinned by a test, not by comment.
+        self._model = CrossEncoder(self.model_name)
 
     def score(self, query: str, docs: list[str]) -> np.ndarray:
         """Return one relevance score per doc (higher = more relevant)."""

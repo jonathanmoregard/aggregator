@@ -1,5 +1,6 @@
 """Qwen3-Reranker: score returns per-doc floats, deterministic, higher
-score wins."""
+score wins — and it does all of that WITHOUT executing hub-hosted code.
+"""
 
 import numpy as np
 import pytest
@@ -35,3 +36,44 @@ def test_relevant_beats_irrelevant(reranker):
         ],
     )
     assert scores[0] > scores[1]
+
+
+# --- no arbitrary code execution on the recall path -------------------------
+
+
+def test_reranker_never_enables_trust_remote_code(monkeypatch):
+    """``rerank=True`` must not license the hub to run code in this process.
+
+    ``Reranker()`` is constructed lazily INSIDE the MCP server — the process
+    holding the user's entire personal history — and that server is registered
+    bare, with no ``HF_HUB_OFFLINE`` wrapper (only the timer-driven embed unit
+    sets it). With ``trust_remote_code=True`` a single ``rerank=True`` query is
+    therefore enough to fetch and execute repository-controlled Python there.
+
+    Nothing is given up by refusing: the weights carry no custom modeling code,
+    and the architecture is native to transformers — see the test below, which
+    proves it against the real model rather than asserting it.
+    """
+    seen = {}
+
+    class _FakeCrossEncoder:
+        def __init__(self, model_name, **kwargs):
+            seen["model_name"] = model_name
+            seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "sentence_transformers.CrossEncoder", _FakeCrossEncoder, raising=True
+    )
+    Reranker()
+
+    assert seen["kwargs"].get("trust_remote_code") in (None, False)
+
+
+def test_the_reranker_architecture_is_native_to_transformers(reranker):
+    """The evidence that dropping the flag costs nothing.
+
+    If this model genuinely needed hub-hosted code, the class below would live
+    in a ``transformers_modules.*`` package written by the repository. It does
+    not — it is the in-tree Qwen3 implementation that ships with transformers.
+    """
+    assert type(reranker._model.model).__module__.startswith("transformers.models")
