@@ -240,6 +240,43 @@ let
     fi
   '';
 
+  # ---- systemd time-span option type ------------------------------------
+  #
+  # Round-2 LOW. `timeoutStartSec` was `lib.types.str`, so `"infinty"`
+  # evaluated clean, built, deployed, and was only then rejected — by
+  # systemd, at unit start, which falls back to its ~90 second default.
+  # Against a backfill measured at 25-30 days that truncates every single
+  # tick. systemd does log a parse error, so it is not literally silent, but
+  # nobody reads that journal until they already suspect a problem, and the
+  # only other symptom is a progress counter that stops moving. Catch it
+  # where the typo is typed instead.
+  #
+  # Grammar from systemd.time(7) "Parsing Time Spans": one or more
+  # `<number><unit>` terms, optional whitespace between them, a bare number
+  # meaning seconds, or the literal `infinity`. The accept/reject split this
+  # produces was checked term-by-term against `systemd-analyze timespan` on
+  # systemd 261, and `checks.<system>.aggregator-embed-unit-hygiene` pins it.
+  systemdTimeSpanUnits = lib.concatStringsSep "|" [
+    "usec" "usecs" "microsecond" "microseconds" "us"
+    "msec" "msecs" "millisecond" "milliseconds" "ms"
+    "seconds" "second" "sec" "s"
+    "minutes" "minute" "min" "m"
+    "hours" "hour" "hr" "h"
+    "days" "day" "d"
+    "weeks" "week" "w"
+    "months" "month" "M"
+    "years" "year" "y"
+  ];
+  systemdTimeSpan =
+    lib.types.strMatching
+      "(infinity|([0-9]+(\\.[0-9]+)?[[:space:]]*(${systemdTimeSpanUnits})?[[:space:]]*)+)"
+    // {
+      description =
+        "systemd time span per systemd.time(7) — e.g. \"8h\", \"90min\","
+        + " \"1h 30min\", or bare seconds \"3600\" — or the literal"
+        + " \"infinity\" to disable the timeout";
+    };
+
   # user-timer schema notes (verified against `man systemd.timer`, systemd v256):
   #   OnCalendar    — realtime calendar spec (`*:0/30` = every 30min of every hour).
   #   OnBootSec     — offset from boot; triggers once per boot after the delay.
@@ -384,7 +421,12 @@ in {
       };
 
       timeoutStartSec = lib.mkOption {
-        type = lib.types.str;
+        # NOT `types.str`. A mistyped span (`"infinty"`) used to evaluate,
+        # build and deploy, and systemd would then reject it and apply its
+        # ~90s default — truncating every tick of a month-long backfill,
+        # with a stalled progress counter as the only visible symptom.
+        # `systemdTimeSpan` rejects it at eval time, where the typo is.
+        type = systemdTimeSpan;
         default = "infinity";
         example = "8h";
         description = ''

@@ -240,6 +240,27 @@ month. Instead —
 `checks.<system>.aggregator-embed-unit-hygiene` asserts both halves — that the
 start timeout is disabled, and that the stop timeout is not.
 
+`timeoutStartSec` is typed as a **systemd time span**, not a bare string. It
+used to be `types.str`, so `"infinty"` evaluated, built and deployed happily;
+systemd then rejected the span at unit start and applied its ~90 second
+default, truncating every tick of a 25-30 day backfill. The parse error goes to
+the journal, but nothing reads that journal until someone already suspects a
+problem, and the only other symptom is a progress counter that stops moving.
+Now the typo fails where it was typed:
+
+```
+error: A definition for option `services.aggregator.embed.timeoutStartSec' is
+not of type `systemd time span per systemd.time(7) — e.g. "8h", "90min",
+"1h 30min", or bare seconds "3600" — or the literal "infinity" to disable the
+timeout'. Definition values:
+- In `<unknown-file>': "infinty"
+```
+
+The grammar is from `systemd.time(7)`, and the check evaluates the module
+against 8 spans `systemd-analyze timespan` accepts and 6 it rejects, failing
+the build in **either** direction — a type that is too loose lets the typo
+through, and one that is too tight blocks a legitimate config.
+
 ### Contention with ingest
 
 `interval` defaults to `*:15/30`, deliberately offset from the ingest timers'

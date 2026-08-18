@@ -66,6 +66,44 @@
               }
             ];
           };
+          # ---- eval-time probe for the timeoutStartSec option type --------
+          #
+          # Round-2 LOW: the option was `types.str`, so `"infinty"` evaluated,
+          # built and deployed, and only systemd rejected it — falling back to
+          # its ~90s default, which truncates every tick of a 25-30 day
+          # backfill while the journal parse error goes unread.
+          #
+          # This asserts the module's type agrees with systemd's own parser.
+          # The expected column is not guesswork: every string below was run
+          # through `systemd-analyze timespan` on systemd 261 and the module
+          # must reproduce that verdict exactly.
+          timeoutStartSecAccepts = value:
+            (builtins.tryEval (builtins.deepSeq
+              (home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  ./nix/aggregator.nix
+                  {
+                    home.username = "aggregator-check";
+                    home.homeDirectory = "/nonexistent/aggregator-check";
+                    home.stateVersion = "24.11";
+                    services.aggregator = {
+                      enable = true;
+                      package = fixturePackage;
+                      embed.timeoutStartSec = value;
+                    };
+                  }
+                ];
+              }).config.systemd.user.services.aggregator-embed.Service.TimeoutStartSec
+              true)).success;
+
+          # `systemd-analyze timespan "<x>"` exits 0 on these.
+          validTimeSpans = [ "infinity" "8h" "90" "1h 30min" "500ms" "1d" "1M" "0" ];
+          # …and non-zero on these ("Failed to parse time span").
+          invalidTimeSpans = [ "infinty" "8hh" "eight hours" "" "h" "8 hourz" ];
+
+          wronglyRejected = builtins.filter (v: !(timeoutStartSecAccepts v)) validTimeSpans;
+          wronglyAccepted = builtins.filter timeoutStartSecAccepts invalidTimeSpans;
         in {
           devShells.default = pkgs.mkShell {
             packages = [
@@ -248,6 +286,21 @@
                 || fail "aggregator-embed.service has no TimeoutStopSec"
               [ "$stop_timeout" != "infinity" ] \
                 || fail "aggregator-embed.service sets TimeoutStopSec=infinity — the manual stop is the last bound on a wedged worker and must not hang"
+
+              # ---- 6b. A mistyped start timeout must fail at EVAL time ----
+              # Assertion 6 above only sees the fixture's default. A real
+              # deployment sets this option in its own home-manager config,
+              # where a typo never reaches this check — it reaches systemd,
+              # which rejects the span and applies its ~90s default, cutting
+              # off every tick of a month-long backfill. So the option type
+              # itself has to be the gate, and this asserts the type agrees
+              # with `systemd-analyze timespan` on systemd 261 case for case.
+              wrongly_rejected=${pkgs.lib.escapeShellArg (builtins.toJSON wronglyRejected)}
+              wrongly_accepted=${pkgs.lib.escapeShellArg (builtins.toJSON wronglyAccepted)}
+              [ "$wrongly_rejected" = "[]" ] \
+                || fail "services.aggregator.embed.timeoutStartSec rejects time spans systemd accepts: $wrongly_rejected — the option type is too tight and blocks a legitimate config"
+              [ "$wrongly_accepted" = "[]" ] \
+                || fail "services.aggregator.embed.timeoutStartSec accepts time spans systemd rejects: $wrongly_accepted — systemd would fall back to its ~90s default and truncate every tick of a 25-30 day backfill"
 
               # ---- 7. The seeding unit is human-triggered only ------------
               if grep -q '^\[Install\]' "$units/aggregator-embed-seed.service"; then
