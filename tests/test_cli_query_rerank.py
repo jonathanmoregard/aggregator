@@ -7,12 +7,22 @@ Every surface that exposed it was interactive, and the only non-interactive
 entry point, the CLI, had no flag at all. So the measured advice named a
 place to use the feature that did not exist.
 
-AND IT MUST NOT DEGRADE QUIETLY. ``_maybe_rerank`` swallows a rerank failure
-and returns the page in its fused order, which is right for the MCP tool — a
-lost ordering should not cost a caller their answer. On a command whose ONLY
-purpose was to rerank it is the wrong trade: the operator waited, got
-recency-ordered output, and nothing said the cross-encoder never ran. So the
-CLI loads the model up front and refuses out loud when it cannot.
+AND IT MUST NOT DEGRADE QUIETLY. ``_maybe_rerank`` still catches a rerank
+failure and returns the page in its fused order, which is right for the MCP
+tool — a lost ordering should not cost a caller their answer. It no longer
+does so in silence: since ``04acf86`` the response carries ``rerank_applied:
+False`` and leads with a ``notice`` naming the exception and pointing at
+``aggregator embed --seed-models``, and this command prints that notice.
+
+On a command whose ONLY purpose is to rerank, reporting after the fact is
+still the wrong trade — measured here with a reranker that loads and then
+raises while scoring: exit 0, the full page printed, and the notice on the
+line after the last row, so the operator reads it only after scrolling past
+the results it disclaims and a caller checking ``$?`` sees success. So the
+CLI loads the model up front and refuses out loud when it cannot, turning a
+degradation reported afterwards into a refusal that costs nothing and exits
+non-zero. It narrows the window rather than closing it — scoring can still
+fail once the model is loaded — and the notice is what covers the remainder.
 """
 
 from __future__ import annotations

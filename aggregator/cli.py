@@ -380,9 +380,23 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         # BEFORE THE QUERY, and loudly. ``_maybe_rerank`` catches a rerank
         # failure and returns the page in its fused order — right for the MCP
         # tool, where a lost ordering must not cost the caller their answer,
-        # and wrong here, where the ordering IS what was asked for. Loading up
-        # front turns "quietly unranked" into a refusal that names its fix,
-        # and the object lands in the singleton the query then reuses.
+        # and wrong here, where the ordering IS what was asked for.
+        #
+        # That degrade is no longer silent: it now sets ``rerank_applied:
+        # False`` and leads the response with a ``notice`` naming the exception
+        # and pointing at ``aggregator embed --seed-models``, which this
+        # command prints. What the up-front load still buys is WHEN and WITH
+        # WHAT EXIT CODE. Measured on this path with a reranker that loads and
+        # then raises while scoring: exit 0, the whole page printed, and the
+        # notice on the line after the last row — an operator who waited ~47 s
+        # reads the report only after scrolling past the results it disclaims,
+        # and a script or timer sees a success. Loading first converts that
+        # post-work degradation into a pre-work refusal that names its fix and
+        # exits 1, and the object lands in the singleton the query then reuses.
+        #
+        # It narrows the window rather than closing it — a cross-encoder can
+        # still fail after loading — so the reporting below is the backstop,
+        # not dead weight.
         try:
             _mcp_get_reranker()
         except Exception as e:  # noqa: BLE001 - reported, not handled
