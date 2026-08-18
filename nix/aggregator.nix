@@ -197,8 +197,25 @@ let
   # acts, so an undebounced popup would fire 48 times a day and be muted,
   # which is how a loud system becomes a silent one. Same reasoning as
   # `60a931d` (report permanently-bad input once, not twice an hour). The
-  # journal line is NOT debounced; only the desktop popup is. The stamp logic
-  # fails OPEN — any error reading it results in a notification.
+  # journal line is NOT debounced; only the desktop popup is.
+  #
+  # The debounce fails OPEN on BOTH halves, which is the whole point:
+  #
+  #   read  — any error stat-ing the stamp leaves `recent` empty, so we
+  #           notify rather than assume we already did.
+  #   write — the stamp is armed ONLY after notify-send exits 0. Round-2 LOW:
+  #           it used to be touched *before* the send, so a popup that failed
+  #           to reach any daemon still bought 24 hours of silence and the
+  #           user was never told the vector index had stopped filling. A
+  #           debounce is a record of "the human was told", and a failed send
+  #           is precisely the case where they were not. Reproduced by running
+  #           this script twice with a notify-send stub exiting 1: run 1
+  #           printed "notify-send failed", run 2 printed "suppressed".
+  #
+  # Failing open here cannot become a popup storm: if notify-send keeps
+  # failing there is no daemon to show anything, so the cost is one extra
+  # journal line per tick, and the moment a daemon does appear the user gets
+  # told once and the debounce arms normally.
   embedFailureNotify = pkgs.writeShellScript "aggregator-embed-failure-notify" ''
     set -uo pipefail
 
@@ -212,13 +229,14 @@ let
       exit 0
     fi
 
-    ${pkgs.coreutils}/bin/mkdir -p "$stamp_dir" 2>/dev/null
-    ${pkgs.coreutils}/bin/touch "$stamp" 2>/dev/null
-
-    if ! ${pkgs.libnotify}/bin/notify-send -u critical -a aggregator \
+    if ${pkgs.libnotify}/bin/notify-send -u critical -a aggregator \
       "aggregator embed FAILED" \
       "The background embed worker exited non-zero, so the vector index is not being filled. Likely: Qwen3 weights missing from the HF cache (fix: systemctl --user start aggregator-embed-seed.service), or the sqlite-vec extension did not load. Keyword search is unaffected. Details: journalctl --user -u aggregator-embed.service -n 200"; then
-      echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only"
+      # Delivered. Arm the 24h debounce, and only now.
+      ${pkgs.coreutils}/bin/mkdir -p "$stamp_dir" 2>/dev/null
+      ${pkgs.coreutils}/bin/touch "$stamp" 2>/dev/null
+    else
+      echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only. NOT arming the 24h debounce: an undelivered popup must not buy silence, so the next failing tick will try again."
     fi
   '';
 

@@ -148,6 +148,61 @@
               grep -q 'notify-send' "$notify_script" \
                 || fail "the failure-notify unit does not call notify-send"
 
+              # ---- 3b. The debounce must fail OPEN on an undelivered popup -
+              # Round-2 LOW. The popup is debounced to once per 24h via a
+              # stamp file, and the stamp used to be touched BEFORE
+              # notify-send ran. So a send that failed — no notification
+              # daemon on the session bus, which is the normal state of a
+              # freshly-booted or headless session — still bought a full day
+              # of silence, and the user was never told the vector index had
+              # stopped filling. A debounce records "the human was told"; a
+              # failed send is exactly the case where they were not.
+              #
+              # This is executed, not pattern-matched: the real generated
+              # script is run twice with notify-send swapped for a stub, once
+              # failing and once succeeding, so the assertion tests the
+              # behaviour rather than the shape of the source. Line-order
+              # greps would pass on any restructure that moved the touch out
+              # of the success branch.
+              work="$TMPDIR/notify-debounce"
+              notify_bin=$(grep -oE '/nix/store/[^ ]*/bin/notify-send' \
+                             "$notify_script" | head -1)
+              [ -n "$notify_bin" ] \
+                || fail "could not locate the notify-send binary in $notify_script"
+
+              run_notify() {
+                # $1 = exit status the notify-send stub should return.
+                rm -rf "$work"
+                mkdir -p "$work/bin" "$work/state" "$work/home"
+                printf '#!/bin/sh\nexit %s\n' "$1" > "$work/bin/notify-send"
+                chmod +x "$work/bin/notify-send"
+                sed "s|$notify_bin|$work/bin/notify-send|" "$notify_script" \
+                  > "$work/notify.sh"
+                chmod +x "$work/notify.sh"
+                # Two ticks inside the same 24h window.
+                HOME="$work/home" XDG_STATE_HOME="$work/state" "$work/notify.sh" \
+                  > "$work/1.log" 2>&1 || true
+                HOME="$work/home" XDG_STATE_HOME="$work/state" "$work/notify.sh" \
+                  > "$work/2.log" 2>&1 || true
+              }
+
+              run_notify 1
+              if grep -q 'suppressed' "$work/2.log"; then
+                echo "--- tick 1 ---" >&2; cat "$work/1.log" >&2
+                echo "--- tick 2 ---" >&2; cat "$work/2.log" >&2
+                fail "the failure-notify debounce fails CLOSED: notify-send exited non-zero on tick 1, yet tick 2 was suppressed. An undelivered popup must never buy 24h of silence — arm the stamp only after a successful send"
+              fi
+
+              # The mirror assertion, so "fail open" cannot be satisfied by
+              # deleting the debounce outright: a DELIVERED popup must arm it,
+              # or the 30-minute timer raises 48 CRITICAL popups a day and
+              # trains the user to ignore all of them.
+              run_notify 0
+              grep -q 'suppressed' "$work/2.log" \
+                || { cat "$work/2.log" >&2; \
+                     fail "the failure-notify popup is not debounced: a delivered notification must arm the 24h stamp, otherwise the embed timer raises 48 CRITICAL popups a day"; }
+              rm -rf "$work"
+
               # ---- 4. Weights are never fetched by the unattended unit ----
               grep -q 'HF_HUB_OFFLINE=1' "$svc" \
                 || fail "aggregator-embed.service is not pinned offline"

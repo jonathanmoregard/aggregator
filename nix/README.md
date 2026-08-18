@@ -168,8 +168,23 @@ unit: a journal line plus a CRITICAL `notify-send` popup. The popup — not the
 journal line — is debounced to once per 24h, because the two standing failure
 modes (weights absent, sqlite-vec absent) persist until a human acts, and 48
 identical popups a day is how a loud system trains you to ignore it. Same
-reasoning as `60a931d`. The debounce fails open: any error reading the stamp
-results in a notification.
+reasoning as `60a931d`.
+
+The debounce fails **open on both halves**:
+
+- *reading* the stamp — any error leaves it looking un-notified, so the run
+  notifies rather than assuming it already did;
+- *writing* the stamp — it is armed only after `notify-send` exits 0. A send
+  that fails (no notification daemon on the session bus, the normal state of a
+  headless or freshly-booted session) buys no silence at all; the next failing
+  tick tries again. The debounce is a record that *the human was told*, and a
+  failed send is precisely the case where they were not.
+
+That cannot become a popup storm: while `notify-send` keeps failing there is no
+daemon to show anything, so the cost is one extra journal line per tick.
+`checks.<system>.aggregator-embed-unit-hygiene` pins both halves by *executing*
+the generated script twice with a stubbed `notify-send` — once exiting 1 (tick
+2 must still notify) and once exiting 0 (tick 2 must be suppressed).
 
 ### Why `--catchup`
 
