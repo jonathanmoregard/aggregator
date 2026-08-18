@@ -221,3 +221,30 @@ def test_embed_requires_a_mode(cache):
 
     with pytest.raises(SystemExit):
         main(["embed"], _store=Store(db_path=cache))
+
+
+# --- the CLI surface must match what the deployment and the docs say --------
+
+
+def test_bare_catchup_embeds_both_ontologies():
+    """Every remediation string in this codebase tells the operator to run
+    ``aggregator embed --catchup`` with no ``--source``:
+    ``store.py`` (missing extension, foreign index, missing vec table),
+    ``cli.py`` (missing extension, unhealthy embedder). The deployed unit runs
+    ``--source both``. A default of ``observations`` therefore left records
+    keyword-only, silently, on exactly the command the operator was told to
+    run — and ``vector_index`` would report records as never started while the
+    person who fixed it believed they had.
+    """
+    from aggregator.cli import build_parser
+
+    args = build_parser().parse_args(["embed", "--catchup"])
+    assert args.source == "both"
+
+
+def test_the_source_choices_are_unchanged():
+    from aggregator.cli import build_parser
+
+    for source in ("observations", "records", "both"):
+        args = build_parser().parse_args(["embed", "--once", "--source", source])
+        assert args.source == source

@@ -1907,7 +1907,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_embed.add_argument(
         "--source",
         choices=["observations", "records", "both"],
-        default="observations",
+        # ``both``, matching the deployed unit and every remediation string in
+        # this codebase — all of which tell the operator to run a bare
+        # `aggregator embed --catchup`. A default of ``observations`` made that
+        # exact command leave records keyword-only, so `vector_index` kept
+        # reporting records as never started while the person who had just
+        # "fixed" it believed otherwise.
+        default="both",
+        help=(
+            "which ontology to embed (default: both, matching the timer unit)"
+        ),
     )
     p_embed.add_argument("--batch-size", type=int, default=500, dest="batch_size")
 
