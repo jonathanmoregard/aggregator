@@ -1087,9 +1087,22 @@ def aggregator_query(
 
     Returns:
       Success: ``{ok: True, records: [...], total: int, mode: str, notice?,
-      next_page_token?, rerank_applied?}``. ``mode`` is ``sessions``,
-      ``observations`` or ``records`` so the caller knows which shape to
-      expect.
+      next_page_token?, rerank_applied?}``. ``mode`` tells you which shape the
+      items in ``records`` have, and it is one of four:
+
+      * ``union`` — **the default, and what a plain text or date query
+        returns.** Any query with no ``source:`` and no ontology-specific key
+        takes this route, including every example above except the
+        source-scoped ones. Its ``records`` list is MIXED: record-shaped items
+        (``stable_id``, ``source``, ``subject``, ``tags``, ``updated_at``,
+        ``content``) and session-shaped items interleaved by recency. Read
+        each item by the keys it has rather than by position — a session item
+        is the one carrying ``kind``.
+      * ``records`` — one card per matching record, for the row-per-unit-of
+        -work sources in the live inventory. Homogeneous.
+      * ``sessions`` — one card per matching session, with
+        ``matching_observations``. Homogeneous.
+      * ``observations`` — raw turns, from ``drilldown=True``. Homogeneous.
 
       ``rerank_applied`` appears only when ``rerank=True`` was requested, and
       is ``False`` when the ordering you received is NOT reranked — the model
