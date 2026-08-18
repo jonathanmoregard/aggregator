@@ -509,8 +509,12 @@ def _rerank_doc(item: dict[str, Any]) -> str:
 
 def _maybe_rerank(
     items: list[dict[str, Any]], query: str | None, rerank: bool
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool, str | None]:
     """Reorder the head of a page by cross-encoder relevance.
+
+    Returns ``(items, applied, notice)``. ``applied`` is False whenever the
+    caller asked for reranking and the ordering they got is not reranked;
+    ``notice`` then says why, in the caller's own response.
 
     Reorders at most ``_RERANK_WINDOW`` items and never changes WHICH items
     are on the page, so pagination is untouched: a page token still addresses
@@ -518,22 +522,66 @@ def _maybe_rerank(
     want the whole page ranked should request a page no larger than the
     window.
 
-    A rerank failure costs the ordering and never the answer — the caller
-    already has a usable result, and turning that into an error to report a
-    lost nicety is the wrong trade.
+    A rerank failure still costs the ordering and never the answer — the
+    caller already has a usable result, and destroying it to report a lost
+    nicety is the wrong trade. WHAT CHANGED IS THAT IT IS NO LONGER SILENT.
+    The failure used to go to the log and nowhere else, and a page in recency
+    order is indistinguishable from a page in reranked order, so the caller
+    waited ~47 s for an ordering, did not get it, and was not told. That is
+    the same shape as an ingest that stops and looks like an ingest with
+    nothing to do: degrading is fine, degrading invisibly is not.
     """
-    if not rerank or not items or not query:
-        return items
+    if not rerank:
+        return items, False, None
+    if not query:
+        # Nothing to score documents against. Reported rather than assumed
+        # obvious: a caller that filtered by source and asked for relevance
+        # ordering got recency, and an ``applied`` flag that said True here
+        # would be worse than no flag at all.
+        return items, False, (
+            "rerank did NOT apply: this query has no free text, so there is "
+            "nothing to score documents against. Results are in the default "
+            "recency order."
+        )
+    if not items:
+        return items, False, None
     window = items[:_RERANK_WINDOW]
     try:
         scores = _get_reranker().score(query, [_rerank_doc(it) for it in window])
-    except Exception:  # noqa: BLE001 — rerank degrades to the fused order
+    except Exception as e:  # noqa: BLE001 — rerank degrades to the fused order
         log.exception("rerank failed; returning the page in its original order")
-        return items
+        return items, False, (
+            f"rerank did NOT apply: the cross-encoder failed while scoring "
+            f"this page ({type(e).__name__}: {e}). These rows are in the "
+            f"fused/recency order — which is exactly what rerank=True asked "
+            f"to replace — so treat their ORDER as unranked. The rows "
+            f"themselves are unaffected: reranking never changes which "
+            f"results you get. Run `aggregator embed --seed-models` if the "
+            f"cross-encoder's weights are missing."
+        )
     order = sorted(
         range(len(window)), key=lambda i: scores[i], reverse=True
     )
-    return [window[i] for i in order] + items[_RERANK_WINDOW:]
+    return [window[i] for i in order] + items[_RERANK_WINDOW:], True, None
+
+
+def _note_rerank(
+    result: dict[str, Any], rerank: bool, applied: bool, notice: str | None
+) -> dict[str, Any]:
+    """Put the rerank outcome in the response, where the caller will see it.
+
+    ``rerank_applied`` appears only when the caller asked for reranking — it
+    is the answer to a question nobody else posed — and it is the machine-
+    readable half. ``notice`` is the human-readable half and leads, because a
+    degradation the reader has to scroll for is one they will miss.
+    """
+    if not rerank:
+        return result
+    result["rerank_applied"] = applied
+    if notice:
+        prior = result.get("notice")
+        result["notice"] = f"{notice} {prior}" if prior else notice
+    return result
 
 
 # --- pagination -------------------------------------------------------------
@@ -1039,8 +1087,16 @@ def aggregator_query(
 
     Returns:
       Success: ``{ok: True, records: [...], total: int, mode: str, notice?,
-      next_page_token?}``. ``mode`` is ``sessions``, ``observations`` or
-      ``records`` so the caller knows which shape to expect.
+      next_page_token?, rerank_applied?}``. ``mode`` is ``sessions``,
+      ``observations`` or ``records`` so the caller knows which shape to
+      expect.
+
+      ``rerank_applied`` appears only when ``rerank=True`` was requested, and
+      is ``False`` when the ordering you received is NOT reranked — the model
+      failed, or the query had no free text to score against. ``notice`` then
+      says which. Reranking degrades to the recency ordering rather than
+      failing the call, so this flag is the only way to tell the two apart:
+      the rows are identical either way.
 
       Failure: ``{ok: False, reason: str, remediation: str}``.
     """
@@ -1236,7 +1292,7 @@ def _query_records_path(
     has_more = len(page_plus_one) > page_size
     page_records = page_plus_one[:page_size]
     items = [_record_to_item(_scrub_record(r), fields) for r in page_records]
-    items = _maybe_rerank(items, query_text, rerank)
+    items, rr_applied, rr_notice = _maybe_rerank(items, query_text, rerank)
     result: dict[str, Any] = {
         "ok": True,
         "mode": "records",
@@ -1252,7 +1308,7 @@ def _query_records_path(
             "Content bodies omitted (fields='summary'). "
             "Re-call with fields=full to include record bodies."
         )
-    return result
+    return _note_rerank(result, rerank, rr_applied, rr_notice)
 
 
 def _query_sessions_path(
@@ -1293,7 +1349,7 @@ def _query_sessions_path(
         has_more = len(page_plus_one) > page_size
         page_obs = page_plus_one[:page_size]
         items = [_observation_to_item(o, fields) for o in page_obs]
-        items = _maybe_rerank(items, query_text, rerank)
+        items, rr_applied, rr_notice = _maybe_rerank(items, query_text, rerank)
         result: dict[str, Any] = {
             "ok": True,
             "mode": "observations",
@@ -1309,7 +1365,7 @@ def _query_sessions_path(
                 "Observation bodies omitted (fields='summary'). "
                 "Re-call with fields=full to include observation bodies."
             )
-        return result
+        return _note_rerank(result, rerank, rr_applied, rr_notice)
 
     try:
         page_plus_one = store.query_sessions(
@@ -1344,7 +1400,7 @@ def _query_sessions_path(
         session_scoped = _count_scope_for(ast, s)
         match_count = store.count_observations(session_scoped)
         items.append(_session_to_item(s, fields, subject, match_count, subject))
-    items = _maybe_rerank(items, query_text, rerank)
+    items, rr_applied, rr_notice = _maybe_rerank(items, query_text, rerank)
     result = {
         "ok": True,
         "mode": "sessions",
@@ -1361,7 +1417,7 @@ def _query_sessions_path(
             "Re-call with fields=full to include the first-user-prompt body, "
             "or with drilldown=True to fetch matching observation rows."
         )
-    return result
+    return _note_rerank(result, rerank, rr_applied, rr_notice)
 
 
 def _query_union_path(
@@ -1503,7 +1559,7 @@ def _query_union_path(
             items.append(
                 _session_to_item(obj, fields, subject, match_count, subject)
             )
-    items = _maybe_rerank(items, query_text, rerank)
+    items, rr_applied, rr_notice = _maybe_rerank(items, query_text, rerank)
 
     result: dict[str, Any] = {
         "ok": True,
@@ -1522,7 +1578,7 @@ def _query_union_path(
             "include bodies, or add source:github / source:sessions to "
             "target a single ontology."
         )
-    return result
+    return _note_rerank(result, rerank, rr_applied, rr_notice)
 
 
 # Type alias for readability in the sort key below.

@@ -178,6 +178,88 @@ def test_the_scored_document_carries_the_body_in_full_mode(store, reranker):
         assert doc.partition("\n\n")[2].strip(), f"still bodiless: {doc!r}"
 
 
+# --- M9: a rerank that did not happen must not look like one that did ------
+
+
+class ExplodingReranker:
+    def score(self, query, docs):
+        raise RuntimeError("cross-encoder died mid-page")
+
+
+def test_a_rerank_failure_is_reported_not_swallowed(store, monkeypatch):
+    """THE REPRO. ``_maybe_rerank`` logged and returned the fused order, and
+    the response was indistinguishable from a successful rerank. The caller
+    waited for an ordering, got recency, and was told nothing."""
+    monkeypatch.setattr(mcp, "_get_reranker", ExplodingReranker)
+    result = mcp.aggregator_query(
+        "source:github voting", fields="full", rerank=True, _store=store
+    )
+    assert result["ok"] is True
+    assert result["rerank_applied"] is False
+    assert "rerank" in result["notice"].lower()
+    assert "RuntimeError" in result["notice"]
+
+
+def test_the_rows_survive_a_rerank_failure(store, monkeypatch):
+    """Loud, but not destructive: losing the ordering must not lose the
+    answer the caller already paid for."""
+    monkeypatch.setattr(mcp, "_get_reranker", ExplodingReranker)
+    result = mcp.aggregator_query(
+        "source:github voting", fields="full", rerank=True, _store=store
+    )
+    assert len(result["records"]) == 3
+
+
+def test_a_successful_rerank_says_so(store, reranker):
+    result = mcp.aggregator_query(
+        "source:github voting", fields="full", rerank=True, _store=store
+    )
+    assert result["rerank_applied"] is True
+
+
+def test_a_query_with_no_free_text_reports_that_rerank_did_not_apply(
+    store, reranker
+):
+    """Same swallow, other cause: with nothing to score documents against the
+    cross-encoder cannot run, and that was silent too. A ``rerank_applied``
+    key that lied here would be worse than no key at all."""
+    result = mcp.aggregator_query(
+        "source:github", fields="full", rerank=True, _store=store
+    )
+    assert result["ok"] is True
+    assert result["rerank_applied"] is False
+    assert "free text" in result["notice"]
+    assert reranker.calls == 0
+
+
+def test_a_plain_query_carries_no_rerank_key(store, reranker):
+    """The key is an answer to a question only a rerank caller asked."""
+    result = mcp.aggregator_query(
+        "source:github voting", fields="full", _store=store
+    )
+    assert "rerank_applied" not in result
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dsl": "source:github voting"},
+        {"dsl": "source:sessions voting"},
+        {"dsl": "source:sessions voting", "drilldown": True},
+        {"dsl": "voting"},
+    ],
+    ids=["records", "sessions", "observations", "union"],
+)
+def test_every_route_reports_a_rerank_failure(kwargs, store, monkeypatch):
+    """Four paths call ``_maybe_rerank``; all four must report."""
+    monkeypatch.setattr(mcp, "_get_reranker", ExplodingReranker)
+    result = mcp.aggregator_query(
+        fields="full", rerank=True, _store=store, **kwargs
+    )
+    assert result["ok"] is True
+    assert result["rerank_applied"] is False, kwargs
+
+
 def test_summary_mode_without_rerank_is_untouched(store, reranker):
     """The default call is the common one and must not have moved."""
     result = mcp.aggregator_query("voting", _store=store)
