@@ -23,6 +23,34 @@ Security invariants (spec §Security):
 4. **Structured errors only.** DSL parse errors, FTS5 syntax errors, and any
    unexpected exception become ``{ok: false, reason, remediation}``.
 
+KNOWN, ACCEPTED EXPOSURE — ``rerank=True`` RUNS TORCH IN THIS PROCESS.
+
+Written down rather than fixed, because the fix that suggests itself does not
+exist. ``_get_reranker().score`` runs a native tokenizer and torch, in-process,
+over corpus text. This process is registered bare — ``claude mcp add
+aggregator <store-path>/bin/aggregator-mcp``, a stdio child of the editor. It
+has no systemd unit, therefore none of the hardening the embed worker gets for
+doing the identical work on the identical data: no ``NoNewPrivileges``, no
+``ProtectSystem``, no ``RestrictAddressFamilies``, no ``MemoryMax``.
+
+An in-process MCP server cannot sandbox itself, so the asymmetry is not
+closeable from here. What bounds it:
+
+* The input is the user's OWN already-ingested corpus, at the same trust level
+  as the text the FTS5 path already handles. Nothing reaches the tokenizer
+  that did not already reach SQLite.
+* It is opt-in twice over — ``rerank=True`` AND ``fields='full'`` — so the
+  default query never constructs the model or imports torch at all. That is
+  also why the import sits inside ``_get_reranker``.
+* The MCP path never sets ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD``, so the model
+  loads ``local_files_only``. A query cannot fetch code or weights from the
+  network into this process.
+
+What is NOT bounded, and is the sharper end of this in practice: the model is
+~2 GB RSS and there is no ``MemoryMax`` on the editor's process. Availability,
+not code execution, is the realistic failure — the same shape as the page-token
+decompression bomb fixed above, arrived at legitimately.
+
 Routing: two ontologies, one DSL surface.
 
 * ``records`` + ``records_fts`` — row-per-unit-of-work sources (GitHub PRs +
@@ -296,6 +324,12 @@ def _get_reranker() -> object:
 
     Costs roughly 2 GB RSS, so a caller who never opts in must not pay even
     the import. Same discipline and same guard as ``_get_embedder``.
+
+    THIS IS THE ONE PLACE THAT PUTS TORCH IN AN UNSANDBOXED PROCESS. See
+    "KNOWN, ACCEPTED EXPOSURE" in the module docstring for what that means and
+    why it is not closeable from inside an in-process MCP server. Keeping the
+    construction to this single function is what makes the exposure one
+    documented point rather than a property of the file.
     """
     global _reranker
     if _reranker is None:
