@@ -41,6 +41,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 # The one path this script exists to protect. Resolved, not compared as text,
 # so a symlink or a ``..`` cannot walk around it.
 LIVE_DATA_DIR = Path.home() / ".local" / "share" / "aggregator"
@@ -830,6 +832,397 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# distances — the evidence the KNN floor decision rests on
+# --------------------------------------------------------------------------
+
+
+def _pct(xs: list[float], p: float) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    i = min(len(s) - 1, max(0, int(round(p / 100 * (len(s) - 1)))))
+    return round(s[i], 4)
+
+
+def _summary(xs: list[float]) -> dict[str, Any]:
+    return {
+        "n": len(xs),
+        "min": round(min(xs), 4) if xs else None,
+        "p1": _pct(xs, 1),
+        "p5": _pct(xs, 5),
+        "p25": _pct(xs, 25),
+        "p50": _pct(xs, 50),
+        "p75": _pct(xs, 75),
+        "p95": _pct(xs, 95),
+        "max": round(max(xs), 4) if xs else None,
+        "mean": round(sum(xs) / len(xs), 4) if xs else None,
+    }
+
+
+def _load_vectors(db: Path) -> dict[str, dict[str, np.ndarray]]:
+    """Every stored vector, keyed by chunk id, per ontology.
+
+    Read wholesale into numpy rather than asked for one KNN at a time: the
+    smoke index is a few thousand chunks, and having the raw matrix makes it
+    possible to compute the distance from a query to a SPECIFIC document —
+    which ``MATCH ... ORDER BY distance`` cannot do, since it only ever
+    answers "what is nearest".
+    """
+    import sqlite_vec
+
+    conn = sqlite3.connect(str(db))
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    out: dict[str, dict[str, np.ndarray]] = {}
+    for kind, table, idcol in (
+        ("observations", "vec_observations", "obs_id"),
+        ("records", "vec_records", "stable_id"),
+    ):
+        out[kind] = {
+            r[0]: np.frombuffer(r[1], dtype=np.float32)
+            for r in conn.execute(f"SELECT {idcol}, embedding FROM {table}")  # noqa: S608
+        }
+    conn.close()
+    return out
+
+
+def _base_id(chunk_id: str, known: set[str]) -> str:
+    """Map a ``<id>:<n>`` chunk id back to its document id when unambiguous."""
+    if chunk_id in known:
+        return chunk_id
+    base, sep, tail = chunk_id.rpartition(":")
+    if sep and base and tail.isdigit() and base in known:
+        return base
+    return chunk_id
+
+
+def cmd_distances(args: argparse.Namespace) -> int:
+    """Cosine-distance distributions for relevant vs irrelevant pairs.
+
+    THE LABELLING SCHEME, stated plainly because the whole floor decision
+    inherits its biases:
+
+    * **positives** = the BM25 top-K documents for a real query. A document
+      that lexically answers the query is relevant by construction. This
+      under-counts semantic-only matches, so the positive distribution
+      measured here is if anything WIDER (worse) than the true one.
+    * **negatives** = the background sample, crossed with every query. A
+      randomly drawn document is irrelevant to a given query with
+      probability ~1; the handful of accidental hits shift the negative
+      distribution toward zero, which again is the conservative direction.
+    * **no-answer** = ten queries on subjects verified absent from this
+      corpus (0 FTS5 hits, checked, not assumed). Their NEAREST neighbour
+      distance is the number that matters: it is exactly what a floorless
+      KNN would serve as an answer to a question with no answer.
+
+    Distance is cosine (``1 - cos_sim``) on the L2-normalised vectors the
+    embedder emits. sqlite-vec's ``vec0`` default metric is L2, and on unit
+    vectors ``l2^2 == 2 * cosine``, so the two orderings are identical and a
+    threshold in either converts exactly. Both are reported.
+    """
+    db = bind_scratch_env(Path(args.scratch_root))
+    assert_not_live(db, "distance target")
+    root = Path(args.scratch_root)
+    from aggregator.core.embed import Embedder
+
+    pool = json.loads((root / "pool.json").read_text())
+    vecs = _load_vectors(db)
+    if not vecs["observations"] and not vecs["records"]:
+        print("ERROR: vector index is empty; run `embed` first", file=sys.stderr)
+        return 1
+
+    doc_ids = {k: {v for v in vs} for k, vs in vecs.items()}
+    by_doc: dict[str, dict[str, list[np.ndarray]]] = {"observations": {}, "records": {}}
+    for kind, vs in vecs.items():
+        known = doc_ids[kind]
+        for cid, vec in vs.items():
+            by_doc[kind].setdefault(_base_id(cid, known), []).append(vec)
+
+    embedder = Embedder()
+    queries = pool["queries"]
+    no_answer = pool["no_answer"]
+    qvecs = {q: embedder.embed_query(q) for q in queries}
+    qvecs.update({q: embedder.embed_query(q) for q in no_answer})
+
+    bg = {
+        "observations": set(pool["background_obs"]),
+        "records": set(pool["background_rec"]),
+    }
+
+    def dist_to(qv: np.ndarray, kind: str, doc: str) -> float | None:
+        chunks = by_doc[kind].get(doc)
+        if not chunks:
+            return None
+        return float(min(1.0 - float(qv @ c) for c in chunks))
+
+    positives: list[float] = []
+    negatives: list[float] = []
+    per_query_best_neg: list[float] = []
+    per_query: dict[str, Any] = {}
+
+    for q in queries:
+        qv = qvecs[q]
+        pos = [
+            d
+            for kind in ("observations", "records")
+            for doc in pool["per_query"][q]["obs" if kind == "observations" else "rec"][
+                : args.top_k
+            ]
+            if (d := dist_to(qv, kind, doc)) is not None
+        ]
+        neg = [
+            d
+            for kind in ("observations", "records")
+            for doc in bg[kind]
+            if (d := dist_to(qv, kind, doc)) is not None
+        ]
+        positives.extend(pos)
+        negatives.extend(neg)
+        if neg:
+            per_query_best_neg.append(min(neg))
+        per_query[q] = {
+            "n_pos": len(pos),
+            "best_pos": round(min(pos), 4) if pos else None,
+            "best_neg": round(min(neg), 4) if neg else None,
+            "fts_error": bool(pool["per_query"][q]["error"]),
+        }
+
+    # No-answer queries: nearest neighbour over the WHOLE index, which is
+    # exactly what a floorless vector arm hands back for a question the
+    # corpus cannot answer.
+    matrix = np.stack(
+        [v for kind in ("observations", "records") for v in vecs[kind].values()]
+    )
+
+    def nearest(qv: np.ndarray) -> float:
+        return float(1.0 - (matrix @ qv).max())
+
+    no_answer_nearest = {q: round(nearest(qvecs[q]), 4) for q in no_answer}
+    real_query_nearest = {q: round(nearest(qvecs[q]), 4) for q in queries}
+
+    report = {
+        "index": {
+            "obs_chunks": len(vecs["observations"]),
+            "rec_chunks": len(vecs["records"]),
+            "obs_docs": len(by_doc["observations"]),
+            "rec_docs": len(by_doc["records"]),
+        },
+        "cosine_distance": {
+            "positives_relevant": _summary(positives),
+            "negatives_random": _summary(negatives),
+            "per_query_nearest_negative": _summary(per_query_best_neg),
+            "no_answer_nearest_neighbour": _summary(list(no_answer_nearest.values())),
+            "real_query_nearest_neighbour": _summary(
+                list(real_query_nearest.values())
+            ),
+        },
+        "no_answer_nearest_by_query": no_answer_nearest,
+        "real_query_nearest_by_query": real_query_nearest,
+        "per_query": per_query,
+    }
+    (root / "distances.json").write_text(json.dumps(report, indent=2))
+    printable = dict(report)
+    printable.pop("per_query")
+    print(json.dumps(printable, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# measure — hybrid vs FTS5-only on the real query log
+# --------------------------------------------------------------------------
+
+
+def cmd_measure(args: argparse.Namespace) -> int:
+    """Compare the two arms on every real query, through the production code.
+
+    Uses ``mcp._fused_id_scope`` and ``Store._fts_obs_ids`` rather than
+    reimplementing fusion, so what is measured is what ships. Emits an
+    aggregate report plus ``labelling.md`` — the top vector-only hits per
+    query, with snippets, for a human to judge. Automated relevance proxies
+    are not trusted here: the reranker is a Qwen3 sibling of the embedder and
+    would mostly agree with it for the wrong reasons.
+    """
+    db = bind_scratch_env(Path(args.scratch_root))
+    assert_not_live(db, "measure target")
+    root = Path(args.scratch_root)
+
+    from aggregator.core.embed import Embedder
+    from aggregator.core.store import Store
+    from aggregator.mcp import _fused_id_scope, _widen_chunk_ids
+
+    pool = json.loads((root / "pool.json").read_text())
+    store = Store(db_path=db, read_only=True)
+    embedder = Embedder()
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+
+    def snippet(kind: str, doc: str) -> str:
+        if kind == "observations":
+            r = conn.execute(
+                "SELECT type, body FROM observations WHERE obs_id = ?", (doc,)
+            ).fetchone()
+            return f"[{r['type']}] {(r['body'] or '')[:200]}" if r else "<missing>"
+        r = conn.execute(
+            "SELECT source, subject, body FROM records WHERE stable_id = ?", (doc,)
+        ).fetchone()
+        return (
+            f"[{r['source']}] {r['subject']}: {(r['body'] or '')[:200]}"
+            if r
+            else "<missing>"
+        )
+
+    rows: list[dict[str, Any]] = []
+    lab: list[str] = ["# Vector-only hits to judge\n"]
+    for group, qs in (("real", pool["queries"]), ("no_answer", list(pool["no_answer"]))):
+        for q in qs:
+            qv = embedder.embed_query(q)
+            fts_err = None
+            try:
+                fts = set(store._fts_obs_ids(q)) | set(store._fts_ids(q))
+            except sqlite3.OperationalError as e:
+                fts, fts_err = set(), str(e)
+            vec_obs = store._vec_obs_ids(qv, 50)
+            vec_rec = store._vec_record_ids(qv, 50)
+            vec_raw = [("observations", i) for i in vec_obs] + [
+                ("records", i) for i in vec_rec
+            ]
+            vec = set(_widen_chunk_ids(vec_obs + vec_rec))
+            scope_o = _fused_id_scope(store, "observations", q, qv) or frozenset()
+            scope_r = _fused_id_scope(store, "records", q, qv) or frozenset()
+            hybrid = set(scope_o) | set(scope_r)
+            extra = vec - fts
+            rows.append(
+                {
+                    "group": group,
+                    "query": q,
+                    "fts_error": fts_err,
+                    "n_fts": len(fts),
+                    "n_vec": len(vec_raw),
+                    "n_hybrid": len(hybrid),
+                    "n_vector_only": len(extra),
+                }
+            )
+            if group == "no_answer" or fts_err or args.label_all:
+                lab.append(f"\n## [{group}] {q}")
+                lab.append(
+                    f"FTS5: {'ERROR ' + fts_err if fts_err else str(len(fts)) + ' hits'}"
+                    f" | vector: {len(vec_raw)} hits\n"
+                )
+                for kind, cid in vec_raw[: args.label_top]:
+                    base = cid
+                    b, sep, tail = cid.rpartition(":")
+                    if sep and tail.isdigit():
+                        base = b
+                    txt = snippet(kind, base)
+                    if txt == "<missing>":
+                        txt = snippet(kind, cid)
+                    lab.append(f"- `{base}` — {txt}".replace("\n", " ")[:400])
+    conn.close()
+
+    def agg(pred) -> dict[str, Any]:
+        sel = [r for r in rows if pred(r)]
+        return {
+            "queries": len(sel),
+            "median_fts_hits": _pct([r["n_fts"] for r in sel], 50),
+            "median_vector_hits": _pct([r["n_vec"] for r in sel], 50),
+            "median_vector_only": _pct([r["n_vector_only"] for r in sel], 50),
+            "queries_where_vector_added_nothing": sum(
+                1 for r in sel if r["n_vector_only"] == 0
+            ),
+        }
+
+    report = {
+        "real_queries_total": sum(1 for r in rows if r["group"] == "real"),
+        "fts5_syntax_errors": sum(
+            1 for r in rows if r["group"] == "real" and r["fts_error"]
+        ),
+        "fts5_zero_hits_no_error": sum(
+            1
+            for r in rows
+            if r["group"] == "real" and not r["fts_error"] and r["n_fts"] == 0
+        ),
+        "by_bucket": {
+            "real_fts_ok": agg(
+                lambda r: r["group"] == "real" and not r["fts_error"]
+            ),
+            "real_fts_syntax_error": agg(
+                lambda r: r["group"] == "real" and r["fts_error"]
+            ),
+            "no_answer": agg(lambda r: r["group"] == "no_answer"),
+        },
+        "per_query": rows,
+    }
+    (root / "measure.json").write_text(json.dumps(report, indent=2))
+    (root / "labelling.md").write_text("\n".join(lab))
+    printable = {k: v for k, v in report.items() if k != "per_query"}
+    print(json.dumps(printable, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# latency
+# --------------------------------------------------------------------------
+
+# vec0's ``distance`` column is plain L2, and the embedder emits unit
+# vectors, so cosine distance and L2 are related by ``cos = l2**2 / 2``.
+# Verified empirically against numpy on this corpus, not assumed from docs.
+def cos_to_l2(cos_distance: float) -> float:
+    return float((2.0 * cos_distance) ** 0.5)
+
+
+def cmd_latency(args: argparse.Namespace) -> int:
+    """End-to-end ``aggregator_search_memory`` latency, cold and warm.
+
+    COLD is measured by this process being fresh: the first call pays the
+    embedder construction and the first page-ins of the vec table. Run the
+    subcommand again for a second cold sample; do not try to "reset" warmth
+    in-process, because the thing that makes it warm (an imported torch, a
+    loaded model, a hot page cache) cannot be honestly undone from inside.
+    """
+    db = bind_scratch_env(Path(args.scratch_root))
+    assert_not_live(db, "latency target")
+    root = Path(args.scratch_root)
+    from aggregator import mcp as mcpmod
+
+    pool = json.loads((root / "pool.json").read_text())
+    qs = [q for q in pool["queries"] if not pool["per_query"][q]["error"]][
+        : args.queries
+    ]
+    from aggregator.core.store import Store
+
+    store = Store(db_path=db, read_only=True)
+
+    def run(q: str, rerank: bool) -> float:
+        t0 = time.monotonic()
+        mcpmod.aggregator_query(q, rerank=rerank, _store=store)
+        return time.monotonic() - t0
+
+    out: dict[str, Any] = {}
+    cold = run(qs[0], False)
+    warm = [run(q, False) for q in qs]
+    out["cold_first_query_seconds"] = round(cold, 3)
+    out["warm_seconds"] = {
+        "n": len(warm),
+        "p50": _pct(warm, 50),
+        "p95": _pct(warm, 95),
+        "max": round(max(warm), 3),
+    }
+    if args.rerank:
+        cold_r = run(qs[0], True)
+        warm_r = [run(q, True) for q in qs[: args.rerank_queries]]
+        out["rerank_cold_seconds"] = round(cold_r, 3)
+        out["rerank_warm_seconds"] = {
+            "n": len(warm_r),
+            "p50": _pct(warm_r, 50),
+            "p95": _pct(warm_r, 95),
+            "max": round(max(warm_r), 3),
+        }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -905,6 +1298,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=lambda s: tuple(int(x) for x in s.split(",")),
     )
     b.set_defaults(func=cmd_bench)
+
+    di = sub.add_parser(
+        "distances", parents=[common], help="cosine distance distributions"
+    )
+    di.add_argument("--top-k", type=int, default=5)
+    di.set_defaults(func=cmd_distances)
+
+    me = sub.add_parser("measure", parents=[common], help="hybrid vs FTS5-only")
+    me.add_argument("--label-top", type=int, default=5)
+    me.add_argument("--label-all", action="store_true")
+    me.set_defaults(func=cmd_measure)
+
+    la = sub.add_parser("latency", parents=[common], help="query latency cold/warm")
+    la.add_argument("--queries", type=int, default=20)
+    la.add_argument("--rerank", action="store_true")
+    la.add_argument("--rerank-queries", type=int, default=5)
+    la.set_defaults(func=cmd_latency)
 
     return p
 
