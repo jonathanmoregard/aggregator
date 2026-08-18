@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from aggregator.core.chunk import chunk_body
-from aggregator.core.embed import Embedder
+from aggregator.core.embed import MODEL_DOWNLOAD_ENV, Embedder
 from aggregator.core.store import (
     EmptyRebuildRefusedError,
     Store,
@@ -81,6 +81,16 @@ from aggregator.imports.runner import (
 )
 from aggregator.imports.store_sink import StoreSink, count_writes
 from aggregator.imports.sync_bridge import accepts_errors_kwarg, unwired_sink_note
+
+# ``_get_reranker`` is the MCP server's LAZY SINGLETON, borrowed rather than
+# re-implemented. The CLI needs the cross-encoder built BEFORE the query runs,
+# so that a load failure is a refusal instead of a silently unranked page —
+# and the query itself asks for the same object a moment later. Constructing a
+# second one here would cost ~2 GB RSS and a second model load to answer one
+# question.
+from aggregator.mcp import (
+    _get_reranker as _mcp_get_reranker,
+)
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
@@ -299,7 +309,46 @@ def _default_sources() -> dict[str, Any]:
     return {name: _build_source(name, factory) for name, factory in factories}
 
 
+#: The ONE command that is allowed to fetch model weights, spelled exactly as
+#: a human would type it. Every message that needs somebody to go and get
+#: weights names this, so "what do I run?" is never left as an exercise.
+SEED_MODELS_COMMAND = f"{MODEL_DOWNLOAD_ENV}=1 aggregator embed --seed-models"
+
+
+def _reranker_load_failure(error: BaseException) -> str:
+    """What to print when ``--rerank`` cannot have the model it asked for."""
+    return (
+        f"ERROR: --rerank could not load the cross-encoder "
+        f"({type(error).__name__}: {error}).\n"
+        f"No results were printed: without the reranker this command returns "
+        f"the fused/recency order, which is exactly what --rerank was asked "
+        f"to replace, and a page that silently is not ranked is worse than "
+        f"no page.\n"
+        f"If the weights are simply not on this machine yet, fetch them once "
+        f"with `{SEED_MODELS_COMMAND}` (needs network); otherwise re-run "
+        f"without --rerank."
+    )
+
+
 def _cmd_query(args: argparse.Namespace, store: Store) -> int:
+    if args.rerank:
+        # BEFORE THE QUERY, and loudly. ``_maybe_rerank`` catches a rerank
+        # failure and returns the page in its fused order — right for the MCP
+        # tool, where a lost ordering must not cost the caller their answer,
+        # and wrong here, where the ordering IS what was asked for. Loading up
+        # front turns "quietly unranked" into a refusal that names its fix,
+        # and the object lands in the singleton the query then reuses.
+        try:
+            _mcp_get_reranker()
+        except Exception as e:  # noqa: BLE001 - reported, not handled
+            print(_reranker_load_failure(e), file=sys.stderr)
+            return 1
+        print(
+            "note: --rerank scores every hit with a cross-encoder; measured "
+            "at 47 s median per query on CPU, plus a one-off model load. "
+            "This is a batch facility.",
+            file=sys.stderr,
+        )
     result = _mcp_query(
         dsl=args.dsl,
         fields=args.fields,
@@ -310,6 +359,7 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         # here and the only evidence of that was an argparse usage error.
         page_token=args.page_token,
         drilldown=args.drilldown,
+        rerank=args.rerank,
         _store=store,
     )
     if args.json:
@@ -2060,6 +2110,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "for session-shaped queries, return observation rows for the "
             "matching sessions (default: session-level hit list only)"
+        ),
+    )
+    q.add_argument(
+        "--rerank",
+        action="store_true",
+        help=(
+            "re-order the head of the page by cross-encoder relevance instead "
+            "of recency. SLOW — 47 s median per query on this CPU against "
+            "0.65 s without, plus a one-off model load; this command is the "
+            "batch surface that cost is documented for. Refuses out loud if "
+            "the weights cannot be loaded rather than returning an unranked "
+            "page"
         ),
     )
 
