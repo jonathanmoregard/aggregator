@@ -46,6 +46,32 @@ _DEFAULT_MODEL_GGUF = "Qwen/Qwen3-Embedding-0.6B-GGUF"
 QWEN3_EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 
 
+#: The ONE opt-in that lets a model load reach the network.
+MODEL_DOWNLOAD_ENV = "AGGREGATOR_ALLOW_MODEL_DOWNLOAD"
+
+
+def downloads_allowed() -> bool:
+    """Whether this process may fetch model weights from the hub.
+
+    FAIL CLOSED, BECAUSE THE HARDENED PATH WAS THE ONLY HARDENED PATH.
+    ``HF_HUB_OFFLINE=1`` is set on the timer-driven embed unit and nowhere
+    else; the MCP server is registered bare. So the first ``rerank=True``, or
+    the first text query once the index is warm, would have resolved the hub
+    and pulled GB-scale weights inside the editor's MCP process — from a tool
+    whose annotations declare ``openWorldHint=False``.
+
+    An env var cannot fix that from inside this package:
+    ``huggingface_hub`` reads ``HF_HUB_OFFLINE`` into a module constant at
+    import time, and it is already imported before ``aggregator.mcp`` finishes
+    loading (``core.scrub`` → spaCy → thinc → transformers). Hence an explicit
+    per-call ``local_files_only``, which no import order can defeat.
+
+    ``aggregator-embed-seed.service`` — human-triggered, never on a timer — is
+    the single place in the deployment that sets this.
+    """
+    return os.environ.get(MODEL_DOWNLOAD_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
 def configured_model_id() -> str:
     """Which model ``Embedder()`` would load right now, without loading it.
 
@@ -87,6 +113,7 @@ class Embedder:
                 revision=(
                     QWEN3_EMBEDDING_REVISION if self.model_name is None else None
                 ),
+                local_files_only=not downloads_allowed(),
             )
         elif self.backend == "gguf":
             try:

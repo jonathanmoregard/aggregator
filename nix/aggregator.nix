@@ -175,6 +175,16 @@ let
       echo "aggregator-embed-seed: downloading ${embedModelRepo} (~1.2 GB) into $hf_home. This is a one-time cost."
     fi
 
+    # THE ONLY OPT-IN IN THIS MODULE. The Python loaders pass
+    # `local_files_only=True` unless this is set, so every other caller — the
+    # timer, the MCP server, an ad-hoc CLI run — refuses to fetch weights
+    # rather than pulling 1.2 GB from wherever it happens to be running.
+    # HF_HUB_OFFLINE cannot express that on its own: huggingface_hub reads it
+    # into a constant at import time, and the MCP server has already imported
+    # it (via the scrubber's spaCy probe) before any aggregator code could set
+    # it. This unit is human-triggered and never timer-driven, which is
+    # exactly the property that makes the download consented to.
+    export AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1
     exec ${aggregatorBin} embed --once --source observations --batch-size 1
   '';
 

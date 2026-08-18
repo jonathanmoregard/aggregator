@@ -29,6 +29,8 @@ class Reranker:
     def __init__(self, model_name: str | None = None):
         from sentence_transformers import CrossEncoder
 
+        from aggregator.core.embed import downloads_allowed
+
         pinned = model_name is None
         self.model_name = model_name or _DEFAULT_MODEL
         # NO ``trust_remote_code``. This constructor runs lazily inside the MCP
@@ -47,6 +49,11 @@ class Reranker:
             # No revision for a caller-supplied model: the pin was taken from
             # the default repository and vouches for nothing else.
             revision=QWEN3_RERANKER_REVISION if pinned else None,
+            # OFFLINE UNLESS EXPLICITLY ALLOWED. This constructor runs inside
+            # the MCP server on ``rerank=True``, so without it one query could
+            # start a GB-scale download in the editor's process. See
+            # ``embed.downloads_allowed``.
+            local_files_only=not downloads_allowed(),
         )
 
     def score(self, query: str, docs: list[str]) -> np.ndarray:
