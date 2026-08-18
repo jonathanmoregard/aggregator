@@ -1926,12 +1926,18 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--catchup",
         action="store_true",
-        help="embed every unembedded row, then exit",
+        help=(
+            "embed every unembedded row, then exit — this is what the systemd "
+            "timer runs (with --source both)"
+        ),
     )
     mode.add_argument(
         "--once",
         action="store_true",
-        help="embed one batch and exit (what the systemd timer runs)",
+        help=(
+            "embed a single batch and exit; used by the human-triggered seed "
+            "unit as a live check, not by the timer"
+        ),
     )
     p_embed.add_argument(
         "--source",

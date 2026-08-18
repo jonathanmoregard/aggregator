@@ -296,3 +296,25 @@ def test_the_batch_size_default_is_unchanged():
     from aggregator.cli import build_parser
 
     assert build_parser().parse_args(["embed", "--catchup"]).batch_size == 500
+
+
+def test_the_mode_help_does_not_misdescribe_what_the_timer_runs():
+    """``--once`` claimed to be "what the systemd timer runs". It is not.
+
+    ``nix/aggregator.nix`` runs ``embed --catchup --source both``; ``--once``
+    appears only in the human-triggered seed unit. An operator reading the
+    help would reach for the wrong flag when reproducing a timer run by hand,
+    and ``--once`` does a single batch — against a 25-30 day backfill that
+    looks like a worker that has stopped making progress.
+    """
+    from aggregator.cli import build_parser
+
+    actions = {
+        a.dest: (a.help or "")
+        for p in build_parser()._subparsers._group_actions
+        for name, sub in p.choices.items()
+        if name == "embed"
+        for a in sub._actions
+    }
+    assert "what the systemd timer runs" in actions["catchup"].lower()
+    assert "what the systemd timer runs" not in actions["once"].lower()
