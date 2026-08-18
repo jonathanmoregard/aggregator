@@ -55,7 +55,11 @@ from typing import Any
 
 from aggregator.core.chunk import chunk_body
 from aggregator.core.embed import Embedder
-from aggregator.core.store import EmptyRebuildRefusedError, Store
+from aggregator.core.store import (
+    EmptyRebuildRefusedError,
+    Store,
+    _stored_hashes,
+)
 from aggregator.imports.ingest_state import (
     POISON_MAX_ATTEMPTS,
     SOURCE_CURSORS,
@@ -1555,6 +1559,12 @@ def _report_embed_outcome(outcome: _EmbedOutcome) -> int:
         )
     if outcome.released:
         print(f"embed: {outcome.released} previously-bad row(s) embedded cleanly")
+    if outcome.superseded:
+        print(
+            f"embed: {outcome.superseded} row(s) were edited by ingest while "
+            f"being embedded; the stale vector was discarded and they stay in "
+            f"the backlog for the next run"
+        )
     return 0
 
 
@@ -1597,6 +1607,10 @@ class _EmbedOutcome:
     known_failures: int = 0
     #: Rows that used to fail and embedded cleanly this time.
     released: int = 0
+    #: Rows whose body was edited while the worker was embedding it. Their old
+    #: vector was discarded and they stay in the backlog for the next run —
+    #: self-healing, so this is a count rather than a failure.
+    superseded: int = 0
     #: A stop was requested (SIGTERM/SIGINT) and the run ended at a boundary
     #: with backlog still to do. Reported, but NOT a failure: the same event
     #: ``ingest`` prints as INTERRUPTED. A run that exited non-zero for being
@@ -1725,6 +1739,30 @@ def _blame_crashed_row(
         outcome.known_failures += 1
 
 
+#: Distinguishes "this row's fingerprint is NULL" from "this row is gone".
+#: Both read as ``None`` out of a ``dict.get``, and they mean opposite things:
+#: a NULL ``src_hash`` (a legacy row, or one a test inserted by hand) is
+#: unchanged and must still be marked, while a row that vanished mid-batch
+#: must not be marked or given a vector.
+_ROW_ABSENT = object()
+
+
+def _row_fingerprints(store: Store, kind: str, ids: list[str]) -> dict[str, Any]:
+    """``src_hash`` per id — what the worker compares against to detect a race.
+
+    READS ``store``'s OWN CHANGE DETECTOR rather than inventing a second one.
+    ``src_hash`` is recomputed by ingest over the raw source fields on every
+    write and is what already decides "this row is unchanged, skip it", so a
+    row whose body moved has a different one by construction. The alternative
+    — re-reading and comparing bodies — would double a batch's body I/O to
+    learn the same fact.
+    """
+    if not ids:
+        return {}
+    col, table = store._kind_columns(kind)
+    return _stored_hashes(store._c(), table, col, ids)
+
+
 def _embed_ledger_source(kind: str) -> str:
     """What the embed worker calls itself in the quarantine ledger.
 
@@ -1822,13 +1860,30 @@ def _embed_batch(
     thing being fixed. One row is the unit of work here and the unit the claim
     covers, so it is the boundary. Whatever embedded before the stop is
     flushed and committed below; the rest stays in the backlog.
+
+    A ROW THAT MOVED WHILE THE WORKER HELD IT IS NOT MARKED. Ingest sets
+    ``embedding_state`` back to NULL and drops a row's vectors whenever its
+    body changes — that is the only thing that ever re-embeds an edited row.
+    Interleave the two and the worker undoes it: it embeds the OLD body,
+    ingest invalidates the row, and the worker then upserts the old vector
+    back and marks the row ``'ok'``. ``select_unembedded`` only looks at NULL,
+    so nothing comes back for it until the body is edited AGAIN, and until
+    then the vector arm answers with text the row no longer contains while the
+    keyword arm (which has a trigger) answers with the text it does. So the
+    fingerprints are re-read before anything is written and only the rows that
+    did not move are given vectors and marked. The rest stay at NULL and the
+    next run embeds them from their current body.
     """
     source = _embed_ledger_source(kind)
     entries = ledger.entries(source)
+    id_key = "obs_id" if kind == "observations" else "stable_id"
+    # Read as close to ``select_unembedded`` as this function can get: what
+    # the batch looked like when the worker took it.
+    fingerprints = _row_fingerprints(store, kind, [r[id_key] for r in rows])
     ok_ids: list[str] = []
     skip_ids: list[str] = []
     error_ids: list[str] = []
-    all_vecs: list[tuple[str, Any]] = []
+    all_vecs: list[tuple[str, str, Any]] = []
     unhealthy: EmbedderUnhealthyError | None = None
     for row in rows:
         if stop is not None and stop():
@@ -1878,7 +1933,7 @@ def _embed_batch(
             continue
         for i, vec in enumerate(vecs):
             chunk_id = row_id if len(chunks) == 1 else f"{row_id}:{i}"
-            all_vecs.append((chunk_id, vec))
+            all_vecs.append((row_id, chunk_id, vec))
         ok_ids.append(row_id)
         if row_id in entries:
             # It used to fail and does not any more. A fault that no longer
@@ -1886,10 +1941,28 @@ def _embed_batch(
             # have ``aggregator status`` overstating the damage forever.
             ledger.release(source, row_id)
             outcome.released += 1
+    # THE RE-CHECK, immediately before the two writes that assert "this row is
+    # done". ``'error'`` is deliberately not filtered: it is not a claim about
+    # a row's content, and the ledger requeues it either way.
+    current = _row_fingerprints(store, kind, [*ok_ids, *skip_ids])
+
+    def _unmoved(row_id: str) -> bool:
+        return current.get(row_id, _ROW_ABSENT) == fingerprints.get(
+            row_id, _ROW_ABSENT
+        )
+
+    superseded = [i for i in (*ok_ids, *skip_ids) if not _unmoved(i)]
+    if superseded:
+        outcome.superseded += len(superseded)
+        ok_ids = [i for i in ok_ids if _unmoved(i)]
+        skip_ids = [i for i in skip_ids if _unmoved(i)]
+        moved = set(superseded)
+        all_vecs = [v for v in all_vecs if v[0] not in moved]
+    vecs_to_write = [(chunk_id, vec) for _, chunk_id, vec in all_vecs]
     if kind == "observations":
-        store.upsert_vec_observations(all_vecs)
+        store.upsert_vec_observations(vecs_to_write)
     else:
-        store.upsert_vec_records(all_vecs)
+        store.upsert_vec_records(vecs_to_write)
     store.mark_embedded(kind, ok_ids, state="ok")
     store.mark_embedded(kind, skip_ids, state="skip")
     store.mark_embedded(kind, error_ids, state="error")
