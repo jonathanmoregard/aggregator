@@ -313,6 +313,15 @@ def _fused_id_scope(
     alone so the query runs down the untouched pre-v5 path. Degrading is
     always to FTS5 and never to an error: ``VectorIndexUnavailableError`` must
     not reach the tool boundary.
+
+    RETURNS A SET, AND THE RRF RANKING IS DELIBERATELY DISCARDED — say so
+    plainly, because calling ``rrf_fuse`` and dropping its ordering looks like
+    a bug until you know why. The store orders results by recency, and that
+    ordering is what the page token addresses; re-sorting the stream by
+    relevance would change what "page 2" means and silently invalidate every
+    token already handed out. So fusion decides MEMBERSHIP — which rows are
+    candidates — and ordering stays the caller's existing contract.
+    Relevance ordering is available, opt-in and bounded, via ``rerank=True``.
     """
     try:
         vec_hits = (

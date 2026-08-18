@@ -423,6 +423,25 @@ def test_a_dead_reranker_returns_the_unreranked_page_rather_than_an_error(
     assert result["total"] == 2
 
 
+def test_rerank_on_a_filter_only_query_loads_neither_model(
+    store, embedder, monkeypatch
+):
+    """There is no query string to score a document against, so a
+    cross-encoder has nothing to do. ``rerank=True`` on a pure-filter query
+    must therefore cost nothing — not the 2 GB reranker, not the embedder."""
+    _seed_sessions(store, [("o1", "quadratic voting", 1)])
+    _embed(store, "observations", [("o1", "quadratic voting")])
+    loaded = []
+    monkeypatch.setattr(
+        "aggregator.mcp._get_reranker",
+        lambda: loaded.append(1) or StubReranker("x"),
+    )
+    result = aggregator_query("source:sessions", rerank=True, _store=store)
+    assert result["ok"] is True
+    assert loaded == []
+    assert embedder.query_calls == 0
+
+
 def test_rerank_works_on_the_records_ontology(store, embedder, monkeypatch):
     store.upsert(
         [
