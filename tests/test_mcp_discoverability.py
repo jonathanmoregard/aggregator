@@ -92,6 +92,29 @@ def test_search_description_has_use_and_dont_use_guidance():
     assert desc.count(".") >= 4, "description should be several sentences"
 
 
+def test_search_description_states_the_measured_cost_of_rerank():
+    """A parameter whose real cost is 70x its documented cost is a trap.
+
+    ``rerank=True`` was documented as "roughly 300 ms per hit", so a caller
+    reading the tool schema would reasonably set it inside an interactive
+    turn. Task M measured it against real corpus bodies at **47 s median,
+    59 s worst** per call on this CPU, versus 0.65 s for the same query
+    without it. The caller reads THIS string and nothing else before
+    deciding, so the number in it has to be the measured one.
+    """
+    desc = _tools(build_server())[SEARCH_TOOL_NAME].description or ""
+    _, _, rerank_doc = desc.partition("rerank:")
+    assert rerank_doc, "the rerank parameter is not documented at all"
+    assert "300 ms" not in rerank_doc, (
+        "the rerank docs still quote the falsified 300 ms/hit estimate"
+    )
+    assert "47 s" in rerank_doc, (
+        "the rerank docs must quote the measured per-call cost (47 s median) "
+        "so a caller can tell an interactive call from a batch one. If this "
+        "was re-measured, update the number here and at _RERANK_WINDOW."
+    )
+
+
 @pytest.mark.parametrize("source_name", KNOWN_SOURCE_NAMES)
 def test_static_strings_do_not_hardcode_sources(source_name):
     """Source lists come from the cache at build time, never from a literal.

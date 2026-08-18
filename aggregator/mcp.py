@@ -723,9 +723,20 @@ def aggregator_query(
                  rows for the matching sessions; ``False`` (default) returns
                  one card per matching session with ``matching_observations``.
       rerank: ``True`` re-orders the head of the page by cross-encoder
-              relevance instead of recency. Costs a model load on first use
-              and roughly 300 ms per hit, so pair it with a small
-              ``page_size``. Off by default.
+              relevance instead of recency. Off by default.
+
+              EXPENSIVE — DO NOT SET THIS IN AN INTERACTIVE TURN. Measured
+              against real corpus bodies on this machine (CPU, no GPU):
+              **47 s median, 59 s worst case per call**, versus 0.65 s for
+              the same query without it, plus a one-off model load on first
+              use. It is a batch/offline facility here, not an interactive
+              one.
+
+              Leaving it off costs ORDERING ONLY. The same rows come back
+              either way — reranking never changes WHICH results you get,
+              only the order of the first few — so the cheap call is the
+              right default, and this is worth paying only when the ranking
+              itself is the answer you need and you can afford to wait.
 
     Free text is answered by a hybrid retriever — keyword (FTS5) and semantic
     (vector) arms fused with RRF — whenever the vector index has been built on
