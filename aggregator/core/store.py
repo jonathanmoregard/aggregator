@@ -728,7 +728,7 @@ _VEC_DDL: list[str] = [
 ]
 
 
-def vector_provenance() -> tuple[str, int]:
+def vector_provenance(embedder: object | None = None) -> tuple[str, int]:
     """``(model id, dimension)`` the vectors in this cache are supposed to be.
 
     Imported from ``aggregator.core.embed`` LAZILY and deliberately. That
@@ -737,10 +737,25 @@ def vector_provenance() -> tuple[str, int]:
     ``store`` is imported by ``aggregator.mcp`` on every editor cold start, so
     the import may not happen at module scope. Importing the module is cheap;
     ``sentence_transformers`` lives inside ``Embedder.__init__``.
+
+    PASS THE EMBEDDER ON THE WRITE PATH. That is round 3's M2, whose embed-side
+    half landed in ``adaa28e``. ``configured_model_id()`` with no argument reads
+    ``AGGREGATOR_EMBED_BACKEND``, while ``Embedder`` resolves from its own
+    ``backend=``/``model_name=`` arguments FIRST — so an embedder constructed
+    with explicit arguments wrote vectors from one model while this stamped
+    them with another. The stamp is the input to round 1's H1, round 2's S1 and
+    round 3's H1, and all three fail in the same direction on a stamp that
+    lies: a foreign index reads as native.
+
+    THE READ PATH KEEPS THE NO-ARGUMENT FORM, deliberately. It asks whether the
+    vectors already on disk may be trusted, and it runs on every ``Store`` —
+    the read-only MCP one included — before any embedder exists. Threading an
+    embedder through it would mean loading a model to answer a question about a
+    file.
     """
     from aggregator.core.embed import configured_model_id
 
-    return configured_model_id(), _VEC_DIM
+    return configured_model_id(embedder), _VEC_DIM
 
 _VEC_DROP_ALL: list[str] = [
     "DROP TABLE IF EXISTS vec_observations;",
@@ -939,8 +954,18 @@ class Store:
 
     # -- schema -----------------------------------------------------------
 
-    def migrate(self, *, allow_vector_reindex: bool = False) -> None:
+    def migrate(
+        self, *, allow_vector_reindex: bool = False, embedder: object | None = None
+    ) -> None:
         """Create tables + FTS virtual tables + triggers. Idempotent.
+
+        ``embedder`` MAKES THE PROVENANCE STAMP TRUTHFUL. A caller that is
+        about to fill the index passes the embedder that will do it, and the
+        stamp then records what actually wrote the vectors rather than what
+        ``AGGREGATOR_EMBED_BACKEND`` implies. See :func:`vector_provenance`.
+        Left ``None`` — which is every caller that is not writing vectors —
+        the stamp and the comparison both describe what ``Embedder()`` would
+        load in this process, which is the right question for a read.
 
         ``allow_vector_reindex`` IS THE ONLY THING THAT MAY DELETE COMPUTED
         VECTORS WHOLESALE, and it defaults to refusing. It reaches exactly one
@@ -986,7 +1011,7 @@ class Store:
             # BEFORE the vec DDL: a foreign table of the wrong width survives
             # ``CREATE VIRTUAL TABLE IF NOT EXISTS`` untouched, so the check
             # that might drop it has to run first.
-            self._reconcile_vector_provenance(c, allow_vector_reindex)
+            self._reconcile_vector_provenance(c, allow_vector_reindex, embedder)
             if self._vector_quarantine is None:
                 for stmt in _VEC_DDL:
                     c.executescript(stmt)
@@ -998,7 +1023,10 @@ class Store:
         c.commit()
 
     def _reconcile_vector_provenance(
-        self, c: sqlite3.Connection, allow_reindex: bool = False
+        self,
+        c: sqlite3.Connection,
+        allow_reindex: bool = False,
+        embedder: object | None = None,
     ) -> None:
         """Adopt the vector index only if this build is what produced it.
 
@@ -1080,7 +1108,9 @@ class Store:
         anyway would tell the next migration, the one that CAN see them, that
         this state had already been vouched for.
         """
-        model, dim = vector_provenance()
+        # THE WRITE PATH'S QUESTION, so the embedder answers it when there is
+        # one: the stamp has to name whatever will actually fill this index.
+        model, dim = vector_provenance(embedder)
         expected = json.dumps({"dim": dim, "model": model}, sort_keys=True)
         row = c.execute(
             "SELECT value FROM meta WHERE key = ?", (VECTOR_PROVENANCE_KEY,)
