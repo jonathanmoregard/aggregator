@@ -1996,7 +1996,9 @@ def _blame_crashed_row(
     )
     previous = ledger.entries(source).get(row_id)
     held = ledger.hold(source, row_id, error, previous=previous)
-    store.mark_embedded(kind, [row_id], state="error")
+    # ``expected=None`` said out loud: this makes no claim about the row's
+    # content, only that a previous process died on it.
+    store.mark_embedded(kind, [row_id], state="error", expected=None)
     store.release_embed_claim()
     if previous is None:
         outcome.new_failures.append(

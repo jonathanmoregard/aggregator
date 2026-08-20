@@ -287,6 +287,35 @@ def _stored_hashes(
     return out
 
 
+def _require_expectations(
+    ids: Sequence[str], expected: dict[str, str | None]
+) -> None:
+    """Every id being compare-and-swapped must have a stated expectation.
+
+    A guarded write asks ``AND src_hash IS ?``. Reading that parameter with
+    ``expected.get(row_id)`` made a MISSING key indistinguishable from an
+    expectation of NULL, which is not a weaker guard but a DIFFERENT one — and
+    one that is wrong in both directions: it never matches a fingerprinted row
+    (the write vanishes, and ``cli._embed_batch`` books the miss as a benign
+    ``superseded``) and it always matches a legacy row (the write lands,
+    guarded against a condition nobody asked for). Pre-v4 rows are all NULL by
+    design, so the second case is the common one on this corpus.
+
+    Raised as ``KeyError`` because that is what it is: the caller built the map
+    from its own row set and lost an id on the way. ``expected=None`` remains
+    the way to say "no claim" — it just has to be said.
+    """
+    missing = [row_id for row_id in ids if row_id not in expected]
+    if missing:
+        raise KeyError(
+            f"no expected src_hash for {missing!r}: a guarded write needs a "
+            f"stated expectation for every id. A missing entry would compare "
+            f"'src_hash IS NULL', which never matches a fingerprinted row and "
+            f"always matches a legacy one. Pass expected=None for a "
+            f"deliberately unguarded write."
+        )
+
+
 def _json_id_clause(column: str) -> str:
     """``<column> IN (…)`` that binds ANY NUMBER of ids as ONE parameter.
 
@@ -1890,6 +1919,27 @@ class Store:
 
         ``expected=None`` is the unguarded form, for callers making no claim
         about content — see ``'error'`` below — and returns ``ids`` unchanged.
+        It is an explicit choice and stays available. What is NOT available is
+        making it BY ACCIDENT: an id in ``ids`` and absent from a supplied
+        ``expected`` raises ``KeyError``.
+
+        WHY THAT IS AN ERROR AND NOT A DEFAULT. The lookup used to be
+        ``expected.get(row_id)``, so a missing key became ``None`` and the
+        guard became ``src_hash IS NULL`` — a condition the caller never
+        expressed, and one that is wrong in BOTH directions at once. Against an
+        ordinary row it never matches, so the row is skipped and
+        ``cli._embed_batch`` books the miss as a benign ``superseded``: a
+        silent no-op reported as a self-healing edit. Against a legacy row it
+        MATCHES — every pre-v4 row has a NULL ``src_hash`` and
+        ``_ensure_src_hash_columns`` deliberately never backfills them — so the
+        write lands, guarded against nothing, on exactly the rows least able to
+        prove they are unchanged. Reproduced: ``mark_embedded(ids=['hashed',
+        'legacy'], expected={})`` returned ``['legacy']`` and marked it.
+
+        Checked for the WHOLE id list before the first UPDATE. A caller whose
+        map is missing an id has a bug in how it built the map, and writing the
+        ids that happened to be present would leave the store in a state
+        neither that caller nor the ledger describes.
 
         ``state`` is one of ``'ok'`` / ``'skip'`` / ``'error'``; anything else
         raises rather than writing a value nothing selects on. An EMPTY ``ids``
@@ -1926,6 +1976,11 @@ class Store:
                 )
             written = list(ids)
         else:
+            # BEFORE THE FIRST UPDATE, so a caller with an incomplete map gets
+            # a refusal rather than a partly-applied batch. See the docstring:
+            # the old ``.get`` turned a missing key into ``src_hash IS NULL``,
+            # which silently skips ordinary rows and silently MARKS legacy ones.
+            _require_expectations(ids, expected)
             # One primary-key UPDATE per id rather than a clever set-based
             # statement: a batch is 500 rows, each of these is microseconds,
             # and ``rowcount`` per statement is how the caller learns WHICH
@@ -1936,7 +1991,7 @@ class Store:
                 cur = c.execute(
                     f"UPDATE {table} SET embedding_state = ? "  # noqa: S608 - allowlisted literals
                     f"WHERE {col} = ? AND src_hash IS ?",
-                    (state, row_id, expected.get(row_id)),
+                    (state, row_id, expected[row_id]),
                 )
                 if cur.rowcount:
                     written.append(row_id)
@@ -2002,6 +2057,13 @@ class Store:
             # be written on a store that cannot hold one.
             self._require_vector()
         c = self._c()
+        # Every OWNER whose vector is about to be written must have a stated
+        # expectation, checked before the first DELETE. The guarded INSERT
+        # below reads the same map, and a missing entry there would write the
+        # vector under ``src_hash IS NULL`` — landing it on a legacy row and
+        # losing it on every other. Same failure as ``mark_embedded``'s, one
+        # table over.
+        _require_expectations([row_id for row_id, _, _ in vectors], expected)
         writes_enabled = self._vector_writes_enabled()
         for row_id, chunk_id, embedding in vectors:
             # Unconditional: if the row moved, ingest already dropped its
@@ -2021,14 +2083,16 @@ class Store:
                     chunk_id,
                     embedding.astype("float32").tobytes(),
                     row_id,
-                    expected.get(row_id),
+                    expected[row_id],
                 ),
             )
         written_ok = self.mark_embedded(kind, ok_ids, "ok", expected, _commit=False)
         written_skip = self.mark_embedded(
             kind, skip_ids, "skip", expected, _commit=False
         )
-        self.mark_embedded(kind, error_ids, "error", _commit=False)
+        # UNGUARDED, and said so explicitly rather than by omission — see the
+        # note above on ``error_ids``.
+        self.mark_embedded(kind, error_ids, "error", None, _commit=False)
         c.commit()
         return written_ok, written_skip
 
