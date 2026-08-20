@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
+from aggregator.core.chunk import CHUNKER_VERSION
+
 log = logging.getLogger(__name__)
 
 QWEN3_QUERY_PREFIX = (
@@ -112,6 +114,67 @@ def _resolve_model_id(backend: str, model_name: str | None) -> str:
     return _DEFAULT_MODEL_ST
 
 
+#: What each backend does to the weights before they multiply anything.
+#:
+#: Two vectors from the same checkpoint at different precisions are close but
+#: not equal, and a KNN compares them against each other with no way to tell —
+#: so this belongs in the version string as surely as the repo id does.
+_QUANTIZATION = {"st": "fp32", "gguf": "q4_k_m"}
+
+
+def configured_quantization(embedder: Embedder | None = None) -> str:
+    """The precision the vectors in this cache are supposed to be.
+
+    Read off the embedder when there is one, for the same reason
+    :func:`configured_model_id` is: the object that did the work knows, and
+    ``AGGREGATOR_EMBED_BACKEND`` only guesses.
+    """
+    if embedder is not None:
+        backend = getattr(embedder, "backend", None)
+        if isinstance(backend, str):
+            return _QUANTIZATION.get(backend, backend)
+    backend = os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
+    return _QUANTIZATION.get(backend, backend)
+
+
+def embedding_version(embedder: Embedder | None = None) -> str:
+    """The identity a stored vector is keyed on: EVERYTHING that changed it.
+
+    ``<repo id>-<quantization>@<dim>/<chunker>/norm-l2``, e.g.
+    ``Qwen/Qwen3-Embedding-0.6B-fp32@768/chunk-4000-400/norm-l2``.
+
+    WHY A BARE REPO ID WAS NOT ENOUGH. The stamp exists so vectors written by
+    one build are never compared against vectors written by another, and a
+    repo id is silent about three things that each change the bytes:
+
+    * **quantization** — the same checkpoint at fp32 and at Q4_K_M produces
+      different vectors, and ``AGGREGATOR_EMBED_BACKEND`` switches between
+      them with no other trace;
+    * **dimension** — MRL truncation to 768 of a 1024-wide model is a
+      different embedding space, and the two are not even the same width;
+    * **chunker version** — the encoder sees the text the chunker handed it,
+      so re-chunking the corpus invalidates every vector in it even though
+      not one byte of the model moved.
+
+    Normalization is named too. ``_truncate_and_normalize`` re-normalizes
+    AFTER truncating, which is what lets sqlite-vec's L2 distance stand in for
+    cosine; a build that stopped doing that would be silently incomparable.
+
+    WHAT IT MUST NEVER CONTAIN is anything that moves per deploy. A git hash
+    or a build date here would invalidate the whole index on every release —
+    on this hardware, a multi-week re-embed (``docs/embedding-throughput.md``)
+    triggered by a typo fix. Every component below is a named constant or a
+    property of the model actually loaded.
+    """
+    return (
+        f"{configured_model_id(embedder)}"
+        f"-{configured_quantization(embedder)}"
+        f"@{_EMBED_DIM}"
+        f"/{CHUNKER_VERSION}"
+        f"/norm-l2"
+    )
+
+
 def configured_model_id(embedder: Embedder | None = None) -> str:
     """The model id vectors should be stamped with.
 
@@ -136,7 +199,21 @@ def configured_model_id(embedder: Embedder | None = None) -> str:
     built, and there the honest answer is what ``Embedder()`` WOULD load.
     """
     if embedder is not None:
-        return embedder.model_id
+        model_id = getattr(embedder, "model_id", None)
+        if isinstance(model_id, str) and model_id:
+            return model_id
+        # A DOUBLE THAT CANNOT SAY WHAT IT IS. ``Embedder`` sets ``model_id``
+        # before it touches a single weight, so this is unreachable from any
+        # real one — it means a duck-typed stand-in was passed. Said out loud
+        # because a silent answer here would be indistinguishable from the bug
+        # this argument exists to fix, and then answered with the process
+        # default, which is what such a stand-in is standing in for.
+        log.warning(
+            "%s was passed as the embedder writing this index but exposes no "
+            ".model_id; stamping what Embedder() would load in this process "
+            "instead. A real Embedder always carries one.",
+            type(embedder).__name__,
+        )
     backend = os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
     return _resolve_model_id(backend, None)
 

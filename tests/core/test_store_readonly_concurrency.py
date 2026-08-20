@@ -64,7 +64,16 @@ def test_routing_predicate_sees_rows_a_live_writer_just_embedded(tmp_path):
     This is the v5-specific consequence: the predicate decides whether the
     vector arm engages at all, so a stale answer changes retrieval, not just
     freshness.
+
+    The writer WRITES VECTORS rather than only flipping a column, because
+    that is what the predicate now reads. ``embedding_state`` could never
+    answer this honestly — it cannot say which model embedded the row, so it
+    reports a warm index after a model change and a cold one after a source
+    rebuild resets it. ``chunk_embeddings`` is written by the same call that
+    writes the vector, so the two cannot disagree.
     """
+    import numpy as np
+
     db = tmp_path / "cache.db"
     writer = Store(db_path=db)
     writer.migrate()
@@ -73,7 +82,9 @@ def test_routing_predicate_sees_rows_a_live_writer_just_embedded(tmp_path):
     reader = Store(db_path=db, read_only=True)
     assert reader.has_embedded_rows("observations") is False
 
-    writer.mark_embedded("observations", [f"o{i:06d}" for i in range(5)], "ok")
+    vec = np.zeros(768, dtype=np.float32)
+    vec[0] = 1.0
+    writer.upsert_vec_observations([(f"o{i:06d}", vec) for i in range(5)])
 
     assert reader.has_embedded_rows("observations") is True
 

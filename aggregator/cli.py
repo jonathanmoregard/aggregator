@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -1665,7 +1666,6 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     # BEFORE ``migrate()``, because migrate is what would do the deleting.
     if args.reindex and not _approve_vector_reindex(store, assume_yes=args.yes):
         return 1
-    store.migrate(allow_vector_reindex=args.reindex)
 
     if not store.vector_available:
         print(
@@ -1693,6 +1693,12 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     # summarised: it already names what disagreed, that nothing was deleted,
     # and the two opposite remedies — and only the operator knows which one
     # they meant.
+    #
+    # ASKED TWICE, AND BOTH ARE CHEAP. This first call uses the no-argument
+    # form — "what would ``Embedder()`` load here?" — which is the answer the
+    # read path uses and costs one indexed ``meta`` lookup. It is asked BEFORE
+    # the weights load so the common mismatch (a stray
+    # ``AGGREGATOR_EMBED_BACKEND``) is refused without paying a model load.
     refusal = store.vector_quarantine
     if refusal is not None:
         print(
@@ -1700,6 +1706,41 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
             f"No row was embedded and the backlog is untouched.",
             file=sys.stderr,
         )
+        return 1
+
+    # THE EMBEDDER IS BUILT BEFORE ``migrate()``, and that is round 4's
+    # triple-converged finding. ``migrate(embedder=)`` landed in round 3 so the
+    # provenance stamp could name the model that actually fills the index —
+    # and nothing ever passed it. ``grep -rn 'migrate(embedder' aggregator/``
+    # returned nothing, so the only write path in the codebase went on stamping
+    # from ``AGGREGATOR_EMBED_BACKEND`` and ``vector_provenance(embedder)`` was
+    # dead code: a fix with no production caller, which is a passing test and
+    # not a fix.
+    #
+    # The order costs one model load ahead of the second quarantine check
+    # below, and that is the right trade now that the version string carries
+    # the QUANTIZATION and the CHUNKER version. Neither is knowable from the
+    # environment, so a stamp written before the embedder exists cannot be
+    # right about them — while the load itself is seconds against a backfill
+    # measured in weeks, and the cheap refusal above has already caught the
+    # common case.
+    embedder = Embedder()
+    store.migrate(allow_vector_reindex=args.reindex, embedder=embedder)
+
+    # THE SECOND ASKING, now that the index has been reconciled against the
+    # embedder that will write it. The first call answered for the process; a
+    # mismatch that only the embedder's own identity reveals surfaces here, and
+    # it must still refuse before a row is selected.
+    refusal = store.vector_quarantine
+    if refusal is not None:
+        print(
+            f"ERROR: aggregator embed cannot run — {refusal}\n"
+            f"No row was embedded and the backlog is untouched.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if _would_start_a_second_index_by_accident(store):
         return 1
 
     lock_path = Path(str(store.db_path) + ".embed.lock")
@@ -1717,12 +1758,10 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
         )
         outcome = _EmbedOutcome()
         ledger = PoisonLedger(store)
-        # BEFORE the embedder is constructed, and before any row is selected:
-        # a claim left on disk means the previous worker did not survive that
-        # row, and it must be set aside now or the very next select hands it
-        # back and this process dies the same way.
+        # BEFORE any row is selected: a claim left on disk means the previous
+        # worker did not survive that row, and it must be set aside now or the
+        # very next select hands it back and this process dies the same way.
         _blame_crashed_row(store, ledger, outcome)
-        embedder = Embedder()
         try:
             # WHAT MAKES THE CLAIM A CRASH DETECTOR RATHER THAN A REBOOT
             # DETECTOR. The claim is written before the attempt and can only
@@ -1746,6 +1785,7 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
                     _embed_backlog(
                         store, embedder, kind, args, ledger, outcome, stop
                     )
+            _flip_completed_pointer(store, args, outcome)
         except (EmbedderUnhealthyError, EmbedStoreUnavailableError) as e:
             # ANNOUNCE FIRST, THEN ABORT. Rows attributed earlier in this run
             # passed their own health probe and have ledger entries already
@@ -1759,6 +1799,86 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     finally:
         os.close(lock_fd)
     return _report_embed_outcome(outcome)
+
+
+def _would_start_a_second_index_by_accident(store: Store) -> bool:
+    """Refuse a whole new backfill that only a shell variable asked for.
+
+    ROUND 3'S H1, TRANSPOSED. Keying vectors on ``(chunk_id, model)`` means a
+    stray ``AGGREGATOR_EMBED_BACKEND`` can no longer DELETE the index — the old
+    vectors keep their own key and nothing is dropped. What it can still do is
+    commit this machine to building a second one, and on this hardware that is
+    a multi-week backfill (``docs/embedding-throughput.md``) for a model nobody
+    chose. "Costs weeks of CPU on the strength of a leftover export" is the
+    failure being guarded, and it does not care which direction the weeks go.
+
+    THE DISCRIMINATOR IS THE VARIABLE, not the change. A model change that came
+    from SOURCE — a new pin in ``aggregator/core/embed.py``, deployed as a new
+    store path — is deliberate by construction: someone edited a constant,
+    reviewed it and rebuilt. There is no ambiguity to resolve and no prompt
+    worth showing. A change that exists only because a variable is exported in
+    this shell is exactly the ambiguous case, and it is the one this refuses.
+
+    So there is no new flag: ``unset AGGREGATOR_EMBED_BACKEND`` is the fix when
+    it was a mistake, and editing the pin is the fix when it was not.
+    """
+    if not os.environ.get("AGGREGATOR_EMBED_BACKEND", "").strip():
+        return False
+    other = store.other_indexed_model()
+    if other is None:
+        return False
+    print(
+        f"ERROR: aggregator embed cannot run — refusing to use the vector "
+        f"index this shell is pointing at. This cache holds vectors for "
+        f"{other!r}, this process is configured for "
+        f"{store.embedding_model!r}, and the difference comes from "
+        f"AGGREGATOR_EMBED_BACKEND being exported here. Starting the backfill "
+        f"would commit this machine to building a SECOND index from scratch — "
+        f"weeks of CPU on this hardware, see docs/embedding-throughput.md.\n"
+        f"NOTHING WAS DELETED and the backlog is untouched: vectors are keyed "
+        f"(chunk_id, model), so the existing index is intact and still serves "
+        f"any process configured for it.\n"
+        f"If this was a leftover export, `unset AGGREGATOR_EMBED_BACKEND` is "
+        f"the whole fix. If the model change is intended, make it in source — "
+        f"the pin in aggregator/core/embed.py — so the deployed artifact and "
+        f"the index agree; a shell variable cannot say that.",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _flip_completed_pointer(
+    store: Store, args: argparse.Namespace, outcome: _EmbedOutcome
+) -> None:
+    """Publish the index once the backlog is genuinely drained.
+
+    RULE 4 OF THE REFERENCE DESIGN, the caller's half. ``completed_at`` is what
+    keeps a half-built index for a NEW model from being served while the
+    previous one is still good — a partially filled embedding space answers
+    with plausible scores drawn from whichever rows happened to be embedded
+    first, and nothing in a result says so.
+
+    ONLY FROM A RUN THAT COULD SEE THE WHOLE BACKLOG. ``--once`` does a single
+    batch by design, and an interrupted or stalled ``--catchup`` stopped
+    somewhere it chose rather than at the end. The store refuses over a live
+    backlog anyway — this is the cheaper guard in front of that one, and it
+    keeps a ``--once`` probe from paying for a scan it cannot act on.
+
+    Best-effort and quiet on refusal: rows arriving from ingest between the
+    last batch and here are an ordinary race, and the next tick flips it.
+    """
+    if args.once or outcome.interrupted or outcome.stalled:
+        return
+    if args.source != "both":
+        # Only one ontology was drained, so "the index is complete" is not a
+        # claim this run is entitled to make about the other.
+        return
+    try:
+        model = store.mark_embedding_version_complete()
+    except RuntimeError:
+        return
+    if store.embedding_version_state(model)["completed_at"]:
+        print(f"embed: index complete for {model}")
 
 
 def _cmd_seed_models() -> int:
@@ -2187,6 +2307,18 @@ def _embed_backlog(
             return
 
 
+def _chunk_sha(text: str) -> str:
+    """The content address of one chunk: sha256 of the exact bytes encoded.
+
+    OF THE CHUNK, NOT OF THE ROW. ``src_hash`` already fingerprints the row and
+    answers a different question ("did the body move under the worker?"). This
+    one answers "have these exact bytes been through the model already", and it
+    has to describe what the encoder saw or a reuse would hand back a vector
+    for different text.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _embed_batch(
     store: Store,
     embedder: Embedder,
@@ -2272,6 +2404,19 @@ def _embed_batch(
     skip_ids: list[str] = []
     error_ids: list[str] = []
     all_vecs: list[tuple[str, str, Any]] = []
+    #: ``chunk_id -> content_sha256``, handed to the store so a later run can
+    #: prove the same bytes were already embedded. See ``reusable_chunk_vectors``.
+    chunk_hashes: dict[str, str] = {}
+    #: ``content_sha256 -> vector`` for text this batch already has an answer
+    #: for, whether from the index on disk or from an earlier row of this same
+    #: batch. THE ONLY LEVER THAT MOVES THE BACKFILL. Measured on this hardware
+    #: the encoder runs at ~40 tokens/second, so one 4000-character chunk is
+    #: ~19 seconds and a lookup that avoids one is worth ~19 seconds; batching,
+    #: by contrast, was measured at under 10% and negative past batch 8
+    #: (``docs/embedding-throughput.md``). Chat transcripts repeat themselves
+    #: constantly — quoted text, re-pasted tool output, the same file read
+    #: twice — and every repeat is a chunk that does not have to be computed.
+    known: dict[str, Any] = {}
     unhealthy: EmbedderUnhealthyError | None = None
     store_fault: sqlite3.Error | None = None
     for row in rows:
@@ -2289,13 +2434,33 @@ def _embed_batch(
             if not chunks:
                 skip_ids.append(row_id)
                 continue
-            # WRITTEN AND COMMITTED BEFORE THE ATTEMPT. Everything else in this
-            # handler needs an exception; a row that OOM-kills or segfaults the
-            # process raises nothing, so the claim on disk is the only trace
-            # that survives. See ``Store.claim_embed_row``.
-            store.claim_embed_row(kind, row_id)
-            vecs = embedder.embed_documents(chunks)
-            store.release_embed_claim()
+            hashes = [_chunk_sha(text) for text in chunks]
+            # ASK THE INDEX BEFORE ASKING THE MODEL. One indexed SELECT per
+            # row, against ~19 seconds per chunk it can save. Scoped to this
+            # model by the store — a hash match under a different model is the
+            # same text in a different embedding space, and reusing it would be
+            # exactly the silent mixing the (chunk_id, model) key exists to
+            # prevent.
+            unknown = [h for h in hashes if h not in known]
+            if unknown:
+                known.update(store.reusable_chunk_vectors(unknown))
+            missing = [i for i, h in enumerate(hashes) if h not in known]
+            if missing:
+                # WRITTEN AND COMMITTED BEFORE THE ATTEMPT. Everything else in
+                # this handler needs an exception; a row that OOM-kills or
+                # segfaults the process raises nothing, so the claim on disk is
+                # the only trace that survives. See ``Store.claim_embed_row``.
+                #
+                # Only when there is something to attempt: a row whose every
+                # chunk was reused never reaches the model, so there is no
+                # crash to attribute and claiming it would be a lie about what
+                # this process was doing.
+                store.claim_embed_row(kind, row_id)
+                fresh = embedder.embed_documents([chunks[i] for i in missing])
+                store.release_embed_claim()
+                for i, vec in zip(missing, fresh, strict=False):
+                    known[hashes[i]] = vec
+            vecs = [known[h] for h in hashes]
         except sqlite3.Error as e:
             # THE STORE FAILED, NOT THE ROW — round 3's M3. Two of the three
             # calls above are writes to the cache, and the ingest timer can
@@ -2348,6 +2513,7 @@ def _embed_batch(
         for i, vec in enumerate(vecs):
             chunk_id = row_id if len(chunks) == 1 else f"{row_id}:{i}"
             all_vecs.append((row_id, chunk_id, vec))
+            chunk_hashes[chunk_id] = hashes[i]
         ok_ids.append(row_id)
         if row_id in entries:
             # It used to fail and does not any more. A fault that no longer
@@ -2371,6 +2537,7 @@ def _embed_batch(
             skip_ids=skip_ids,
             error_ids=error_ids,
             expected=expected,
+            hashes=chunk_hashes,
         )
     except sqlite3.Error as e:
         raise _embed_store_unavailable(kind, store_fault or e) from e

@@ -56,6 +56,22 @@ def _seed_observation(s, obs_id, body="hello"):
     c.commit()
 
 
+def _record_embedding(s, kind, chunk_id, owner_id=None):
+    """Stage an index row WITHOUT a vector, for a cache whose extension broke.
+
+    The real writer puts both halves down together (``record_chunk_embedding``);
+    this stages the history a broken-extension cache already carries, which is
+    the state ``count_embedding_states`` most has to be able to report on.
+    """
+    c = s._c()
+    c.execute(
+        "INSERT INTO chunk_embeddings(chunk_id, model, kind, owner_id, dim, "
+        "content_sha256, created_at) VALUES (?, ?, ?, ?, 768, NULL, '2026-01-01')",
+        (chunk_id, s.embedding_model, kind, owner_id or chunk_id),
+    )
+    c.commit()
+
+
 def _force_state(s, kind, ids, state):
     """Write ``embedding_state`` directly, bypassing ``mark_embedded``.
 
@@ -144,9 +160,22 @@ def test_select_unembedded_rejects_unknown_kind(store):
         store.select_unembedded("nope", limit=1)
 
 
-def test_mark_embedded_flips_state(store):
+def test_a_vector_is_what_takes_a_row_out_of_the_backlog(store):
+    """``'ok'`` ALONE NO LONGER MEANS EMBEDDED, and that is criterion E.
+
+    The backlog is a LEFT JOIN against ``chunk_embeddings``, so what removes a
+    row is the existence of an embedding under this model — not a column. A
+    column cannot say WHICH model embedded the row, which makes it wrong in
+    both directions: it hides the whole corpus from a new model's backfill, and
+    a source rebuild that resets it hands ~483k already-embedded rows back.
+    """
     _seed_observation(store, "u0")
     store.mark_embedded("observations", ["u0"], state="ok")
+    assert any(
+        r["obs_id"] == "u0" for r in store.select_unembedded("observations", limit=10)
+    ), "a bare 'ok' column took a row with no vector out of the backlog"
+
+    store.upsert_vec_observations([("u0", np.eye(1, 768, dtype=np.float32)[0])])
     rows = store.select_unembedded("observations", limit=10)
     assert not any(r["obs_id"] == "u0" for r in rows)
 
@@ -298,7 +327,11 @@ def test_count_vec_rows_rejects_unknown_kind_before_touching_the_extension(
 def test_count_embedding_states_tallies_the_backlog(store):
     for i in range(4):
         _seed_observation(store, f"o{i}")
-    store.mark_embedded("observations", ["o0", "o1"], state="ok")
+    # ``ok`` is counted off the embedding index, so the tally needs vectors
+    # rather than a column value — see the note in ``count_embedding_states``.
+    store.upsert_vec_observations(
+        [(f"o{i}", np.eye(1, 768, dtype=np.float32)[0]) for i in range(2)]
+    )
     store.mark_embedded("observations", ["o2"], state="skip")
     counts = store.count_embedding_states("observations")
     assert counts["total"] == 4
@@ -326,12 +359,13 @@ def test_count_embedding_states_rejects_unknown_kind(store):
 
 
 def test_count_embedding_states_works_without_the_extension(no_vec_store):
-    """``embedding_state`` is a plain column. How far the backfill got is
-    exactly what an operator needs when the vector arm is broken, so this
-    read must not depend on the native extension."""
+    """How far the backfill got is exactly what an operator needs when the
+    vector arm is broken, so this read must not depend on the native
+    extension. ``chunk_embeddings`` is an ordinary table for that reason —
+    the index of record is plain SQL even though the vectors are not."""
     _seed_observation(no_vec_store, "o0")
     _seed_observation(no_vec_store, "o1")
-    _force_state(no_vec_store, "observations", ["o0"], "ok")
+    _record_embedding(no_vec_store, "observations", "o0")
     counts = no_vec_store.count_embedding_states("observations")
     assert counts["total"] == 2
     assert counts["ok"] == 1

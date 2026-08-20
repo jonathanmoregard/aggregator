@@ -22,6 +22,14 @@ THE READ PATH DELIBERATELY KEEPS THE NO-ARGUMENT FORM. It asks "may this
 process trust what is on disk?", and it runs on every ``Store``, including the
 read-only MCP one, long before any embedder exists. Threading an embedder into
 it would mean building a model to answer a question about a file.
+
+CRITERION E WIDENED WHAT THE STAMP HOLDS. It is no longer a bare repo id but
+the full embedding version — model, quantization, dimension, chunker geometry,
+normalization — because a repo id is silent about three things that each change
+the bytes of every vector while leaving the model name untouched. The
+assertions below therefore check that the id is CARRIED, not that it is the
+whole string; the components get their own coverage in
+``tests/test_cli_embed_stamps_its_own_embedder.py``.
 """
 
 import json
@@ -65,7 +73,9 @@ def _no_backend_override(monkeypatch):
 
 def test_vector_provenance_reads_the_embedder_it_is_given():
     fake = _FakeEmbedder("acme/embedder-that-actually-ran")
-    assert vector_provenance(fake) == ("acme/embedder-that-actually-ran", _VEC_DIM)
+    version, dim = vector_provenance(fake)
+    assert version.startswith("acme/embedder-that-actually-ran")
+    assert dim == _VEC_DIM
 
 
 def test_vector_provenance_without_an_embedder_still_answers_for_the_process():
@@ -92,10 +102,8 @@ def test_migrate_stamps_the_embedder_that_will_write(tmp_path):
 
     store.migrate(embedder=fake)
 
-    assert _stamp(store) == {
-        "dim": _VEC_DIM,
-        "model": "acme/embedder-that-actually-ran",
-    }
+    assert _stamp(store)["dim"] == _VEC_DIM
+    assert _stamp(store)["model"].startswith("acme/embedder-that-actually-ran")
 
 
 def test_migrate_without_an_embedder_stamps_the_process_default(tmp_path):
@@ -116,7 +124,7 @@ def test_a_stamp_written_for_one_model_is_refused_for_another(tmp_path):
 
     # Nothing computed was on disk, so the honest answer is to adopt and
     # re-stamp rather than refuse — but the stamp must move to model-b.
-    assert _stamp(second) == {"dim": _VEC_DIM, "model": "acme/model-b"}
+    assert _stamp(second)["model"].startswith("acme/model-b")
 
 
 def test_a_matching_embedder_stamp_is_adopted_not_rewritten(tmp_path):
@@ -129,4 +137,4 @@ def test_a_matching_embedder_stamp_is_adopted_not_rewritten(tmp_path):
     again = Store(db_path=db)
     again.migrate(embedder=_FakeEmbedder("acme/model-a"))
     assert again.vector_quarantine is None
-    assert _stamp(again) == {"dim": _VEC_DIM, "model": "acme/model-a"}
+    assert _stamp(again)["model"].startswith("acme/model-a")

@@ -292,30 +292,64 @@ def _stamp_a_different_model(store):
     store._c().commit()
 
 
-def test_a_changed_model_refuses_the_index_it_no_longer_matches(tmp_path):
-    """Refuse, keep, and say so — the reads must not be answered from it."""
+def test_a_changed_model_refuses_to_serve_the_index_it_did_not_write(
+    tmp_path, monkeypatch
+):
+    """Refuse, KEEP, and say so — criterion E's form of round 1's H1.
+
+    What changed is where the refusal comes from. Vectors are keyed
+    ``(chunk_id, model)`` now, so a model change is a background job and the
+    old index is neither deleted nor quarantined: it keeps serving any process
+    configured for it. What must NOT happen is this process filtering the KNN
+    to its own empty partition, returning nothing, and looking exactly like a
+    corpus that has not been backfilled yet — a silent degradation where there
+    used to be a loud one.
+    """
+    monkeypatch.delenv("AGGREGATOR_EMBED_BACKEND", raising=False)
     db = tmp_path / "cache.db"
     store = Store(db_path=db)
     store.migrate()
     _seed_obs(store, "o1")
     store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
-    store.mark_embedded("observations", ["o1"], "ok")
-    _stamp_a_different_model(store)
     store.close()
 
+    monkeypatch.setenv("AGGREGATOR_EMBED_BACKEND", "gguf")
     again = Store(db_path=db)
     again.migrate()
 
-    with pytest.raises(VectorIndexUnavailableError):
-        again.count_vec_rows("observations")
-    with pytest.raises(VectorIndexUnavailableError):
+    with pytest.raises(VectorIndexUnavailableError) as e:
         again.has_embedded_rows("observations")
-    # Kept: the stamp is not overwritten either, so the next process reaches
-    # the same verdict instead of quietly adopting on the second run.
-    assert "some/other-embedding-model" in _meta(again, "vector_provenance")
+    assert "NOTHING WAS DELETED" in str(e.value)
+    assert "unset AGGREGATOR_EMBED_BACKEND" in str(e.value)
+    with pytest.raises(VectorIndexUnavailableError):
+        again._vec_obs_ids(_unit(_VEC_DIM), k=3)
+
     raw = _raw_vec_conn(db)
     assert raw.execute("SELECT COUNT(*) FROM vec_observations").fetchone()[0] == 1
     raw.close()
+
+
+def test_the_previous_models_index_still_serves_its_own_process(
+    tmp_path, monkeypatch
+):
+    """The other half, and the reason the refusal above can be non-destructive:
+    the vectors are not damaged by another process having looked at them."""
+    monkeypatch.delenv("AGGREGATOR_EMBED_BACKEND", raising=False)
+    db = tmp_path / "cache.db"
+    store = Store(db_path=db)
+    store.migrate()
+    _seed_obs(store, "o1")
+    store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
+    store.close()
+
+    monkeypatch.setenv("AGGREGATOR_EMBED_BACKEND", "gguf")
+    Store(db_path=db).migrate()
+
+    monkeypatch.delenv("AGGREGATOR_EMBED_BACKEND")
+    back = Store(db_path=db)
+    back.migrate()
+    assert back.has_embedded_rows("observations") is True
+    assert back._vec_obs_ids(_unit(_VEC_DIM), k=3) == ["o1"]
 
 
 def test_a_changed_model_discards_the_index_when_consent_is_given(tmp_path):
@@ -406,7 +440,11 @@ def test_vector_provenance_reports_the_model_the_embedder_would_load():
     from aggregator.core.embed import _DEFAULT_MODEL_ST
 
     model, dim = vector_provenance()
-    assert model == _DEFAULT_MODEL_ST
+    # A VERSION STRING, not a bare repo id — criterion E. The repo id is
+    # carried; so are the quantization, the width, the chunker geometry and
+    # the normalization, because each of those changes the bytes of every
+    # vector while leaving the model name untouched.
+    assert model.startswith(_DEFAULT_MODEL_ST)
     assert dim == _VEC_DIM
 
 
@@ -472,23 +510,27 @@ def test_a_consented_discard_is_announced_not_silent(tmp_path, caplog, kind):
 # --- the read path, which never migrates ------------------------------------
 
 
-def test_a_read_only_store_refuses_a_mismatched_index_too(tmp_path):
+def test_a_read_only_store_refuses_a_mismatched_index_too(tmp_path, monkeypatch):
     """``Store(read_only=True)`` is the MCP server — the surface most queried.
 
     Under the old answer this needed no check: the mismatched vectors had
     already been deleted by whichever writable command ran first. Refusing
     leaves them on disk, so the read path has to reach the same verdict on its
     own or H1's protection is gone exactly where it matters most.
+
+    The read-only store NEVER MIGRATES, so it cannot re-stamp its way out of
+    the disagreement — which makes it the strictest test of the guard, and the
+    one that proves the refusal is not a side effect of the write path.
     """
+    monkeypatch.delenv("AGGREGATOR_EMBED_BACKEND", raising=False)
     db = tmp_path / "cache.db"
     store = Store(db_path=db)
     store.migrate()
     _seed_obs(store, "o1")
     store.upsert_vec_observations([("o1", _unit(_VEC_DIM))])
-    store.mark_embedded("observations", ["o1"], "ok")
-    _stamp_a_different_model(store)
     store.close()
 
+    monkeypatch.setenv("AGGREGATOR_EMBED_BACKEND", "gguf")
     ro = Store(db_path=db, read_only=True)
     with pytest.raises(VectorIndexUnavailableError):
         ro.has_embedded_rows("observations")

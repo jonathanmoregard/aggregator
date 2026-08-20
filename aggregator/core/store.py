@@ -95,7 +95,7 @@ import logging
 import os
 import sqlite3
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -122,6 +122,27 @@ class VectorIndexUnavailableError(RuntimeError):
     Its own type, and raised by name, so a caller can tell "the vector arm is
     not installed here" apart from "the query was wrong" — which a bare
     ``sqlite3.OperationalError: no such table: vec_observations`` cannot.
+    """
+
+
+class VectorReindexNotConsentedError(RuntimeError):
+    """A wholesale delete of the vector index was attempted without consent.
+
+    THE THIRD PATH. Rounds 1-3 spent three iterations narrowing who may
+    destroy computed vectors: the ambient ``AGGREGATOR_VECTOR_REINDEX``
+    variable was deleted, replaced by a per-call ``allow_vector_reindex=``
+    argument that only ``embed --reindex`` passes, behind a printed preview and
+    a ``y`` on stdin. All three rounds guarded ``migrate()``.
+
+    ``rebuild_all()`` ran ``_VEC_DROP_ALL`` unconditionally the entire time,
+    and ``scripts/reingest_v2.py`` calls it as its first act. So the sentence
+    "``migrate()`` is the only thing that may delete computed vectors
+    wholesale" — written into three docstrings — was false, and every gate in
+    front of it was a fence with a gap beside it.
+
+    Its own type, rather than a bare ``RuntimeError``, because the two callers
+    that can hit it want opposite things: a script wants to catch it and ask
+    the operator, while a library caller wants it to propagate.
     """
 
 
@@ -257,6 +278,11 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _now_iso() -> str:
+    """UTC, aware, ISO-8601 — the format every timestamp column here uses."""
+    return datetime.now(UTC).isoformat()
+
+
 def _chunked(items: Iterable, size: int) -> Iterable[list]:
     """Bounded batching over an arbitrary iterable. Consumes lazily."""
     batch: list = []
@@ -376,6 +402,39 @@ def _vec_table_usable(c: sqlite3.Connection, table: str) -> bool:
     return True
 
 
+def _owner_of_chunk(
+    c: sqlite3.Connection, base_table: str, base_key: str, chunk_id: str
+) -> str:
+    """Which row a chunk id belongs to, for callers that were not told.
+
+    ``commit_embed_batch`` carries the owner explicitly and never comes here,
+    because the parse below is genuinely ambiguous: ``github:x:1`` is a real
+    record id AND a plausible chunk 1 of ``github:x``. This exists for
+    ``upsert_vec_*``, which is handed a bare chunk id.
+
+    THE AMBIGUITY IS RESOLVED BY ASKING THE TABLE, not by preferring one
+    reading. A trailing ``:<n>`` is stripped only when the remainder is an
+    actual row and the full id is not; anything else is its own owner. Getting
+    this wrong is not cosmetic — ``owner_id`` is what the backfill LEFT JOINs
+    on, so a wrong answer means a row that is never selected for embedding
+    again and never reported as missing.
+    """
+    head, sep, tail = chunk_id.rpartition(":")
+    if not sep or not head or not tail.isdigit():
+        return chunk_id
+    own = c.execute(
+        f"SELECT 1 FROM {base_table} WHERE {base_key} = ?",  # noqa: S608 - allowlisted literals
+        (chunk_id,),
+    ).fetchone()
+    if own is not None:
+        return chunk_id
+    parent = c.execute(
+        f"SELECT 1 FROM {base_table} WHERE {base_key} = ?",  # noqa: S608 - allowlisted literals
+        (head,),
+    ).fetchone()
+    return head if parent is not None else chunk_id
+
+
 def _drop_row_vectors(
     c: sqlite3.Connection, table: str, key: str, row_id: str
 ) -> None:
@@ -396,6 +455,13 @@ def _drop_row_vectors(
 
     ``rowcount <= 0`` rather than ``== 0`` ends the walk: a virtual table that
     reported -1 would otherwise spin forever.
+
+    ACROSS EVERY MODEL, and the index rows with them. The caller reaches here
+    because the row's BODY changed, which invalidates the text that went into
+    the encoder — so a vector under a second model is exactly as stale as the
+    one under the first. Leaving the ``chunk_embeddings`` rows behind would be
+    worse than leaving the vectors: the backfill LEFT JOIN would report the row
+    as embedded and never come back for it.
     """
     c.execute(f"DELETE FROM {table} WHERE {key} = ?", (row_id,))  # noqa: S608 - fixed literals
     i = 0
@@ -405,8 +471,10 @@ def _drop_row_vectors(
             (f"{row_id}:{i}",),
         )
         if cur.rowcount <= 0:
-            return
+            break
         i += 1
+    if _table_present(c, "chunk_embeddings"):
+        c.execute("DELETE FROM chunk_embeddings WHERE owner_id = ?", (row_id,))
 
 
 #: ``(vec table, key column, base table, base key)`` for the orphan purge.
@@ -693,6 +761,75 @@ _DDL: list[str] = [
     "ON observations(embedding_state);",
     "CREATE INDEX IF NOT EXISTS rec_embedding_state "
     "ON records(embedding_state);",
+    # --- v5: the embedding index of record, keyed (chunk_id, model) ------
+    #
+    # THE TABLE THE REFERENCE DESIGN PUTS AT THE CENTRE, and the reason a
+    # model change stops being an outage. Keying on the chunk ALONE makes the
+    # vector index a singleton: there is exactly one embedding per chunk, its
+    # model is whatever the file as a whole was last stamped with, and moving
+    # to a new model is therefore a DELETE of everything followed by a
+    # multi-week recompute (``docs/embedding-throughput.md``). Every consent
+    # gate in this file exists because of that shape.
+    #
+    # With the model in the key, model B's vectors are extra ROWS beside model
+    # A's. The backfill for B is a background job that runs to completion while
+    # A goes on answering queries, and nothing is ever deleted to make room.
+    #
+    # ``content_sha256`` is what carries an embedding across a RE-CHUNK. When a
+    # document changes in one paragraph most chunk hashes are unchanged, and
+    # this corpus is chat transcripts that are APPENDED to rather than
+    # rewritten — so the leading chunks of an edited session are byte-identical
+    # and their vectors are still correct. NULLABLE on purpose: a vector
+    # written through a path that never saw the text (``upsert_vec_*``) cannot
+    # prove any content matched, and the honest answer to an unprovable reuse
+    # is to embed it again.
+    #
+    # ``owner_id`` is the row a chunk came from, carried explicitly rather than
+    # parsed back out of ``<owner>:<n>``. That parse is genuinely ambiguous —
+    # ``github:x:1`` is a real record id AND a plausible chunk 1 of
+    # ``github:x`` — and it is the join key the backfill LEFT JOINs on, so
+    # guessing it wrong means a row silently never gets embedded.
+    #
+    # NO FOREIGN KEY, because a chunk's owner lives in one of two tables and
+    # SQLite has no polymorphic reference. ``_purge_orphan_vectors`` sweeps.
+    """
+    CREATE TABLE IF NOT EXISTS chunk_embeddings (
+        chunk_id       TEXT    NOT NULL,
+        model          TEXT    NOT NULL,
+        kind           TEXT    NOT NULL,
+        owner_id       TEXT    NOT NULL,
+        dim            INTEGER NOT NULL,
+        content_sha256 TEXT,
+        created_at     TEXT    NOT NULL,
+        PRIMARY KEY (chunk_id, model)
+    );
+    """,
+    # The backfill's LEFT JOIN runs against exactly this prefix, once per
+    # candidate row, so it is the difference between a probe and a scan.
+    "CREATE INDEX IF NOT EXISTS chunk_embeddings_owner "
+    "ON chunk_embeddings(model, kind, owner_id);",
+    # The reuse lookup: "is there already a vector for this exact text under
+    # this exact model?"
+    "CREATE INDEX IF NOT EXISTS chunk_embeddings_sha "
+    "ON chunk_embeddings(model, content_sha256);",
+    # --- v5: the version pointer ----------------------------------------
+    #
+    # ``completed_at`` is the flip that keeps a half-built index invisible. A
+    # partially filled embedding space does not fail loudly — it answers, with
+    # plausible-looking scores, from whichever fraction of the corpus happened
+    # to be embedded first. That is worse than no vector arm, because nothing
+    # about the result says it was drawn from a tenth of the index.
+    #
+    # See ``Store.serving_embedding_model`` for the one deliberate exception:
+    # the FIRST index a cache ever builds has nothing to fall back to.
+    """
+    CREATE TABLE IF NOT EXISTS embedding_versions (
+        model        TEXT PRIMARY KEY,
+        dim          INTEGER NOT NULL,
+        started_at   TEXT NOT NULL,
+        completed_at TEXT
+    );
+    """,
 ]
 
 
@@ -741,16 +878,34 @@ EMBED_CLAIM_KEY = "embed_inflight"
 #: environment state can authorise this, so nothing can authorise it silently.
 VECTOR_REINDEX_COMMAND = "aggregator embed --catchup --source both --reindex"
 
+# ``model`` IS A vec0 PARTITION KEY, and the key column is a plain metadata
+# column rather than the PRIMARY KEY it used to be. Both halves are needed for
+# ``(chunk_id, model)``:
+#
+# * vec0's ``primary key`` is globally unique and a partition key does NOT
+#   participate in it — measured, not assumed: inserting the same ``chunk_id``
+#   under two models against a ``text primary key`` raises "UNIQUE constraint
+#   failed on t primary key". So the key column has to stop being the PK.
+# * A partition key gives each model its own shadow index, so a KNN with
+#   ``AND model = ?`` searches only that model's vectors. Without it the two
+#   spaces would share one brute-force scan and a foreign vector could win a
+#   top-k slot with a meaningless distance.
+#
+# Uniqueness of ``(chunk_id, model)`` is enforced by ``chunk_embeddings``, the
+# plain table that owns the key; these tables hold the bytes. The writers below
+# keep their existing delete-then-insert idempotency.
 _VEC_DDL: list[str] = [
     f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_observations USING vec0(
-        obs_id     TEXT PRIMARY KEY,
+        model      TEXT PARTITION KEY,
+        obs_id     TEXT,
         embedding  float[{_VEC_DIM}]
     );
     """,
     f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_records USING vec0(
-        stable_id  TEXT PRIMARY KEY,
+        model      TEXT PARTITION KEY,
+        stable_id  TEXT,
         embedding  float[{_VEC_DIM}]
     );
     """,
@@ -781,10 +936,16 @@ def vector_provenance(embedder: object | None = None) -> tuple[str, int]:
     the read-only MCP one included — before any embedder exists. Threading an
     embedder through it would mean loading a model to answer a question about a
     file.
-    """
-    from aggregator.core.embed import configured_model_id
 
-    return configured_model_id(embedder), _VEC_DIM
+    THE ANSWER IS A VERSION STRING, NOT A REPO ID, and that is criterion E.
+    A bare repo id is silent about quantization, about the MRL width, and
+    about the chunker geometry — three things that each change the bytes of
+    every vector while leaving the model name untouched. See
+    :func:`aggregator.core.embed.embedding_version`.
+    """
+    from aggregator.core.embed import embedding_version
+
+    return embedding_version(embedder), _VEC_DIM
 
 _VEC_DROP_ALL: list[str] = [
     "DROP TABLE IF EXISTS vec_observations;",
@@ -834,6 +995,37 @@ def _provenance_refusal(stamped: str, expected: str, vectors: int | None) -> str
         f"be rebuilt from scratch (weeks of CPU) — say so once, explicitly, on "
         f"the command that owns the vector index: `{VECTOR_REINDEX_COMMAND}`. "
         f"It prints what it would delete and asks for a 'y' first."
+    )
+
+
+def _unattributable_refusal(stamped: str) -> str:
+    """The READ path's refusal: vectors on disk that name no model at all.
+
+    Its own message, rather than :func:`_provenance_refusal`, for two reasons.
+
+    It is a DIFFERENT fault. That one is "the index names a model and it is not
+    the one I want", which is now handled by keeping both and choosing at query
+    time. This one is "the index names nobody" — a vec table from before
+    embeddings were keyed on the model, or one nothing ever stamped — and no
+    amount of choosing helps, because there is nothing to choose between.
+
+    And it must NOT NAME THE EXPECTED MODEL, which is what keeps it cheap.
+    Computing that value imports ``aggregator.core.embed`` and numpy, and this
+    runs under ``capabilities()`` on the MCP connect path, where every import
+    is paid before the user's first search returns.
+    """
+    return (
+        f"refusing to use the vector index on this cache: it is {stamped}, and "
+        f"its vectors carry no model attribution — either they predate "
+        f"model-keyed embeddings (no `model` column on the vec tables) or "
+        f"nothing ever stamped them. NOTHING WAS DELETED — the vectors on disk "
+        f"are intact. The vector arm is switched off for this process instead, "
+        f"so no vector whose model is unknown is served; FTS5 keyword search "
+        f"is unaffected. If AGGREGATOR_EMBED_BACKEND is exported in this shell "
+        f"then that is worth ruling out first — `unset "
+        f"AGGREGATOR_EMBED_BACKEND` costs nothing. Otherwise the index cannot "
+        f"be converted, only rebuilt: `{VECTOR_REINDEX_COMMAND}`, which prints "
+        f"what it would delete and asks for a 'y' first."
     )
 
 
@@ -1044,6 +1236,19 @@ class Store:
             if self._vector_quarantine is None:
                 for stmt in _VEC_DDL:
                     c.executescript(stmt)
+        # THE VERSION ROW, recorded whether or not sqlite-vec loaded. It is
+        # plain-table bookkeeping and the moment an operator most needs to know
+        # which model this cache is filling is the moment the extension broke.
+        # ``DO NOTHING`` so a re-migration never resets a ``completed_at``
+        # earned by a finished backfill — ``migrate()`` runs on every
+        # subcommand, and an index that un-completed itself on the next
+        # ``aggregator query`` would be a pointer that flips at random.
+        model, dim = vector_provenance(embedder)
+        c.execute(
+            "INSERT INTO embedding_versions(model, dim, started_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(model) DO NOTHING",
+            (model, dim, _now_iso()),
+        )
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
@@ -1144,32 +1349,118 @@ class Store:
         row = c.execute(
             "SELECT value FROM meta WHERE key = ?", (VECTOR_PROVENANCE_KEY,)
         ).fetchone()
-        if row is not None and row[0] == expected:
+        keyed = self._vec_tables_are_model_keyed(c)
+        if row is not None and row[0] == expected and keyed:
+            self._adopt_vectors()
+            return
+
+        # EXPLICIT CONSENT STILL WINS, and it is checked before the adopt
+        # below. Keying on the model means a model change no longer NEEDS a
+        # delete — but ``embed --reindex`` exists for the operator who wants
+        # one anyway (a corrupt index, a disk reclaim, a chunker change whose
+        # old vectors are simply dead weight), and it has already printed what
+        # it would destroy and taken a 'y'. Silently adopting under a flag that
+        # says "delete" would be its own kind of lie.
+        if allow_reindex and not (row is not None and row[0] == expected):
+            self._drop_and_restamp(c, expected, row)
+            return
+
+        if row is not None and keyed:
+            # A MODEL CHANGE OVER A MODEL-KEYED INDEX IS NOT A CONFLICT, and
+            # that is criterion E's whole thesis. The refusal below exists
+            # because the index used to be a SINGLETON: one vector per chunk,
+            # its model implied by the file, so two models could not be told
+            # apart at query time and the only safe answers were "refuse" or
+            # "delete everything and spend a month recomputing".
+            #
+            # With ``(chunk_id, model)`` there is nothing to tell apart. The
+            # old model's vectors keep their own key, every KNN filters on the
+            # partition, and the new model's backfill is a background job that
+            # runs to completion beside them. Nothing is deleted and nothing is
+            # refused — ``serving_embedding_model`` is what withholds the new
+            # index until it is finished.
+            #
+            # STILL LOUD, because the commonest cause of arriving here is not a
+            # deliberate model change: it is ``AGGREGATOR_EMBED_BACKEND``
+            # exported in a shell. That no longer destroys anything, but it
+            # does start a multi-week backfill for a model nobody wanted, so it
+            # has to be visible and the message has to name the one-word fix.
+            log.warning(
+                "vector index model changed: this cache is stamped %s and this "
+                "process is configured for %s. NOTHING WAS DELETED — vectors "
+                "are keyed (chunk_id, model), so the existing ones keep "
+                "serving any process configured for them and the new model is "
+                "filled by a background backfill. If AGGREGATOR_EMBED_BACKEND "
+                "is merely exported in this shell then that is the cause and "
+                "`unset AGGREGATOR_EMBED_BACKEND` is the whole fix. If the "
+                "change is intended, run `aggregator embed --catchup --source "
+                "both`; until it completes, vector search is served by the "
+                "previously completed index or, if there is none, degrades to "
+                "FTS5 keyword search.",
+                row[0],
+                expected,
+            )
+            c.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                (VECTOR_PROVENANCE_KEY, expected),
+            )
             self._adopt_vectors()
             return
 
         stamped = "no stamp" if row is None else f"stamped {row[0]}"
         # O(n) on a vec0 table, and deliberately paid only here: the matching
         # stamp returns above, so this runs once, on the mismatch path.
-        on_disk = 0
-        for table in ("vec_observations", "vec_records"):
-            exists = c.execute(
-                "SELECT 1 FROM sqlite_master WHERE name = ?", (table,)
-            ).fetchone()
-            if exists:
-                on_disk += c.execute(
-                    f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed literals
-                ).fetchone()[0]
+        on_disk = self._count_vectors_on_disk(c)
 
-        if on_disk and not allow_reindex:
+        if on_disk:
+            # AN UNATTRIBUTABLE INDEX. Everything adoptable returned above, so
+            # what is left holds vectors this build cannot key to any model:
+            # no stamp, or a pre-keying vec table shape. Those cannot be told
+            # apart from correct ones at query time, and nobody asked for them
+            # to be deleted. Refuse, keep, and say so.
             self._quarantine_vectors(
                 _provenance_refusal(stamped, expected, on_disk)
             )
             log.error("%s", self._vector_quarantine)
             return
 
+        self._drop_and_restamp(c, expected, row)
+
+    def _count_vectors_on_disk(self, c: sqlite3.Connection) -> int:
+        total = 0
+        for table in ("vec_observations", "vec_records"):
+            if not _vec_table_usable(c, table):
+                continue
+            total += c.execute(
+                f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed literals
+            ).fetchone()[0]
+        return total
+
+    def _drop_and_restamp(
+        self, c: sqlite3.Connection, expected: str, row: sqlite3.Row | None
+    ) -> None:
+        """Discard every vector, re-open the backlog, stamp, adopt.
+
+        Reached two ways, and they are opposite in spirit but identical in
+        effect: an index with nothing computed in it (adopting costs nothing)
+        and an operator who typed ``--reindex`` and answered the prompt. Kept
+        as one method so the second can never diverge from the first — the
+        ``chunk_embeddings`` and ``embedding_versions`` deletes below were
+        exactly the kind of thing a duplicate would forget.
+        """
+        stamped = "no stamp" if row is None else f"stamped {row[0]}"
+        on_disk = self._count_vectors_on_disk(c)
         for stmt in _VEC_DROP_ALL:
             c.execute(stmt)
+        # THE INDEX OF RECORD GOES WITH THE BYTES. Leaving ``chunk_embeddings``
+        # behind would make the backfill's LEFT JOIN report every row as
+        # already embedded against vectors that no longer exist — a corpus that
+        # never re-embeds and a vector arm that returns nothing, with every
+        # count claiming the index is complete.
+        if _table_present(c, "chunk_embeddings"):
+            c.execute("DELETE FROM chunk_embeddings")
+        if _table_present(c, "embedding_versions"):
+            c.execute("DELETE FROM embedding_versions")
         requeued = 0
         for table in ("observations", "records"):
             cur = c.execute(
@@ -1196,6 +1487,33 @@ class Store:
             (VECTOR_PROVENANCE_KEY, expected),
         )
         self._adopt_vectors()
+
+    @staticmethod
+    def _vec_tables_are_model_keyed(c: sqlite3.Connection) -> bool:
+        """Whether the vec tables on disk carry the ``model`` partition key.
+
+        THE SHAPE IS PART OF THE PROVENANCE. A pre-keying ``vec0`` table holds
+        one vector per chunk with no record of which model produced it, so a
+        second model's vectors cannot be added to it and its existing ones
+        cannot be attributed. That is the state the live cache is in — vec
+        tables written by an abandoned 2026-08-08 branch — and it is exactly
+        the case the refusal below must keep refusing.
+
+        False when there are no vec tables at all: nothing to adopt, and the
+        create-and-stamp path is the right one for a fresh cache.
+        """
+        seen = False
+        for table in ("vec_observations", "vec_records"):
+            if not _table_present(c, table):
+                continue
+            seen = True
+            try:
+                cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.OperationalError:
+                return False
+            if "model" not in cols:
+                return False
+        return seen
 
     @property
     def vector_quarantine(self) -> str | None:
@@ -1289,20 +1607,46 @@ class Store:
         except sqlite3.OperationalError:
             # No ``meta`` table: nothing has ever migrated this file.
             row = None
-        model, dim = vector_provenance()
-        expected = json.dumps({"dim": dim, "model": model}, sort_keys=True)
-        if row is not None and row[0] == expected:
-            self._adopt_vectors()
-            return None
+        # THE TWO STRUCTURAL ANSWERS COME FIRST, BEFORE THE EXPENSIVE ONE, and
+        # the ordering is load-bearing rather than tidy. Computing ``expected``
+        # imports ``aggregator.core.embed`` (hence numpy), and this method sits
+        # under ``count_vec_rows`` → ``vector_index_state`` → ``capabilities``,
+        # which the MCP server calls at CONNECT time — a path
+        # ``test_mcp_cold_start`` guards precisely because every import there is
+        # paid before the user's first search returns. Both branches below
+        # answer without knowing which model this process would load, so on a
+        # healthy cache the import never happens at all.
         present = c.execute(
             "SELECT 1 FROM sqlite_master WHERE name IN "
             "('vec_observations', 'vec_records')"
         ).fetchone()
         if row is None and present is None:
+            # Nothing has ever written a vector here.
             self._adopt_vectors()
             return None
+        if row is not None and self._vec_tables_are_model_keyed(c):
+            # MIRRORS THE WRITE PATH. A stamp over a model-keyed index is
+            # adoptable whether or not it names THIS model: those vectors are
+            # attributable and every KNN filters on the partition, so nothing
+            # here can be served by accident. Whether this model may be served
+            # is ``serving_embedding_model``'s question, and it answers with a
+            # message naming which of the two situations applies.
+            self._adopt_vectors()
+            return None
+        # WHAT IS LEFT CANNOT BE ATTRIBUTED TO ANY MODEL. Both adoptable cases
+        # returned above, so this is a vec table with no ``model`` column — the
+        # pre-keying shape, which stores one vector per chunk and no record of
+        # what produced it — or one with no stamp at all. Neither can be told
+        # apart from a correct index at query time.
+        #
+        # THE MESSAGE IS BUILT FROM DISK FACTS ONLY, with no reference to what
+        # THIS process would load, and that is deliberate: naming the expected
+        # model means computing it, which imports ``aggregator.core.embed`` and
+        # numpy onto the MCP connect path. It also says nothing useful here —
+        # the fault is that the vectors name NOBODY, so no expected value makes
+        # it better or worse.
         stamped = "no stamp" if row is None else f"stamped {row[0]}"
-        self._quarantine_vectors(_provenance_refusal(stamped, expected, None))
+        self._quarantine_vectors(_unattributable_refusal(stamped))
         return self._vector_quarantine
 
     @staticmethod
@@ -1391,14 +1735,51 @@ class Store:
         row = c.execute("PRAGMA user_version").fetchone()
         return int(row[0]) if row else 0
 
-    def rebuild_all(self) -> None:
+    def rebuild_all(self, *, allow_vector_reindex: bool = False) -> None:
         """Drop every table (records, sessions, observations, FTS shadows,
         meta) and re-run DDL. Migration escape hatch: SQLite is a derived
         index; JSONLs / API responses are source of truth. Callers detecting
         a stale ``user_version`` invoke this before re-ingesting.
+
+        ``allow_vector_reindex`` IS THE SAME CONSENT ``migrate()`` TAKES, and
+        this method needing it is round 4's confirmed finding. The rows this
+        drops are re-fetched in minutes; the vectors are not, and on this
+        hardware refilling them is a multi-week operation
+        (``docs/embedding-throughput.md``). Rounds 1-3 built a preview, a
+        stdin prompt and a per-call argument in front of ``migrate()`` while
+        this method ran ``_VEC_DROP_ALL`` unconditionally — so "``migrate()``
+        is the only wholesale delete" was a claim with a documented
+        counter-example in ``scripts/reingest_v2.py`` line 32.
+
+        DELIBERATELY THE SAME PARAMETER NAME AND THE SAME REFUSAL TEXT. A
+        second vocabulary for the same decision is how the first gap opened:
+        a reader auditing "who may delete the index" greps for one spelling.
+
+        Only refuses when there is something to lose. A cold index, an absent
+        one, and a cache on an interpreter without sqlite-vec all rebuild
+        without a question — prompting where nothing is at stake is how a
+        prompt that matters stops being read.
         """
         self._ensure_writable()
         c = self._c()
+        if not allow_vector_reindex:
+            vectors, rows = self.vector_reindex_preview()
+            if vectors:
+                raise VectorReindexNotConsentedError(
+                    f"refusing to rebuild this cache: it holds {vectors} "
+                    f"vector(s) that rebuild_all() would DELETE, and dropping "
+                    f"the vector index is not implied by re-ingesting the "
+                    f"rows. NOTHING WAS DELETED — the vectors on disk are "
+                    f"intact and so is the {rows} row(s) of embed watermark. "
+                    f"The rows come back from their sources in minutes; the "
+                    f"vectors are recomputed, and on this hardware that is a "
+                    f"multi-week operation (see "
+                    f"docs/embedding-throughput.md). If the vector index "
+                    f"genuinely has to go, say so on the call: "
+                    f"rebuild_all(allow_vector_reindex=True), or use "
+                    f"`{VECTOR_REINDEX_COMMAND}`, which prints what it would "
+                    f"delete and asks for a 'y' first."
+                )
         # Vec tables first, and only when the module that owns them is loaded:
         # SQLite runs the vtab's xDestroy to drop one, so ``DROP TABLE IF
         # EXISTS vec_observations`` raises ``no such module: vec0`` rather than
@@ -1782,6 +2163,301 @@ class Store:
     # ordinary reads and writes of a plain column and have no business
     # depending on a native extension.
 
+    # -- the (chunk_id, model) index of record -----------------------------
+
+    @property
+    def embedding_model(self) -> str:
+        """The version string vectors written by THIS process are keyed on.
+
+        Deliberately the same value the provenance stamp holds — one identity,
+        one place it is computed. See
+        :func:`aggregator.core.embed.embedding_version`.
+        """
+        return vector_provenance()[0]
+
+    def _stamped_model(self) -> str | None:
+        """The model THIS CACHE's vectors are keyed on, read off disk.
+
+        NO IMPORT, and that is the whole reason it exists beside
+        ``embedding_model``. That property answers "what would this process
+        load", which needs ``aggregator.core.embed`` and therefore numpy — and
+        ``capabilities()`` reaches it, which the MCP server calls at connect
+        time on a path ``test_mcp_cold_start`` guards precisely because every
+        import there is paid before the user's first search returns.
+
+        The stamp is a string in ``meta``: one indexed lookup, no module graph.
+        It is also the better question for a status count, which is asking how
+        far the index ON DISK has got rather than what this process would build.
+        ``None`` when nothing has ever stamped this cache.
+        """
+        c = self._c()
+        try:
+            row = c.execute(
+                "SELECT value FROM meta WHERE key = ?", (VECTOR_PROVENANCE_KEY,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row is not None:
+            try:
+                return str(json.loads(row[0])["model"])
+            except (ValueError, KeyError, TypeError):
+                pass
+        # NO STAMP IS NOT THE SAME AS NO ANSWER. The provenance stamp is only
+        # written when sqlite-vec loaded, and a cache whose extension broke
+        # AFTER a backfill is exactly when an operator most needs the counts.
+        # ``embedding_versions`` is a plain table written on every migrate, so
+        # it can answer where the stamp cannot — still without an import.
+        if not _table_present(c, "embedding_versions"):
+            return None
+        latest = c.execute(
+            "SELECT model FROM embedding_versions ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        return None if latest is None else str(latest["model"])
+
+    def embedding_version_state(self, model: str | None = None) -> dict:
+        """``{model, dim, started_at, completed_at}`` for a version row.
+
+        ``completed_at is None`` means the backfill for that model has not
+        drained yet. Returns the row for the CONFIGURED model by default.
+        """
+        model = model or self.embedding_model
+        c = self._c()
+        if not _table_present(c, "embedding_versions"):
+            return {"model": model, "dim": None, "started_at": None, "completed_at": None}
+        row = c.execute(
+            "SELECT model, dim, started_at, completed_at FROM embedding_versions "
+            "WHERE model = ?",
+            (model,),
+        ).fetchone()
+        if row is None:
+            return {"model": model, "dim": None, "started_at": None, "completed_at": None}
+        return dict(row)
+
+    def serving_embedding_model(self) -> str | None:
+        """The model the vector arm may ANSWER FROM, or ``None`` to refuse.
+
+        RULE 4 OF THE REFERENCE DESIGN: flip a pointer, do not expose a
+        half-built index. A partially filled embedding space does not fail
+        loudly — it answers from whichever fraction of the corpus happened to
+        be embedded first, with scores that look exactly like complete ones.
+        Nothing in a result says it was drawn from a tenth of the index, so
+        the failure is invisible at exactly the moment it matters.
+
+        THE BOOTSTRAP EXCEPTION IS DELIBERATE AND NAMED. If NO version has
+        ever completed on this cache, the in-progress one is served. There is
+        no previous index to fall back to, so refusing would mean no vector arm
+        at all for the length of the first backfill — weeks, on this hardware —
+        and the project's own design has always been "a background worker with
+        a watermark, so queries never block on the backfill". The watermark
+        (``count_embedding_states``) is what reports how far it got. The moment
+        any version completes, that argument expires: a later incomplete
+        version now has something better to defer to, and stays invisible until
+        it finishes.
+
+        Returns ``None`` when the configured model has no version row at all —
+        which is a cache whose vectors were written by something else, and is
+        the same refusal the provenance stamp makes for the same reason.
+        """
+        c = self._c()
+        if not _table_present(c, "embedding_versions"):
+            # A cache migrated before this table existed. The provenance stamp
+            # is the guard there; refusing on the absence of bookkeeping that
+            # was never written would take the arm down for no gain.
+            return self.embedding_model
+        model = self.embedding_model
+        row = c.execute(
+            "SELECT completed_at FROM embedding_versions WHERE model = ?", (model,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["completed_at"] is not None:
+            return model
+        other = c.execute(
+            "SELECT 1 FROM embedding_versions WHERE completed_at IS NOT NULL "
+            "AND model <> ? LIMIT 1",
+            (model,),
+        ).fetchone()
+        return None if other is not None else model
+
+    def mark_embedding_version_complete(self) -> str:
+        """Flip ``completed_at`` for the configured model. Returns the model.
+
+        REFUSES OVER A BACKLOG THAT IS NOT EMPTY, because a pointer that can be
+        flipped early is not a pointer, it is a comment. The check is the same
+        LEFT JOIN the worker drains against, so "complete" means precisely
+        "that query returns nothing" and cannot drift from it.
+
+        Idempotent: flipping an already-complete version keeps the original
+        timestamp, so a second ``--catchup`` over a drained backlog does not
+        rewrite when the index was finished.
+        """
+        self._ensure_writable()
+        model = self.embedding_model
+        outstanding = 0
+        for kind in self._VEC_TABLES:
+            outstanding += len(self.select_unembedded(kind, limit=1))
+        if outstanding:
+            raise RuntimeError(
+                f"refusing to mark the embedding index complete: "
+                f"{outstanding} kind(s) still have rows with no vector under "
+                f"{model!r}. `completed_at` is what keeps a half-built index "
+                f"from being served, so setting it over a live backlog would "
+                f"publish a partial embedding space that answers with "
+                f"plausible scores. Run `aggregator embed --catchup --source "
+                f"both` to drain it first."
+            )
+        c = self._c()
+        c.execute(
+            "UPDATE embedding_versions SET completed_at = ? "
+            "WHERE model = ? AND completed_at IS NULL",
+            (_now_iso(), model),
+        )
+        c.commit()
+        return model
+
+    def record_chunk_embedding(
+        self,
+        kind: str,
+        *,
+        chunk_id: str,
+        owner_id: str,
+        embedding: np.ndarray,
+        content_sha256: str | None = None,
+        model: str | None = None,
+        _commit: bool = True,
+    ) -> None:
+        """Write one ``(chunk_id, model)`` embedding — bytes AND index row.
+
+        ONE CALL WRITES BOTH, deliberately. A vector in the vec table with no
+        ``chunk_embeddings`` row is invisible to the backfill query, so it gets
+        computed again forever; a row with no vector is a hole the KNN cannot
+        fill while every count says the index is complete. They are two halves
+        of one fact and there is no correct interleaving of two separate calls.
+
+        ``model`` defaults to this build's version string. It is a parameter so
+        a caller can register another model's vectors — which is what makes
+        "two models coexist as extra rows" a thing this store can express
+        rather than a thing it merely permits.
+        """
+        self._ensure_writable()
+        vec_table = self._VEC_TABLES.get(kind)
+        if vec_table is None:
+            raise ValueError(f"unknown kind: {kind!r}")
+        vec_key = "obs_id" if kind == "observations" else "stable_id"
+        model = model or self.embedding_model
+        c = self._c()
+        if self._vector_writes_enabled():
+            c.execute(
+                f"DELETE FROM {vec_table} WHERE model = ? AND {vec_key} = ?",  # noqa: S608 - allowlisted literals
+                (model, chunk_id),
+            )
+            c.execute(
+                f"INSERT INTO {vec_table}(model, {vec_key}, embedding) "  # noqa: S608 - allowlisted literals
+                f"VALUES (?, ?, ?)",
+                (model, chunk_id, embedding.astype("float32").tobytes()),
+            )
+            self._record_chunk_row(
+                c, kind, chunk_id, owner_id, model, content_sha256
+            )
+        if _commit:
+            c.commit()
+
+    @staticmethod
+    def _record_chunk_row(
+        c: sqlite3.Connection,
+        kind: str,
+        chunk_id: str,
+        owner_id: str,
+        model: str,
+        content_sha256: str | None,
+    ) -> None:
+        """The index half of :meth:`record_chunk_embedding`, without a commit.
+
+        ``DO UPDATE`` rather than ``DO NOTHING`` on conflict: the bytes above
+        were just overwritten, so the hash describing them has to move with
+        them or the reuse path would hand out a vector for text it no longer
+        holds. Re-running the job over UNCHANGED content still writes the same
+        values, so "twice equals once" survives.
+        """
+        c.execute(
+            "INSERT INTO chunk_embeddings("
+            "  chunk_id, model, kind, owner_id, dim, content_sha256, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(chunk_id, model) DO UPDATE SET "
+            "  kind = excluded.kind,"
+            "  owner_id = excluded.owner_id,"
+            "  dim = excluded.dim,"
+            "  content_sha256 = excluded.content_sha256",
+            (chunk_id, model, kind, owner_id, _VEC_DIM, content_sha256, _now_iso()),
+        )
+
+    def reusable_chunk_vectors(
+        self, content_hashes: Sequence[str], model: str | None = None
+    ) -> dict[str, np.ndarray]:
+        """``{content_sha256: embedding}`` for text already embedded here.
+
+        RULE 2 OF THE REFERENCE DESIGN, and on this corpus it is close to the
+        whole cost of a re-index. When a document changes in one paragraph most
+        chunk hashes are unchanged; ours are chat transcripts that get APPENDED
+        to rather than rewritten, so every chunk but the last is byte-identical
+        after an edit and its vector is still exactly right.
+
+        SCOPED TO ONE MODEL, always. A hash match under a different model is
+        the same text in a different embedding space, and handing that back
+        would be the silent mixing this whole key exists to prevent.
+
+        A ``NULL`` hash never matches: it means the vector was written through
+        a path that never saw the text, so nothing can prove the content is the
+        same, and the honest answer to an unprovable reuse is to embed again.
+        """
+        if not content_hashes:
+            return {}
+        c = self._c()
+        if not _table_present(c, "chunk_embeddings"):
+            return {}
+        model = model or self.embedding_model
+        out: dict[str, np.ndarray] = {}
+        for page in _chunked(list(dict.fromkeys(content_hashes)), 400):
+            placeholders = ",".join("?" * len(page))
+            rows = c.execute(
+                f"SELECT chunk_id, kind, content_sha256 FROM chunk_embeddings "  # noqa: S608 - fixed literals
+                f"WHERE model = ? AND content_sha256 IN ({placeholders})",
+                (model, *page),
+            ).fetchall()
+            for row in rows:
+                if row["content_sha256"] in out:
+                    continue
+                vec = self._chunk_vector(row["kind"], row["chunk_id"], model)
+                if vec is not None:
+                    out[row["content_sha256"]] = vec
+        return out
+
+    def _chunk_vector(
+        self, kind: str, chunk_id: str, model: str
+    ) -> np.ndarray | None:
+        """The stored bytes for one ``(chunk_id, model)``, or ``None``."""
+        vec_table = self._VEC_TABLES.get(kind)
+        if vec_table is None or not self.vector_available:
+            return None
+        vec_key = "obs_id" if kind == "observations" else "stable_id"
+        try:
+            row = self._c().execute(
+                f"SELECT embedding FROM {vec_table} "  # noqa: S608 - allowlisted literals
+                f"WHERE model = ? AND {vec_key} = ?",
+                (model, chunk_id),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if row is None:
+            return None
+        # LOCAL IMPORT, like ``vector_provenance``'s. ``store`` is on the MCP
+        # cold-start path and numpy is deliberately TYPE_CHECKING-only at
+        # module scope; this is the one method here that has to MAKE an array
+        # rather than accept one.
+        import numpy
+
+        return numpy.frombuffer(row["embedding"], dtype=numpy.float32)
+
     def upsert_vec_observations(
         self, rows: list[tuple[str, np.ndarray]]
     ) -> int:
@@ -1793,31 +2469,35 @@ class Store:
         The return value is what makes the degrade path checkable from outside:
         0 means the vectors were discarded because the extension is missing,
         which is otherwise indistinguishable from success.
+
+        REGISTERS EACH VECTOR IN ``chunk_embeddings`` TOO — see
+        :meth:`record_chunk_embedding` for why the two are one write. This
+        entry point never sees the text, so it can prove nothing about content
+        and stores no hash: these vectors are correct, but they are not
+        reusable across a re-chunk.
         """
-        self._ensure_writable()
-        if not self._vector_writes_enabled():
-            return 0
-        c = self._c()
-        for obs_id, embedding in rows:
-            c.execute("DELETE FROM vec_observations WHERE obs_id = ?", (obs_id,))
-            c.execute(
-                "INSERT INTO vec_observations(obs_id, embedding) VALUES (?, ?)",
-                (obs_id, embedding.astype("float32").tobytes()),
-            )
-        c.commit()
-        return len(rows)
+        return self._upsert_vectors("observations", rows)
 
     def upsert_vec_records(self, rows: list[tuple[str, np.ndarray]]) -> int:
         """Upsert ``(stable_id, embedding)`` rows. Returns how many were written."""
+        return self._upsert_vectors("records", rows)
+
+    def _upsert_vectors(
+        self, kind: str, rows: list[tuple[str, np.ndarray]]
+    ) -> int:
         self._ensure_writable()
         if not self._vector_writes_enabled():
             return 0
         c = self._c()
-        for stable_id, embedding in rows:
-            c.execute("DELETE FROM vec_records WHERE stable_id = ?", (stable_id,))
-            c.execute(
-                "INSERT INTO vec_records(stable_id, embedding) VALUES (?, ?)",
-                (stable_id, embedding.astype("float32").tobytes()),
+        col, base_table = self._kind_columns(kind)
+        for chunk_id, embedding in rows:
+            self.record_chunk_embedding(
+                kind,
+                chunk_id=chunk_id,
+                owner_id=_owner_of_chunk(c, base_table, col, chunk_id),
+                embedding=embedding,
+                content_sha256=None,
+                _commit=False,
             )
         c.commit()
         return len(rows)
@@ -1859,8 +2539,137 @@ class Store:
         if quarantine is not None:
             raise VectorIndexUnavailableError(quarantine)
 
-    def select_unembedded(self, kind: str, limit: int = 500) -> list[sqlite3.Row]:
-        """Rows whose ``embedding_state IS NULL`` — the embed worker's backlog.
+    def _require_vector_readable(self) -> str:
+        """Everything :meth:`_require_vector` checks, PLUS ``completed_at``.
+
+        Returns the model a read may answer from. Split from the write guard
+        deliberately and in one direction only: the worker filling a new
+        model's index must be able to write to it while it is still invisible,
+        or the pointer could never flip. Reads may not, because a half-built
+        embedding space answers with plausible scores drawn from whatever
+        fraction happens to be embedded.
+
+        Same exception type as every other way the arm is off — one fact,
+        several causes, and every caller already degrades to FTS5 on it.
+        """
+        self._require_vector()
+        model = self.serving_embedding_model()
+        if model is None:
+            raise VectorIndexUnavailableError(self._not_serving_reason())
+        # AN EMPTY INDEX BESIDE A FULL ONE IS NOT A COLD CACHE. Keying on the
+        # model removed the need to DELETE anything on a model change, but it
+        # introduced a way to degrade silently: a process configured for a
+        # model this cache has never embedded would filter the KNN to its own
+        # empty partition, return nothing, and look exactly like a corpus that
+        # has not been backfilled yet — while a perfectly good index for
+        # another model sat beside it. That is round 1's H1 in its new form,
+        # and it gets round 1's answer: refuse, name both models, delete
+        # nothing. A genuinely cold cache (no vectors under ANY model) is not
+        # this case and still answers "nothing embedded yet".
+        foreign = self.other_indexed_model(model)
+        if foreign is None:
+            return model
+        raise VectorIndexUnavailableError(
+            f"this cache holds vectors for {foreign!r} and none at all "
+            f"for {model!r}, which is what this process is configured to "
+            f"query. Serving the query anyway would silently return nothing "
+            f"and look identical to a corpus that has not been embedded yet. "
+            f"NOTHING WAS DELETED — vectors are keyed (chunk_id, model), so "
+            f"the existing index is intact and still serves any process "
+            f"configured for it. If AGGREGATOR_EMBED_BACKEND is exported in "
+            f"this shell then that is the cause and `unset "
+            f"AGGREGATOR_EMBED_BACKEND` is the whole fix. If the model change "
+            f"is intended, run `aggregator embed --catchup --source both` to "
+            f"build the new index; FTS5 keyword search is unaffected "
+            f"meanwhile."
+        )
+
+    def other_indexed_model(self, model: str | None = None) -> str | None:
+        """A model this cache HAS embedded, when ``model`` has nothing at all.
+
+        ``None`` in the two healthy cases: this model has vectors (so there is
+        nothing to compare it against), or the cache has no vectors under any
+        model (a genuinely cold index, which is not a disagreement).
+
+        Two callers, one question. The read path refuses to serve an empty
+        partition while a full one sits beside it — otherwise a model change
+        would degrade silently to "no results" and look like an unfinished
+        backfill. The embed worker asks the same thing before deciding whether
+        it is about to start a SECOND index by accident.
+        """
+        model = model or self.embedding_model
+        c = self._c()
+        if not _table_present(c, "chunk_embeddings"):
+            return None
+        mine = c.execute(
+            "SELECT 1 FROM chunk_embeddings WHERE model = ? LIMIT 1", (model,)
+        ).fetchone()
+        if mine is not None:
+            return None
+        other = c.execute(
+            "SELECT model FROM chunk_embeddings WHERE model <> ? LIMIT 1", (model,)
+        ).fetchone()
+        return None if other is None else str(other["model"])
+
+    def _not_serving_reason(self) -> str:
+        """Why the configured model may not be served. Two causes, two fixes.
+
+        Both are actionable and they are OPPOSITE actions, which is why the
+        message has to say which one applies rather than offering both.
+        """
+        state = self.embedding_version_state()
+        wanted = self.embedding_model
+        if state["started_at"] is None:
+            return (
+                f"this cache holds no vector index for {wanted!r} — nothing "
+                f"has ever been embedded under that model here. NOTHING WAS "
+                f"DELETED; vectors are keyed (chunk_id, model), so whatever "
+                f"other model this cache holds is intact and still serves any "
+                f"process configured for it. If AGGREGATOR_EMBED_BACKEND is "
+                f"exported in this shell then that is the cause and `unset "
+                f"AGGREGATOR_EMBED_BACKEND` is the whole fix. If the model "
+                f"change is intended, run `aggregator embed --catchup --source "
+                f"both` to build it; FTS5 keyword search is unaffected "
+                f"meanwhile."
+            )
+        return (
+            f"the vector index for {wanted!r} is still being built, and a "
+            f"previously completed index exists on this cache, so this partial "
+            f"one is not served. NOTHING IS WRONG and nothing was deleted — a "
+            f"half-filled embedding space answers with plausible scores drawn "
+            f"from whichever rows happened to be embedded first, which is "
+            f"worse than not answering at all. FTS5 keyword search is "
+            f"unaffected. Run `aggregator embed --catchup --source both` to "
+            f"finish it; `aggregator status` reports how far it has got "
+            f"(started {state['started_at']})."
+        )
+
+    def select_unembedded(
+        self, kind: str, limit: int = 500, model: str | None = None
+    ) -> list[sqlite3.Row]:
+        """The embed worker's backlog: rows with no vector under ``model``.
+
+        A QUERY, NOT A LEDGER — rule 3 of the reference design, and the reason
+        this is a LEFT JOIN against ``chunk_embeddings`` rather than a scan of
+        an ``embedding_state`` column. The store IS the ledger, so the backlog
+        is restart-safe by construction: there is no second table to fall out
+        of step with the first, every write is idempotent, and running the job
+        twice equals running it once.
+
+        The column could never have carried this. ``embedding_state = 'ok'``
+        cannot say WHICH MODEL embedded the row, so it is wrong the moment the
+        model moves — a model change with a column-based backlog selects
+        nothing and the new index stays empty forever. It is wrong in the other
+        direction too: round 4 found that a source rebuild re-INSERTs rows
+        without the column, returning ~483k of them to the backlog while their
+        vectors are still perfectly good. Both are the same bug, which is that
+        the ledger and the vectors are two separate facts that must agree.
+
+        ``embedding_state`` KEEPS THE TWO NEGATIVE OUTCOMES, and only those.
+        ``'skip'`` (nothing embeddable in this body) and ``'error'`` (set aside
+        by the poison ledger) are facts no ``chunk_embeddings`` row could
+        record, because in both cases there is no embedding to record. They
+        hold a row out of the backlog; ``'ok'`` no longer does anything.
 
         Newest first: a fresh observation is the one most likely to be searched
         for, so a partially-embedded corpus is useful long before it is
@@ -1877,22 +2686,37 @@ class Store:
         ``commit_embed_batch``, which is where the value is spent.
         """
         c = self._c()
+        model = model or self.embedding_model
         if kind == "observations":
             return list(
                 c.execute(
-                    "SELECT obs_id, body, src_hash FROM observations "
-                    "WHERE embedding_state IS NULL "
-                    "ORDER BY ts DESC LIMIT ?",
-                    (limit,),
+                    "SELECT o.obs_id AS obs_id, o.body AS body, "
+                    "       o.src_hash AS src_hash "
+                    "FROM observations o "
+                    "LEFT JOIN chunk_embeddings e "
+                    "  ON e.owner_id = o.obs_id AND e.kind = 'observations' "
+                    "  AND e.model = ? "
+                    "WHERE e.chunk_id IS NULL "
+                    "  AND o.embedding_state IS NOT 'skip' "
+                    "  AND o.embedding_state IS NOT 'error' "
+                    "ORDER BY o.ts DESC LIMIT ?",
+                    (model, limit),
                 )
             )
         if kind == "records":
             return list(
                 c.execute(
-                    "SELECT stable_id, subject, body, src_hash FROM records "
-                    "WHERE embedding_state IS NULL "
-                    "ORDER BY updated_at DESC LIMIT ?",
-                    (limit,),
+                    "SELECT r.stable_id AS stable_id, r.subject AS subject, "
+                    "       r.body AS body, r.src_hash AS src_hash "
+                    "FROM records r "
+                    "LEFT JOIN chunk_embeddings e "
+                    "  ON e.owner_id = r.stable_id AND e.kind = 'records' "
+                    "  AND e.model = ? "
+                    "WHERE e.chunk_id IS NULL "
+                    "  AND r.embedding_state IS NOT 'skip' "
+                    "  AND r.embedding_state IS NOT 'error' "
+                    "ORDER BY r.updated_at DESC LIMIT ?",
+                    (model, limit),
                 )
             )
         raise ValueError(f"unknown kind: {kind!r}")
@@ -2008,6 +2832,7 @@ class Store:
         skip_ids: list[str],
         error_ids: list[str],
         expected: dict[str, str | None],
+        hashes: dict[str, str] | None = None,
     ) -> tuple[list[str], list[str]]:
         """The embed worker's commit point. Returns ``(ok written, skip written)``.
 
@@ -2065,27 +2890,41 @@ class Store:
         # table over.
         _require_expectations([row_id for row_id, _, _ in vectors], expected)
         writes_enabled = self._vector_writes_enabled()
+        model = self.embedding_model
+        hashes = hashes or {}
         for row_id, chunk_id, embedding in vectors:
-            # Unconditional: if the row moved, ingest already dropped its
-            # vectors and this removes nothing. If it did not, this is the
-            # delete half of the idempotent delete-then-insert.
+            # Unconditional, and scoped to THIS model: if the row moved, ingest
+            # already dropped every model's vectors for it and this removes
+            # nothing. If it did not, this is the delete half of the idempotent
+            # delete-then-insert. Another model's vector for the same chunk is
+            # not touched — that coexistence is the point of the key.
             c.execute(
-                f"DELETE FROM {vec_table} WHERE {vec_key} = ?",  # noqa: S608 - allowlisted literals
-                (chunk_id,),
+                f"DELETE FROM {vec_table} WHERE model = ? AND {vec_key} = ?",  # noqa: S608 - allowlisted literals
+                (model, chunk_id),
             )
             if not writes_enabled:
                 continue
-            c.execute(
-                f"INSERT INTO {vec_table}({vec_key}, embedding) "  # noqa: S608 - allowlisted literals
-                f"SELECT ?, ? WHERE EXISTS ("
+            cur = c.execute(
+                f"INSERT INTO {vec_table}(model, {vec_key}, embedding) "  # noqa: S608 - allowlisted literals
+                f"SELECT ?, ?, ? WHERE EXISTS ("
                 f"SELECT 1 FROM {table} WHERE {col} = ? AND src_hash IS ?)",
                 (
+                    model,
                     chunk_id,
                     embedding.astype("float32").tobytes(),
                     row_id,
                     expected[row_id],
                 ),
             )
+            # THE INDEX ROW RIDES THE SAME GUARD. It is written only when the
+            # vector was, so ``chunk_embeddings`` can never claim an embedding
+            # that a compare-and-swap rejected — which would take the row out
+            # of the backfill query permanently, for a vector that does not
+            # exist.
+            if cur.rowcount:
+                self._record_chunk_row(
+                    c, kind, chunk_id, row_id, model, hashes.get(chunk_id)
+                )
         written_ok = self.mark_embedded(kind, ok_ids, "ok", expected, _commit=False)
         written_skip = self.mark_embedded(
             kind, skip_ids, "skip", expected, _commit=False
@@ -2242,11 +3081,13 @@ class Store:
         would put a tenth of a second of pure overhead on the recall path and
         make it worse every time the corpus grows.
 
-        ``embedding_state`` is a plain column with an index on it, so the same
-        question costs microseconds. It is also the more honest predicate:
-        the worker writes vectors BEFORE it marks a row ``'ok'``, so ``'ok'``
-        implies a retrievable vector, while ``'skip'`` (nothing embeddable)
-        and ``'error'`` correctly do not.
+        ``chunk_embeddings`` is a plain table with an index on
+        ``(model, kind, …)``, so the same question costs microseconds — and it
+        is the more honest predicate for a second reason round 4 made concrete.
+        The old form read ``embedding_state = 'ok'``, a column a source rebuild
+        silently resets: after one, ~483k rows returned to NULL and this method
+        reported the arm OFF over a fully populated index. The embedding index
+        is not touched by a row rewrite, so it cannot lie in that direction.
 
         Raises when the extension is missing, like every other vector read —
         routing has to be able to tell "nothing embedded yet" from "this
@@ -2254,10 +3095,13 @@ class Store:
         """
         if kind not in self._VEC_TABLES:
             raise ValueError(f"unknown kind: {kind!r}")
-        self._require_vector()
+        model = self._require_vector_readable()
         c = self._c()
+        if not _table_present(c, "chunk_embeddings"):
+            return False
         row = c.execute(
-            f"SELECT 1 FROM {kind} WHERE embedding_state = 'ok' LIMIT 1"  # noqa: S608 - allowlisted literals
+            "SELECT 1 FROM chunk_embeddings WHERE model = ? AND kind = ? LIMIT 1",
+            (model, kind),
         ).fetchone()
         return row is not None
 
@@ -2284,8 +3128,30 @@ class Store:
         for row in rows:
             n = int(row["n"])
             counts["total"] += n
-            key = "pending" if row["s"] is None else str(row["s"])
-            counts[key] = counts.get(key, 0) + n
+            if row["s"] in ("skip", "error"):
+                counts[str(row["s"])] += n
+        # ``ok`` COMES OFF THE EMBEDDING INDEX, not the column, for the same
+        # reason the backlog query does: the column cannot say which model, so
+        # after a model change it would report a complete index for a space
+        # that holds nothing. Counting owners rather than chunks keeps this a
+        # DOCUMENT-level tally, comparable with ``total``.
+        # ``_stamped_model``, not ``embedding_model``: this is reached from
+        # ``capabilities()`` at MCP connect time, and the property would drag
+        # ``aggregator.core.embed`` (and numpy) onto the cold-start path the
+        # ``test_mcp_cold_start`` guard exists to keep clear. The stamp is also
+        # the right question here — "how far has the index on disk got".
+        model = self._stamped_model()
+        if model is not None and _table_present(c, "chunk_embeddings"):
+            counts["ok"] = int(
+                c.execute(
+                    "SELECT COUNT(DISTINCT owner_id) AS n FROM chunk_embeddings "
+                    "WHERE model = ? AND kind = ?",
+                    (model, kind),
+                ).fetchone()["n"]
+            )
+        counts["pending"] = max(
+            0, counts["total"] - counts["ok"] - counts["skip"] - counts["error"]
+        )
         return counts
 
     def _vec_obs_ids(self, query_embedding: np.ndarray, k: int) -> list[str]:
@@ -2293,34 +3159,44 @@ class Store:
 
         Returns top-K ``obs_id`` ordered by ascending distance — best match
         first, which is the order RRF expects.
+
+        ``AND model = ?`` IS LOAD-BEARING, not a filter for tidiness. Two
+        models coexist in this table by design, and their vectors are not
+        comparable: a distance computed between a query in one embedding space
+        and a document in another is an apples-to-rulers number that looks
+        exactly like a good score. The partition key means this costs less than
+        the unfiltered scan did, not more.
         """
-        self._require_vector()
+        model = self._require_vector_readable()
         c = self._c()
         rows = c.execute(
             """
             SELECT obs_id
             FROM vec_observations
             WHERE embedding MATCH ?
+              AND model = ?
+              AND k = ?
             ORDER BY distance
-            LIMIT ?
             """,
-            (query_embedding.astype("float32").tobytes(), k),
+            (query_embedding.astype("float32").tobytes(), model, k),
         ).fetchall()
         return [r["obs_id"] for r in rows]
 
     def _vec_record_ids(self, query_embedding: np.ndarray, k: int) -> list[str]:
-        """Vector KNN over ``vec_records``. Same contract as ``_vec_obs_ids``."""
-        self._require_vector()
+        """Vector KNN over ``vec_records``. Same contract as ``_vec_obs_ids``,
+        including the load-bearing ``AND model = ?``."""
+        model = self._require_vector_readable()
         c = self._c()
         rows = c.execute(
             """
             SELECT stable_id
             FROM vec_records
             WHERE embedding MATCH ?
+              AND model = ?
+              AND k = ?
             ORDER BY distance
-            LIMIT ?
             """,
-            (query_embedding.astype("float32").tobytes(), k),
+            (query_embedding.astype("float32").tobytes(), model, k),
         ).fetchall()
         return [r["stable_id"] for r in rows]
 

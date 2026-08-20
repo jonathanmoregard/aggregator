@@ -21,6 +21,20 @@ What that cost, per tick, twice an hour, forever:
 * 500 rows of CPU burned on work thrown away before it was written.
 
 The rule: refuse before the batch, name the real cause, exit non-zero.
+
+CRITERION E CHANGED WHAT THE MISMATCH COSTS, NOT WHETHER IT REFUSES. Vectors
+are keyed ``(chunk_id, model)`` now, so a stray backend variable can no longer
+DELETE anything — the existing index keeps its own key and goes on serving any
+process configured for it. What it CAN still do is commit the machine to
+building a second index from scratch, which on this hardware is weeks of CPU
+(``docs/embedding-throughput.md``) for a model nobody chose. Same failure
+class, opposite direction, so it gets the same answer: refuse before a row is
+embedded, name both fixes, exit non-zero.
+
+The two fixes it names have changed with it. "Delete and rebuild with
+``--reindex``" was the only way out when the index was a singleton; now the
+opposite of "unset the variable" is "make the model change in SOURCE", because
+a deployed pin is the only thing that can say a model change was deliberate.
 """
 
 import argparse
@@ -138,7 +152,10 @@ def test_the_refusal_names_the_cause_that_actually_applies(
     err = capsys.readouterr().err
 
     assert "unset AGGREGATOR_EMBED_BACKEND" in err
-    assert "--reindex" in err
+    assert "aggregator/core/embed.py" in err, (
+        "did not name the deliberate way to change the model"
+    )
+    assert "NOTHING WAS DELETED" in err
     assert "sqlite-vec` wheel" not in err, (
         "named the missing-extension cause on a run where the extension loaded"
     )
@@ -152,11 +169,19 @@ def test_the_backlog_and_the_vectors_are_left_exactly_as_they_were(
     capsys.readouterr()
 
     assert _vector_count(quarantined) == 2
+    # The BACKLOG is now read under the model this shell asked for, and that
+    # model has embedded nothing — so all four rows are legitimately due. The
+    # guarantee is that none of them was touched: no vector was written, no
+    # row was marked, and the two existing vectors are still there.
     store = Store(db_path=quarantined)
     assert {r["obs_id"] for r in store.select_unembedded("observations")} == {
+        "o0",
+        "o1",
         "o2",
         "o3",
     }
+    c = store._c()
+    assert c.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0] == 2
 
 
 def test_a_healthy_index_is_not_refused(tmp_path, monkeypatch, capsys):

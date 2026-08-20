@@ -107,15 +107,31 @@ def test_environment_alone_cannot_authorise_a_reindex(populated, monkeypatch):
         store._vec_obs_ids(_unit(_VEC_DIM), k=3)
 
 
-def test_migrate_default_refuses_and_keeps_every_vector(populated):
-    """S1, unchanged: a mismatch refuses, deletes nothing, arm off."""
+def test_migrate_default_keeps_every_vector(populated):
+    """S1's guarantee, reached without a quarantine at all.
+
+    Criterion E moved the protection from "refuse the index" to "key the
+    index". A plain ``migrate()`` under a stray backend variable now ADOPTS
+    the cache — the existing vectors carry their own model and are in no
+    danger from being looked at — and the refusal happens at read time, where
+    it can be specific about which model is missing. What has not changed, and
+    is the whole point, is that nothing is deleted.
+    """
     store = Store(db_path=populated)
     store.migrate()
     assert _vector_count(populated) == 5
-    assert store.vector_quarantine is not None
-    assert "NOTHING WAS DELETED" in store.vector_quarantine
-    rows = store.select_unembedded("observations", limit=10)
-    assert rows == [], "an unconsented mismatch must not requeue the backlog"
+    with pytest.raises(VectorIndexUnavailableError) as e:
+        store.has_embedded_rows("observations")
+    assert "NOTHING WAS DELETED" in str(e.value)
+
+
+def test_the_new_models_backlog_is_the_whole_corpus(populated):
+    """A model change is a background JOB: everything is due under the new
+    key, and the old vectors are not touched while it runs."""
+    store = Store(db_path=populated)
+    store.migrate()
+    assert len(store.select_unembedded("observations", limit=10)) == 5
+    assert _vector_count(populated) == 5
 
 
 def test_the_explicit_parameter_is_what_deletes(populated):
@@ -139,11 +155,16 @@ def test_preview_is_safe_on_a_cache_that_never_migrated(tmp_path):
     assert store.vector_reindex_preview() == (0, 0)
 
 
-def test_refusal_names_the_command_that_authorises_the_rebuild(populated):
+def test_refusal_names_the_two_opposite_fixes(populated):
+    """They ARE opposite, so the message has to name both and say which is
+    which: unset a stray variable, or build the new index deliberately."""
     store = Store(db_path=populated)
     store.migrate()
-    reason = store.vector_quarantine
-    assert "--reindex" in reason
+    with pytest.raises(VectorIndexUnavailableError) as e:
+        store.has_embedded_rows("observations")
+    reason = str(e.value)
+    assert "unset AGGREGATOR_EMBED_BACKEND" in reason
+    assert "embed --catchup" in reason
     assert "AGGREGATOR_VECTOR_REINDEX" not in reason, (
         "the refusal still tells the operator to export a variable nothing reads"
     )

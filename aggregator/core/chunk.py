@@ -11,8 +11,28 @@ still see full context.
 
 from __future__ import annotations
 
+#: The window geometry every stored vector was produced under.
+CHUNK_MAX_LEN = 4000
+CHUNK_OVERLAP = 400
 
-def chunk_body(text: str, max_len: int = 4000, overlap: int = 400) -> list[str]:
+#: The chunker's contribution to the embedding version string.
+#:
+#: DERIVED FROM THE CONSTANTS ABOVE, not written out beside them, because the
+#: whole job of this string is to change when the geometry changes. A version
+#: someone has to remember to bump is one that silently stops describing the
+#: index — and two chunkings of the same document are not interchangeable
+#: vectors even when the model and the weights are identical: the text that
+#: went into the encoder was different text.
+#:
+#: What it must NOT contain is anything that moves per deploy. A git hash here
+#: would re-embed the entire corpus on every release, which on this hardware is
+#: a multi-week operation (see ``docs/embedding-throughput.md``).
+CHUNKER_VERSION = f"chunk-{CHUNK_MAX_LEN}-{CHUNK_OVERLAP}"
+
+
+def chunk_body(
+    text: str, max_len: int = CHUNK_MAX_LEN, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
     """Return zero-or-more chunks of ``text``.
 
     Empty / whitespace-only input returns ``[]`` so the caller writes no
