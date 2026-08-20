@@ -783,12 +783,35 @@ in {
           Nice = 19;
           IOSchedulingClass = "idle";
           TimeoutStartSec = cfg.embed.timeoutStartSec;
-          # Give an in-flight batch room to commit before SIGKILL. Note the
-          # worker installs no SIGTERM handler, so a stop is immediate
-          # regardless; correctness comes from the commit ordering (vectors
-          # first, watermark second), which makes the worst case a repeated
-          # batch — the vec upserts are delete-then-insert, hence idempotent
-          # — and never a row marked embedded with no vector behind it.
+          # The window between SIGTERM and SIGKILL, and round 2 changed what
+          # it buys. This used to say the worker installed no SIGTERM handler
+          # and that correctness came from committing vectors before the
+          # watermark. BOTH premises are now false: `cli.py` wraps the embed
+          # loop in `graceful_shutdown()`, and `Store.commit_embed_batch` is a
+          # single transaction rather than two ordered commits.
+          #
+          # What the timeout is for NOW. SIGTERM sets a flag — no work in the
+          # handler — which the loop reads at a ROW boundary, not a batch one.
+          # The rows already embedded are flushed through the same one-shot
+          # commit, the in-flight claim on the current row is released, and
+          # the process exits cleanly. A row is sub-second, so 5min is wildly
+          # generous on purpose: it costs nothing on every ordinary stop and
+          # still covers a pathologically long body or a cold model.
+          #
+          # What it PREVENTS, which is no longer just repeated work. The claim
+          # a row leaves on disk is the worker's crash detector: only code
+          # that runs can clear it, so a claim found at startup means the
+          # previous worker died on that row and it gets set aside as poison.
+          # A stop that reaches its boundary clears the claim and is therefore
+          # invisible to that logic. A SIGKILL does not — so a too-short
+          # window would turn every routine `systemctl --user stop`, reboot
+          # and deploy into a good row being condemned, on a backlog measured
+          # in weeks. Losing the batch would be cheap; losing the row from the
+          # index quietly is not.
+          #
+          # And it stays FINITE. With TimeoutStartSec=infinity above, a manual
+          # stop is the last bound on a wedged worker, so it must itself
+          # complete — asserted by `aggregator-embed-unit-hygiene` step 6.
           TimeoutStopSec = "5min";
           StandardOutput = "journal";
           StandardError = "journal";
