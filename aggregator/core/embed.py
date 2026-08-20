@@ -96,20 +96,49 @@ def downloads_allowed() -> bool:
     return os.environ.get(MODEL_DOWNLOAD_ENV, "").strip().lower() in ("1", "true", "yes")
 
 
-def configured_model_id() -> str:
-    """Which model ``Embedder()`` would load right now, without loading it.
+def _resolve_model_id(backend: str, model_name: str | None) -> str:
+    """The repo id a given ``(backend, model_name)`` pair resolves to.
 
-    The vector index is only valid for the model that wrote it, so this is
-    what ``Store.migrate()`` stamps into the cache and compares against on
-    every later run. It mirrors ``Embedder.__init__``'s default selection
-    exactly — if the two ever disagree, the stamp starts vouching for vectors
-    a different model produced, which is the failure the stamp exists to
-    prevent. Kept next to those defaults for that reason.
+    THE SINGLE RESOLUTION. ``Embedder.__init__`` and ``configured_model_id``
+    used to answer this question with two separate copies of the same
+    if-statement, and the docstring below claimed they "mirror exactly" — a
+    claim held up by nothing but the two being adjacent. They are one function
+    now, so the mirror is structural rather than aspirational.
     """
-    backend = os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
+    if model_name is not None:
+        return model_name
     if backend == "gguf":
         return _DEFAULT_MODEL_GGUF
     return _DEFAULT_MODEL_ST
+
+
+def configured_model_id(embedder: Embedder | None = None) -> str:
+    """The model id vectors should be stamped with.
+
+    The vector index is only valid for the model that wrote it, so this is
+    what ``Store`` stamps into the cache and compares against on every later
+    run. Round 1's H1 (refuse a foreign index rather than silently reranking
+    against it) and round 2's S1 (never delete one without explicit consent)
+    are both decisions taken FROM that stamp, so a stamp that can disagree
+    with reality undermines both.
+
+    PASS THE EMBEDDER WHENEVER ONE EXISTS. That is round 3's M2. This function
+    took no arguments and read ``AGGREGATOR_EMBED_BACKEND`` only, while
+    ``Embedder`` resolves from its own ``backend=``/``model_name=`` arguments
+    first. So ``Embedder(backend="gguf")`` in a process with the variable
+    unset wrote vectors from one model and stamped them with another — the
+    stamp vouching for exactly the thing it exists to catch. With an embedder
+    in hand the answer is read off the object that did the work, and it cannot
+    be wrong.
+
+    The no-argument form is still correct and still needed: the read path asks
+    "may this process trust the vectors on disk?" before any embedder is
+    built, and there the honest answer is what ``Embedder()`` WOULD load.
+    """
+    if embedder is not None:
+        return embedder.model_id
+    backend = os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
+    return _resolve_model_id(backend, None)
 
 
 class Embedder:
@@ -124,13 +153,18 @@ class Embedder:
     ):
         self.backend = backend or os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
         self.model_name = model_name
+        #: The repo id THIS instance actually loaded, whatever the environment
+        #: says. Vectors this embedder produces must be stamped with this and
+        #: nothing else — see ``configured_model_id``. Set before any weights
+        #: are touched, so it is readable even if the load below raises.
+        self.model_id = _resolve_model_id(self.backend, model_name)
         self._st_model = None
         self._gguf_model = None
         if self.backend == "st":
             from sentence_transformers import SentenceTransformer
 
             self._st_model = SentenceTransformer(
-                self.model_name or _DEFAULT_MODEL_ST,
+                self.model_id,
                 cache_folder=str(cache_dir) if cache_dir else None,
                 # No revision for a caller-supplied model: this pin was taken
                 # from the default repository and vouches for nothing else.
@@ -182,7 +216,7 @@ class Embedder:
             # argument is spelled out regardless, so the pin is a wired,
             # greppable, testable thing rather than a missing keyword nobody
             # can assert on.
-            repo_id = self.model_name or _DEFAULT_MODEL_GGUF
+            repo_id = self.model_id
             revision = self._gguf_revision(repo_id)
 
             from huggingface_hub import hf_hub_download
