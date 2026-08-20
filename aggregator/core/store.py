@@ -304,12 +304,47 @@ def _json_id_clause(column: str) -> str:
     return f"{column} IN (SELECT value FROM json_each(?))"
 
 
-def _vec_table_present(c: sqlite3.Connection, table: str) -> bool:
+def _table_present(c: sqlite3.Connection, table: str) -> bool:
     """Whether ``table`` exists. Probed once per write group, not per row."""
     return (
         c.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone()
         is not None
     )
+
+
+def _vec_table_usable(c: sqlite3.Connection, table: str) -> bool:
+    """Whether ``table`` exists AND ``vec0`` is loaded on THIS connection.
+
+    EXISTENCE IS THE WRONG QUESTION FOR A VIRTUAL TABLE, and asking it was
+    round 3's H3. ``sqlite_master`` records that the table was created; it says
+    nothing about whether the module implementing it is available now.
+    ``sqlite-vec`` is a loadable extension, so the two come apart in a case
+    that is ordinary rather than exotic: a cache filled on a working
+    interpreter, then opened on one where the wheel is missing or ABI-
+    mismatched. Every statement against the table — ``DELETE`` included —
+    then raises ``no such module: vec0``.
+
+    That mattered because the probe guarded the ingest write path. An edited
+    row's stale vectors are dropped inside the same transaction that writes
+    the row, so a raise there did not cost the vector arm (which was already
+    gone) — it aborted the WRITE, and took FTS5 keyword recall down with it.
+    Serving keyword search when the vector arm cannot load is a founding
+    requirement of this branch, not a nicety.
+
+    So the probe runs the cheapest statement that would fail for the same
+    reason the real one would. ``LIMIT 1`` on a ``vec0`` table touches its
+    shadow index and returns at most one row, and it is asked once per write
+    GROUP — never per row — for the same reason the existence probe was.
+    """
+    if not _table_present(c, table):
+        return False
+    try:
+        c.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()  # noqa: S608 - fixed literals
+    except sqlite3.OperationalError:
+        # ``no such module: vec0``. Same degradation as a failed load: the
+        # vector arm is off, and the caller's write proceeds without it.
+        return False
+    return True
 
 
 def _drop_row_vectors(
@@ -377,7 +412,7 @@ def _purge_orphan_vectors(c: sqlite3.Connection, kind: str) -> int:
     while dropping one costs the row its recall.
     """
     vec_table, vec_key, base_table, base_key = _VEC_OWNERSHIP[kind]
-    if not _vec_table_present(c, vec_table):
+    if not _table_present(c, vec_table):
         return 0
     # ``rtrim(key,'0-9')`` strips a trailing chunk index; when what remains
     # ends in ':' the key was ``<owner>:<n>`` and the owner is the rest.
@@ -655,24 +690,24 @@ VECTOR_PROVENANCE_KEY = "vector_provenance"
 #: unwinding — see ``Store.claim_embed_row``.
 EMBED_CLAIM_KEY = "embed_inflight"
 
-#: The ONE opt-in that lets a provenance mismatch DELETE computed vectors.
+#: The command that may authorise a provenance mismatch to DELETE vectors.
 #:
-#: Deliberately not inferred from anything. ``AGGREGATOR_EMBED_BACKEND`` names a
-#: loader; it is not consent to discard a month of CPU, and round 2's S1 is
-#: exactly that conflation — a stray ``export`` in one shell turning
-#: ``aggregator query`` into a demolition, then the pinned timer demolishing
-#: what got rebuilt. This variable does nothing at all when the stamp matches,
-#: and its name says what it costs.
-VECTOR_REINDEX_ENV = "AGGREGATOR_VECTOR_REINDEX"
-
-
-def reindex_consented() -> bool:
-    """Whether this process was explicitly told it may rebuild the index."""
-    return os.environ.get(VECTOR_REINDEX_ENV, "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+#: NOT AN ENVIRONMENT VARIABLE, and round 3's H1 is why. The first opt-in was
+#: ``AGGREGATOR_VECTOR_REINDEX=1``, read by ``reindex_consented()`` inside
+#: ``migrate()`` — and ``migrate()`` runs on EVERY subcommand. So the consent
+#: was ambient and sticky: export it once for the rebuild you meant, and the
+#: next ``aggregator query`` in that shell carried it too. Pair that with a
+#: stray ``AGGREGATOR_EMBED_BACKEND`` and a READ deleted 25-30 days of CPU,
+#: which is exactly the failure round 2's S1 fix existed to prevent,
+#: reintroduced through the fix's own escape hatch.
+#:
+#: Consent is therefore a PARAMETER — ``migrate(allow_vector_reindex=True)`` —
+#: and only ``cli._cmd_embed`` passes it, only when ``--reindex`` was typed on
+#: that invocation, and only after printing what it would destroy and taking a
+#: ``y`` on stdin. That is the shape ``ingest --rebuild`` already uses for a
+#: row drop of comparable cost, and it makes the loud path the easy one: no
+#: environment state can authorise this, so nothing can authorise it silently.
+VECTOR_REINDEX_COMMAND = "aggregator embed --catchup --source both --reindex"
 
 _VEC_DDL: list[str] = [
     f"""
@@ -749,8 +784,9 @@ def _provenance_refusal(stamped: str, expected: str, vectors: int | None) -> str
         f"AGGREGATOR_EMBED_BACKEND is exported in this shell then that is the "
         f"cause and `unset AGGREGATOR_EMBED_BACKEND` is the whole fix. If the "
         f"model change is intended, the index cannot be converted and has to "
-        f"be rebuilt from scratch (weeks of CPU) — say so once, explicitly: "
-        f"`{VECTOR_REINDEX_ENV}=1 aggregator embed --catchup --source both`."
+        f"be rebuilt from scratch (weeks of CPU) — say so once, explicitly, on "
+        f"the command that owns the vector index: `{VECTOR_REINDEX_COMMAND}`. "
+        f"It prints what it would delete and asks for a 'y' first."
     )
 
 
@@ -900,8 +936,20 @@ class Store:
 
     # -- schema -----------------------------------------------------------
 
-    def migrate(self) -> None:
+    def migrate(self, *, allow_vector_reindex: bool = False) -> None:
         """Create tables + FTS virtual tables + triggers. Idempotent.
+
+        ``allow_vector_reindex`` IS THE ONLY THING THAT MAY DELETE COMPUTED
+        VECTORS WHOLESALE, and it defaults to refusing. It reaches exactly one
+        branch of ``_reconcile_vector_provenance``: a provenance mismatch over
+        an index that has vectors in it. Everything else here is additive.
+
+        Keyword-only, and every caller but one leaves it alone. This method
+        runs on EVERY subcommand — that is what made the previous environment
+        variable so dangerous, since a value exported for one deliberate
+        rebuild was then honoured by every read that followed it. A parameter
+        cannot leak out of the call that passes it. See
+        ``VECTOR_REINDEX_COMMAND``.
 
         Bumps ``PRAGMA user_version`` to SCHEMA_VERSION. A downgraded schema
         won't be silently touched — callers detect via ``user_version`` and
@@ -935,7 +983,7 @@ class Store:
             # BEFORE the vec DDL: a foreign table of the wrong width survives
             # ``CREATE VIRTUAL TABLE IF NOT EXISTS`` untouched, so the check
             # that might drop it has to run first.
-            self._reconcile_vector_provenance(c)
+            self._reconcile_vector_provenance(c, allow_vector_reindex)
             if self._vector_quarantine is None:
                 for stmt in _VEC_DDL:
                     c.executescript(stmt)
@@ -946,7 +994,9 @@ class Store:
         )
         c.commit()
 
-    def _reconcile_vector_provenance(self, c: sqlite3.Connection) -> None:
+    def _reconcile_vector_provenance(
+        self, c: sqlite3.Connection, allow_reindex: bool = False
+    ) -> None:
         """Adopt the vector index only if this build is what produced it.
 
         WHY EXISTENCE IS NOT ENOUGH. Every other probe in ``migrate()`` asks
@@ -1005,8 +1055,15 @@ class Store:
         The refusal names both fixes, because they are opposite actions and
         only the operator knows which one is meant: unset the stray env var,
         or — if the model change is real — consent to the rebuild explicitly
-        via ``AGGREGATOR_VECTOR_REINDEX=1``, which is the only thing in this
+        with ``aggregator embed --reindex``, which is the only thing in this
         codebase that may delete computed vectors WHOLESALE.
+
+        ``allow_reindex`` IS THAT CONSENT, and it arrives as an argument
+        because round 3 found the environment variable it replaced could not
+        be scoped. ``migrate()`` runs on every subcommand, so a variable
+        exported for one intended rebuild authorised every command that
+        followed it in that shell — a read included. An argument is spent by
+        the call that passes it and cannot be left lying around.
 
         Not wholesale: ingest's per-row invalidation (``_drop_row_vectors``
         when a body is edited, ``_purge_orphan_vectors`` after a rebuild) still
@@ -1042,7 +1099,7 @@ class Store:
                     f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed literals
                 ).fetchone()[0]
 
-        if on_disk and not reindex_consented():
+        if on_disk and not allow_reindex:
             self._quarantine_vectors(
                 _provenance_refusal(stamped, expected, on_disk)
             )
@@ -1077,6 +1134,56 @@ class Store:
             (VECTOR_PROVENANCE_KEY, expected),
         )
         self._adopt_vectors()
+
+    @property
+    def vector_quarantine(self) -> str | None:
+        """Why the vector arm is refusing on this store, or ``None``.
+
+        THE PUBLIC READING OF THE S1 VERDICT, and round 3's H2 is what it is
+        for. ``_require_vector`` consults the same answer, but only at the
+        moment of a vector write — which in the embed worker is AFTER a full
+        500-row batch has been embedded, so the refusal arrived as an uncaught
+        exception on top of work already thrown away. A caller that wants to
+        refuse BEFORE spending anything needs to be able to ask.
+
+        Same cost and caching as ``_require_vector``: one indexed ``meta``
+        lookup per connection, and nothing at all on the FTS5-only path.
+        """
+        return self._vector_quarantine_reason()
+
+    def vector_reindex_preview(self) -> tuple[int, int]:
+        """``(vectors that would be deleted, rows that would be re-embedded)``.
+
+        WHAT THE OPERATOR IS SHOWN BEFORE BEING ASKED TO CONFIRM. A destructive
+        prompt that cannot say how much it destroys is a prompt people learn to
+        answer 'y' to, and the quantity is the whole argument here: this is the
+        difference between discarding a cold index and discarding weeks of CPU.
+
+        Deliberately safe to call BEFORE ``migrate()`` — that is exactly when
+        the CLI needs it, since the confirmation has to happen before the
+        migration that would act on it. Every table is probed for existence
+        first, and the vec counts are additionally guarded against the
+        ``no such module: vec0`` this file already handles elsewhere: a cache
+        that HAS the tables on an interpreter where the extension did not load
+        can still answer "nothing would be deleted here".
+        """
+        c = self._c()
+        vectors = 0
+        for table in ("vec_observations", "vec_records"):
+            if not _vec_table_usable(c, table):
+                continue
+            vectors += c.execute(
+                f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed literals
+            ).fetchone()[0]
+        rows = 0
+        for table in ("observations", "records"):
+            if not _table_present(c, table):
+                continue
+            rows += c.execute(
+                f"SELECT COUNT(*) FROM {table} "  # noqa: S608 - fixed literals
+                "WHERE embedding_state IS NOT NULL"
+            ).fetchone()[0]
+        return vectors, rows
 
     def _adopt_vectors(self) -> None:
         """The vector state on disk is this build's. Trust it."""
@@ -1341,7 +1448,7 @@ class Store:
         stored_obs = _stored_hashes(c, "observations", "obs_id", obs_ids)
         # Probed ONCE per group. A cache migrated without sqlite-vec has no vec
         # tables at all, and the watermark reset below must still happen there.
-        vec_present = _vec_table_present(c, "vec_observations")
+        vec_present = _table_present(c, "vec_observations")
 
         unchanged = 0
         for e in group:
@@ -2671,7 +2778,7 @@ class Store:
         # its vector survives the re-insert — the row is back at
         # ``embedding_state IS NULL`` and will be re-embedded, but it keeps
         # serving the vector arm in the meantime instead of going dark.
-        if existed and _vec_table_present(c, "vec_records"):
+        if existed and _table_present(c, "vec_records"):
             _drop_row_vectors(c, "vec_records", "stable_id", r.stable_id)
         c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
         c.execute(

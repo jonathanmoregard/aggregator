@@ -1542,6 +1542,61 @@ def _print_run_report(report: RunReport) -> None:
     )
 
 
+def _approve_vector_reindex(store: Store, *, assume_yes: bool) -> bool:
+    """Show what ``--reindex`` would destroy, then ask. Round 3's H1, CLI half.
+
+    THE ASYMMETRY THIS REMOVES. ``ingest --rebuild`` drops rows it can re-fetch
+    in minutes, and it still prints a count and demands a ``y`` on stdin.
+    Deleting the vector index costs 25-30 days of continuous CPU to put back,
+    and its opt-in was a shell variable that every command honoured in silence.
+    The cheaper operation had the louder gate.
+
+    So: the same gate, on the more expensive operation. The count comes off
+    disk rather than out of an estimate, because "some vectors" is not a
+    number anyone can weigh a month of CPU against.
+
+    A REINDEX WITH NOTHING TO DELETE IS NOT A QUESTION. ``migrate()`` already
+    adopts an empty or absent index for free — nothing computed exists, so
+    nothing is at stake — and prompting there would train the operator to
+    answer ``y`` without reading, which is exactly how the real prompt stops
+    working.
+
+    ``--yes`` is for scripted use and mirrors ``ingest --yes``. It skips the
+    question, never the report: the counts are printed either way, so a run
+    in a journal still says what it destroyed.
+    """
+    vectors, rows = store.vector_reindex_preview()
+    if not vectors:
+        print(
+            "embed --reindex: no computed vectors on disk, so there is "
+            "nothing to delete and nothing to confirm. Continuing."
+        )
+        return True
+    print(
+        f"embed --reindex will DELETE {vectors} vector(s) from this cache and "
+        f"return {rows} row(s) to the embed backlog.\n"
+        f"They cannot be converted, only recomputed: the last full backfill "
+        f"of this corpus was measured at 25-30 days of continuous CPU.\n"
+        f"Do this only if the embedding model genuinely changed. If "
+        f"AGGREGATOR_EMBED_BACKEND is merely exported in this shell, "
+        f"`unset AGGREGATOR_EMBED_BACKEND` is the whole fix and costs nothing.",
+        file=sys.stderr,
+    )
+    if assume_yes:
+        print("embed --reindex: --yes given; proceeding without asking.")
+        return True
+    if _confirm_force_on_stdin("Type 'y' to delete them and re-embed: "):
+        return True
+    print(
+        "aborted: vector reindex not confirmed. NOTHING WAS DELETED — the "
+        "vectors on disk are intact and the backlog is untouched. The vector "
+        "arm stays switched off for mismatched provenance; FTS5 keyword "
+        "search is unaffected.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     """Background embed worker — fills the v5 vector index.
 
@@ -1557,9 +1612,20 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     and nothing ever looks at a row twice. That is the watermark-ahead-of-data
     failure the ingest rules forbid, so the whole run is refused and the
     backlog is left exactly where it was.
+
+    THIS IS ALSO THE ONLY COMMAND THAT MAY DELETE THE VECTOR INDEX, under
+    ``--reindex``, and that is round 3's H1. The consent used to be
+    ``AGGREGATOR_VECTOR_REINDEX=1`` read inside ``Store.migrate()`` — which
+    every subcommand calls — so it was ambient, sticky, and honoured by reads.
+    It belongs here because the reindex is embed-side maintenance: this is the
+    command that owns the index, and the only one that can put back what it
+    destroys.
     """
     store = _store or Store()
-    store.migrate()
+    # BEFORE ``migrate()``, because migrate is what would do the deleting.
+    if args.reindex and not _approve_vector_reindex(store, assume_yes=args.yes):
+        return 1
+    store.migrate(allow_vector_reindex=args.reindex)
 
     if not store.vector_available:
         print(
@@ -2354,6 +2420,25 @@ def build_parser() -> argparse.ArgumentParser:
         dest="batch_size",
         help="rows per checkpointed batch (default: 500, must be >= 1)",
     )
+    p_embed.add_argument(
+        "--reindex",
+        action="store_true",
+        help=(
+            "DELETE every vector in the cache and re-embed from scratch. Only "
+            "does anything when the index on disk was written by a different "
+            "model or dimension than this build produces — otherwise it is a "
+            "no-op. Prints how many vectors it would destroy and asks for a "
+            "'y' on stdin first (--yes skips the question, not the report). "
+            "The last full backfill of this corpus took 25-30 days of CPU, so "
+            "check `unset AGGREGATOR_EMBED_BACKEND` is not the real fix before "
+            "using this. Nothing outside this flag can authorise the deletion"
+        ),
+    )
+    p_embed.add_argument(
+        "--yes",
+        action="store_true",
+        help="assume 'y' for the --reindex confirmation (scripted use)",
+    )
 
     tks = sub.add_parser(
         "github-token-status",
@@ -2385,7 +2470,14 @@ def main(
     if args.cmd == "embed" and args.seed_models:
         return _cmd_seed_models()
     store = _store or Store()
-    store.migrate()
+    # ``embed`` MIGRATES ITSELF, and must be the one to do it. It is the only
+    # command that may authorise a vector reindex (``--reindex``), and that
+    # authority is an argument to ``migrate()``. Migrating eagerly here would
+    # run the provenance check first, without the argument — logging a refusal
+    # that names two fixes, immediately before the run that applies one of
+    # them. Every other subcommand still gets its schema up front.
+    if args.cmd != "embed":
+        store.migrate()
 
     def sources() -> dict[str, Any]:
         """Build the source registry ON THE COMMAND THAT NEEDS IT.

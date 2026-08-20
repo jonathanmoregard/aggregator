@@ -42,8 +42,15 @@ So the answer is now proportional to what is at stake:
   the vector arm switches off for the process: reads raise
   ``VectorIndexUnavailableError``, writes no-op, ``vector_index_state`` says
   ``unavailable``, FTS5 is untouched. A mismatch still cannot serve a vector
-  whose model is unknown. Deleting requires saying so:
-  ``AGGREGATOR_VECTOR_REINDEX=1``.
+  whose model is unknown. Deleting requires saying so.
+
+ROUND 3 MOVED WHERE "SAYING SO" HAPPENS. The opt-in was
+``AGGREGATOR_VECTOR_REINDEX=1``, read inside ``migrate()`` — which every
+subcommand calls — so the consent was ambient and outlived the command it was
+meant for. It is now an argument, ``migrate(allow_vector_reindex=True)``,
+passed by exactly one caller: ``aggregator embed --reindex``. See
+``test_store_reindex_consent.py`` for that boundary; the tests here pin what
+happens on either side of it.
 """
 
 import sqlite3
@@ -54,7 +61,7 @@ import sqlite_vec
 
 from aggregator.core.store import (
     _VEC_DIM,
-    VECTOR_REINDEX_ENV,
+    VECTOR_REINDEX_COMMAND,
     Store,
     VectorIndexUnavailableError,
     vector_provenance,
@@ -176,9 +183,7 @@ def test_a_foreign_vec_table_of_the_wrong_dimension_never_serves_a_query(tmp_pat
     assert {r["obs_id"] for r in store.select_unembedded("observations")} == {"o1"}
 
 
-def test_a_wrong_width_table_is_repaired_once_consent_is_given(
-    tmp_path, monkeypatch
-):
+def test_a_wrong_width_table_is_repaired_once_consent_is_given(tmp_path):
     """The rebuild still exists — it is just no longer implicit."""
     db = tmp_path / "cache.db"
     _plant_foreign_vec_table(db, dim=1024)
@@ -187,9 +192,8 @@ def test_a_wrong_width_table_is_repaired_once_consent_is_given(
     store.migrate()  # refuses; the foreign table survives
     store.close()
 
-    monkeypatch.setenv(VECTOR_REINDEX_ENV, "1")
     again = Store(db_path=db)
-    again.migrate()
+    again.migrate(allow_vector_reindex=True)
 
     _seed_obs(again, "o1")
     assert again.upsert_vec_observations([("o1", _unit(_VEC_DIM))]) == 1
@@ -314,9 +318,7 @@ def test_a_changed_model_refuses_the_index_it_no_longer_matches(tmp_path):
     raw.close()
 
 
-def test_a_changed_model_discards_the_index_when_consent_is_given(
-    tmp_path, monkeypatch
-):
+def test_a_changed_model_discards_the_index_when_consent_is_given(tmp_path):
     db = tmp_path / "cache.db"
     store = Store(db_path=db)
     store.migrate()
@@ -326,9 +328,8 @@ def test_a_changed_model_discards_the_index_when_consent_is_given(
     _stamp_a_different_model(store)
     store.close()
 
-    monkeypatch.setenv(VECTOR_REINDEX_ENV, "1")
     again = Store(db_path=db)
-    again.migrate()
+    again.migrate(allow_vector_reindex=True)
 
     assert again.count_vec_rows("observations") == 0
     assert {r["obs_id"] for r in again.select_unembedded("observations")} == {"o1"}
@@ -447,21 +448,20 @@ def test_a_refusal_is_announced_and_names_both_ways_out(tmp_path, caplog, kind):
 
     said = "\n".join(r.message for r in caplog.records)
     assert "unset AGGREGATOR_EMBED_BACKEND" in said, caplog.text
-    assert VECTOR_REINDEX_ENV in said, caplog.text
+    assert VECTOR_REINDEX_COMMAND in said, caplog.text
     assert "NOTHING WAS DELETED" in said, caplog.text
 
 
 @pytest.mark.parametrize("kind", ["observations", "records"])
-def test_a_consented_discard_is_announced_not_silent(tmp_path, caplog, kind, monkeypatch):
+def test_a_consented_discard_is_announced_not_silent(tmp_path, caplog, kind):
     """Throwing away an index is expensive news even when it was asked for."""
     db = tmp_path / "cache.db"
     table = "vec_observations" if kind == "observations" else "vec_records"
     col = "obs_id" if kind == "observations" else "stable_id"
     _plant_foreign_vec_table(db, dim=_VEC_DIM, n=2, table=table, col=col)
-    monkeypatch.setenv(VECTOR_REINDEX_ENV, "1")
 
     with caplog.at_level("WARNING"):
-        Store(db_path=db).migrate()
+        Store(db_path=db).migrate(allow_vector_reindex=True)
 
     assert any(
         "vector" in r.message.lower() and "re-embed" in r.message.lower()

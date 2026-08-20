@@ -96,7 +96,12 @@ class PoisonEmbedder:
 
 def ns(**kw):
     n = argparse.Namespace(
-        catchup=True, once=False, source="observations", batch_size=500
+        catchup=True,
+        once=False,
+        source="observations",
+        batch_size=500,
+        reindex=False,
+        yes=False,
     )
     for k, v in kw.items():
         setattr(n, k, v)

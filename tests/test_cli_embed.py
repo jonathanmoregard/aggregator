@@ -62,7 +62,12 @@ def _make_stub_embedder(monkeypatch):
 
 def argparse_ns(**kw):
     ns = argparse.Namespace(
-        catchup=False, once=False, source="observations", batch_size=500
+        catchup=False,
+        once=False,
+        source="observations",
+        batch_size=500,
+        reindex=False,
+        yes=False,
     )
     for k, v in kw.items():
         setattr(ns, k, v)
