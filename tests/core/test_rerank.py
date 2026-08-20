@@ -125,6 +125,58 @@ def test_a_caller_supplied_reranker_gets_no_borrowed_revision():
     assert seen["kwargs"].get("revision") is None
 
 
+# --- the sequence-length budget ---------------------------------------------
+
+
+def test_the_reranker_caps_the_pair_at_a_stated_token_budget():
+    """Untruncated pairs are where the rerank latency lived.
+
+    Qwen3-Reranker-0.6B carries a 40960-token window, and
+    ``CrossEncoder`` inherits it, so the stage was configured to score whatever
+    it was handed. Measured on a snapshot of the real cache: the median
+    candidate document is 183 tokens but the longest is 25941, and a batch is
+    padded to its longest member — so one oversized record made the whole page
+    cost 140x its median document.
+
+    512 is a BUDGET, not the model's limit; saying so matters because the
+    obvious justification ("the model maxes out at 512 anyway") is true of the
+    bge-reranker family and false of this one. What is given up is ranking
+    signal past token 512 of a document, and the numbers behind choosing that
+    trade are in ``aggregator/core/rerank.py``.
+    """
+    import aggregator.core.rerank as rerank_mod
+
+    seen = {}
+
+    class _FakeCrossEncoder:
+        def __init__(self, model_name, **kwargs):
+            seen["kwargs"] = kwargs
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("sentence_transformers.CrossEncoder", _FakeCrossEncoder)
+    try:
+        rerank_mod.Reranker()
+    finally:
+        monkey.undo()
+
+    assert rerank_mod.MAX_PAIR_TOKENS == 512
+    assert seen["kwargs"].get("max_length") == rerank_mod.MAX_PAIR_TOKENS
+
+
+def test_text_past_the_cap_cannot_change_the_score(reranker):
+    """The kwarg is the mechanism; this is the behaviour it has to produce.
+
+    Two documents that are identical for the first ~1000 tokens and differ
+    wildly after must score identically, because the second half is never
+    tokenized into the pair. Asserting the constant alone would pass just as
+    happily if a future ``predict`` call overrode it.
+    """
+    prefix = "quadratic voting governance mechanism credits ballot " * 200
+    a = reranker.score("what is quadratic voting", [prefix + " PELICAN" * 40])
+    b = reranker.score("what is quadratic voting", [prefix + " SUBMARINE" * 40])
+    assert a[0] == b[0]
+
+
 def test_the_pinned_reranker_revision_is_the_one_on_disk():
     from pathlib import Path
 
