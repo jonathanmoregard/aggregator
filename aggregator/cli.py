@@ -1833,6 +1833,22 @@ def _report_embed_outcome(outcome: _EmbedOutcome) -> int:
             f"being embedded; the stale vector was discarded and they stay in "
             f"the backlog for the next run"
         )
+    if outcome.stalled:
+        # SAID OUT LOUD, because "drained the backlog" and "gave up on it"
+        # otherwise both print nothing and exit 0, and the difference is
+        # whether the index is still filling. Not a failure: every row is
+        # intact at NULL, and a writer that is outrunning the worker is a
+        # condition the next tick may well not find.
+        print(
+            f"embed: STOPPED WITHOUT PROGRESS — {_MAX_STALLED_BATCHES} "
+            f"consecutive batches moved no row out of the backlog, so this run "
+            f"ended rather than re-reading the same rows indefinitely. The "
+            f"usual cause is ingest rewriting those bodies faster than they "
+            f"can be embedded. Nothing was lost: every row is still queued and "
+            f"the next run re-reads it from its current body. If `aggregator "
+            f"status` shows the pending count flat across several runs, the "
+            f"writer is not backing off and the two timers need separating."
+        )
     return 0
 
 
@@ -1884,6 +1900,11 @@ class _EmbedOutcome:
     #: ``ingest`` prints as INTERRUPTED. A run that exited non-zero for being
     #: asked to stop is the false alarm this flag exists to replace.
     interrupted: bool = False
+    #: ``--catchup`` ended because consecutive batches moved no row out of the
+    #: backlog, not because the backlog was empty. Reported, not failed: every
+    #: row is intact at NULL and the next tick re-reads it from its current
+    #: body. See ``_MAX_STALLED_BATCHES``.
+    stalled: bool = False
 
 
 class EmbedderUnhealthyError(RuntimeError):
@@ -1897,6 +1918,21 @@ class EmbedderUnhealthyError(RuntimeError):
 #: A body the model must be able to embed if it is working at all: short,
 #: plain ASCII, nothing a chunker or tokenizer has any reason to choke on.
 _EMBED_HEALTH_PROBE = "aggregator embed health probe"
+
+#: How many consecutive batches may move NO row out of the backlog before
+#: ``--catchup`` gives up and lets the next tick try.
+#:
+#: Three, not one: a single zero-write batch is an ordinary race — ingest
+#: rewrote a body while the worker held it — and the very next pass re-reads
+#: the new fingerprint and succeeds, so stopping on the first would abandon a
+#: healthy backlog over one unlucky interleaving. Three consecutive passes that
+#: all move nothing is no longer a race; it is a writer keeping ahead of the
+#: worker, and more attempts inside this run will not change that.
+#:
+#: Not large, either. The cost of stopping is one timer tick (30 minutes) and
+#: nothing else — every row is still at NULL with its vectors intact — while
+#: the cost of not stopping is a worker spinning at full CPU on a laptop.
+_MAX_STALLED_BATCHES = 3
 
 
 def _embedder_is_healthy(embedder: Embedder) -> bool:
@@ -2046,6 +2082,7 @@ def _embed_backlog(
     due = ledger.due(source)
     if due:
         store.requeue_embedding(kind, sorted(due))
+    stalls = 0
     while True:
         if stop is not None and stop():
             outcome.interrupted = True
@@ -2053,8 +2090,30 @@ def _embed_backlog(
         rows = store.select_unembedded(kind, limit=args.batch_size)
         if not rows:
             return
-        _embed_batch(store, embedder, kind, rows, ledger, outcome, stop)
+        moved = _embed_batch(store, embedder, kind, rows, ledger, outcome, stop)
         if args.once:
+            return
+        # THE TERMINATION ARGUMENT. Every other exit from this loop is "the
+        # backlog is empty"; this one is "the backlog is not emptying".
+        #
+        # Until round 2's S4 the first was enough, because a batch always
+        # emptied itself — each row left as 'ok', 'skip' or 'error', so the
+        # next SELECT could not return it. S4 made the writes a
+        # compare-and-swap, and a batch whose CAS all fails writes NOTHING:
+        # every row stays at NULL and the identical batch is selected again.
+        #
+        # In practice each pass re-reads a fresh ``src_hash``, so one failed
+        # CAS self-corrects on the next pass and a real spin needs rewrites
+        # landing faster than the worker embeds. Rare — and not the point. The
+        # 2026-08-16 shape requires each chunk to commit a checkpoint, which
+        # means every pass must either advance the watermark or end the run.
+        # A loop that cannot say why it stops is one that can fail to.
+        if moved:
+            stalls = 0
+            continue
+        stalls += 1
+        if stalls >= _MAX_STALLED_BATCHES:
+            outcome.stalled = True
             return
 
 
@@ -2066,8 +2125,14 @@ def _embed_batch(
     ledger: PoisonLedger,
     outcome: _EmbedOutcome,
     stop: Callable[[], bool] | None = None,
-) -> None:
+) -> int:
     """Embed one batch, then advance the watermark — IN THAT ORDER.
+
+    RETURNS HOW MANY ROWS LEFT THE BACKLOG, which is what makes ``--catchup``'s
+    loop terminating rather than merely usually-terminating. Since round 2's S4
+    the writes are a compare-and-swap, so a batch can legitimately write
+    nothing at all and leave every row exactly where it found it — and the next
+    SELECT then returns that same batch. See ``_MAX_STALLED_BATCHES``.
 
     Vectors are written before ``embedding_state`` moves. The reverse order is
     the one that loses rows: a crash between the two would leave rows marked
@@ -2207,12 +2272,16 @@ def _embed_batch(
     outcome.superseded += (len(ok_ids) - len(written_ok)) + (
         len(skip_ids) - len(written_skip)
     )
+    # ``error_ids`` count: they are marked unguarded, so they always leave the
+    # backlog, and a batch that only set rows aside has still made progress.
+    moved = len(written_ok) + len(written_skip) + len(error_ids)
     if unhealthy is not None:
         # The rows that DID embed before the model died are flushed above and
         # keep their vectors: a run that threw away completed work would be
         # re-doing it on the next tick, which the ingest rules call a bug even
         # when the answer comes out right.
         raise unhealthy
+    return moved
 
 
 def _cmd_github_token_status(
