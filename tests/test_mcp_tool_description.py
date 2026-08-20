@@ -167,10 +167,12 @@ def test_the_weight_fetch_command_named_in_a_remediation_exists(capsys):
 
     mcp._get_reranker, saved = (lambda: Dead()), mcp._get_reranker
     try:
-        _items, applied, notice = _maybe_rerank([{"content": "x"}], "q", True)
+        _items, reranked, notice = _maybe_rerank([{"content": "x"}], "q", True)
     finally:
         mcp._get_reranker = saved
 
-    assert applied is False
+    # A count now, not a flag: it is how far down the page the ranking got,
+    # and ``rerank_applied`` is a view of it. Nothing was ranked here.
+    assert reranked == 0
     assert "aggregator embed --seed-models" in notice
     assert "--seed-models" in _cli_help("embed", capsys)
