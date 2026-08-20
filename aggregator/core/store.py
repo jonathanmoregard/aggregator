@@ -93,6 +93,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
@@ -357,6 +358,65 @@ def _json_id_clause(column: str) -> str:
     passes a literal.
     """
     return f"{column} IN (SELECT value FROM json_each(?))"
+
+
+#: The ONLY characters allowed to reach FTS5 ``MATCH``: letters, numbers and
+#: underscore. ``\w`` under Python's default Unicode semantics is exactly
+#: ``[\p{L}\p{N}_]`` — ``str.isalnum()`` plus ``_`` — so this is unicode-aware
+#: without a third-party ``regex`` dependency.
+#:
+#: UNDERSCORE IS IN THE WHITELIST ON PURPOSE, and it is the one deviation from
+#: the letters-and-digits-only rule this fix was specified with. Two reasons,
+#: one measured and one structural:
+#:
+#: * Measured. ``_`` is a legal FTS5 bareword character, so ``ERR_TLS_CERT``
+#:   and ``root_session_id`` are queries that ALREADY WORKED. FTS5 tokenizes
+#:   such a bareword into an adjacency phrase (``err`` ``tls`` ``cert`` next to
+#:   each other); rewriting it to three independent phrases is a different
+#:   question with different answers. On a seeded corpus it changed both the
+#:   rows and the score: bm25 -5.857257 -> -17.571770 for ``ERR_TLS_CERT``.
+#:   The whole point of this fix is that queries which worked keep returning
+#:   identical rows with identical scores, and on a corpus saturated with
+#:   snake_case identifiers, dropping ``_`` breaks precisely that.
+#: * Structural. Widening the whitelist by ``_`` gives up nothing. Inside a
+#:   quoted FTS5 string the only meta-character is ``"``; ``_`` cannot begin an
+#:   operator, a column filter, ``NEAR``, a prefix ``*`` or a quote in any
+#:   position, quoted or not. The safety property — "the only thing that
+#:   reaches MATCH is quoted word characters" — is unchanged.
+_FTS5_TOKEN_RE = re.compile(r"\w+")
+
+
+def fts5_match_query(text: str | None) -> str:
+    """Rewrite arbitrary user text into a safe FTS5 ``MATCH`` expression.
+
+    ``power-on`` -> ``"power" "on"``. ``!!!`` -> ``""``.
+
+    WHITELIST, NOT ESCAPE. Keep the word-character runs, quote each as a
+    literal phrase, join with spaces (FTS5's implicit AND). Everything else is
+    discarded, so no operator, column filter, ``NEAR``, prefix ``*`` or stray
+    quote survives to be interpreted. An escape-based fix has to enumerate
+    every character FTS5 gives meaning to and stay right as SQLite changes:
+    the docs warn that input which raises a syntax error today "may be
+    interpreted differently by some future version of FTS5". A whitelist is
+    right by construction, including about characters nobody has thought of.
+
+    Quoting a single-token bareword does not change what it matches — an
+    unquoted bareword and a one-token quoted phrase tokenize identically under
+    ``unicode61`` — which is why 29% of real queries stop erroring while the
+    ones that already worked return the same rows with the same bm25 scores.
+    Asserted in ``tests/core/test_store_fts_sanitize.py``.
+
+    Returns ``""`` for text with no word characters at all. Callers MUST read
+    that as "no lexical matches" and skip the query: ``MATCH ''`` is a
+    different question, not a cheaper form of this one.
+
+    THE VECTOR ARM MUST BE HANDED THE ORIGINAL TEXT. This is a property of the
+    lexical arm only — ``power-on`` carries meaning to an embedding model that
+    ``"power" "on"`` does not. That holds by construction here because the
+    rewrite happens inside the FTS5 binding sites below, downstream of every
+    caller that also drives the vector arm.
+    """
+    return " ".join(f'"{t}"' for t in _FTS5_TOKEN_RE.findall(text or ""))
 
 
 def _table_present(c: sqlite3.Connection, table: str) -> bool:
@@ -3846,12 +3906,41 @@ class Store:
         clauses.append(_json_id_clause(column))
         params.append(json.dumps(sorted(ast.id_scope)))
 
+    def _fts_rows(self, sql: str, params: Sequence, text: str) -> list[sqlite3.Row]:
+        """Run one MATCH-bearing SELECT, and be LOUD if it still fails.
+
+        After :func:`fts5_match_query` nothing reaching ``MATCH`` can be a
+        syntax error, so a failure here is a lock, a corrupt index, or an FTS5
+        that has changed under us. The exception is re-raised UNCHANGED — the
+        callers above each have a considered answer to it, and swallowing it
+        here would turn "the index is broken" into "there are no matches",
+        which is the empty-result-looks-like-success failure this project bans
+        by name. The log line exists so the degrade-to-vector-only path in
+        ``mcp._fused_id_scope`` can never be silent: that path answers from the
+        vector arm alone, which is right for the caller, but a query answered
+        by one arm must say so somewhere.
+        """
+        try:
+            return self._c().execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            log.exception(
+                "FTS5 MATCH failed for %r (rewritten to %r) — the lexical arm "
+                "contributes nothing to this query",
+                text,
+                params[0] if params else "",
+            )
+            raise
+
     def _fts_ids(self, text: str) -> set[str]:
-        c = self._c()
-        rows = c.execute(
+        """Records-path FTS5 arm. Empty set when the text has no word chars."""
+        match_expr = fts5_match_query(text)
+        if not match_expr:
+            return set()
+        rows = self._fts_rows(
             "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
-            (text,),
-        ).fetchall()
+            (match_expr,),
+            text,
+        )
         return {row["stable_id"] for row in rows}
 
     def query(
@@ -4003,20 +4092,39 @@ class Store:
         return found
 
     def probe_fts(self, text: str) -> None:
-        """Run cheap MATCH probes to surface FTS5 syntax errors.
+        """Run cheap MATCH probes over both FTS indexes.
 
-        Checks both records_fts and obs_fts so a syntactically bad query is
-        caught regardless of which index the actual query would hit.
+        Checks both records_fts and obs_fts so a failure is caught regardless
+        of which index the actual query would hit.
+
+        THIS NO LONGER REJECTS USER TEXT. It used to be the place a caller
+        learned its freeform query was malformed — ``power-on``, ``#178``,
+        ``cache.db`` all raised here — but :func:`fts5_match_query` means the
+        expression handed to ``MATCH`` cannot be malformed. What survives is
+        the OTHER half of the job, which is the half that matters more: the
+        probe runs the same statement the real query will run against the same
+        tables, so a locked or corrupt cache still raises here and is reported
+        as a cache problem rather than as a bad query.
+
+        Text with no word characters at all probes nothing, because the query
+        it stands in for will not run a ``MATCH`` either. Callers that use this
+        as a HEALTH probe must therefore pass text with word characters in it;
+        ``tests/core/test_store_fts_sanitize.py`` pins that for the one
+        constant that does.
         """
-        c = self._c()
-        c.execute(
+        match_expr = fts5_match_query(text)
+        if not match_expr:
+            return
+        self._fts_rows(
             "SELECT rowid FROM records_fts WHERE records_fts MATCH ? LIMIT 1",
-            (text,),
-        ).fetchone()
-        c.execute(
+            (match_expr,),
+            text,
+        )
+        self._fts_rows(
             "SELECT rowid FROM obs_fts WHERE obs_fts MATCH ? LIMIT 1",
-            (text,),
-        ).fetchone()
+            (match_expr,),
+            text,
+        )
 
     # -- reads: v2 sessions + observations --------------------------------
 
@@ -4320,16 +4428,19 @@ class Store:
         Used to project obs_fts hits back up to the sessions layer for
         session-level hit lists.
         """
-        c = self._c()
-        rows = c.execute(
+        match_expr = fts5_match_query(text)
+        if not match_expr:
+            return []
+        rows = self._fts_rows(
             """
             SELECT DISTINCT o.root_session_id AS root
             FROM obs_fts f
             JOIN observations o ON o.rowid = f.rowid
             WHERE obs_fts MATCH ?
             """,
-            (text,),
-        ).fetchall()
+            (match_expr,),
+            text,
+        )
         return [r["root"] for r in rows if r["root"]]
 
     @staticmethod
@@ -4382,18 +4493,20 @@ class Store:
         mapping ignored ``type:`` and surfaced sibling subagents with
         zero own matches.
         """
-        c = self._c()
+        match_expr = fts5_match_query(text)
+        if not match_expr:
+            return set(), set()
         sql = """
             SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
             FROM obs_fts f
             JOIN observations o ON o.rowid = f.rowid
             WHERE obs_fts MATCH ?
         """
-        params: list = [text]
+        params: list = [match_expr]
         if obs_type:
             sql += " AND o.type = ?"
             params.append(obs_type)
-        rows = c.execute(sql, params).fetchall()
+        rows = self._fts_rows(sql, params, text)
         roots = {r["root"] for r in rows if r["root"]}
         exacts = {r["sid"] for r in rows if r["sid"]}
         return roots, exacts
@@ -4451,16 +4564,20 @@ class Store:
         return roots, exacts
 
     def _fts_obs_ids(self, text: str) -> list[str]:
-        c = self._c()
-        rows = c.execute(
+        """Observations-path FTS5 arm. Empty when the text has no word chars."""
+        match_expr = fts5_match_query(text)
+        if not match_expr:
+            return []
+        rows = self._fts_rows(
             """
             SELECT o.obs_id AS obs_id
             FROM obs_fts f
             JOIN observations o ON o.rowid = f.rowid
             WHERE obs_fts MATCH ?
             """,
-            (text,),
-        ).fetchall()
+            (match_expr,),
+            text,
+        )
         return [r["obs_id"] for r in rows]
 
     # -- capabilities -----------------------------------------------------

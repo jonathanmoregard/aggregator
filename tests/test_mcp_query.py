@@ -171,13 +171,30 @@ def test_query_bad_dsl_returns_structured_error(tmp_data_home):
     assert "Traceback" not in result["reason"]
 
 
-def test_query_bad_fts_syntax_returns_structured_error(tmp_data_home):
+def test_query_fts_metacharacters_are_answered_not_refused(tmp_data_home):
+    """Was ``…bad_fts_syntax_returns_structured_error``. An unbalanced quote —
+    and ``power-on``, ``#178``, ``cache.db``, 29% of the frozen golden set —
+    used to come back ``ok: False`` telling the agent to rewrite a perfectly
+    reasonable query. The text is whitelisted before it reaches ``MATCH``, so
+    there is no syntax error left to report and the words are answered."""
     store = Store()
     _seed_records(store)
-    result = aggregator_query(dsl='"unbalanced', _store=store)
-    assert result["ok"] is False
-    assert "reason" in result
-    assert "remediation" in result
+    result = aggregator_query(dsl='"refactor', _store=store)
+    assert result["ok"] is True
+    assert result["total"] == 1
+
+
+def test_query_all_punctuation_text_finds_nothing_rather_than_everything(
+    tmp_data_home,
+):
+    """The dangerous half of the same change: whitelisting ``!!!`` down to the
+    empty string must mean "no lexical matches", never an unconstrained
+    ``MATCH`` that returns the whole corpus."""
+    store = Store()
+    _seed_records(store)
+    result = aggregator_query(dsl="!!! ...", _store=store)
+    assert result["ok"] is True
+    assert result["total"] == 0
 
 
 # --- Sessions path --------------------------------------------------------

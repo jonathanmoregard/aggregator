@@ -137,12 +137,17 @@ def test_store_scrubs_on_upsert(tmp_data_home):
     assert "[REDACTED:anthropic_key]" in results[0].body
 
 
-def test_store_fts5_syntax_error_returns_empty_without_crashing(tmp_data_home):
+def test_store_fts5_metacharacters_are_answered_not_rejected(tmp_data_home):
+    """Was ``…syntax_error_returns_empty_without_crashing``: an unbalanced
+    quote used to reach ``MATCH`` verbatim, raise, and be logged into an empty
+    page. ``fts5_match_query`` whitelists the text first, so the quote is gone
+    and the words behind it are answered — which is what the caller asked for
+    and what 29% of real queries were being denied."""
     s = Store()
     s.migrate()
-    s.upsert([_rec("github:a", "github", "s", "hello world")])
+    s.upsert([_rec("github:a", "github", "s", "hello unterminated world")])
     r = s.query(QueryAST(source="github", text='"unterminated'))
-    assert r == []
+    assert [rec.stable_id for rec in r] == ["github:a"]
 
 
 def test_store_upsert_overwrites_same_stable_id(tmp_data_home):
@@ -180,15 +185,16 @@ def test_store_count_matches_query_size(tmp_data_home):
 
 
 def test_store_probe_fts_public(tmp_data_home):
-    import sqlite3
-
-    import pytest as _pytest
+    """``probe_fts`` no longer rejects user text — nothing malformed can reach
+    ``MATCH`` any more, so there is no syntax error left for it to find. It
+    still runs the real statement against both indexes, which is how a locked
+    or corrupt cache is told apart from a bad query."""
     s = Store()
     s.migrate()
     s.upsert([_rec("github:a", "github", "s", "hello world")])
     s.probe_fts("hello")
-    with _pytest.raises(sqlite3.OperationalError):
-        s.probe_fts('"unterminated')
+    s.probe_fts('"unterminated')
+    s.probe_fts("power-on")
 
 
 # --- Codex Phase 2 findings (RED) -----------------------------------------
