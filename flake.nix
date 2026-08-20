@@ -104,6 +104,55 @@
 
           wronglyRejected = builtins.filter (v: !(timeoutStartSecAccepts v)) validTimeSpans;
           wronglyAccepted = builtins.filter timeoutStartSecAccepts invalidTimeSpans;
+
+          # ---- the repo ids that ACTUALLY determine what gets fetched ------
+          #
+          # Round-3 finding: step 7b used to grep the seed script for two
+          # hardcoded repo ids, and those strings occur in that script only
+          # inside an informational `echo`. The real fetch is
+          # `aggregator embed --seed-models`, which constructs `Embedder()` and
+          # `Reranker()` and resolves whatever the PYTHON defaults say. So the
+          # assertion could not fail for the thing it appeared to protect:
+          # changing `_DEFAULT_MODEL_ST` left the check green — verified, and
+          # `nix build` even returned a byte-identical store path, because the
+          # derivation did not depend on that file at all. Fake coverage, which
+          # is worse than none: it reads as protection.
+          #
+          # Reading the ids OUT of the Python source fixes both halves. The
+          # value asserted on is now the one that decides the download, and the
+          # check's inputs include the file that decides it, so editing that
+          # file re-runs this.
+          pythonDefaultModel = { file, const }:
+            let
+              lines = pkgs.lib.splitString "\n" (builtins.readFile file);
+              hits = builtins.filter (m: m != null) (
+                map (l: builtins.match "${const} = \"([^\"]+)\".*" l) lines
+              );
+            in
+              if builtins.length hits == 1
+              then builtins.elemAt (builtins.head hits) 0
+              else throw (
+                "flake check: expected exactly one `${const} = \"...\"` in "
+                + "${toString file}, found ${toString (builtins.length hits)}. "
+                + "This is how the check knows which model is really fetched; "
+                + "if the declaration moved, teach it the new shape rather "
+                + "than deleting the assertion."
+              );
+
+          # huggingface_hub's on-disk mangling: `Org/Name` -> `models--Org--Name`.
+          # This is what `have_model` globs for, so a repo id that changes
+          # without its directory changing makes the worker's preflight test
+          # for weights nobody will ever write there.
+          hfCacheDirOf = repo: "models--" + builtins.replaceStrings ["/"] ["--"] repo;
+
+          pyEmbedModel = pythonDefaultModel {
+            file = ./aggregator/core/embed.py;
+            const = "_DEFAULT_MODEL_ST";
+          };
+          pyRerankModel = pythonDefaultModel {
+            file = ./aggregator/core/rerank.py;
+            const = "_DEFAULT_MODEL";
+          };
         in {
           devShells.default = pkgs.mkShell {
             packages = [
@@ -436,9 +485,37 @@
                               "$units/aggregator-embed-seed.service")
               grep -q 'embed --seed-models' "$seed_script" \
                 || fail "aggregator-embed-seed.service does not run 'aggregator embed --seed-models' — that is the only entry point that constructs both the Embedder and the Reranker"
-              for repo in 'Qwen/Qwen3-Embedding-0.6B' 'Qwen/Qwen3-Reranker-0.6B'; do
+
+              # THE IDS COME FROM THE PYTHON SOURCE, not from a literal typed
+              # here. `--seed-models` builds `Embedder()` and `Reranker()`, so
+              # `_DEFAULT_MODEL_ST` and `_DEFAULT_MODEL` are what decide which
+              # bytes are fetched. The previous version of this loop compared
+              # the unit against two hardcoded strings that appear only in the
+              # seed script's informational `echo`, so changing the real model
+              # left it green — the derivation did not even depend on those
+              # files. Now it does, and every string below is derived.
+              py_embed_model=${pkgs.lib.escapeShellArg pyEmbedModel}
+              py_rerank_model=${pkgs.lib.escapeShellArg pyRerankModel}
+              py_embed_dir=${pkgs.lib.escapeShellArg (hfCacheDirOf pyEmbedModel)}
+              py_rerank_dir=${pkgs.lib.escapeShellArg (hfCacheDirOf pyRerankModel)}
+
+              for repo in "$py_embed_model" "$py_rerank_model"; do
                 grep -qF "$repo" "$seed_script" \
-                  || fail "the seed unit never mentions $repo — a model the product loads at runtime has no fetch path, so it degrades forever the first time it is asked for"
+                  || fail "the seed unit never mentions $repo, which is the repo id the Python default actually resolves to — the module and the code disagree about which model this deployment fetches, so the operator is told one thing and 'embed --seed-models' downloads another"
+              done
+
+              # The PRESENCE GATE has to agree too, and it is the half that
+              # bites silently. `have_model <dir>` is what makes the worker
+              # refuse when weights are absent; point it at the cache
+              # directory of a model nobody fetches and it either refuses
+              # forever on a correctly seeded machine, or waves through a
+              # machine holding the wrong weights.
+              worker_script=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$svc")
+              grep -qF "$py_embed_dir" "$worker_script" \
+                || fail "aggregator-embed.service's preflight does not check for $py_embed_dir — the HF cache directory of $py_embed_model, which is the model the worker will actually load. It is gating on some other directory, so 'weights present' is a claim about the wrong model"
+              for dir in "$py_embed_dir" "$py_rerank_dir"; do
+                grep -qF "$dir" "$seed_script" \
+                  || fail "the seed unit's presence check never looks at $dir — it would report 'already present' or 'downloading' about a directory the loaders do not use"
               done
 
               # The seeder is a DOWNLOAD, not a workload. It used to embed a
