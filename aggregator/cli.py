@@ -45,6 +45,7 @@ import logging
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -1710,7 +1711,7 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
                     _embed_backlog(
                         store, embedder, kind, args, ledger, outcome, stop
                     )
-        except EmbedderUnhealthyError as e:
+        except (EmbedderUnhealthyError, EmbedStoreUnavailableError) as e:
             # ANNOUNCE FIRST, THEN ABORT. Rows attributed earlier in this run
             # passed their own health probe and have ledger entries already
             # written; swallowing their lines here would leave each one
@@ -1979,6 +1980,40 @@ def _embedder_is_healthy(embedder: Embedder) -> bool:
     return True
 
 
+class EmbedStoreUnavailableError(RuntimeError):
+    """The CACHE failed mid-batch. Not a bad row, and not the embedder either.
+
+    Its own type so the run reports an environment fault in the vocabulary of
+    an environment fault. The sibling of :class:`EmbedderUnhealthyError`, for
+    the half of the try block round 2's probe reasoning never covered.
+    """
+
+
+def _embed_store_unavailable(
+    kind: str, error: BaseException
+) -> EmbedStoreUnavailableError:
+    """The message an operator gets when the cache, not the corpus, failed.
+
+    It has to say the row was NOT blamed, because the whole failure mode is a
+    good row being condemned for a transient lock and quietly leaving the
+    index. It also has to name the likely cause: on this machine the ingest
+    timer fires every 30 minutes and the embed timer every 30 minutes offset by
+    15, and a long ingest run overlaps regardless.
+    """
+    return EmbedStoreUnavailableError(
+        f"aggregator embed stopped: the cache could not be written while "
+        f"embedding {kind} "
+        f"({type(error).__name__}: {error}). That is the STORE failing, not "
+        f"bad data and not the embedder, so NO row was blamed for it, nothing "
+        f"was added to the poison ledger, and every row still unembedded "
+        f"stays in the backlog exactly where it was. The usual cause is "
+        f"another writer holding the database — the ingest timer runs every "
+        f"30 minutes and a long run overlaps the embed tick. The next run "
+        f"resumes from the watermark; if it keeps happening, check for a "
+        f"`--rebuild` holding a savepoint for hours."
+    )
+
+
 class EmbedWorkerKilledError(RuntimeError):
     """A previous worker process died on a row without raising anything.
 
@@ -2203,6 +2238,7 @@ def _embed_batch(
     error_ids: list[str] = []
     all_vecs: list[tuple[str, str, Any]] = []
     unhealthy: EmbedderUnhealthyError | None = None
+    store_fault: sqlite3.Error | None = None
     for row in rows:
         if stop is not None and stop():
             outcome.interrupted = True
@@ -2225,8 +2261,33 @@ def _embed_batch(
             store.claim_embed_row(kind, row_id)
             vecs = embedder.embed_documents(chunks)
             store.release_embed_claim()
+        except sqlite3.Error as e:
+            # THE STORE FAILED, NOT THE ROW — round 3's M3. Two of the three
+            # calls above are writes to the cache, and the ingest timer can
+            # lock it at any moment. ``_embedder_is_healthy`` cannot see that:
+            # it probes the EMBEDDER, which is working perfectly, so the
+            # handler below concluded the fault discriminated between bodies
+            # and blamed whichever row was in flight. Reproduced: a single
+            # `database is locked` put all three rows of the batch in the
+            # poison ledger, each with an attempt count, on their way to
+            # becoming terminal after POISON_MAX_ATTEMPTS — permanently out of
+            # the vector arm because two writers overlapped once.
+            #
+            # A lock discriminates between nothing, exactly like a cold model
+            # or an OOM, so it gets the same answer round 2 gave those: abort,
+            # blame nobody, leave the backlog untouched.
+            store_fault = e
+            break
         except Exception as e:
-            store.release_embed_claim()
+            try:
+                store.release_embed_claim()
+            except sqlite3.Error as release_error:
+                # The release is itself a write, so it can fail for the same
+                # reason. The row's own failure goes unattributed and it stays
+                # at NULL: it is re-read next run, which costs one embed and
+                # cannot condemn anything.
+                store_fault = release_error
+                break
             if not _embedder_is_healthy(embedder):
                 unhealthy = EmbedderUnhealthyError(
                     f"aggregator embed stopped after {kind} row {row_id!r} failed "
@@ -2261,14 +2322,23 @@ def _embed_batch(
             outcome.released += 1
     # The vectors and the watermark, in one guarded transaction. Anything the
     # guard rejected moved underneath the worker and is reported as such.
-    written_ok, written_skip = store.commit_embed_batch(
-        kind,
-        vectors=all_vecs,
-        ok_ids=ok_ids,
-        skip_ids=skip_ids,
-        error_ids=error_ids,
-        expected=expected,
-    )
+    #
+    # ATTEMPTED EVEN AFTER A STORE FAULT, because the rows that embedded before
+    # the lock are real work and discarding them means re-doing it next tick —
+    # which the 2026-08-16 rules call a bug even when the answer comes out
+    # right. If the cache is still locked this raises too, and it becomes the
+    # fault that is reported.
+    try:
+        written_ok, written_skip = store.commit_embed_batch(
+            kind,
+            vectors=all_vecs,
+            ok_ids=ok_ids,
+            skip_ids=skip_ids,
+            error_ids=error_ids,
+            expected=expected,
+        )
+    except sqlite3.Error as e:
+        raise _embed_store_unavailable(kind, store_fault or e) from e
     outcome.superseded += (len(ok_ids) - len(written_ok)) + (
         len(skip_ids) - len(written_skip)
     )
@@ -2281,6 +2351,8 @@ def _embed_batch(
         # re-doing it on the next tick, which the ingest rules call a bug even
         # when the answer comes out right.
         raise unhealthy
+    if store_fault is not None:
+        raise _embed_store_unavailable(kind, store_fault)
     return moved
 
 
