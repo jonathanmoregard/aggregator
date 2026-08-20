@@ -1209,7 +1209,11 @@ def _session_to_item(
     ``matching_observations`` = how many observations match the query.
 
     ``content`` (M1): empty in summary mode (no body to wrap, subject already
-    shown in the CLI header); wrapped first-user-prompt preview in full mode.
+    shown in the CLI header); in full mode, the wrapped ``body_preview`` the
+    caller supplies — see ``_session_body_preview``, which builds it from the
+    observations that matched. It used to be handed the SUBJECT, which made
+    the card a copy of its own header and gave the cross-encoder a document to
+    score against itself.
 
     v3: chat-export rows label their card with the origin (``chatgpt`` /
     ``claude-web``) rather than the claude-code kind buckets.
@@ -1816,7 +1820,8 @@ def _query_sessions_path(
         #   session_id match (top_session_id in the AST).
         session_scoped = _count_scope_for(ast, s)
         match_count = store.count_observations(session_scoped)
-        items.append(_session_to_item(s, fields, subject, match_count, subject))
+        preview = _session_body_preview(store, session_scoped, fields, subject)
+        items.append(_session_to_item(s, fields, subject, match_count, preview))
     items, rr_count, rr_notice = _maybe_rerank(items, query_text, rerank)
     result = {
         "ok": True,
@@ -1975,8 +1980,9 @@ def _query_union_path(
             subject = _first_user_prompt(store, obj)
             session_scoped = _count_scope_for(sess_ast, obj)
             match_count = store.count_observations(session_scoped)
+            preview = _session_body_preview(store, session_scoped, fields, subject)
             items.append(
-                _session_to_item(obj, fields, subject, match_count, subject)
+                _session_to_item(obj, fields, subject, match_count, preview)
             )
     items, rr_count, rr_notice = _maybe_rerank(items, query_text, rerank)
 
@@ -2050,6 +2056,69 @@ def _first_user_prompt(store: Store, s: SessionRow) -> str:
         return f"session {s.session_id}"
     body = scrub(rows[0].body or "").text
     return body[:280] if body else f"session {s.session_id}"
+
+
+# How much of a session's matching text goes into its ``content`` preview.
+# Sized against ``rerank.MAX_PAIR_TOKENS``: ~4 chars per token, so 1500 chars
+# lands just under the 512-token pair budget the cross-encoder truncates to,
+# and a preview materially larger than that would be paid for and then thrown
+# away by the tokenizer.
+_SESSION_PREVIEW_OBSERVATIONS = 5
+_SESSION_PREVIEW_CHARS = 1500
+
+
+def _session_body_preview(
+    store: Store, scoped: QueryAST, fields: str, subject: str
+) -> str:
+    """The body of a session card: the observations that actually matched.
+
+    THE DEFECT THIS REPLACES. Both session-shaped routes called
+    ``_session_to_item(s, fields, subject, match_count, subject)`` — the last
+    slot is ``body_preview``, and it was handed the subject. In
+    ``fields='full'`` the card's ``content`` was therefore the subject wrapped
+    in ``<ExternalContent>``, and ``_rerank_doc`` concatenates head and
+    content, so the string the cross-encoder scored was the subject twice: a
+    document against itself. The union route is the DEFAULT, so this was the
+    common path, and the ``fields='full'`` precondition that exists precisely
+    to guarantee the reranker sees real bodies bought nothing there.
+
+    It cost twice. The ordering ``reranked_count`` reported was derived from
+    near-empty documents that differed only in their first user turn — a field
+    the response already returns, so the caller could have sorted it for free —
+    and the caller paid the full cross-encoder latency for it.
+
+    ``scoped`` is the card's own AST from ``_count_scope_for``, so this returns
+    the same rows ``matching_observations`` counted: with free text, the
+    observations that matched it; under hybrid, the fused hits inside this
+    session; with neither, the session's opening turns. That is the evidence a
+    cross-encoder needs to judge the card, and what a reader wants to see.
+
+    Summary mode returns "" without querying: ``_session_to_item`` discards the
+    preview there, and this runs once per card on the default surface.
+
+    Falls back to the subject when the session yields no usable body — an
+    honest degenerate case (there is nothing else in it) rather than an empty
+    ``<ExternalContent>`` block, which M1 removed from summary mode for
+    exactly this reason: it looks like content and holds none. Reachable three
+    ways — a session whose observations are all empty, an orphan root row with
+    none at all, and an FTS5 syntax error inside ``query_observations``, which
+    returns ``[]`` while the session itself still matched on metadata.
+    """
+    if fields != "full":
+        return ""
+    rows = store.query_observations(scoped, limit=_SESSION_PREVIEW_OBSERVATIONS)
+    parts: list[str] = []
+    used = 0
+    for o in rows:
+        body = scrub(o.body or "").text.strip()
+        if not body:
+            continue
+        body = body[: _SESSION_PREVIEW_CHARS - used]
+        parts.append(f"[{o.type}] {body}")
+        used += len(body)
+        if used >= _SESSION_PREVIEW_CHARS:
+            break
+    return "\n\n".join(parts) if parts else subject
 
 
 def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
