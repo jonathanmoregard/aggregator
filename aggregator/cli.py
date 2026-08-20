@@ -89,6 +89,9 @@ from aggregator.imports.sync_bridge import accepts_errors_kwarg, unwired_sink_no
 # second one here would cost ~2 GB RSS and a second model load to answer one
 # question.
 from aggregator.mcp import (
+    _RERANK_WINDOW,
+)
+from aggregator.mcp import (
     _get_reranker as _mcp_get_reranker,
 )
 from aggregator.mcp import (
@@ -403,10 +406,18 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         except Exception as e:  # noqa: BLE001 - reported, not handled
             print(_reranker_load_failure(e), file=sys.stderr)
             return 1
+        # "SCORES EVERY HIT" WAS FALSE, and round 3's M4. ``_maybe_rerank``
+        # reorders at most ``_RERANK_WINDOW`` items; --page-size defaults to
+        # 50. So the flag's most ordinary invocation returned a 40%-ranked page
+        # while the one line the operator reads during the 47-second wait told
+        # them the whole thing had been scored.
         print(
-            "note: --rerank scores every hit with a cross-encoder; measured "
-            "at 47 s median per query on CPU, plus a one-off model load. "
-            "This is a batch facility.",
+            f"note: --rerank scores the first {_RERANK_WINDOW} hits of the "
+            f"page with a cross-encoder and reorders those; any hit after them "
+            f"keeps the default recency order. Measured at 47 s median per "
+            f"query on CPU, plus a one-off model load. This is a batch "
+            f"facility. Pass --page-size {_RERANK_WINDOW} or less for a page "
+            f"that is ranked all the way down.",
             file=sys.stderr,
         )
     result = _mcp_query(
@@ -430,7 +441,25 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         print(f"remediation: {result.get('remediation')}", file=sys.stderr)
         return 1
     mode = result.get("mode", "records")
-    for rec in result["records"]:
+    # WHERE THE RANKED PREFIX ENDS. Below this line the rows were never scored
+    # — they are in the ordinary recency order — and they are otherwise
+    # indistinguishable from the ranked ones, so a reader scrolling a 50-row
+    # page reads 30 rows of recency ordering as relevance ordering. Printed
+    # only when there is genuinely a seam: the rerank applied AND the page is
+    # longer than the window.
+    ranked_upto = (
+        _RERANK_WINDOW
+        if result.get("rerank_applied") and len(result["records"]) > _RERANK_WINDOW
+        else None
+    )
+    for i, rec in enumerate(result["records"]):
+        if ranked_upto is not None and i == ranked_upto:
+            print(
+                f"# ---- end of the {ranked_upto} hits ranked by relevance; "
+                f"the {len(result['records']) - ranked_upto} below are in the "
+                f"default recency order and were NOT scored ----"
+            )
+            print()
         if mode == "sessions":
             print(
                 f"# {rec['source']} :: {rec['subject']}  "
@@ -2455,10 +2484,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--rerank",
         action="store_true",
         help=(
-            "re-order the head of the page by cross-encoder relevance instead "
-            "of recency. SLOW — 47 s median per query on this CPU against "
-            "0.65 s without, plus a one-off model load; this command is the "
-            "batch surface that cost is documented for. Refuses out loud if "
+            f"re-order the head of the page by cross-encoder relevance instead "
+            f"of recency. THE HEAD ONLY: the first {_RERANK_WINDOW} hits are "
+            f"scored and reordered, and anything after them stays in recency "
+            f"order — so at the default --page-size 50 most of the page is NOT "
+            f"ranked, and the output marks where the ranked part ends. Pass "
+            f"--page-size {_RERANK_WINDOW} or less to have the whole page "
+            f"ranked. SLOW — 47 s median per query on this CPU against "
+            f"0.65 s without, plus a one-off model load; this command is the "
+            f"batch surface that cost is documented for. Refuses out loud if "
             "the weights cannot be loaded rather than returning an unranked "
             "page. IMPLIES --fields full when --fields is not given, because "
             "the cross-encoder ranks document bodies and summary mode returns "
