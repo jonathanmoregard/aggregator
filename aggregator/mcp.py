@@ -42,9 +42,16 @@ closeable from here. What bounds it:
 * It is opt-in twice over — ``rerank=True`` AND ``fields='full'`` — so the
   default query never constructs the model or imports torch at all. That is
   also why the import sits inside ``_get_reranker``.
-* The MCP path never sets ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD``, so the model
-  loads ``local_files_only``. A query cannot fetch code or weights from the
-  network into this process.
+* The model loads ``local_files_only``, so a query cannot fetch code or
+  weights from the network into this process. ENFORCED, NOT ASSUMED — this
+  used to say only that the MCP path "never sets"
+  ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD``, which was true of this file and
+  irrelevant: the server is a stdio child of the editor and INHERITS the
+  environment of the shell that launched it, and ``downloads_allowed()``
+  reads nothing else. One leftover export — from following our own
+  ``aggregator embed --seed-models`` remediation, say — and the claim was
+  false. ``_downloads_denied`` now removes the variable across both model
+  constructions.
 
 What is NOT bounded, and is the sharper end of this in practice: the model is
 ~2 GB RSS and there is no ``MemoryMax`` on the editor's process. Availability,
@@ -87,11 +94,14 @@ by running FTS on both ``records_fts`` and ``obs_fts``.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import zlib
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -314,6 +324,45 @@ _embedder: object | None = None
 _reranker: object | None = None
 
 
+@contextlib.contextmanager
+def _downloads_denied() -> Iterator[None]:
+    """Make "the MCP path never downloads weights" true, rather than claimed.
+
+    THIS PROCESS INHERITS THE USER'S SHELL. It is a stdio child of the editor,
+    registered bare — no systemd unit, no ``Environment=``, no
+    ``HF_HUB_OFFLINE``. ``downloads_allowed()`` reads ``os.environ`` and
+    nothing else, so the offline property depended entirely on
+    ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD`` not being exported in whichever shell
+    launched the editor — while this project's own remediation text tells the
+    operator to export exactly that to seed the models. One leftover export
+    and a single ``rerank=True`` query fetches ~1.2 GB from the hub, in the
+    editor's process, from a tool that advertises ``openWorldHint=False``.
+
+    REMOVED, NOT MATCHED. Deleting the variable defers to
+    ``downloads_allowed``'s own parsing of it instead of re-implementing the
+    accepted spellings here, so the two cannot drift apart.
+
+    SCOPED TO THE CONSTRUCTION, AND RESTORED AFTER. Both loaders resolve their
+    weights eagerly in ``__init__``, so that window is the only moment either
+    consults the flag. Clearing it process-wide would be simpler and wrong:
+    ``aggregator embed --seed-models`` is the one sanctioned downloader, it
+    runs in an interpreter that has imported this module (the CLI borrows
+    ``_get_reranker``), and disarming it would leave no supported way to
+    obtain the weights at all.
+
+    The import is deferred for the same reason every other model-side import
+    in this module is — see ``_get_embedder``.
+    """
+    from aggregator.core.embed import MODEL_DOWNLOAD_ENV
+
+    prior = os.environ.pop(MODEL_DOWNLOAD_ENV, None)
+    try:
+        yield
+    finally:
+        if prior is not None:
+            os.environ[MODEL_DOWNLOAD_ENV] = prior
+
+
 def _get_embedder() -> object:
     """Lazy singleton for the query embedder.
 
@@ -325,9 +374,10 @@ def _get_embedder() -> object:
     """
     global _embedder
     if _embedder is None:
-        from aggregator.core.embed import Embedder
+        with _downloads_denied():
+            from aggregator.core.embed import Embedder
 
-        _embedder = Embedder()
+            _embedder = Embedder()
     return _embedder
 
 
@@ -345,9 +395,10 @@ def _get_reranker() -> object:
     """
     global _reranker
     if _reranker is None:
-        from aggregator.core.rerank import Reranker
+        with _downloads_denied():
+            from aggregator.core.rerank import Reranker
 
-        _reranker = Reranker()
+            _reranker = Reranker()
     return _reranker
 
 
