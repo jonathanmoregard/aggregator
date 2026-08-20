@@ -1630,11 +1630,17 @@ def _approve_vector_reindex(store: Store, *, assume_yes: bool) -> bool:
 def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     """Background embed worker — fills the v5 vector index.
 
-    ``--catchup`` drains the whole backlog; ``--once`` does one batch and exits
-    (what the systemd timer runs). Both take an OS-level ``flock`` on
-    ``<cache>.embed.lock``, so a slow catchup and a timer tick cannot both
-    consume the same batch. A tick that finds the lock held is a healthy no-op
-    and exits 0.
+    ``--catchup`` drains the whole backlog and IS WHAT THE TIMER RUNS
+    (``embed --catchup --source both``, see ``nix/aggregator.nix``);
+    ``--once`` does a single batch and exits, and no deployed unit uses it —
+    it is a hand-run probe. This comment used to say the opposite, which was
+    wrong in the direction that costs the most: at batch-size 500 against 483k
+    observations, one batch per 30-minute tick is ~970 ticks, i.e. about three
+    weeks before the last row is even attempted.
+
+    Both take an OS-level ``flock`` on ``<cache>.embed.lock``, so a slow
+    catchup and a timer tick cannot both consume the same batch. A tick that
+    finds the lock held is a healthy no-op and exits 0.
 
     REFUSES TO RUN WITHOUT A WRITABLE VECTOR INDEX, loudly and non-zero, and
     the arm can be unusable for two unrelated reasons. With sqlite-vec missing
@@ -2579,16 +2585,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--catchup",
         action="store_true",
         help=(
-            "embed every unembedded row, then exit — this is what the systemd "
-            "timer runs (with --source both)"
+            "embed every unembedded row, then exit, in bounded per-batch "
+            "committed chunks — this is what the systemd timer runs (with "
+            "--source both), and what to run by hand against a stalled index"
         ),
     )
     mode.add_argument(
         "--once",
         action="store_true",
         help=(
-            "embed a single batch and exit; used by the human-triggered seed "
-            "unit as a live check, not by the timer"
+            "embed a single batch and exit. A HAND-RUN PROBE — no deployed "
+            "unit runs this: the timer runs --catchup and the seed unit runs "
+            "--seed-models. Useful to watch one batch go through; useless for "
+            "filling the index, since one batch per 30-minute tick is about "
+            "three weeks to first full coverage of this corpus. Use --catchup "
+            "for that"
         ),
     )
     mode.add_argument(
