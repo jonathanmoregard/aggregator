@@ -166,11 +166,26 @@ def test_a_locked_db_at_the_routing_probe_does_not_escape(healthy_db, monkeypatc
 # --- and the thing that must NOT change ------------------------------------
 
 
-def test_a_real_fts5_syntax_error_is_still_reported_as_one(healthy_db):
-    """Widening the handler must not relabel genuine query-text errors."""
+def test_hostile_query_text_on_a_healthy_cache_is_answered_not_refused(healthy_db):
+    """Was ``test_a_real_fts5_syntax_error_is_still_reported_as_one``, which
+    pinned the old contract: ``'voting AND OR "'`` came back ``ok: False`` with
+    "FTS5 syntax error" in the reason. There is no such error left to report —
+    ``fts5_match_query`` whitelists the text before it reaches ``MATCH``, so
+    the operators and the stray quote are gone and the words are answered.
+
+    The concern that test guarded is not dropped, it moved: what must never
+    happen is a CACHE failure being labelled a query-text problem, and
+    ``test_a_malformed_cache_is_not_reported_as_an_fts5_syntax_error`` above is
+    now the only test that owns that distinction. Here the mirror image is
+    pinned instead — hostile text against a healthy cache must never produce a
+    cache-unavailable refusal.
+    """
     result = aggregator_query('voting AND OR "', _store=_reader(healthy_db))
-    assert result["ok"] is False
-    assert "fts5" in result["reason"].lower()
+    assert result["ok"] is True, result
+    # '"voting" "AND" "OR"' — all three tokens, AND-ed. The corpus has the
+    # first and not the others, so the honest answer is zero hits.
+    assert result["total"] == 0
+    assert aggregator_query("voting", _store=_reader(healthy_db))["total"] > 0
 
 
 def test_a_healthy_cache_still_answers(healthy_db):
