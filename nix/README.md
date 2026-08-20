@@ -136,10 +136,32 @@ services.aggregator.embed = {
 
 Two models, about 1.2 GB of safetensors each:
 
-| Model | Loaded by | Used for |
-|---|---|---|
-| `Qwen/Qwen3-Embedding-0.6B` | `aggregator-embed.service` | filling the vector index |
-| `Qwen/Qwen3-Reranker-0.6B` | the MCP server, lazily | `rerank=True` on a search |
+| Model | Loaded by | Used for | Pinned |
+|---|---|---|---|
+| `Qwen/Qwen3-Embedding-0.6B` | `aggregator-embed.service` | filling the vector index | sha, `embed.QWEN3_EMBEDDING_REVISION` |
+| `Qwen/Qwen3-Reranker-0.6B` | the MCP server, lazily | `rerank=True` on a search | sha, `rerank.QWEN3_RERANKER_REVISION` |
+| `Qwen/Qwen3-Embedding-0.6B-GGUF` | nothing deployed — opt-in `AGGREGATOR_EMBED_BACKEND=gguf` only | the low-RAM embed backend | **no sha yet** — downloads refuse, see below |
+
+"Pinned artifact, no in-place update" has to cover the weights: without a
+`revision=`, every load resolves `main` on the hub, so the bytes a rev-pinned
+unit executes can change with no commit anywhere in the repo. A sha, never a
+tag — a tag is repointable by the repo owner, which is the thing being
+defended against.
+
+The `gguf` backend's `hf_hub_download` used to pass no `revision=` at all
+while the safetensors path passed one, so the two backends were not equally
+safe on the single path that can reach the network. `QWEN3_EMBEDDING_REVISION`
+cannot be reused: it was read off the safetensors repo and is not a valid ref
+in the separate `-GGUF` one. No sha for that repo has been verified yet, so
+`embed.QWEN3_EMBEDDING_GGUF_REVISION` is `None` and the **download** path
+refuses rather than silently resolving `main`; loading an already-seeded cache
+is unaffected. Nothing deployed can reach it — the units pin
+`AGGREGATOR_EMBED_BACKEND=st` and the `embed-gguf` extra is not in the closure.
+To close it: resolve `HfApi().model_info("Qwen/Qwen3-Embedding-0.6B-GGUF").sha`
+on a networked machine, verify the Q4_K_M file loads at that revision, and put
+the sha in `aggregator/core/embed.py`. A source constant, deliberately not an
+environment variable — an env-var pin is exactly the in-place mutable knob the
+deployment rule forbids.
 
 **Both** are seeded by `aggregator-embed-seed.service`. That is not a detail:
 the seed unit used to run `embed --once`, which constructs only the `Embedder`.
@@ -194,6 +216,17 @@ Fetching weights has no business touching the corpus.
 `checks.<system>.aggregator-embed-unit-hygiene` fails the build if the seed
 unit stops naming either model repo, stops running `--seed-models`, drops the
 download opt-in, or starts embedding rows again.
+
+The repo ids it compares against are **read out of the Python source** —
+`embed.py::_DEFAULT_MODEL_ST` and `rerank.py::_DEFAULT_MODEL` — because those
+are what `--seed-models` actually resolves. They used to be two string literals
+typed into `flake.nix`, matching strings that appear in the seed script only
+inside an informational `echo`, so changing the real model left the check green
+and `nix build` returned a byte-identical store path. That is fake coverage,
+which is worse than none: it reads as protection. The check now also derives
+each model's `models--Org--Name` cache directory and asserts the worker's
+`have_model` preflight gates on it, since a stale directory makes "weights
+present" a claim about the wrong model.
 
 ### Sandboxing the two units that run torch
 
@@ -313,12 +346,36 @@ rule out.
 
 ### Failure is loud, but only once a day
 
-`OnFailure=aggregator-embed-failure-notify.service`, mirroring the ingest
-unit: a journal line plus a CRITICAL `notify-send` popup. The popup — not the
-journal line — is debounced to once per 24h, because the two standing failure
-modes (weights absent, sqlite-vec absent) persist until a human acts, and 48
-identical popups a day is how a loud system trains you to ignore it. Same
-reasoning as `60a931d`.
+Each unit that can fail has **its own** `OnFailure=` notifier, mirroring the
+ingest unit: a journal line plus a CRITICAL `notify-send` popup.
+
+| failing unit | notifier | debounce stamp |
+| --- | --- | --- |
+| `aggregator-embed.service` | `aggregator-embed-failure-notify.service` | `embed-failure-notified` |
+| `aggregator-embed-seed.service` | `aggregator-embed-seed-failure-notify.service` | `embed-seed-failure-notified` |
+
+One notifier used to serve both, written as though only the worker could fire
+it. A **seed** failure therefore sent you to `journalctl -u
+aggregator-embed.service` — a unit that had not run — and named `systemctl
+--user start aggregator-embed-seed.service` as the remedy, i.e. the unit whose
+failure you were being told about. They also shared one stamp, so a worker
+failure silenced an unrelated seed failure for 24h. Both are generated from one
+`mkFailureNotify`, so they cannot drift apart on anything but the text.
+
+Not the templated `OnFailure=notify@%n.service` idiom. Probed here on systemd
+261: `%i` expands correctly, but `%I` mangles `aggregator-embed.service` into
+`aggregator/embed.service`, and the half that matters — `%n` inside
+`OnFailure=` — could not be verified on this host at all, because
+`systemd-analyze verify` ignores `OnFailure=` targets entirely (a control
+naming a nonexistent unit draws no complaint) and these units cannot be started
+here. `$SERVICE_RESULT` / `$EXIT_CODE` are not available to a separate
+`OnFailure=` unit either. With two statically known units, generating two
+notifiers needs none of that.
+
+The popup — not the journal line — is debounced to once per 24h, because the
+two standing failure modes (weights absent, sqlite-vec absent) persist until a
+human acts, and 48 identical popups a day is how a loud system trains you to
+ignore it. Same reasoning as `60a931d`.
 
 The debounce fails **open on both halves**:
 
@@ -333,8 +390,10 @@ The debounce fails **open on both halves**:
 That cannot become a popup storm: while `notify-send` keeps failing there is no
 daemon to show anything, so the cost is one extra journal line per tick.
 `checks.<system>.aggregator-embed-unit-hygiene` pins both halves by *executing*
-the generated script twice with a stubbed `notify-send` — once exiting 1 (tick
-2 must still notify) and once exiting 0 (tick 2 must be suppressed).
+each generated script twice with a stubbed `notify-send` — once exiting 1 (tick
+2 must still notify) and once exiting 0 (tick 2 must be suppressed) — and then
+runs the two scripts against one shared `XDG_STATE_HOME`, in both orders, to
+prove neither unit's failure silences the other.
 
 ### Why `--catchup`
 
@@ -455,17 +514,20 @@ What it enforces, and why each one is there:
   makes every HTTPS host look like it is serving a self-signed certificate,
   which sends you on exactly the wrong investigation. It cost the TickTick
   source a day once.
-- **`OnFailure=` is wired.**
+- **`OnFailure=` is wired, and each unit names its OWN notifier** — which
+  cites its own journal and no other unit's.
 - **`HF_HUB_OFFLINE=1`** on the timer-driven unit.
 - **The embed timer's `OnCalendar` differs from every ingest timer's.**
 - **`aggregator-embed-seed.service` has no `[Install]` section**, so it can
   never be pulled in by a target and start a 2.4 GB download unattended.
-- **The seed unit names both model repos, runs `embed --seed-models`, exports
-  the download opt-in, and embeds no rows.**
+- **The seed unit names both model repos — as read from the Python defaults
+  that decide the fetch — runs `embed --seed-models`, exports the download
+  opt-in, and embeds no rows.**
 - **`timeoutStartSec` accepts exactly the time spans `systemd-analyze timespan`
   accepts** — checked in both directions against 14 cases.
-- **The failure-notify debounce arms only on a delivered popup** — asserted by
-  executing the generated script with a stubbed `notify-send`.
+- **The failure-notify debounce arms only on a delivered popup, and is
+  per-unit** — asserted by executing both generated scripts with a stubbed
+  `notify-send`, including against one shared state dir in both orders.
 - **Both torch units carry the shared sandbox set**, the seeder can still open
   an IP socket, and neither unit sets `MemoryDenyWriteExecute` or
   `ProtectHome`.
