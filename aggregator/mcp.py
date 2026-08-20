@@ -860,6 +860,52 @@ def _pack_frozen(frozen: dict[str, list[str]]) -> str:
     return base64.urlsafe_b64encode(zlib.compress(payload, 9)).decode().rstrip("=")
 
 
+def _frozen_over_budget(frozen: dict[str, list[str]]) -> str | None:
+    """Why this frozen set cannot be minted into a token, or ``None``.
+
+    THE BUDGET WAS DERIVED FROM AN ASSUMPTION AND ENFORCED ONLY ON THE WAY IN.
+    ``_MAX_FROZEN_ID_CHARS`` is "the longest id we mint, a dropbox path" — a
+    claim about today's sources, which ``_unpack_frozen`` then treats as a
+    hard ceiling. Nothing checked it on the way out, so an id family longer
+    than the guess produced a token this same process refused on the next
+    page: a pagination the caller cannot finish, whose remediation ("pass back
+    the exact token, unmodified") is precisely what it already did.
+
+    MEASURED AGAINST THE ARTIFACT, NOT AGAINST A PROXY. The last two checks
+    ask the two questions ``_unpack_frozen`` actually asks, of the exact bytes
+    it would be handed, so the two sides cannot drift apart as the packing
+    changes. The first two come first anyway because they name the CAUSE — "an
+    id is 2 000 characters" is actionable, "the payload expands past 52 256
+    bytes" is a symptom two derivations downstream.
+    """
+    for kind in sorted(frozen):
+        ids = frozen[kind]
+        if len(ids) > _VECTOR_ARM_K:
+            return (
+                f"the {kind} arm produced {len(ids)} hits, past the "
+                f"{_VECTOR_ARM_K} a page token can carry"
+            )
+        longest = max((len(i) for i in ids), default=0)
+        if longest > _MAX_FROZEN_ID_CHARS:
+            return (
+                f"the longest {kind} id is {longest} characters, past the "
+                f"{_MAX_FROZEN_ID_CHARS} the page-token budget was derived from"
+            )
+    payload = json.dumps(frozen, separators=(",", ":"), sort_keys=True).encode()
+    if len(payload) > _MAX_FROZEN_PAYLOAD_BYTES:
+        return (
+            f"the frozen hits are {len(payload)} bytes, past the "
+            f"{_MAX_FROZEN_PAYLOAD_BYTES} a page token can carry"
+        )
+    packed = len(_pack_frozen(frozen))
+    if packed > _MAX_FROZEN_PAYLOAD_B64_CHARS:
+        return (
+            f"the packed hits are {packed} characters, past the "
+            f"{_MAX_FROZEN_PAYLOAD_B64_CHARS} a page token can carry"
+        )
+    return None
+
+
 def _unpack_frozen(payload: str) -> dict[str, list[str]]:
     """Decode a frozen-set payload, or raise ``_PageTokenError``.
 
@@ -1050,12 +1096,61 @@ def _mint_page_token(
     ``fingerprint`` is required rather than defaulted on purpose: a default
     would let a future call site mint an unbound token by omission, which is
     the whole defect this argument exists to close.
+
+    A frozen set that will not fit is DROPPED, not truncated and not raised.
+    Truncating would hand back a plausible, wrong frozen set — the thing
+    ``_PageTokenError`` exists to refuse. Raising would destroy a page that is
+    already correct, or (worse) suppress its ``next_page_token`` and read to
+    the caller as the end of the results. Dropping it costs the freeze and
+    nothing else: the arm and the query stay pinned, the KNN is re-run on the
+    next page, and that is exactly the behaviour of every token minted before
+    round 1 — correct, with the drift the freeze exists to remove. The caller
+    is told, by ``_attach_next_page_token``; the operator is told here.
     """
     head = f"h{offset}" if hybrid else str(offset)
     head = f"{head}~{fingerprint}"
     if not hybrid or not frozen:
         return head
+    if problem := _frozen_over_budget(frozen):
+        log.error(
+            "page token minted without its frozen hits: %s. The vector arm "
+            "will be re-run for each page of this query, so the candidate set "
+            "can move underneath the caller. Raise _MAX_FROZEN_ID_CHARS to "
+            "cover this source's ids, or cap the ids the arm returns.",
+            problem,
+        )
+        return head
     return f"{head}.{_pack_frozen(frozen)}"
+
+
+def _attach_next_page_token(
+    result: dict[str, Any],
+    offset: int,
+    hybrid: bool,
+    fingerprint: str,
+    frozen: dict[str, list[str]] | None,
+) -> None:
+    """Mint the continuation token and, if it lost its freeze, say so.
+
+    A degradation the caller cannot see is the failure mode this file keeps
+    coming back to — see ``_maybe_rerank``. Pages served from a token with no
+    frozen hits can duplicate and skip rows as the embed worker lands vectors
+    between them, which is caller-visible harm, so it is reported in the
+    caller's own response rather than only in a log the editor may swallow.
+    """
+    result["next_page_token"] = _mint_page_token(offset, hybrid, fingerprint, frozen)
+    problem = _frozen_over_budget(frozen) if (hybrid and frozen) else None
+    if not problem:
+        return
+    notice = (
+        f"Pagination is DEGRADED for this query: {problem}, so the page token "
+        f"could not carry the vector arm's hits. Later pages re-run the "
+        f"semantic search, and rows arriving in between can therefore be "
+        f"served twice or skipped. Treat a full pagination of this query as "
+        f"approximate, and prefer a single larger page_size over many pages."
+    )
+    prior = result.get("notice")
+    result["notice"] = f"{notice} {prior}" if prior else notice
 
 
 def _scrub_record(r: Record) -> Record:
@@ -1579,17 +1674,18 @@ def _query_records_path(
         "records": items,
         "total": total,
     }
-    if has_more:
-        result["next_page_token"] = _mint_page_token(
-            offset + page_size,
-            hybrid,
-            fingerprint,
-            {"records": vec_hits} if hybrid else None,
-        )
     if fields != "full":
         result["notice"] = (
             "Content bodies omitted (fields='summary'). "
             "Re-call with fields=full to include record bodies."
+        )
+    if has_more:
+        _attach_next_page_token(
+            result,
+            offset + page_size,
+            hybrid,
+            fingerprint,
+            {"records": vec_hits} if hybrid else None,
         )
     return _note_rerank(result, rerank, rr_applied, rr_notice)
 
@@ -1641,14 +1737,14 @@ def _query_sessions_path(
             "records": items,
             "total": total,
         }
-        if has_more:
-            result["next_page_token"] = _mint_page_token(
-                offset + page_size, hybrid, fingerprint, frozen_out
-            )
         if fields != "full":
             result["notice"] = (
                 "Observation bodies omitted (fields='summary'). "
                 "Re-call with fields=full to include observation bodies."
+            )
+        if has_more:
+            _attach_next_page_token(
+                result, offset + page_size, hybrid, fingerprint, frozen_out
             )
         return _note_rerank(result, rerank, rr_applied, rr_notice)
 
@@ -1692,15 +1788,15 @@ def _query_sessions_path(
         "records": items,
         "total": total,
     }
-    if has_more:
-        result["next_page_token"] = _mint_page_token(
-            offset + page_size, hybrid, fingerprint, frozen_out
-        )
     if fields != "full":
         result["notice"] = (
             "Session subject only (fields='summary'). "
             "Re-call with fields=full to include the first-user-prompt body, "
             "or with drilldown=True to fetch matching observation rows."
+        )
+    if has_more:
+        _attach_next_page_token(
+            result, offset + page_size, hybrid, fingerprint, frozen_out
         )
     return _note_rerank(result, rerank, rr_applied, rr_notice)
 
@@ -1854,16 +1950,16 @@ def _query_union_path(
         "records": items,
         "total": total,
     }
-    if has_more:
-        result["next_page_token"] = _mint_page_token(
-            offset + page_size, hybrid, fingerprint, frozen_out or None
-        )
     if fields != "full":
         result["notice"] = (
             "Cross-source union (records + sessions). Content bodies "
             "omitted (fields='summary'). Re-call with fields=full to "
             "include bodies, or add source:github / source:sessions to "
             "target a single ontology."
+        )
+    if has_more:
+        _attach_next_page_token(
+            result, offset + page_size, hybrid, fingerprint, frozen_out or None
         )
     return _note_rerank(result, rerank, rr_applied, rr_notice)
 
