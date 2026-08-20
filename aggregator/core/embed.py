@@ -45,6 +45,30 @@ _DEFAULT_MODEL_GGUF = "Qwen/Qwen3-Embedding-0.6B-GGUF"
 #: nothing about a model name a caller passed in.
 QWEN3_EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 
+#: The same pin for the ``-GGUF`` repository — **not yet established**.
+#:
+#: ``QWEN3_EMBEDDING_REVISION`` above was read off the safetensors repo and is
+#: not a valid ref in the ``-GGUF`` one; they are separate repositories with
+#: separate histories. Reusing it would not pin the download, it would break
+#: it, and inventing a plausible-looking sha would be worse than either.
+#:
+#: So the hole is left open and NAMED rather than papered over. It is not a
+#: silent one: ``Embedder`` refuses to construct the default gguf backend on
+#: the download path while this is ``None`` (see ``_gguf_revision``), because
+#: that path — and only that path — is where unpinned bytes would actually
+#: move. An already-seeded machine loading from cache is unaffected.
+#:
+#: TO CLOSE IT: resolve the sha of ``Qwen/Qwen3-Embedding-0.6B-GGUF`` on a
+#: machine with network access — ``huggingface_hub.HfApi().model_info(
+#: "Qwen/Qwen3-Embedding-0.6B-GGUF").sha`` — verify the Q4_K_M file loads at
+#: that revision, and put the 40-hex-character sha here. A sha, never a tag:
+#: a tag is repointable by the repo owner, which is the thing being defended
+#: against. Deliberately a source constant and NOT an environment variable —
+#: an env-var pin is an in-place mutable knob, i.e. the exact thing
+#: "pinned artifact, no in-place update" forbids. New sha → new commit → new
+#: store path.
+QWEN3_EMBEDDING_GGUF_REVISION: str | None = None
+
 
 #: The ONE opt-in that lets a model load reach the network.
 MODEL_DOWNLOAD_ENV = "AGGREGATOR_ALLOW_MODEL_DOWNLOAD"
@@ -141,16 +165,32 @@ class Embedder:
             # ``from_pretrained`` used, so an already-seeded machine loads
             # exactly the file it loaded before.
             #
-            # STILL NOT PINNED: ``QWEN3_EMBEDDING_REVISION`` was taken from the
-            # safetensors repository and says nothing about the separate
-            # ``-GGUF`` one. The shipped default backend is ``st``, which is
-            # pinned above; anyone opting into gguf is choosing an unpinned
-            # artifact and this comment is where they find that out.
+            # THE PIN IS PASSED HERE TOO, and that is round 3's M1. This call
+            # used to omit ``revision=`` entirely while the ``st`` path four
+            # branches up passed one, so the two backends were not equally safe
+            # on the single path that can reach the network: gguf resolved
+            # ``main``, a moving target, under a deployment whose whole rule is
+            # that a rev-pinned unit executes fixed bytes. A comment admitting
+            # the gap is not the same as closing it — nothing enforced it, and
+            # nothing would have noticed it widening.
+            #
+            # ``QWEN3_EMBEDDING_GGUF_REVISION`` is currently ``None`` because no
+            # sha for the ``-GGUF`` repo has been verified (see its docstring).
+            # ``revision=None`` resolves exactly as omitting the argument did,
+            # so this line alone changes no behaviour — what changes behaviour
+            # is ``_gguf_revision`` refusing the unpinned DOWNLOAD below. The
+            # argument is spelled out regardless, so the pin is a wired,
+            # greppable, testable thing rather than a missing keyword nobody
+            # can assert on.
+            repo_id = self.model_name or _DEFAULT_MODEL_GGUF
+            revision = self._gguf_revision(repo_id)
+
             from huggingface_hub import hf_hub_download
 
             model_path = hf_hub_download(
-                repo_id=self.model_name or _DEFAULT_MODEL_GGUF,
+                repo_id=repo_id,
                 filename=gguf_filename,
+                revision=revision,
                 cache_dir=str(cache_dir) if cache_dir else None,
                 local_files_only=not downloads_allowed(),
             )
@@ -162,6 +202,52 @@ class Embedder:
             )
         else:
             raise ValueError(f"unknown embed backend: {self.backend!r}")
+
+    @staticmethod
+    def _gguf_revision(repo_id: str) -> str | None:
+        """The revision to resolve the gguf repo at — or a loud refusal.
+
+        A CALLER-SUPPLIED REPO GETS NO PIN AND NO REFUSAL, exactly as on the
+        ``st`` path: a pin taken from one repository vouches for nothing else,
+        and someone who names their own repo has already chosen it. The rule
+        being enforced is only about the repo this package picks by default.
+
+        REFUSING IS THE POINT, and only on the download path. While
+        ``QWEN3_EMBEDDING_GGUF_REVISION`` is ``None`` the default gguf repo has
+        no verified sha, so a fetch would resolve ``main`` — whatever the repo
+        owner pushed most recently — into a deployment that claims every
+        artifact is pinned to a commit. Loading an ALREADY-SEEDED cache is
+        untouched: those bytes are on disk and not moving, and breaking a
+        working offline load to protest a missing pin would help nobody.
+
+        Loud rather than silent, and a raise rather than a warning, because
+        this can only be reached by a human who opted into ``gguf`` AND into
+        ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD`` in the same breath — someone
+        watching a terminal right now, who can act on a message that names the
+        file, the constant and the command. The deployed units pin
+        ``AGGREGATOR_EMBED_BACKEND=st`` and the ``embed-gguf`` extra is not in
+        the closure, so no unit can reach this at all.
+        """
+        if repo_id != _DEFAULT_MODEL_GGUF:
+            return None
+        if QWEN3_EMBEDDING_GGUF_REVISION is not None:
+            return QWEN3_EMBEDDING_GGUF_REVISION
+        if not downloads_allowed():
+            # Offline: nothing can move, so nothing to refuse.
+            return None
+        raise RuntimeError(
+            f"refusing to DOWNLOAD {_DEFAULT_MODEL_GGUF} unpinned. "
+            f"aggregator.core.embed.QWEN3_EMBEDDING_GGUF_REVISION is None, so "
+            f"this fetch would resolve 'main' — whatever that repo holds right "
+            f"now — while every other artifact in this deployment is pinned to "
+            f"a commit. QWEN3_EMBEDDING_REVISION cannot be reused: it belongs "
+            f"to the safetensors repo {_DEFAULT_MODEL_ST} and is not a valid "
+            f"ref here. Either use the pinned default backend "
+            f"(AGGREGATOR_EMBED_BACKEND=st), or set "
+            f"QWEN3_EMBEDDING_GGUF_REVISION in aggregator/core/embed.py to a "
+            f"sha you verified — "
+            f"HfApi().model_info({_DEFAULT_MODEL_GGUF!r}).sha — and rebuild."
+        )
 
     def _encode(self, texts: list[str]) -> np.ndarray:
         """Backend-specific encode. Returns raw native-dim vectors."""
