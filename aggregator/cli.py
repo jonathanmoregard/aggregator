@@ -1606,12 +1606,16 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     consume the same batch. A tick that finds the lock held is a healthy no-op
     and exits 0.
 
-    REFUSES TO RUN WITHOUT THE VECTOR EXTENSION, loudly and non-zero. With
-    sqlite-vec missing the store's vec writers no-op; embedding the batch
-    anyway would advance ``embedding_state`` past rows that have no vector,
-    and nothing ever looks at a row twice. That is the watermark-ahead-of-data
-    failure the ingest rules forbid, so the whole run is refused and the
-    backlog is left exactly where it was.
+    REFUSES TO RUN WITHOUT A WRITABLE VECTOR INDEX, loudly and non-zero, and
+    the arm can be unusable for two unrelated reasons. With sqlite-vec missing
+    the store's vec writers no-op; embedding the batch anyway would advance
+    ``embedding_state`` past rows that have no vector, and nothing ever looks
+    at a row twice. That is the watermark-ahead-of-data failure the ingest
+    rules forbid. With the extension loaded but the index under an S1
+    provenance refusal, the writes would be this build's vectors landing in a
+    table another model filled. Both are checked HERE, before a row is
+    selected, so the run is refused and the backlog is left exactly where it
+    was — see the second check for what discovering it late used to cost.
 
     THIS IS ALSO THE ONLY COMMAND THAT MAY DELETE THE VECTOR INDEX, under
     ``--reindex``, and that is round 3's H1. The consent used to be
@@ -1634,6 +1638,30 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
             "advancing embedding_state past rows with no vector. FTS5 search "
             "is unaffected. Reinstall the `sqlite-vec` wheel for this "
             "interpreter and re-run `aggregator embed --catchup`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # THE OTHER WAY THE ARM IS OFF, and round 3's H2. ``vector_available``
+    # answers "did the extension load?" — which under an S1 provenance refusal
+    # is YES, while the index it loaded is one this build may not write to.
+    # Without this check the worker got all the way to
+    # ``commit_embed_batch``, where ``_require_vector`` raises, having already
+    # embedded a full batch: an uncaught traceback, the unit marked failed, a
+    # CRITICAL toast naming missing weights and a missing wheel (neither of
+    # which applied), the run's ledger report discarded with the exception,
+    # and 500 rows of CPU spent on work that was never written. On a
+    # 30-minute timer, every tick, indefinitely.
+    #
+    # The store's own refusal text is reprinted verbatim rather than
+    # summarised: it already names what disagreed, that nothing was deleted,
+    # and the two opposite remedies — and only the operator knows which one
+    # they meant.
+    refusal = store.vector_quarantine
+    if refusal is not None:
+        print(
+            f"ERROR: aggregator embed cannot run — {refusal}\n"
+            f"No row was embedded and the backlog is untouched.",
             file=sys.stderr,
         )
         return 1
