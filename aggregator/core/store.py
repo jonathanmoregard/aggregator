@@ -412,7 +412,10 @@ def _purge_orphan_vectors(c: sqlite3.Connection, kind: str) -> int:
     while dropping one costs the row its recall.
     """
     vec_table, vec_key, base_table, base_key = _VEC_OWNERSHIP[kind]
-    if not _table_present(c, vec_table):
+    # USABLE, not merely present: this runs inside the rebuild's savepoint, so
+    # ``no such module: vec0`` here rolls back the re-write it was cleaning up
+    # after. See ``_vec_table_usable``.
+    if not _vec_table_usable(c, vec_table):
         return 0
     # ``rtrim(key,'0-9')`` strips a trailing chunk index; when what remains
     # ends in ':' the key was ``<owner>:<n>`` and the owner is the rest.
@@ -1446,9 +1449,13 @@ class Store:
         obs_ids = [e.obs_id for e in group if isinstance(e, ObservationRow)]
         stored_sessions = _stored_hashes(c, "sessions", "session_id", session_ids)
         stored_obs = _stored_hashes(c, "observations", "obs_id", obs_ids)
-        # Probed ONCE per group. A cache migrated without sqlite-vec has no vec
-        # tables at all, and the watermark reset below must still happen there.
-        vec_present = _table_present(c, "vec_observations")
+        # Probed ONCE per group, and it asks whether the table can be WRITTEN,
+        # not merely whether it exists. A cache migrated without sqlite-vec has
+        # no vec tables at all; a cache FILLED with the extension and then
+        # opened without it has them and cannot touch them. Both must leave the
+        # row write and the watermark reset below untouched — see
+        # ``_vec_table_usable``.
+        vec_present = _vec_table_usable(c, "vec_observations")
 
         unchanged = 0
         for e in group:
@@ -2692,6 +2699,11 @@ class Store:
             for row in rows:
                 stored[row[0]] = (row[1], row[2], row[3])
 
+        # Once per group, matching the observations path. The probe runs a
+        # statement against the vec table, so asking it per row would put it in
+        # the write loop for no added truth.
+        vec_usable = _vec_table_usable(c, "vec_records")
+
         unchanged = 0
         for r in records:
             held_hash, held_created, held_updated = stored.get(
@@ -2713,12 +2725,19 @@ class Store:
             if held_hash == digest:
                 unchanged += 1
                 continue
-            Store._write_one_record(c, r, digest, r.stable_id in stored)
+            Store._write_one_record(
+                c, r, digest, r.stable_id in stored, vec_usable=vec_usable
+            )
         return unchanged
 
     @staticmethod
     def _write_one_record(
-        c: sqlite3.Connection, r: Record, digest: str, existed: bool = False
+        c: sqlite3.Connection,
+        r: Record,
+        digest: str,
+        existed: bool = False,
+        *,
+        vec_usable: bool = False,
     ) -> None:
         scrubbed_body = scrub(r.body).text
         scrubbed_subject = scrub(r.subject).text
@@ -2778,7 +2797,10 @@ class Store:
         # its vector survives the re-insert — the row is back at
         # ``embedding_state IS NULL`` and will be re-embedded, but it keeps
         # serving the vector arm in the meantime instead of going dark.
-        if existed and _table_present(c, "vec_records"):
+        # ``vec_usable`` is probed once per group by the caller, and defaults to
+        # False so a future call site that forgets it degrades to "leave the
+        # vectors alone" rather than to a raise inside the row write.
+        if existed and vec_usable:
             _drop_row_vectors(c, "vec_records", "stable_id", r.stable_id)
         c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
         c.execute(
