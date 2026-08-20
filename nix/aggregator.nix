@@ -242,9 +242,39 @@ let
     exec ${aggregatorBin} embed --seed-models
   '';
 
-  # OnFailure target. Mirrors the deployed aggregator-ingest-failure-notify
-  # unit (journal line + CRITICAL libnotify popup), with one addition: the
-  # popup is debounced to once per day.
+  # OnFailure target, generated PER FAILING UNIT. Mirrors the deployed
+  # aggregator-ingest-failure-notify unit (journal line + CRITICAL libnotify
+  # popup), with one addition: the popup is debounced to once per day.
+  #
+  # ONE NOTIFIER PER UNIT, and that is round 3's M3. There used to be a single
+  # script wired as `OnFailure=` for BOTH `aggregator-embed.service` and
+  # `aggregator-embed-seed.service`, and it was written as though only the
+  # first could ever fire it. Two concrete defects fell out, both reproduced
+  # by running the rendered script twice:
+  #
+  #   1. WRONG JOURNAL AND CIRCULAR ADVICE. When the SEED unit failed, the
+  #      operator was handed `journalctl --user -u aggregator-embed.service`
+  #      — which contains nothing about the download that just died — and was
+  #      told the fix was to run `systemctl --user start
+  #      aggregator-embed-seed.service`, i.e. the very unit whose failure they
+  #      were being notified about.
+  #   2. ONE STAMP SILENCED THE OTHER UNIT. Both shared
+  #      `embed-failure-notified`, so a worker failure armed the 24h debounce
+  #      and a seed failure minutes later was suppressed outright. Observed:
+  #      tick 1 (worker) notified, tick 2 (seed) printed "suppressed".
+  #
+  # NOT the templated `OnFailure=notify@%n.service` idiom, deliberately.
+  # Verified on this host with systemd 261: `%i` on an instance named
+  # `aggregator-embed.service` does expand to `aggregator-embed.service`, and
+  # `%I` mangles it to `aggregator/embed.service` (the `-`→`/` unescape), so
+  # the idiom works but has a live footgun in it. The half that MATTERS —
+  # that `%n` inside `OnFailure=` expands to the failing unit's own name —
+  # could not be verified here at all: `systemd-analyze verify` does not
+  # inspect `OnFailure=` targets, confirmed with a control naming a unit that
+  # does not exist and drawing no complaint, and the embed units cannot be
+  # started on this host. With exactly two statically-known units, a
+  # parameterised generator needs no specifier semantics, no instance
+  # escaping, and nothing that has to be taken on trust.
   #
   # The embed timer fires every 30 minutes. Its two standing failure modes —
   # weights absent, sqlite-vec absent — are both *persistent* until a human
@@ -270,29 +300,73 @@ let
   # failing there is no daemon to show anything, so the cost is one extra
   # journal line per tick, and the moment a daemon does appear the user gets
   # told once and the debounce arms normally.
-  embedFailureNotify = pkgs.writeShellScript "aggregator-embed-failure-notify" ''
-    set -uo pipefail
+  #
+  # `$SERVICE_RESULT` / `$EXIT_CODE` are NOT available to a separate
+  # `OnFailure=` unit (round 2 established this), which is why the failing
+  # unit's identity has to be baked in at generation time rather than read
+  # from the environment at runtime.
+  mkFailureNotify = { name, unit, stamp, summary, body }:
+    pkgs.writeShellScript name ''
+      set -uo pipefail
 
-    echo "aggregator embed run FAILED — inspect: journalctl --user -u aggregator-embed.service -n 200"
+      echo "${unit} FAILED — inspect: journalctl --user -u ${unit} -n 200"
 
-    stamp_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/aggregator"
-    stamp="$stamp_dir/embed-failure-notified"
-    recent="$(${pkgs.findutils}/bin/find "$stamp" -mmin -1440 2>/dev/null)"
-    if [ -n "$recent" ]; then
-      echo "desktop notification suppressed — already notified within 24h (stamp: $stamp). Failure is in the journal above."
-      exit 0
-    fi
+      stamp_dir="''${XDG_STATE_HOME:-$HOME/.local/state}/aggregator"
+      # Per-unit stamp. A shared one makes either unit's failure buy silence
+      # for the other, which is the same "loud system becomes silent" bug the
+      # debounce exists to avoid, arrived at from the other direction.
+      stamp="$stamp_dir/${stamp}"
+      recent="$(${pkgs.findutils}/bin/find "$stamp" -mmin -1440 2>/dev/null)"
+      if [ -n "$recent" ]; then
+        echo "desktop notification suppressed — already notified within 24h (stamp: $stamp). Failure is in the journal above."
+        exit 0
+      fi
 
-    if ${pkgs.libnotify}/bin/notify-send -u critical -a aggregator \
-      "aggregator embed FAILED" \
-      "The background embed worker exited non-zero, so the vector index is not being filled. Likely: Qwen3 weights missing from the HF cache (fix: systemctl --user start aggregator-embed-seed.service), or the sqlite-vec extension did not load. Keyword search is unaffected. Details: journalctl --user -u aggregator-embed.service -n 200"; then
-      # Delivered. Arm the 24h debounce, and only now.
-      ${pkgs.coreutils}/bin/mkdir -p "$stamp_dir" 2>/dev/null
-      ${pkgs.coreutils}/bin/touch "$stamp" 2>/dev/null
-    else
-      echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only. NOT arming the 24h debounce: an undelivered popup must not buy silence, so the next failing tick will try again."
-    fi
-  '';
+      if ${pkgs.libnotify}/bin/notify-send -u critical -a aggregator \
+        "${summary}" \
+        "${body} Details: journalctl --user -u ${unit} -n 200"; then
+        # Delivered. Arm the 24h debounce, and only now.
+        ${pkgs.coreutils}/bin/mkdir -p "$stamp_dir" 2>/dev/null
+        ${pkgs.coreutils}/bin/touch "$stamp" 2>/dev/null
+      else
+        echo "notify-send failed (no notification daemon on session bus?) — failure recorded in journal only. NOT arming the 24h debounce: an undelivered popup must not buy silence, so the next failing tick will try again."
+      fi
+    '';
+
+  embedFailureNotify = mkFailureNotify {
+    name = "aggregator-embed-failure-notify";
+    unit = "aggregator-embed.service";
+    stamp = "embed-failure-notified";
+    summary = "aggregator embed FAILED";
+    body =
+      "The background embed worker exited non-zero, so the vector index is"
+      + " not being filled. Likely: Qwen3 weights missing from the HF cache"
+      + " (fix: systemctl --user start aggregator-embed-seed.service), or the"
+      + " sqlite-vec extension did not load. Keyword search is unaffected.";
+  };
+
+  # The seeder's own notification. Pointing this one at the worker's journal
+  # told the operator to read a unit that had not run, and naming the seed
+  # unit as the remedy told them to run the thing that had just failed.
+  #
+  # Re-running IS the right move here — but only after the cause is fixed,
+  # and the cause is in this unit's own journal. The causes named are the
+  # ones this unit can actually hit: it is the only unit permitted to reach
+  # the network, it has a 4h start timeout, and it writes ~2.4 GB to disk.
+  embedSeedFailureNotify = mkFailureNotify {
+    name = "aggregator-embed-seed-failure-notify";
+    unit = "aggregator-embed-seed.service";
+    stamp = "embed-seed-failure-notified";
+    summary = "aggregator model download FAILED";
+    body =
+      "The one-time Qwen3 weight download exited non-zero, so the embedding"
+      + " and reranker weights are NOT in the cache: the embed worker will"
+      + " refuse on every tick and rerank=True stays degraded. Likely: no"
+      + " network, an empty CA bundle, not enough disk for ~2.4 GB, a hub"
+      + " rate limit, or the 4h start timeout. Keyword search is unaffected."
+      + " Fix the cause below, then re-run: systemctl --user start"
+      + " aggregator-embed-seed.service.";
+  };
 
   # ---- systemd time-span option type ------------------------------------
   #
@@ -762,7 +836,11 @@ in {
       systemd.user.services.aggregator-embed-seed = lib.mkIf cfg.embed.enable {
         Unit = {
           Description = "Aggregator: one-time download of the Qwen3 embedding + reranker weights (~2.4 GB)";
-          OnFailure = "aggregator-embed-failure-notify.service";
+          # ITS OWN notifier, not the worker's. See `mkFailureNotify`: sharing
+          # one sent the operator to a journal this unit never wrote to, told
+          # them to run the unit that had just failed, and let either unit's
+          # failure silence the other for 24h through a shared stamp.
+          OnFailure = "aggregator-embed-seed-failure-notify.service";
         };
         Service = {
           Type = "oneshot";
@@ -822,6 +900,18 @@ in {
           Service = {
             Type = "oneshot";
             ExecStart = "${embedFailureNotify}";
+            StandardOutput = "journal";
+            StandardError = "journal";
+          };
+        };
+
+      systemd.user.services.aggregator-embed-seed-failure-notify =
+        lib.mkIf cfg.embed.enable {
+          Unit.Description =
+            "Desktop notification: aggregator model download failed";
+          Service = {
+            Type = "oneshot";
+            ExecStart = "${embedSeedFailureNotify}";
             StandardOutput = "journal";
             StandardError = "journal";
           };

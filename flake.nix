@@ -125,9 +125,14 @@
               units=${hmFixture.config.home-files}/.config/systemd/user
               fail() { echo "FAIL: $*" >&2; exit 1; }
 
-              for u in aggregator-embed.service aggregator-embed.timer \
-                       aggregator-embed-seed.service \
-                       aggregator-embed-failure-notify.service; do
+              # Every unit this module generates. The two notifiers are
+              # separate on purpose — see step 3.
+              all_units="aggregator-embed.service aggregator-embed.timer \
+                         aggregator-embed-seed.service \
+                         aggregator-embed-failure-notify.service \
+                         aggregator-embed-seed-failure-notify.service"
+
+              for u in $all_units; do
                 [ -e "$units/$u" ] || fail "$u was not generated"
               done
 
@@ -143,9 +148,7 @@
               # So the check follows every ExecStart into the script it names
               # and greps that too. Grepping only the unit would have passed
               # on the broken deployment.
-              for u in aggregator-embed.service aggregator-embed-seed.service \
-                       aggregator-embed-failure-notify.service \
-                       aggregator-embed.timer; do
+              for u in $all_units; do
                 f="$units/$u"
                 # Dereference: home-manager installs units as symlinks.
                 real=$(readlink -f "$f")
@@ -178,13 +181,65 @@
               grep -qE '^Environment="?NIX_SSL_CERT_FILE=' "$svc" \
                 || fail "aggregator-embed.service does not set NIX_SSL_CERT_FILE"
 
-              # ---- 3. Fail loudly ----------------------------------------
-              grep -q '^OnFailure=aggregator-embed-failure-notify.service$' "$svc" \
-                || fail "aggregator-embed.service has no OnFailure notification"
-              notify_unit=$(readlink -f "$units/aggregator-embed-failure-notify.service")
-              notify_script=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$notify_unit")
-              grep -q 'notify-send' "$notify_script" \
-                || fail "the failure-notify unit does not call notify-send"
+              # ---- 3. Fail loudly, AND about the unit that actually failed -
+              # Round-3 MEDIUM. One notifier used to be the OnFailure= target
+              # for both the worker and the seeder, written as though only the
+              # worker could fire it. So a SEED failure sent the operator to
+              # `journalctl -u aggregator-embed.service` — a unit that had not
+              # run — and told them the fix was to start
+              # aggregator-embed-seed.service, the very unit whose failure they
+              # were being told about. There is one notifier per unit now.
+              #
+              # `$SERVICE_RESULT`/`$EXIT_CODE` are not available to a separate
+              # OnFailure= unit, and `OnFailure=notify@%n.service` could not be
+              # verified on this host (systemd-analyze verify does not inspect
+              # OnFailure= targets at all — checked with a control naming an
+              # absent unit, which drew no complaint). With two statically
+              # known units, generating two notifiers needs neither.
+              notify_script_for() {
+                # $1 = notify unit name. Echoes its ExecStart script path.
+                sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' \
+                  "$(readlink -f "$units/$1")"
+              }
+
+              for pair in \
+                "aggregator-embed.service:aggregator-embed-failure-notify.service" \
+                "aggregator-embed-seed.service:aggregator-embed-seed-failure-notify.service"; do
+                failing=''${pair%%:*}
+                notifier=''${pair##*:}
+
+                grep -q "^OnFailure=$notifier$" "$units/$failing" \
+                  || fail "$failing does not name $notifier as its OnFailure target — a failure notification that describes a different unit sends the operator to a journal that says nothing about what broke"
+
+                script=$(notify_script_for "$notifier")
+                grep -q 'notify-send' "$script" \
+                  || fail "$notifier does not call notify-send"
+
+                # It must name ITS OWN unit's journal...
+                grep -qF "journalctl --user -u $failing" "$script" \
+                  || fail "$notifier never points at 'journalctl --user -u $failing' — the operator is sent to the wrong unit's journal"
+
+                # ...and must not send them to the other one's.
+                for other in aggregator-embed.service aggregator-embed-seed.service; do
+                  [ "$other" = "$failing" ] && continue
+                  if grep -qF "journalctl --user -u $other" "$script"; then
+                    grep -nF "journalctl --user -u $other" "$script" >&2
+                    fail "$notifier tells the operator to read $other's journal, but it fires for $failing"
+                  fi
+                done
+              done
+
+              # The seeder's notification must not be circular: "your download
+              # failed, so run the download" is what the shared notifier said,
+              # and it said it because it was written for the other unit.
+              # Re-running is legitimate ONLY once the cause is fixed, so the
+              # advice has to be conditioned on that.
+              seed_notify=$(notify_script_for aggregator-embed-seed-failure-notify.service)
+              grep -qF 'Fix the cause below, then re-run' "$seed_notify" \
+                || fail "aggregator-embed-seed-failure-notify.service names the seed unit as the remedy without telling the operator to fix the cause first — that is the circular advice this split exists to remove"
+
+              # Kept for the assertions further down that predate the split.
+              notify_script=$(notify_script_for aggregator-embed-failure-notify.service)
 
               # ---- 3b. The debounce must fail OPEN on an undelivered popup -
               # Round-2 LOW. The popup is debounced to once per 24h via a
@@ -202,43 +257,97 @@
               # behaviour rather than the shape of the source. Line-order
               # greps would pass on any restructure that moved the touch out
               # of the success branch.
+              #
+              # Run for BOTH notifiers, and then once more ACROSS them: round
+              # 3's M3 second half. The two used to share one stamp file, so a
+              # worker failure armed the debounce and a seed failure minutes
+              # later was suppressed outright — the operator got no popup at
+              # all for the second, different, problem.
               work="$TMPDIR/notify-debounce"
-              notify_bin=$(grep -oE '/nix/store/[^ ]*/bin/notify-send' \
-                             "$notify_script" | head -1)
-              [ -n "$notify_bin" ] \
-                || fail "could not locate the notify-send binary in $notify_script"
 
-              run_notify() {
-                # $1 = exit status the notify-send stub should return.
-                rm -rf "$work"
-                mkdir -p "$work/bin" "$work/state" "$work/home"
-                printf '#!/bin/sh\nexit %s\n' "$1" > "$work/bin/notify-send"
+              stub_notify() {
+                # $1 = notify script, $2 = destination, $3 = stub exit status.
+                local bin
+                bin=$(grep -oE '/nix/store/[^ ]*/bin/notify-send' "$1" | head -1)
+                [ -n "$bin" ] \
+                  || fail "could not locate the notify-send binary in $1"
+                printf '#!/bin/sh\nexit %s\n' "$3" > "$work/bin/notify-send"
                 chmod +x "$work/bin/notify-send"
-                sed "s|$notify_bin|$work/bin/notify-send|" "$notify_script" \
-                  > "$work/notify.sh"
-                chmod +x "$work/notify.sh"
-                # Two ticks inside the same 24h window.
-                HOME="$work/home" XDG_STATE_HOME="$work/state" "$work/notify.sh" \
-                  > "$work/1.log" 2>&1 || true
-                HOME="$work/home" XDG_STATE_HOME="$work/state" "$work/notify.sh" \
-                  > "$work/2.log" 2>&1 || true
+                sed "s|$bin|$work/bin/notify-send|" "$1" > "$2"
+                chmod +x "$2"
               }
 
-              run_notify 1
-              if grep -q 'suppressed' "$work/2.log"; then
-                echo "--- tick 1 ---" >&2; cat "$work/1.log" >&2
-                echo "--- tick 2 ---" >&2; cat "$work/2.log" >&2
-                fail "the failure-notify debounce fails CLOSED: notify-send exited non-zero on tick 1, yet tick 2 was suppressed. An undelivered popup must never buy 24h of silence — arm the stamp only after a successful send"
-              fi
+              tick() {
+                # $1 = prepared script, $2 = log. Shares $work/state, so the
+                # debounce sees the same stamp directory a real session would.
+                HOME="$work/home" XDG_STATE_HOME="$work/state" "$1" \
+                  > "$2" 2>&1 || true
+              }
 
-              # The mirror assertion, so "fail open" cannot be satisfied by
-              # deleting the debounce outright: a DELIVERED popup must arm it,
-              # or the 30-minute timer raises 48 CRITICAL popups a day and
-              # trains the user to ignore all of them.
-              run_notify 0
-              grep -q 'suppressed' "$work/2.log" \
-                || { cat "$work/2.log" >&2; \
-                     fail "the failure-notify popup is not debounced: a delivered notification must arm the 24h stamp, otherwise the embed timer raises 48 CRITICAL popups a day"; }
+              run_notify() {
+                # $1 = notify script, $2 = exit status for the stub.
+                rm -rf "$work"
+                mkdir -p "$work/bin" "$work/state" "$work/home"
+                stub_notify "$1" "$work/notify.sh" "$2"
+                # Two ticks inside the same 24h window.
+                tick "$work/notify.sh" "$work/1.log"
+                tick "$work/notify.sh" "$work/2.log"
+              }
+
+              for notifier in aggregator-embed-failure-notify.service \
+                              aggregator-embed-seed-failure-notify.service; do
+                script=$(notify_script_for "$notifier")
+
+                run_notify "$script" 1
+                if grep -q 'suppressed' "$work/2.log"; then
+                  echo "--- tick 1 ---" >&2; cat "$work/1.log" >&2
+                  echo "--- tick 2 ---" >&2; cat "$work/2.log" >&2
+                  fail "$notifier's debounce fails CLOSED: notify-send exited non-zero on tick 1, yet tick 2 was suppressed. An undelivered popup must never buy 24h of silence — arm the stamp only after a successful send"
+                fi
+
+                # The mirror assertion, so "fail open" cannot be satisfied by
+                # deleting the debounce outright: a DELIVERED popup must arm
+                # it, or the 30-minute timer raises 48 CRITICAL popups a day
+                # and trains the user to ignore all of them.
+                run_notify "$script" 0
+                grep -q 'suppressed' "$work/2.log" \
+                  || { cat "$work/2.log" >&2; \
+                       fail "$notifier's popup is not debounced: a delivered notification must arm the 24h stamp, otherwise the embed timer raises 48 CRITICAL popups a day"; }
+              done
+
+              # ---- 3c. One unit's failure must not silence the OTHER -------
+              # Executed, not grepped: both real scripts are run against ONE
+              # shared XDG_STATE_HOME, worker first and seeder second, with a
+              # notify-send stub that always succeeds. The seeder's popup must
+              # still be delivered. With the pre-round-3 shared stamp it was
+              # suppressed, so the operator learned about the embed worker and
+              # never learned the weight download had died.
+              rm -rf "$work"
+              mkdir -p "$work/bin" "$work/state" "$work/home"
+              worker_script=$(notify_script_for aggregator-embed-failure-notify.service)
+              seed_script_notify=$(notify_script_for aggregator-embed-seed-failure-notify.service)
+              stub_notify "$worker_script" "$work/worker.sh" 0
+              stub_notify "$seed_script_notify" "$work/seed.sh" 0
+              tick "$work/worker.sh" "$work/worker.log"
+              tick "$work/seed.sh" "$work/seed.log"
+              if grep -q 'suppressed' "$work/seed.log"; then
+                echo "--- worker notification ---" >&2; cat "$work/worker.log" >&2
+                echo "--- seed notification ---" >&2; cat "$work/seed.log" >&2
+                fail "a worker failure silenced the seed unit's notification for 24h — the two notifiers share a debounce stamp, so one unit's problem hides an unrelated one. Give each unit its own stamp file"
+              fi
+              # ...and the reverse direction, which a single shared stamp
+              # would break just as thoroughly.
+              rm -rf "$work"
+              mkdir -p "$work/bin" "$work/state" "$work/home"
+              stub_notify "$seed_script_notify" "$work/seed.sh" 0
+              stub_notify "$worker_script" "$work/worker.sh" 0
+              tick "$work/seed.sh" "$work/seed.log"
+              tick "$work/worker.sh" "$work/worker.log"
+              if grep -q 'suppressed' "$work/worker.log"; then
+                echo "--- seed notification ---" >&2; cat "$work/seed.log" >&2
+                echo "--- worker notification ---" >&2; cat "$work/worker.log" >&2
+                fail "a seed failure silenced the embed worker's notification for 24h — see above"
+              fi
               rm -rf "$work"
 
               # ---- 4. Weights are never fetched by the unattended unit ----
@@ -355,7 +464,8 @@
               # that source actually renders to, including every Environment=
               # line and every ExecStart script, so the two cannot drift.
               for u in aggregator-embed.service aggregator-embed.timer \
-                       aggregator-embed-failure-notify.service; do
+                       aggregator-embed-failure-notify.service \
+                       aggregator-embed-seed-failure-notify.service; do
                 f=$(readlink -f "$units/$u")
                 if grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD' "$f"; then
                   fail "$u sets AGGREGATOR_ALLOW_MODEL_DOWNLOAD — only the human-triggered seed unit may enable model downloads"
@@ -532,9 +642,7 @@
               # Keep the rendered units as the check's output, so a human can
               # read exactly what was asserted on without re-deriving it.
               mkdir -p "$out"
-              for u in aggregator-embed.service aggregator-embed.timer \
-                       aggregator-embed-seed.service \
-                       aggregator-embed-failure-notify.service; do
+              for u in $all_units; do
                 cp -L "$units/$u" "$out/$u"
               done
             '';
