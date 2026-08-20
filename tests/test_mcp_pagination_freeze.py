@@ -202,11 +202,12 @@ def test_a_token_carrying_frozen_ids_round_trips(store):
     from aggregator.mcp import _mint_page_token
 
     frozen = {"observations": ["a-1", "b-2:3"], "records": ["github:x:1"]}
-    token = _mint_page_token(40, True, frozen)
+    token = _mint_page_token(40, True, "fingerprint01", frozen)
     cursor = _parse_page_token(token)
     assert cursor.offset == 40
     assert cursor.hybrid is True
     assert cursor.frozen == frozen
+    assert cursor.fingerprint == "fingerprint01"
 
 
 def test_legacy_tokens_keep_working(store, embedder):
@@ -229,7 +230,7 @@ def test_a_garbage_payload_is_refused_rather_than_raising(store, embedder):
     _seed(store, [("o1", "quadratic voting", 1)])
     _embed(store, [("o1", "quadratic voting")])
     result = aggregator_query(
-        "governance", page_token="h0.!!!not-base64!!!", _store=store
+        "governance", page_token="h0~fingerprint01.!!!not-base64!!!", _store=store
     )
     assert result["ok"] is False
     assert "page_token" in result["reason"]
@@ -256,7 +257,7 @@ def test_union_mode_freezes_both_ontologies_independently(store, embedder):
     from aggregator.mcp import _mint_page_token
 
     token = _mint_page_token(
-        10, True, {"observations": ["o1"], "records": ["github:x:1"]}
+        10, True, "fingerprint01", {"observations": ["o1"], "records": ["github:x:1"]}
     )
     cursor = _parse_page_token(token)
     assert set(cursor.frozen) == {"observations", "records"}

@@ -81,7 +81,7 @@ def test_a_decompression_bomb_token_is_never_expanded(store):
     """THE REPRO. 64 MB of expansion from a ~90 KB token, and the pre-fix code
     materialised every byte of it inside the editor's own process."""
     expanded = 64 * 1024 * 1024
-    token = "h0." + _bomb_payload(expanded)
+    token = "h0~fingerprint01." + _bomb_payload(expanded)
 
     tracemalloc.start()
     try:
@@ -100,7 +100,7 @@ def test_a_decompression_bomb_token_is_never_expanded(store):
 
 def test_the_bomb_is_refused_loudly_and_not_truncated_into_a_wrong_page(store):
     """Truncating at the cap would hand back a plausible, wrong frozen set."""
-    token = "h40." + _bomb_payload(8 * 1024 * 1024)
+    token = "h40~fingerprint01." + _bomb_payload(8 * 1024 * 1024)
     result = aggregator_query("voting", page_token=token, _store=store)
     assert result["ok"] is False
     assert result["remediation"]
@@ -108,7 +108,7 @@ def test_the_bomb_is_refused_loudly_and_not_truncated_into_a_wrong_page(store):
 
 def test_an_oversized_payload_is_rejected_before_it_is_decoded(store):
     """A huge token must cost O(1), not a base64 decode of the whole thing."""
-    token = "h0." + ("A" * (4 * _MAX_FROZEN_PAYLOAD_BYTES))
+    token = "h0~fingerprint01." + ("A" * (4 * _MAX_FROZEN_PAYLOAD_BYTES))
     result = aggregator_query("voting", page_token=token, _store=store)
     assert result["ok"] is False
 
@@ -116,7 +116,7 @@ def test_an_oversized_payload_is_rejected_before_it_is_decoded(store):
 def test_more_ids_than_the_vector_arm_can_ever_return_is_refused(store):
     """``_VECTOR_ARM_K`` is the real maximum; the token claimed more."""
     payload = _pack_frozen({"observations": [f"o{i}" for i in range(_VECTOR_ARM_K + 1)]})
-    result = aggregator_query("voting", page_token=f"h0.{payload}", _store=store)
+    result = aggregator_query("voting", page_token=f"h0~fingerprint01.{payload}", _store=store)
     assert result["ok"] is False
     assert "page_token" in result["reason"]
 
@@ -176,7 +176,7 @@ def test_a_token_that_is_not_a_number_is_refused(store):
 
 def test_an_undecodable_payload_is_refused(store):
     result = aggregator_query(
-        "source:github", page_token="h0.!!!not-base64!!!", _store=store
+        "source:github", page_token="h0~fingerprint01.!!!not-base64!!!", _store=store
     )
     assert result["ok"] is False
 
@@ -188,7 +188,7 @@ def test_a_payload_that_is_not_a_frozen_set_is_refused(store):
         .rstrip("=")
     )
     result = aggregator_query(
-        "source:github", page_token=f"h0.{payload}", _store=store
+        "source:github", page_token=f"h0~fingerprint01.{payload}", _store=store
     )
     assert result["ok"] is False
 
@@ -230,7 +230,7 @@ def test_a_token_cannot_claim_fts5_only_and_carry_frozen_hits(store):
     silently in favour of whichever field the code happened to read first."""
     payload = _pack_frozen({"observations": ["o1", "o2"]})
     result = aggregator_query(
-        "voting", page_token=f"40.{payload}", _store=store
+        "voting", page_token=f"40~fingerprint01.{payload}", _store=store
     )
     assert result["ok"] is False
     assert "page_token" in result["reason"]
@@ -241,9 +241,16 @@ def test_the_cursor_cannot_even_represent_the_contradiction():
     cursor that pins no arm and freezes one anyway."""
     from aggregator.mcp import _PageCursor
 
-    _PageCursor(offset=0, hybrid=True, frozen={"records": ["r1"]})  # fine
+    _PageCursor(
+        offset=0, hybrid=True, frozen={"records": ["r1"]}, fingerprint="fp01"
+    )  # fine
     with pytest.raises(ValueError, match="frozen"):
-        _PageCursor(offset=0, hybrid=False, frozen={"records": ["r1"]})
+        _PageCursor(
+            offset=0, hybrid=False, frozen={"records": ["r1"]}, fingerprint="fp01"
+        )
+    # Same closure, one field over: frozen hits with no query to bind them to.
+    with pytest.raises(ValueError, match="fingerprint"):
+        _PageCursor(offset=0, hybrid=True, frozen={"records": ["r1"]})
 
 
 def test_a_maximum_legitimate_token_still_round_trips():
@@ -253,6 +260,6 @@ def test_a_maximum_legitimate_token_still_round_trips():
         "observations": [f"{long_id}:{i}" for i in range(_VECTOR_ARM_K)],
         "records": [f"{long_id}:{i}" for i in range(_VECTOR_ARM_K)],
     }
-    cursor = _parse_page_token(_mint_page_token(40, True, frozen))
+    cursor = _parse_page_token(_mint_page_token(40, True, "fingerprint01", frozen))
     assert cursor.frozen == frozen
     assert cursor.offset == 40

@@ -87,6 +87,7 @@ by running FTS on both ``records_fts`` and ``obs_fts``.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import sqlite3
@@ -177,6 +178,17 @@ _MAX_FROZEN_PAYLOAD_BYTES = 2 * _VECTOR_ARM_K * (_MAX_FROZEN_ID_CHARS + 8) + 256
 # ceiling on a legitimate token and lets an over-long one be rejected BEFORE
 # it is base64-decoded — a 50 MB argument must not first cost a 37 MB decode.
 _MAX_FROZEN_PAYLOAD_B64_CHARS = ((_MAX_FROZEN_PAYLOAD_BYTES + 1024) * 4) // 3
+
+# Bytes of query fingerprint carried in every page token. See
+# ``_query_fingerprint`` for what goes into it and why.
+#
+# NOT A SECURITY BOUNDARY, so 72 bits is generous rather than marginal. The
+# fingerprint stops a caller ACCIDENTALLY reusing a token against a changed
+# query; it cannot stop a caller that hand-builds one, and nothing can — the
+# offset field has always been type-able. What it must do is be small: it
+# rides in the token's head on every page, including the FTS5-only tokens
+# that carry no payload at all, so it is 12 base64 characters and no more.
+_FINGERPRINT_BYTES = 9
 
 # Exposed MCP tool names. The search tool deliberately carries "search" and
 # "memory" in its name: under deferred tool loading the client only sees tool
@@ -645,6 +657,83 @@ def _note_rerank(
 # did before v5 — a property of a stateless offset API over a live corpus, not
 # something hybrid introduced — and unlike the vector arm it is uncapped, so
 # freezing it would put an unbounded id list in the token.
+#
+# AND FREEZING THE ARM'S HITS MADE THE TOKEN QUERY-SPECIFIC WITHOUT SAYING SO.
+# That is the second half of the same fix. An offset was always only meaningful
+# against the result set it was cut from, but an offset alone is at least
+# self-evidently a position; a frozen hit list is a piece of ANOTHER query's
+# retrieval, and ``_fused_id_scope`` substitutes it for the KNN and unions it
+# with whatever the new dsl's FTS arm returns. So a caller that reused a token
+# against a changed query got the previous query's 50 neighbours inside this
+# query's candidate set, at an offset that indexed neither — and got
+# ``ok: True``. The caller is an LLM that cannot ask a follow-up question, so a
+# wrong-but-plausible page is worse than an error. Hence: every token carries
+# ``_query_fingerprint`` of the query that minted it, a disagreement is refused
+# structurally, and frozen hits may not travel without one.
+
+
+def _query_fingerprint(ast: QueryAST, drilldown: bool) -> str:
+    """Identify the query a page token was minted for.
+
+    OVER THE PARSED AST, NOT THE dsl STRING. ``source:github pr`` and
+    ``pr  source:github`` are the same query written two ways; hashing the
+    string would refuse a caller that did nothing wrong, and a refusal that
+    cannot be acted on is its own failure mode. Tags and ``extra`` are sorted
+    for the same reason — they are filter sets, and their order is incidental.
+
+    WHAT IS IN IT is every input that decides which rows the candidate set
+    holds and in what order, because that is what an offset indexes:
+
+    * ``text`` — it is what the vector arm embedded, so it alone determines
+      the frozen hits. Changing it makes them another query's retrieval.
+    * every filter — ``source``, ``tags``, dates, the session keys, ``extra``.
+      None of these reach the KNN, but all of them change the row set the
+      offset is cut from, so a token carried across a change to any of them
+      addresses a position that never existed. This is why the fingerprint
+      rides on FTS5-only tokens too, which have no frozen hits to protect.
+    * ``drilldown`` — not part of the dsl, but it selects WHICH TABLE the
+      offset indexes (session cards vs observation rows). Same hazard, same
+      mechanism, one boolean away; leaving it out would keep exactly one
+      argument that can still hand back a plausible wrong page.
+
+    WHAT IS DELIBERATELY NOT IN IT:
+
+    * ``page_size`` — the offset is a row offset, and stays a valid one when
+      the window around it changes size. Binding it would refuse a caller that
+      legitimately asked for a bigger next page.
+    * ``fields`` and ``rerank`` — presentation. ``rerank`` reorders the head of
+      a page already selected and never changes membership (see
+      ``_maybe_rerank``), and ``fields`` only decides whether bodies come back.
+    * ``id_scope`` — no DSL key can set it, and this is computed before
+      ``_apply_hybrid`` fills it in, so it is always ``None`` here. Including
+      it would hash a field that means "the answer" rather than "the question".
+    """
+    canonical = json.dumps(
+        {
+            "source": ast.source,
+            "tags": sorted(ast.tags),
+            "from": _iso_or_none(ast.from_date),
+            "to": _iso_or_none(ast.to_date),
+            "text": ast.text,
+            "extra": {k: ast.extra[k] for k in sorted(ast.extra)},
+            "session": ast.session_id,
+            "top": ast.top_session_id,
+            "agent": ast.agent_id,
+            "obs_type": ast.obs_type,
+            "active_from": _iso_or_none(ast.active_from),
+            "active_to": _iso_or_none(ast.active_to),
+            "drilldown": bool(drilldown),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    digest = hashlib.blake2b(canonical, digest_size=_FINGERPRINT_BYTES).digest()
+    # digest_size is a multiple of 3, so this is padding-free by construction.
+    return base64.urlsafe_b64encode(digest).decode()
+
+
+def _iso_or_none(value: Any) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 @dataclass(frozen=True)
@@ -657,9 +746,13 @@ class _PageCursor:
     hybrid: bool | None = None
     #: ``{kind: [vector arm hit ids]}``, or ``None`` to re-run the KNN.
     frozen: dict[str, list[str]] | None = None
+    #: ``_query_fingerprint`` of the query that minted this token. ``None``
+    #: only for the bare pre-fingerprint offsets described in
+    #: ``_parse_page_token``; those can carry no frozen hits.
+    fingerprint: str | None = None
 
     def __post_init__(self) -> None:
-        """Frozen hits and ``hybrid=False`` are a contradiction, not a state.
+        """Two states this cursor must not be able to hold.
 
         ``pin_for`` reads ``frozen`` before ``hybrid``, so a cursor holding
         both resolved the disagreement silently, in favour of whichever field
@@ -667,11 +760,22 @@ class _PageCursor:
         FTS5-only. Rejecting it in the constructor closes the whole class:
         ``_parse_page_token`` refuses such a token at the boundary, and no
         future call site can reconstruct the state from the inside either.
+
+        The same argument covers frozen hits with no fingerprint. Those hits
+        are another query's retrieval unless something says which query, so a
+        cursor that carries them unbound is not a cursor — and stripping the
+        fingerprint off a token must not be a route back to the behaviour the
+        fingerprint exists to remove.
         """
         if self.frozen is not None and self.hybrid is not True:
             raise ValueError(
                 f"a cursor with frozen hits must pin the hybrid arm; "
                 f"got hybrid={self.hybrid!r} with frozen={sorted(self.frozen)}"
+            )
+        if self.frozen is not None and not self.fingerprint:
+            raise ValueError(
+                f"a cursor with frozen hits must name the query that minted "
+                f"them; got frozen={sorted(self.frozen)} with no fingerprint"
             )
 
     def pin_for(self, kind: str) -> bool | None:
@@ -778,11 +882,19 @@ def _unpack_frozen(payload: str) -> dict[str, list[str]]:
 def _parse_page_token(token: str | None) -> _PageCursor:
     """Decode a page token into a cursor, or raise ``_PageTokenError``.
 
-    ``"h40.<payload>"`` — page 40 of a hybrid set, with that set's vector hits
-    carried inline. ``"h40"`` — a hybrid page minted before the payload
-    existed; the arm is still pinned and the KNN is re-run, which is the old
-    behaviour and the reason tokens already in flight keep working. ``"40"`` —
-    an FTS5 page, which is also every token minted before v5.
+    ``"h40~<fp>.<payload>"`` — page 40 of a hybrid set minted for the query
+    fingerprinted ``<fp>``, with that set's vector hits carried inline.
+    ``"40~<fp>"`` — page 40 of an FTS5-only set for the same query. Both
+    shapes are what this server mints today; ``~`` separates the head because
+    it is outside the base64url alphabet the fingerprint and payload use, so
+    the split can never land inside a field.
+
+    ``"h40"`` and ``"40"`` — bare offsets, the shapes minted before the
+    fingerprint and (for ``"h40"``) before the payload. Still accepted: they
+    carry no other query's retrieval, only a position, and refusing them would
+    strand tokens in flight across an upgrade for no gain — a caller able to
+    strip a field is equally able to type a bare offset. A bare offset can
+    never carry frozen hits: ``_PageCursor`` refuses to hold them unbound.
 
     ANYTHING ELSE IS REFUSED, and it used to reset to offset 0 with a free
     choice of arm. That looked like graceful degradation and was silent data
@@ -800,7 +912,8 @@ def _parse_page_token(token: str | None) -> _PageCursor:
     if not token:
         return _PageCursor()
     hybrid = token.startswith("h")
-    body, _, payload = token.partition(".")
+    head, _, payload = token.partition(".")
+    body, _, fingerprint = head.partition("~")
     try:
         offset = max(0, int(body[1:] if hybrid else body))
     except (TypeError, ValueError) as e:
@@ -813,10 +926,18 @@ def _parse_page_token(token: str | None) -> _PageCursor:
         raise _PageTokenError(
             "token carries frozen vector hits but does not pin the hybrid arm"
         )
+    if payload and not fingerprint:
+        # Same shape of contradiction, one field over: frozen hits are only
+        # interpretable against the query they were retrieved for.
+        raise _PageTokenError(
+            "token carries frozen vector hits but does not name the query "
+            "that minted them"
+        )
     return _PageCursor(
         offset=offset,
         hybrid=hybrid,
         frozen=_unpack_frozen(payload) if payload else None,
+        fingerprint=fingerprint or None,
     )
 
 
@@ -840,14 +961,50 @@ def _page_token_refusal(e: _PageTokenError) -> dict[str, Any]:
     }
 
 
+def _query_changed_refusal(minted_for: str, asked_for: str) -> dict[str, Any]:
+    """The structured refusal for a token reused against a different query.
+
+    Reported as a failure and not as a ``notice`` on an otherwise-fine page,
+    for the reason ``_page_token_refusal`` gives: what is being reported is
+    that the caller's position is unknown, so serving rows under it IS the
+    failure. Here it is sharper still — the previous query's frozen vector
+    hits would have been fused into this query's candidate set, so the rows
+    themselves would have been wrong too, not merely mis-positioned.
+    """
+    return {
+        "ok": False,
+        "reason": (
+            f"page_token was minted for a different query (token "
+            f"fingerprint {minted_for}, this query {asked_for})"
+        ),
+        "remediation": (
+            "A page token is only meaningful to the query that minted it: it "
+            "carries that query's position AND its frozen vector hits. Re-run "
+            "this query with no page_token to get its own first page, then "
+            "page it with the tokens it returns. To continue the earlier "
+            "query instead, send its dsl back unchanged — including the same "
+            "filters and the same drilldown setting."
+        ),
+    }
+
+
 def _mint_page_token(
-    offset: int, hybrid: bool, frozen: dict[str, list[str]] | None = None
+    offset: int,
+    hybrid: bool,
+    fingerprint: str,
+    frozen: dict[str, list[str]] | None = None,
 ) -> str:
-    if not hybrid:
-        return str(offset)
-    if not frozen:
-        return f"h{offset}"
-    return f"h{offset}.{_pack_frozen(frozen)}"
+    """Mint the token for the NEXT page of this exact query.
+
+    ``fingerprint`` is required rather than defaulted on purpose: a default
+    would let a future call site mint an unbound token by omission, which is
+    the whole defect this argument exists to close.
+    """
+    head = f"h{offset}" if hybrid else str(offset)
+    head = f"{head}~{fingerprint}"
+    if not hybrid or not frozen:
+        return head
+    return f"{head}.{_pack_frozen(frozen)}"
 
 
 def _scrub_record(r: Record) -> Record:
@@ -1237,11 +1394,19 @@ def aggregator_query(
         cursor = _parse_page_token(page_token)
     except _PageTokenError as e:
         return _page_token_refusal(e)
+    # ONE PLACE COMPUTES IT AND ONE PLACE CHECKS IT. Taken from the AST as
+    # parsed, before ``_apply_hybrid`` rewrites ``text`` into an ``id_scope``,
+    # so what is checked on the way in is byte-identical to what the paths
+    # mint on the way out.
+    fingerprint = _query_fingerprint(ast, drilldown)
+    if cursor.fingerprint is not None and cursor.fingerprint != fingerprint:
+        return _query_changed_refusal(cursor.fingerprint, fingerprint)
 
     mode = _route_mode(ast)
     try:
         return _dispatch(
-            store, ast, mode, fields, page_size, cursor, drilldown, rerank
+            store, ast, mode, fields, page_size, cursor, drilldown, rerank,
+            fingerprint,
         )
     # THE LAST STRUCTURED-ERROR BACKSTOP. Every per-path handler below guards
     # the store call it wraps, and the routing that runs BEFORE those handlers
@@ -1269,14 +1434,19 @@ def _dispatch(
     cursor: _PageCursor,
     drilldown: bool,
     rerank: bool,
+    fingerprint: str,
 ) -> dict[str, Any]:
     """Route a parsed, validated query to the path that answers it."""
     if mode == "sessions":
         return _query_sessions_path(
-            store, ast, fields, page_size, cursor, drilldown, rerank
+            store, ast, fields, page_size, cursor, drilldown, rerank,
+            fingerprint=fingerprint,
         )
     if mode == "records":
-        return _query_records_path(store, ast, fields, page_size, cursor, rerank)
+        return _query_records_path(
+            store, ast, fields, page_size, cursor, rerank,
+            fingerprint=fingerprint,
+        )
     if mode == "mismatch_sessions_on_records":
         return _mismatch_response(
             mode="records",
@@ -1300,7 +1470,9 @@ def _dispatch(
             ),
         )
     # mode == "union"
-    return _query_union_path(store, ast, fields, page_size, cursor, rerank)
+    return _query_union_path(
+        store, ast, fields, page_size, cursor, rerank, fingerprint=fingerprint
+    )
 
 
 def _mismatch_response(mode: str, notice: str) -> dict[str, Any]:
@@ -1321,6 +1493,8 @@ def _query_records_path(
     page_size: int,
     cursor: _PageCursor,
     rerank: bool = False,
+    *,
+    fingerprint: str,
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
@@ -1356,7 +1530,10 @@ def _query_records_path(
     }
     if has_more:
         result["next_page_token"] = _mint_page_token(
-            offset + page_size, hybrid, {"records": vec_hits} if hybrid else None
+            offset + page_size,
+            hybrid,
+            fingerprint,
+            {"records": vec_hits} if hybrid else None,
         )
     if fields != "full":
         result["notice"] = (
@@ -1374,6 +1551,8 @@ def _query_sessions_path(
     cursor: _PageCursor,
     drilldown: bool,
     rerank: bool = False,
+    *,
+    fingerprint: str,
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
@@ -1413,7 +1592,7 @@ def _query_sessions_path(
         }
         if has_more:
             result["next_page_token"] = _mint_page_token(
-                offset + page_size, hybrid, frozen_out
+                offset + page_size, hybrid, fingerprint, frozen_out
             )
         if fields != "full":
             result["notice"] = (
@@ -1464,7 +1643,7 @@ def _query_sessions_path(
     }
     if has_more:
         result["next_page_token"] = _mint_page_token(
-            offset + page_size, hybrid, frozen_out
+            offset + page_size, hybrid, fingerprint, frozen_out
         )
     if fields != "full":
         result["notice"] = (
@@ -1482,6 +1661,8 @@ def _query_union_path(
     page_size: int,
     cursor: _PageCursor,
     rerank: bool = False,
+    *,
+    fingerprint: str,
 ) -> dict[str, Any]:
     """UNION mode: no source hint, no ontology-specific keys.
 
@@ -1624,7 +1805,7 @@ def _query_union_path(
     }
     if has_more:
         result["next_page_token"] = _mint_page_token(
-            offset + page_size, hybrid, frozen_out or None
+            offset + page_size, hybrid, fingerprint, frozen_out or None
         )
     if fields != "full":
         result["notice"] = (
