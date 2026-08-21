@@ -251,7 +251,7 @@ def test_a_broken_lexical_arm_is_not_quietly_measured_as_hybrid(store):
 
 
 def test_the_modes_on_offer_are_named(store):
-    assert set(SEARCH_MODES) == {"lexical", "hybrid"}
+    assert set(SEARCH_MODES) == {"lexical", "hybrid", "mcp"}
 
 
 def test_resolving_an_unknown_mode_fails_loudly(store):
@@ -266,3 +266,130 @@ def test_resolving_hybrid_without_an_embedder_fails_loudly(store):
 
 def test_resolving_lexical_gives_a_working_callable(store):
     assert set(resolve_search_fn("lexical", store)("quadratic", 50)) == {"o1", "o2"}
+
+
+# --- mcp: the surface the agent actually queries ----------------------------
+#
+# ``lexical`` and ``hybrid`` talk to the Store, so neither can see anything in
+# ``aggregator.mcp``: not the RRF membership rule, not the per-arm distance
+# floor, not the confidence signal, not the response layer. Criteria D, G and H
+# all changed that module and all three measured 0.000 drift, which was not
+# evidence of stability — it was a metric run over a path they did not touch.
+
+
+def test_mcp_mode_routes_through_the_server_entry_point(store, monkeypatch):
+    """THE POINT OF THE MODE, and the only assertion that can establish it.
+
+    Spy on the exact callable ``aggregator.mcp`` exposes. Reimplementing the
+    server's routing here would be a second pipeline to keep in step, and a
+    harness measuring its own reimplementation is the blind spot this closes.
+    """
+    import aggregator.mcp as mcp_mod
+    from aggregator.evals.search import mcp_search_fn
+
+    embedder = StubEmbedder()
+    _embed_all(store, embedder, DOCS)
+    store.mark_embedded("observations", [d[0] for d in DOCS], state="ok")
+    monkeypatch.setattr(mcp_mod, "_get_embedder", lambda: embedder)
+
+    seen: list[dict] = []
+    real = mcp_mod.aggregator_query
+
+    def spy(**kwargs):
+        seen.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(mcp_mod, "aggregator_query", spy)
+    mcp_search_fn(store)("quadratic", 50)
+    assert seen, "the mcp mode did not reach aggregator.mcp.aggregator_query"
+    assert seen[0]["dsl"] == "quadratic"
+
+
+def test_mcp_mode_returns_the_ids_the_server_returned(store, monkeypatch):
+    import aggregator.mcp as mcp_mod
+    from aggregator.evals.search import mcp_search_fn
+
+    embedder = StubEmbedder()
+    _embed_all(store, embedder, DOCS)
+    store.mark_embedded("observations", [d[0] for d in DOCS], state="ok")
+    monkeypatch.setattr(mcp_mod, "_get_embedder", lambda: embedder)
+
+    hits = mcp_search_fn(store)("quadratic", 50)
+    # SESSION ids, not observation ids: the server answers a free-text query
+    # with cards, and this mode reports what the agent is handed rather than
+    # what the store holds. Baselines are per-mode, so the two id spaces never
+    # meet — but a drift number from this mode is NOT comparable with one from
+    # ``lexical``, and the report says so.
+    #
+    # ``s-o3`` IS THE WHOLE ARGUMENT FOR THIS MODE. The pigeon document shares
+    # no word with the query; the lexical mode returns {o1, o2} and cannot ever
+    # return it. It is here because the server's vector arm proposed it and the
+    # floor failed open on a 3-candidate sample — production behaviour, in a
+    # module the other two modes cannot see.
+    assert set(hits) == {"s-o1", "s-o2", "s-o3"}
+    assert set(lexical_search_fn(store)("quadratic", 50)) == {"o1", "o2"}
+
+
+def test_mcp_mode_respects_the_limit(store, monkeypatch):
+    import aggregator.mcp as mcp_mod
+    from aggregator.evals.search import mcp_search_fn
+
+    embedder = StubEmbedder()
+    _embed_all(store, embedder, DOCS)
+    store.mark_embedded("observations", [d[0] for d in DOCS], state="ok")
+    monkeypatch.setattr(mcp_mod, "_get_embedder", lambda: embedder)
+
+    assert len(mcp_search_fn(store)("quadratic", 1)) == 1
+
+
+def test_mcp_mode_refuses_a_cold_vector_arm_instead_of_measuring_fts5(store):
+    """NEVER DEGRADE, applied to a mode whose subject degrades on purpose.
+
+    ``aggregator_query`` falls back to FTS5 whenever the vector index is cold,
+    silently and correctly — a user would rather have keyword results than an
+    error. Measured through this mode that fallback would file the keyword
+    arm's ranking under ``mcp``, and the fused membership rule and the distance
+    floor would be absent from a run that claimed to cover them.
+
+    This is not a hypothetical: the read-only snapshot of the live cache holds
+    505k observations and zero embeddings, so it is the state an mcp run is
+    most likely to be pointed at first.
+    """
+    from aggregator.evals.search import McpModeUnavailableError, mcp_search_fn
+
+    with pytest.raises(McpModeUnavailableError, match="embedded"):
+        mcp_search_fn(store)("quadratic", 50)
+
+
+def test_mcp_mode_stops_when_the_server_refuses_a_query(store, monkeypatch):
+    """``ok: False`` is a refusal, not a result. Reading it as zero hits would
+    score a server error as maximum drift and bury the reason."""
+    import aggregator.mcp as mcp_mod
+    from aggregator.evals.search import McpModeUnavailableError, mcp_search_fn
+
+    embedder = StubEmbedder()
+    _embed_all(store, embedder, DOCS)
+    store.mark_embedded("observations", [d[0] for d in DOCS], state="ok")
+    monkeypatch.setattr(mcp_mod, "_get_embedder", lambda: embedder)
+    monkeypatch.setattr(
+        mcp_mod,
+        "aggregator_query",
+        lambda **kw: {"ok": False, "reason": "cache unavailable: disk I/O error"},
+    )
+    with pytest.raises(McpModeUnavailableError, match="disk I/O error"):
+        mcp_search_fn(store)("quadratic", 50)
+
+
+def test_resolving_mcp_needs_no_embedder(store, monkeypatch):
+    """The server constructs its own, lazily, exactly as it does in production.
+    Handing it one here would measure a pipeline nobody runs."""
+    import aggregator.mcp as mcp_mod
+
+    embedder = StubEmbedder()
+    _embed_all(store, embedder, DOCS)
+    store.mark_embedded("observations", [d[0] for d in DOCS], state="ok")
+    monkeypatch.setattr(mcp_mod, "_get_embedder", lambda: embedder)
+
+    assert set(resolve_search_fn("mcp", store)("quadratic", 50)) == {
+        "s-o1", "s-o2", "s-o3",
+    }

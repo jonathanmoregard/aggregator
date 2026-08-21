@@ -32,6 +32,16 @@ gets ignored:
   reproduces at zero drift forever. That is what the labelled metrics and the
   negative queries are for.
 
+* IT ONLY EVER DESCRIBES THE MODE THAT PRODUCED IT. ``--mode lexical`` reads
+  the Store and cannot execute a line of ``aggregator.mcp``; three acceptance
+  criteria on this branch changed exactly that module and were each reported at
+  0.000 drift by a lexical run. The zero was structural — a metric run over a
+  path those criteria did not touch — and nothing in the output said so. Every
+  report now prints a ``scope`` line naming what its mode could not reach, and
+  a mean drift of exactly zero prints an explicit caveat next to it. See
+  :data:`MODE_SCOPE`, and use ``--mode mcp`` when the thing you changed is the
+  server.
+
 THE ONE THING THAT IS UNAMBIGUOUS WITHOUT LABELS is abstention: a negative
 query that returned nothing and now returns something is a regression by
 construction, and it is the only condition that fails the command by default.
@@ -62,7 +72,11 @@ from aggregator.evals.metrics import (
     recall_at_k,
     top1_changed,
 )
-from aggregator.evals.search import SearchFn, resolve_search_fn
+from aggregator.evals.search import (
+    McpModeUnavailableError,
+    SearchFn,
+    resolve_search_fn,
+)
 
 #: How many ids per query the baseline freezes. Ten, per the report.
 BASELINE_DEPTH = 10
@@ -74,6 +88,51 @@ RUN_DEPTH = 50
 #: Below this, a query counts as unchanged. Not zero: floating-point noise in
 #: the fused score can reorder tied results without anything having changed.
 DRIFT_EPSILON = 1e-9
+
+#: WHAT EACH MODE'S NUMBERS CANNOT SEE, printed on every report.
+#:
+#: A metric that cannot reach the layer under test must not print a confident
+#: zero, and this branch has already paid for that: criteria D, G and H each
+#: changed ``aggregator.mcp`` and each was signed off at 0.000 drift by a
+#: ``lexical`` run that talks to the Store. The zero was structural. Nothing in
+#: the output said which code the run had executed, so there was nothing to
+#: read it against.
+#:
+#: One entry per :data:`aggregator.evals.search.SEARCH_MODES` member, asserted
+#: in ``tests/evals/test_harness.py`` — a mode added without a note would print
+#: an empty caveat, which reads as "nothing is out of scope".
+MODE_SCOPE: dict[str, str] = {
+    "lexical": (
+        "Store.query_observations only. NOT in this path: RRF fusion, the "
+        "per-arm vector floor, the confidence signal, routing, pagination — "
+        "everything in aggregator.mcp. Ids are observation ids."
+    ),
+    "hybrid": (
+        "Store-level FTS5 + vector KNN fused with RRF, in RRF rank order. NOT "
+        "in this path: the vector floor, the confidence signal, and the whole "
+        "of aggregator.mcp — the server discards the RRF ordering this mode "
+        "keeps. Ids are observation ids."
+    ),
+    "mcp": (
+        "the whole server, via aggregator.mcp.aggregator_query with default "
+        "arguments. Covers fusion, the vector floor, routing, the confidence "
+        "signal and the response shape. Ordering is RECENCY, not relevance, so "
+        "drift here reports membership changes rather than re-ranking. Ids are "
+        "session/record stable_ids and are NOT comparable with the other "
+        "modes'."
+    ),
+}
+
+#: Printed under a mean drift of exactly zero, and only then.
+#:
+#: On every run it would be furniture and stop being read; the failure it
+#: guards against is specifically a zero being quoted as a clean bill of health
+#: for code the run never executed.
+_ZERO_DRIFT_CAVEAT = (
+    "0.000 drift means THIS MODE'S path did not move. It is not evidence "
+    "about anything outside the scope line above — re-run with a mode that "
+    "covers the layer you changed."
+)
 
 
 class MissingBaselineError(RuntimeError):
@@ -129,10 +188,16 @@ class RegressionReport:
             return f"  {name:<12} {value:.3f}  ({self.labels_note})"
 
         total = len(self.outcomes)
+        scope = MODE_SCOPE.get(
+            self.mode,
+            f"UNKNOWN MODE {self.mode!r} — nothing here says what it measured, "
+            "so treat every number below as unscoped",
+        )
         lines = [
             f"retrieval regression {self.run_id}  mode={self.mode}  "
             f"queries={total}"
             + (f"  label={self.label}" if self.label else ""),
+            f"  scope        {scope}",
             f"  drift        mean {self.mean_drift:.3f}  max {self.max_drift:.3f}  "
             f"moved {self.drifted_queries}/{total}  top-1 changes "
             f"{self.top1_changes}",
@@ -142,6 +207,8 @@ class RegressionReport:
             metric("Recall@50", self.recall_at_50),
             metric("MRR@10", self.mrr_at_10),
         ]
+        if self.mean_drift <= DRIFT_EPSILON:
+            lines.append(f"  NOTE         {_ZERO_DRIFT_CAVEAT}")
         moved = sorted(
             (o for o in self.outcomes if o.drift > DRIFT_EPSILON),
             key=lambda o: o.drift,
@@ -396,7 +463,17 @@ def retrieval_regression_command(
             )
             return 1
         return 0
-    except (GoldenSetError, EvalStoreError, MissingBaselineError, ValueError) as e:
+    except (
+        GoldenSetError,
+        EvalStoreError,
+        MissingBaselineError,
+        # EXIT 2, NOT 1. "The mcp mode could not measure the server path it
+        # names" is the harness failing to run, not retrieval regressing —
+        # collapsing it into 1 would put a coverage gap in the same bucket as a
+        # ranking change, and collapsing it into 0 would hide it entirely.
+        McpModeUnavailableError,
+        ValueError,
+    ) as e:
         print(f"retrieval-regression: {e}", file=err)
         return 2
     finally:

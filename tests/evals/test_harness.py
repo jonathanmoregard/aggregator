@@ -208,6 +208,54 @@ def test_labels_for_a_query_that_is_not_in_the_golden_set_fail_loudly(eval_store
         )
 
 
+# --- what the number cannot see ---------------------------------------------
+#
+# A metric that cannot reach the layer under test must not print a confident
+# zero. Criteria D, G and H all changed ``aggregator.mcp`` and all three were
+# reported at 0.000 drift by a ``lexical`` run that talks to the Store — so the
+# zero was structural, not evidence, and nothing in the output said so.
+
+
+def test_the_report_names_the_layers_its_mode_cannot_see(eval_store):
+    freeze_baseline(eval_store, QUERIES, fake_search(STABLE), mode="lexical")
+    report = run_regression(eval_store, QUERIES, fake_search(STABLE), mode="lexical")
+    text = report.to_text()
+    assert "scope" in text.lower()
+    assert "aggregator.mcp" in text, (
+        "a lexical run must name the module it cannot reach; without that, "
+        "0.000 reads as evidence about the whole pipeline"
+    )
+
+
+def test_a_zero_drift_run_says_a_zero_is_not_a_clean_bill_of_health(eval_store):
+    freeze_baseline(eval_store, QUERIES, fake_search(STABLE), mode="lexical")
+    report = run_regression(eval_store, QUERIES, fake_search(STABLE), mode="lexical")
+    assert report.mean_drift == pytest.approx(0.0)
+    text = report.to_text()
+    assert "not evidence" in text.lower(), text
+
+
+def test_a_run_that_moved_does_not_carry_the_zero_caveat(eval_store):
+    """The caveat is about a zero specifically. Printed on every run it would
+    become furniture and stop being read."""
+    freeze_baseline(eval_store, QUERIES, fake_search(STABLE), mode="lexical")
+    moved = dict(STABLE)
+    moved["rrf fusion"] = list(reversed(STABLE["rrf fusion"]))
+    report = run_regression(eval_store, QUERIES, fake_search(moved), mode="lexical")
+    assert report.mean_drift > 0.0
+    assert "not evidence" not in report.to_text().lower()
+
+
+def test_every_mode_has_a_scope_note(eval_store):
+    """A mode added without one would print an empty caveat, which reads as
+    'nothing is out of scope' — the opposite of the truth."""
+    from aggregator.evals.harness import MODE_SCOPE
+    from aggregator.evals.search import SEARCH_MODES
+
+    assert set(MODE_SCOPE) == set(SEARCH_MODES)
+    assert all(MODE_SCOPE[m].strip() for m in SEARCH_MODES)
+
+
 # --- persistence ------------------------------------------------------------
 
 

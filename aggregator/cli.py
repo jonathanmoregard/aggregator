@@ -2883,11 +2883,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="lexical",
         choices=SEARCH_MODES,
         help=(
-            "which retrieval arm to measure. Baselines are per-mode, so a "
-            "'hybrid' run is compared against a 'hybrid' freeze and never "
-            "against the lexical one. 'hybrid' loads the embedding model and "
-            "REFUSES on a machine with no vector index rather than quietly "
-            "measuring the lexical arm and filing it under hybrid"
+            "what to measure. 'lexical' and 'hybrid' read the Store and CANNOT "
+            "SEE aggregator.mcp — no fusion membership rule, no vector floor, "
+            "no confidence signal — so a clean run in either says nothing "
+            "about the server. 'mcp' drives the same entry point the agent "
+            "calls and covers all of it. Baselines are per-mode and result ids "
+            "differ between them, so runs are never compared across modes. "
+            "'hybrid' and 'mcp' both REFUSE on a cache with no vector index "
+            "rather than quietly measuring the keyword arm and filing it under "
+            "the mode you asked for. Every report prints what its mode could "
+            "not reach"
         ),
     )
     rr.add_argument(
