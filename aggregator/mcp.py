@@ -676,6 +676,16 @@ def _fused_id_scope(
     candidates — and ordering stays the caller's existing contract.
     Relevance ordering is available, opt-in and bounded, via ``rerank=True``.
 
+    THE PER-ARM DISTANCE FLOOR IS APPLIED HERE, and this is its only caller.
+    ``hybrid.vector_floor`` drops neighbours that do not stand out from their
+    own candidate set, before fusion and never on the fused score — an RRF
+    score has no absolute meaning across queries, so thresholding it would be
+    thresholding a number that does not mean anything. It runs before
+    ``vec_hits`` is returned for the page token to freeze, so a continuation is
+    cut from the same set as page 1, and it can only ever remove vector-ONLY
+    candidates: when it empties the arm this returns ``None`` and the query
+    falls through to the untouched FTS5 path.
+
     ``search_mode='vector'`` DROPS THE KEYWORD ARM from the fusion rather than
     skipping the fusion: ``rrf_fuse`` over one arm is that arm's own ranking,
     so there is no second code path to keep in step with this one.
