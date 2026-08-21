@@ -374,6 +374,19 @@ _SEARCH_MODES = ("hybrid", "lexical", "vector")
 _embedder: object | None = None
 _reranker: object | None = None
 
+#: The zero-result log's open connection, and the cache it belongs to.
+#:
+#: A SINGLETON FOR THE SAME REASON THE MODELS ARE ONE. A miss opens a second
+#: SQLite file and runs its schema script; doing that per query would put a
+#: connect + ``executescript`` on the recall path of every unanswered question,
+#: and the unanswered ones are exactly the queries an agent retries.
+#:
+#: KEYED BY PATH so a process that serves two caches — every test run, and any
+#: tool that opens a scratch cache beside the real one — cannot end up writing
+#: one cache's misses into the other's log.
+_miss_log: object | None = None
+_miss_log_path: object | None = None
+
 
 class _VectorModeUnavailableError(RuntimeError):
     """``search_mode='vector'`` was asked for and the vector arm cannot run.
@@ -474,6 +487,60 @@ def _get_reranker() -> object:
 
             _reranker = Reranker()
     return _reranker
+
+
+def _log_search_miss(store: Store, query_text: str, search_mode: str) -> str | None:
+    """Record a query that came back with nothing. Returns a notice, or ``None``.
+
+    THE LOOP THIS CLOSES. The eval harness can only measure queries somebody
+    thought to freeze, and the ones worth freezing are precisely the ones that
+    fail today — which nobody writes down, because a zero-result answer looks
+    like a question with no answer rather than like a retrieval bug. This is
+    the only production writer of ``search_misses``; ``suggest_from_misses``
+    surfaces the accumulated list at the end of every regression run.
+
+    A SEPARATE DATABASE, BESIDE THE CACHE BEING SERVED. Never inside
+    ``cache.db`` — the eval store refuses that name outright — because the
+    harness must not migrate the artifact it measures, and a baseline has to
+    outlive a re-ingest, a vector rebuild and a model swap. Deriving the
+    location from ``store.db_path`` rather than from ``$XDG_DATA_HOME`` makes
+    it the same file ``evals.db.default_eval_db_path`` resolves whenever the
+    real cache is being served, while a scratch or test cache gets its own
+    beside itself instead of writing into the developer's home directory.
+
+    THE IMPORT IS DEFERRED, like every other optional dependency in this
+    module, so a session that never misses never opens a second database.
+
+    A FAILURE HERE COSTS THE LOG ENTRY AND NOT THE ANSWER — but it is never
+    silent. The caller already has a correct (empty) result, and destroying it
+    to report lost bookkeeping is the wrong trade; swallowing the failure is
+    the banned one, because an empty miss log is indistinguishable from a
+    pipeline that never misses. So it returns a notice and the caller shows it.
+    """
+    global _miss_log, _miss_log_path
+
+    from aggregator.evals.db import EvalStore
+
+    path = store.db_path.parent / "retrieval_eval.db"
+    try:
+        if _miss_log is None or _miss_log_path != path:
+            if _miss_log is not None:
+                with contextlib.suppress(Exception):
+                    _miss_log.close()
+            _miss_log = EvalStore(path)
+            _miss_log_path = path
+        _miss_log.record_search_miss(query_text, mode=search_mode)
+    except Exception as e:  # noqa: BLE001 — bookkeeping never costs the answer
+        _miss_log, _miss_log_path = None, None
+        log.exception("could not log the zero-result query %r", query_text)
+        return (
+            f"This zero-result query could NOT be written to the retrieval "
+            f"miss log at {path} ({type(e).__name__}: {e}), so it will not "
+            f"reach the golden query set on its own. The empty result itself "
+            f"is unaffected. Add it by hand if it matters, and check that the "
+            f"directory is writable."
+        )
+    return None
 
 
 def _strip_chunk_suffix(doc_id: str) -> str | None:
@@ -1915,10 +1982,20 @@ def aggregator_query(
 
     mode = _route_mode(ast)
     try:
-        return _dispatch(
+        result = _dispatch(
             store, ast, mode, fields, page_size, cursor, drilldown, rerank,
             fingerprint, search_mode,
         )
+        # ZERO-RESULT LOGGING, at the one place every route passes through.
+        # Only for free text: the log feeds a RETRIEVAL golden set, and a
+        # filter that matched no rows is a fact about the corpus rather than
+        # about ranking. ``total`` and not ``len(records)`` so a caller paging
+        # off the end of a real result set is not recorded as a miss.
+        missed = ast.text and result.get("ok") and not result.get("total")
+        if missed and (notice := _log_search_miss(store, ast.text, search_mode)):
+            prior = result.get("notice")
+            result["notice"] = f"{notice} {prior}" if prior else notice
+        return result
     # The one refusal that is raised rather than returned, because the
     # condition is discovered four call frames down inside the retrieval the
     # per-path handlers wrap. See ``_VectorModeUnavailableError``.
