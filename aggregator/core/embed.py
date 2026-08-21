@@ -9,10 +9,15 @@ Two loader paths, one interface:
   ``embed-gguf`` extra installed.
 
 Both paths return float32, L2-normalized, MRL-truncated to 768 dims.
-The Qwen3 query prefix ("Instruct: ...\\nQuery: ...") is applied by
+The Qwen3 query instruction ("Instruct: ...\\nQuery:...") is applied by
 ``embed_query``; documents go through ``embed_documents`` unprefixed
-(load-bearing per the Qwen3 model card — omitting the prefix loses
+(load-bearing per the Qwen3 model card — omitting the instruction loses
 1–5% retrieval on the leaderboard).
+
+THE INSTRUCTION IS READ OFF THE MODEL, NOT RETYPED HERE. See
+``Embedder.query_prompt``: it comes from the checkpoint's own
+``config_sentence_transformers.json``, and ``QWEN3_QUERY_PREFIX`` below is only
+the fallback for a load that cannot expose one.
 """
 
 from __future__ import annotations
@@ -27,8 +32,34 @@ from aggregator.core.chunk import CHUNKER_VERSION
 
 log = logging.getLogger(__name__)
 
+#: The task instruction Qwen3-Embedding expects on the QUERY side — VERBATIM
+#: from the checkpoint's ``config_sentence_transformers.json``, not a
+#: restatement of it.
+#:
+#: THIS IS A FALLBACK. ``Embedder.query_prompt`` prefers the registry the
+#: loaded model exposes; this literal covers the loads that cannot expose one
+#: (the gguf backend has no such file, and a stripped export may not carry it).
+#:
+#: WHY IT IS COPIED CHARACTER-FOR-CHARACTER. It used to read "Given a search
+#: query" with a trailing space after "Query:" — a plausible paraphrase, and
+#: wrong in two places at once. Microsoft's Olive recipe for this exact model
+#: records what that costs in the limit: an export that drops
+#: ``config_sentence_transformers.json`` loses ~20% on the retrieval
+#: benchmarks, because these task prompts are trained-in state and not
+#: documentation. A near-miss is the same bug with a smaller blast radius, and
+#: it is invisible without putting the two strings side by side — which is what
+#: ``tests/core/test_embed_query_instruction.py`` now does against the file on
+#: disk.
+#:
+#: No trailing space, deliberately: sentence-transformers concatenates
+#: ``prompt + text`` with no separator, and so does Qwen's own published
+#: ``get_detailed_instruct`` helper. The space was ours.
+#:
+#: NOT in ``embedding_version``. Documents never see it, so no stored vector
+#: can be invalidated by changing it — see that function's docstring.
 QWEN3_QUERY_PREFIX = (
-    "Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery: "
+    "Instruct: Given a web search query, retrieve relevant passages that "
+    "answer the query\nQuery:"
 )
 _EMBED_DIM = 768  # MRL truncation target
 _NATIVE_DIM = 1024
@@ -165,6 +196,23 @@ def embedding_version(embedder: Embedder | None = None) -> str:
     on this hardware, a multi-week re-embed (``docs/embedding-throughput.md``)
     triggered by a typo fix. Every component below is a named constant or a
     property of the model actually loaded.
+
+    THE QUERY INSTRUCTION IS DELIBERATELY ABSENT, and that is a decision rather
+    than an oversight. The retrieval research is right that Qwen3's task
+    instruction is part of the embedding contract; it is wrong that it belongs
+    in THIS string, because this string exists for one purpose — so a vector
+    written by one build is never compared against a vector written by another.
+    The instruction cannot make two stored vectors incomparable, because no
+    stored vector has ever seen it: ``embed_documents`` applies nothing. It
+    transforms the QUERY, which is embedded fresh on every search, so a reword
+    takes effect immediately and uniformly against the index already on disk.
+
+    Keying on it would mean rewording a sentence invalidates ~483k document
+    vectors and starts a 25-30 day re-embed to recompute bytes that provably do
+    not change — the paragraph above, in its purest form. What WOULD belong
+    here is a DOCUMENT-side instruction; Qwen3 ships an empty one, and
+    ``tests/core/test_embed_query_instruction.py`` fails if that ever stops
+    being true, so the exclusion cannot outlive its justification.
     """
     return (
         f"{configured_model_id(embedder)}"
@@ -314,6 +362,52 @@ class Embedder:
         else:
             raise ValueError(f"unknown embed backend: {self.backend!r}")
 
+        #: The instruction ``embed_query`` puts in front of the query text.
+        #: Resolved once, after the weights are in hand, because the honest
+        #: answer depends on WHICH model got loaded — see
+        #: :meth:`_resolve_query_prompt`.
+        self.query_prompt = self._resolve_query_prompt()
+
+    def _resolve_query_prompt(self) -> str:
+        """The query-side instruction for the model THIS instance loaded.
+
+        READ IT OFF THE MODEL. ``config_sentence_transformers.json`` ships a
+        ``prompts`` registry with the exact strings the checkpoint was trained
+        and benchmarked with, and sentence-transformers exposes it as
+        ``.prompts``. Taking the value from there rather than from a constant
+        in this file means a checkpoint bump cannot leave a stale instruction
+        glued to every query, and it removes the transcription step that had
+        already introduced two errors (see ``QWEN3_QUERY_PREFIX``).
+
+        This is the local form of the failure Microsoft's Olive recipe for this
+        model documents: an export that leaves
+        ``config_sentence_transformers.json`` behind drops the retrieval
+        benchmarks by ~20%, because the task prompts are trained-in state.
+        Dropping the file and retyping it slightly wrong are the same bug.
+
+        A CALLER-SUPPLIED MODEL WITH NO REGISTRY GETS NO INSTRUCTION, and that
+        is the same rule ``QWEN3_EMBEDDING_REVISION`` follows: a value taken
+        from one repository vouches for nothing else. BGE, E5 and GTE each want
+        a different prefix, so pasting Qwen's onto one of them is not a milder
+        error than omitting it — it is a different wrong answer. A Qwen3
+        checkpoint passed by name still gets its own, because it carries its
+        own registry.
+
+        THE DEFAULT MODEL FALLS BACK TO THE LITERAL rather than to nothing.
+        No registry on the model this package pins means an old
+        sentence-transformers or a stripped export — the Olive case exactly —
+        and 1–5% of retrieval is not worth losing to a missing config file when
+        the string is known.
+        """
+        prompts = getattr(self._st_model, "prompts", None)
+        if isinstance(prompts, dict):
+            shipped = prompts.get("query")
+            if isinstance(shipped, str) and shipped:
+                return shipped
+        if self.model_id in (_DEFAULT_MODEL_ST, _DEFAULT_MODEL_GGUF):
+            return QWEN3_QUERY_PREFIX
+        return ""
+
     @staticmethod
     def _gguf_revision(repo_id: str) -> str | None:
         """The revision to resolve the gguf repo at — or a loud refusal.
@@ -392,13 +486,30 @@ class Embedder:
         return (arr / norms).astype(np.float32)
 
     def embed_documents(self, docs: list[str]) -> np.ndarray:
-        """Encode ``docs`` without the Qwen3 query prefix."""
+        """Encode ``docs`` EXACTLY AS GIVEN — no instruction, ever.
+
+        Qwen3 ships ``prompts['document'] == ''``, and this path applies
+        nothing rather than applying an empty string, so the two cannot drift
+        apart. That is what makes the query instruction safe to leave out of
+        :func:`embedding_version`: no stored vector has ever seen one, so
+        rewording it cannot invalidate a single row. Add a document-side
+        instruction and that stops being true and the version string has to
+        move with it — ``tests/core/test_embed_query_instruction.py`` fails on
+        the day somebody tries.
+        """
         if not docs:
             return np.zeros((0, _EMBED_DIM), dtype=np.float32)
         raw = self._encode(list(docs))
         return self._truncate_and_normalize(raw)
 
     def embed_query(self, query: str) -> np.ndarray:
-        """Encode ``query`` with the Qwen3 instruction prefix applied."""
-        raw = self._encode([f"{QWEN3_QUERY_PREFIX}{query}"])
+        """Encode ``query`` with this model's own task instruction applied.
+
+        Plain concatenation rather than ``encode(prompt_name='query')``, and
+        the two are identical here: the checkpoint's pooling config sets
+        ``include_prompt: true``, so instruction tokens are pooled either way.
+        One code path then serves both backends — the gguf loader has no prompt
+        registry to call through — instead of two that are quietly different.
+        """
+        raw = self._encode([f"{self.query_prompt}{query}"])
         return self._truncate_and_normalize(raw)[0]

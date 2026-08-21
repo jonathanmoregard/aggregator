@@ -28,7 +28,13 @@ def test_query_gets_prefix(monkeypatch, embedder):
         )[1],
     )
     embedder.embed_query("quadratic voting")
-    assert calls == [f"{QWEN3_QUERY_PREFIX}quadratic voting"]
+    # ``embedder.query_prompt``, not the module constant: the instruction is
+    # read off the loaded checkpoint and the constant is only the fallback for
+    # a load that exposes no registry. Asserting the constant here would pass
+    # for the wrong reason on the day the two diverge. That they agree for the
+    # pinned model is pinned separately, in test_embed_query_instruction.py.
+    assert calls == [f"{embedder.query_prompt}quadratic voting"]
+    assert embedder.query_prompt == QWEN3_QUERY_PREFIX
 
 
 def test_document_no_prefix(monkeypatch, embedder):
