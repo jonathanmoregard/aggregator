@@ -108,6 +108,17 @@ def test_nothing_is_written_until_something_misses(store, tmp_path):
     assert not (tmp_path / "retrieval_eval.db").exists()
 
 
+def test_an_ontology_mismatch_is_not_logged_as_a_miss(store, tmp_path):
+    """``source:github session:abc voting`` returns nothing because the two
+    filter families cannot both apply, not because retrieval failed. Freezing
+    it into the golden set would pin a query that can never return a row, and
+    it would score as a permanent abstention nobody can fix."""
+    result = aggregator_query("source:github session:abc voting", _store=store)
+    assert result["ok"] is True and result["total"] == 0, result
+    assert "do not apply" in result["notice"]
+    assert _misses(tmp_path) == []
+
+
 def test_a_refused_query_is_not_logged_as_a_miss(store, tmp_path):
     result = aggregator_query("voting", fields="bogus", _store=store)
     assert result["ok"] is False

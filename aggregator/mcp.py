@@ -2015,11 +2015,23 @@ def aggregator_query(
             fingerprint, search_mode,
         )
         # ZERO-RESULT LOGGING, at the one place every route passes through.
+        #
         # Only for free text: the log feeds a RETRIEVAL golden set, and a
         # filter that matched no rows is a fact about the corpus rather than
         # about ranking. ``total`` and not ``len(records)`` so a caller paging
         # off the end of a real result set is not recorded as a miss.
-        missed = ast.text and result.get("ok") and not result.get("total")
+        #
+        # And not for an ontology mismatch, which is empty for a THIRD reason:
+        # the query names filter families that cannot both apply, so no
+        # retrieval ran and none ever will. Freezing that into the golden set
+        # would pin a query no change can ever make return a row, and it would
+        # then score as a permanent abstention nobody can act on.
+        missed = (
+            ast.text
+            and result.get("ok")
+            and not result.get("total")
+            and not mode.startswith("mismatch_")
+        )
         if missed and (notice := _log_search_miss(store, ast.text, search_mode)):
             prior = result.get("notice")
             result["notice"] = f"{notice} {prior}" if prior else notice
