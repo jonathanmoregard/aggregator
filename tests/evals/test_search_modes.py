@@ -139,13 +139,19 @@ def test_lexical_search_returns_nothing_for_an_absent_term(store):
     assert lexical_search_fn(store)("axolotl", 50) == []
 
 
-def test_lexical_search_survives_a_query_fts5_cannot_parse(store):
-    """Criterion B's bug, seen from here: today it abstains rather than raising.
+def test_a_query_fts5_could_not_parse_now_searches_for_its_words(store):
+    """Criterion B, seen from here, AFTER b4eab9b.
 
-    Frozen as an empty baseline, the fix will show up as maximum drift on
-    exactly these queries — which is the point of freezing before fixing.
+    This assertion used to be ``== []`` and the reason was the bug: ``power-on``
+    raised ``no such column: on`` and the store abstained. Now
+    ``fts5_match_query`` rewrites it to ``"power" "on"``, so it is an ordinary
+    two-term search — and the corpus is asked a real question rather than
+    handed a syntax error. Seeded so the answer is non-empty, because an empty
+    list here would pass under either regime and would therefore be worth
+    nothing as evidence.
     """
-    assert lexical_search_fn(store)("power-on", 50) == []
+    _seed(store, [("o4", "the power-on self test writes to the console", 4)])
+    assert lexical_search_fn(store)("power-on", 50) == ["o4"]
 
 
 def test_lexical_search_needs_no_vector_index(no_vec_store):
@@ -181,6 +187,64 @@ def test_hybrid_search_refuses_to_run_without_a_vector_index(no_vec_store):
     """Never degrade silently: that would measure the lexical arm and say hybrid."""
     with pytest.raises(VectorIndexUnavailableError):
         hybrid_search_fn(no_vec_store, StubEmbedder())("quadratic", 50)
+
+
+# --- the swallow that outlived the bug it was for ---------------------------
+#
+# ``hybrid_search_fn`` caught ``sqlite3.OperationalError`` from the FTS5 arm
+# and fused the vector arm alone, under a comment naming "Criterion B's bug: an
+# unescaped MATCH". b4eab9b fixed that bug at the five MATCH binding sites, so
+# no user text can produce a syntax error any more — which does NOT make the
+# except clause harmless. It makes it a trap: the only OperationalErrors left
+# are a locked cache, a corrupt index, and an FTS5 that changed under us, and
+# every one of those is a reason to stop rather than a reason to quietly
+# measure half the pipeline and file it under "hybrid". That is the module
+# docstring's own NEVER DEGRADE rule, violated by the module.
+#
+# Both halves are asserted below, because deleting a swallow on the strength of
+# "it cannot trigger" needs the "cannot" demonstrated, not asserted.
+
+
+def test_no_frozen_golden_query_can_make_the_lexical_arm_raise(store):
+    """The swallow's STATED cause, checked against the whole frozen set.
+
+    86 real queries, 25 of which used to raise. Run through the shipped
+    ``_fts_obs_ids`` — the same call ``hybrid_search_fn`` makes — against a
+    real index. Anything that raises here is a syntax error the whitelist
+    missed, and would mean the except clause still has work to do.
+    """
+    from aggregator.evals.golden import load_golden_queries
+
+    raised: list[tuple[str, str]] = []
+    for query in load_golden_queries():
+        try:
+            store._fts_obs_ids(query.query)
+        except sqlite3.OperationalError as e:  # pragma: no cover - the assertion
+            raised.append((query.id, str(e)))
+    assert raised == [], (
+        "the FTS5 arm still raises for frozen golden queries, so the swallow "
+        f"in evals/search.py is not dead after all: {raised}"
+    )
+
+
+def test_a_broken_lexical_arm_is_not_quietly_measured_as_hybrid(store):
+    """THE REPRO for what the swallow would do now that the bug is gone.
+
+    A locked cache raises ``OperationalError`` exactly like a malformed MATCH
+    used to. Swallowed, the run fuses the vector arm alone, reports a full
+    result list and drifts by however much the missing arm was contributing —
+    an eval that measured a different system and said nothing.
+    """
+    embedder = StubEmbedder()
+    _embed_all(store, embedder, DOCS)
+
+    def locked(_text):
+        raise sqlite3.OperationalError("database is locked")
+
+    store._fts_obs_ids = locked  # type: ignore[method-assign]
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        hybrid_search_fn(store, embedder)("quadratic", 50)
 
 
 # --- mode resolution --------------------------------------------------------

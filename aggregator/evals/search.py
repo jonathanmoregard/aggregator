@@ -23,7 +23,6 @@ measuring there.
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Callable
 
 from aggregator.core.dsl import parse
@@ -74,13 +73,22 @@ def hybrid_search_fn(store, embedder) -> SearchFn:
     def search(text: str, limit: int) -> list[str]:
         embedding = embedder.embed_query(text)
         vec_ids = store._vec_obs_ids(embedding, FUSION_ARM_DEPTH)
-        try:
-            fts_ids = store._fts_obs_ids(text)[:FUSION_ARM_DEPTH]
-        except sqlite3.OperationalError:
-            # Criterion B's bug: an unescaped MATCH. The keyword arm
-            # contributes nothing for this query, which is a measurable fact
-            # about today's pipeline rather than a reason to abort the run.
-            fts_ids = []
+        # NOTHING IS CAUGHT HERE, AND THE ABSENCE IS THE FEATURE. This call
+        # used to sit inside ``except sqlite3.OperationalError: fts_ids = []``,
+        # under a comment calling it "Criterion B's bug: an unescaped MATCH".
+        # b4eab9b whitelisted every string that reaches MATCH, so that cause is
+        # gone — demonstrated over all 86 frozen golden queries in
+        # ``tests/evals/test_search_modes.py``, the 25 that used to raise
+        # included.
+        #
+        # A swallow whose reason has been removed is not harmless, it is a
+        # trap. What can still raise here is a locked cache, a corrupt index or
+        # an FTS5 that changed under us, and catching any of those would fuse
+        # the vector arm alone, return a full-looking result list and report it
+        # as ``hybrid`` — the NEVER DEGRADE rule in this module's own docstring,
+        # broken by this module. So it propagates, the run stops, and the
+        # operator finds out.
+        fts_ids = store._fts_obs_ids(text)[:FUSION_ARM_DEPTH]
         return [doc_id for doc_id, _ in rrf_fuse(fts_ids, vec_ids)][:limit]
 
     return search
