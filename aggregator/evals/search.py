@@ -26,7 +26,16 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from aggregator.core.dsl import parse
-from aggregator.core.hybrid import rrf_fuse
+
+#: Per-arm depth for the fused mode, IMPORTED AND NOT RE-DECLARED.
+#:
+#: This module used to carry its own ``= 150`` beside ``aggregator.mcp``'s own
+#: ``= 50``, so the pipeline the harness measured was not the pipeline the
+#: server served and a clean eval run described a configuration nobody used.
+#: The two numbers agree today; re-typing either is how they stop agreeing
+#: without anyone noticing. Re-exported under this module's name because the
+#: harness and its tests read it from here.
+from aggregator.core.hybrid import FUSION_ARM_DEPTH, rrf_fuse
 
 #: ``(query_text, limit) -> ranked result ids``.
 SearchFn = Callable[[str, int], list[str]]
@@ -34,10 +43,6 @@ SearchFn = Callable[[str, int], list[str]]
 #: Modes the harness can measure today. Criterion H owns the user-facing
 #: version of this list; this one exists so an eval run names what it measured.
 SEARCH_MODES = ("lexical", "hybrid")
-
-#: Per-arm depth for the fused mode. Deliberately generous: fusion quality is
-#: sensitive to arm depth, and the harness exists to make that measurable.
-FUSION_ARM_DEPTH = 150
 
 
 def lexical_search_fn(store) -> SearchFn:
@@ -72,7 +77,12 @@ def hybrid_search_fn(store, embedder) -> SearchFn:
 
     def search(text: str, limit: int) -> list[str]:
         embedding = embedder.embed_query(text)
-        vec_ids = store._vec_obs_ids(embedding, FUSION_ARM_DEPTH)
+        # THE RAW ARM, DELIBERATELY UN-FLOORED. ``hybrid.vector_floor`` runs in
+        # ``mcp._fused_id_scope`` and is measurable through the ``mcp`` mode
+        # below; keeping it out of this arm is what makes the two modes
+        # separable — drift between them is the floor's contribution, and a
+        # mode that also applied it would have nothing to compare against.
+        vec_ids = [doc_id for doc_id, _ in store._vec_obs_scored(embedding, FUSION_ARM_DEPTH)]
         # NOTHING IS CAUGHT HERE, AND THE ABSENCE IS THE FEATURE. This call
         # used to sit inside ``except sqlite3.OperationalError: fts_ids = []``,
         # under a comment calling it "Criterion B's bug: an unescaped MATCH".

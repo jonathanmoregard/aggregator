@@ -136,7 +136,7 @@ def test_editing_a_body_drops_the_vector_of_the_old_text(store):
     store.upsert_entities([session(), observation(body="something else entirely")])
 
     assert store.count_vec_rows("observations") == 0
-    assert store._vec_obs_ids(_unit(0), k=5) == []
+    assert store._vec_obs_scored(_unit(0), k=5) == []
 
 
 def test_an_unchanged_reingest_leaves_the_vector_and_the_watermark_alone(store):
@@ -161,7 +161,7 @@ def test_editing_one_observation_does_not_disturb_its_neighbours(store):
     store.upsert_entities([session(), observation("o1", "first body, rewritten")])
 
     assert _state(store, "observations", "obs_id", "o2") == "ok"
-    assert store._vec_obs_ids(_unit(2), k=5) == ["o2"]
+    assert [i for i, _ in store._vec_obs_scored(_unit(2), k=5)] == ["o2"]
 
 
 def test_every_chunk_row_of_an_edited_observation_is_dropped(store):

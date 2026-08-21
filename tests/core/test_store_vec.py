@@ -110,7 +110,7 @@ def test_upsert_and_read_vec_obs(store):
     vec = vec / np.linalg.norm(vec)
     store.upsert_vec_observations([("o1", vec)])
     query = vec  # exact match
-    hits = store._vec_obs_ids(query, k=5)
+    hits = [i for i, _ in store._vec_obs_scored(query, k=5)]
     assert hits[0] == "o1"
 
 
@@ -119,7 +119,7 @@ def test_knn_returns_topk_ordered(store):
         _seed_observation(store, f"o{i}")
     vecs = np.eye(5, 768, dtype=np.float32)  # 5 orthogonal unit vectors
     store.upsert_vec_observations([(f"o{i}", vecs[i]) for i in range(5)])
-    hits = store._vec_obs_ids(vecs[2], k=3)
+    hits = [i for i, _ in store._vec_obs_scored(vecs[2], k=3)]
     assert hits[0] == "o2"
     assert len(hits) == 3
 
@@ -139,7 +139,7 @@ def test_upsert_and_read_vec_records(store):
     _seed_record(store, "github:2")
     vecs = np.eye(2, 768, dtype=np.float32)
     store.upsert_vec_records([("github:1", vecs[0]), ("github:2", vecs[1])])
-    assert store._vec_record_ids(vecs[1], k=1) == ["github:2"]
+    assert [i for i, _ in store._vec_record_scored(vecs[1], k=1)] == ["github:2"]
 
 
 def test_select_unembedded_observations(store):
@@ -231,9 +231,9 @@ def test_vec_read_raises_named_error_when_unavailable(no_vec_store):
     """Never a bare ``no such table: vec_observations``."""
     vec = np.eye(1, 768, dtype=np.float32)[0]
     with pytest.raises(VectorIndexUnavailableError, match="sqlite-vec"):
-        no_vec_store._vec_obs_ids(vec, k=5)
+        no_vec_store._vec_obs_scored(vec, k=5)
     with pytest.raises(VectorIndexUnavailableError, match="sqlite-vec"):
-        no_vec_store._vec_record_ids(vec, k=5)
+        no_vec_store._vec_record_scored(vec, k=5)
 
 
 def test_vec_write_is_a_noop_when_unavailable(no_vec_store, caplog):

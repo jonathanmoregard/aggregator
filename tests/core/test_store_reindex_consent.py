@@ -104,7 +104,7 @@ def test_environment_alone_cannot_authorise_a_reindex(populated, monkeypatch):
         "environment variable"
     )
     with pytest.raises(VectorIndexUnavailableError):
-        store._vec_obs_ids(_unit(_VEC_DIM), k=3)
+        store._vec_obs_scored(_unit(_VEC_DIM), k=3)
 
 
 def test_migrate_default_keeps_every_vector(populated):

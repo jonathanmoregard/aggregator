@@ -17,16 +17,16 @@ ABSTENTION LIVES HERE TOO, AND IT IS PER-ARM ON PURPOSE. See
 may threshold the FUSED score, so the only place a floor can go is
 before fusion, on an arm whose scores mean something on their own.
 
-``vector_floor`` HAS NO PRODUCTION CALLER YET, AND THAT IS A MISSING STORE
-METHOD RATHER THAN a design decision. ``Store._vec_obs_ids`` /
-``_vec_record_ids`` run ``ORDER BY distance`` and then select only the id
-column, so the number this rule reads is computed by sqlite-vec and thrown
-away one layer below the caller that needs it. Wiring the floor needs those
-two reads to return ``(id, distance)``; until they do, ``aggregator.mcp``
-has nothing to feed it and the default path abstains only by reporting low
-confidence, never by dropping candidates. Written down here rather than left
-implicit, because a rule with no caller is otherwise indistinguishable from
-a rule that was decided against.
+``vector_floor``'s PRODUCTION CALLER IS ``mcp._fused_id_scope``, which applies
+it to ``Store._vec_obs_scored`` / ``_vec_record_scored`` on every default query
+before the arms are fused and before the page token freezes the survivors. It
+had no caller at all until 2026-08-21: those two store reads ran
+``ORDER BY distance`` and then selected the id column alone, so the number this
+rule needs was computed by sqlite-vec and discarded one layer below the caller.
+The rule was fully implemented and fully tested throughout, which is exactly why
+this paragraph is here — a green unit test is not evidence that a guard is live,
+and ``tests/test_mcp_vector_floor_wired.py`` asserts the production call rather
+than the function.
 """
 
 from __future__ import annotations
@@ -70,10 +70,11 @@ FUSION_ARM_DEPTH = 150
 #: the tail is normal, both of which clear a 1.5 bar. A 1.5 threshold therefore
 #: sits inside the noise floor and abstains on nothing; it is pinned as a
 #: failing case in ``tests/core/test_hybrid_abstention.py``. 3.0 is the first
-#: round bar above that noise floor. It is UNMEASURED on the real index — see
-#: the module note on why the arm cannot report distances yet — so treat it as
-#: derived rather than calibrated, and recalibrate it the moment the harness
-#: can score it.
+#: round bar above that noise floor. It is DERIVED, NOT CALIBRATED — the
+#: argument above is an extreme-value one about the shape of the window, and no
+#: number in it came off the real index. Recalibrating it needs labels, which
+#: the golden set does not have yet; ``aggregator retrieval-regression --mode
+#: mcp`` is the surface that will score a change to it when they arrive.
 VECTOR_FLOOR_Z = 3.0
 
 #: Fewer candidates than this and :func:`vector_floor` does not fire.

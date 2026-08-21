@@ -131,6 +131,7 @@ from aggregator.core.hybrid import (
     RERANK_STANDOUT_Z,
     has_standout,
     rrf_fuse,
+    vector_floor,
 )
 from aggregator.core.scrub import scrub
 from aggregator.core.store import (
@@ -159,14 +160,11 @@ _DEFAULT_PAGE_SIZE_FULL = 40
 # because too few documents appear in both lists for the cross-arm agreement
 # signal to fire at all.
 #
-# A COUNT IS STILL THE ONLY LIMIT ON THIS PATH, and that is now a gap rather
-# than a decision. ``hybrid.vector_floor`` is the per-arm distance floor the
-# design calls for, and it cannot be wired from here: ``Store._vec_obs_ids``
-# orders by distance and then selects the id column alone, so the number the
-# floor reads is computed by sqlite-vec and discarded one layer down. Until
-# those reads return ``(id, distance)`` the vector arm contributes its k
-# nearest neighbours however far away they are, and the only abstention on
-# this path is the low-confidence signal ``_note_confidence`` attaches.
+# A COUNT IS NOT THE ONLY LIMIT ON THIS PATH. ``k`` bounds how many neighbours
+# the arm proposes; ``hybrid.vector_floor``, applied in ``_fused_id_scope``,
+# decides how many of them are far enough above their own candidate set to be
+# worth fusing. Both are needed: a k-nearest search always returns k, however
+# irrelevant the k-th is.
 _VECTOR_ARM_K = FUSION_ARM_DEPTH
 
 # How many hits of a page the cross-encoder reorders when ``rerank=True``.
@@ -688,14 +686,15 @@ def _fused_id_scope(
     no-answer query produces, because the KNN returns its ``k`` nearest
     neighbours whether or not any of them is relevant.
     """
+    floored_out = 0
     if frozen is not None:
         vec_hits = frozen
     else:
         try:
-            vec_hits = (
-                store._vec_obs_ids(embedding, _VECTOR_ARM_K)
+            scored = (
+                store._vec_obs_scored(embedding, _VECTOR_ARM_K)
                 if kind == "observations"
-                else store._vec_record_ids(embedding, _VECTOR_ARM_K)
+                else store._vec_record_scored(embedding, _VECTOR_ARM_K)
             )
         except VectorIndexUnavailableError as e:
             log.info(
@@ -726,17 +725,48 @@ def _fused_id_scope(
                     "the keyword arm meanwhile.",
                 ) from e
             return None, [], False
+        # CRITERION D, ON THE DEFAULT PATH. The floor runs here and nowhere
+        # else: before fusion, on the one arm whose scores mean something
+        # relative to each other, and never on the fused RRF score.
+        #
+        # BEFORE THE FREEZE, NOT AFTER. ``vec_hits`` is what the page token
+        # carries, so filtering after it was frozen would apply the floor to
+        # page 1 and to no other page of the same query.
+        vec_hits = vector_floor(scored)
+        floored_out = len(scored) - len(vec_hits)
+        if floored_out:
+            log.debug(
+                "vector floor dropped %d/%d neighbours for %r",
+                floored_out, len(scored), kind,
+            )
     vec_ids = _widen_chunk_ids(vec_hits)
     if not vec_ids:
         if search_mode == "vector":
+            # NAME WHICH OF THE TWO HAPPENED. "nothing is embedded" and "the
+            # neighbours were all too far away" have opposite remedies —
+            # waiting for the backfill fixes one and cannot touch the other —
+            # and a diagnostic mode that conflated them would send an operator
+            # to run a 25-30 day job against a query that abstained on purpose.
             raise _VectorModeUnavailableError(
                 f"search_mode='vector' returned no candidates for {kind!r}: "
-                f"the vector index holds nothing this query can reach",
-                "Run `aggregator embed --catchup --source both` and check "
-                "`aggregator status` for how much of the corpus is embedded. "
-                "A partially embedded corpus answers vector-mode queries from "
-                "the fraction that is done, and an empty one cannot answer "
-                "them at all.",
+                + (
+                    f"the vector arm's {floored_out} nearest neighbours were "
+                    "all too far from this query to clear the per-arm distance "
+                    "floor, so it abstained"
+                    if floored_out
+                    else "the vector index holds nothing this query can reach"
+                ),
+                (
+                    "The index answered; nothing in it was close enough. Try "
+                    "different wording, or run the same query with the default "
+                    "search_mode='hybrid' to see what the keyword arm finds."
+                    if floored_out
+                    else "Run `aggregator embed --catchup --source both` and "
+                    "check `aggregator status` for how much of the corpus is "
+                    "embedded. A partially embedded corpus answers vector-mode "
+                    "queries from the fraction that is done, and an empty one "
+                    "cannot answer them at all."
+                ),
             )
         return None, [], False
     try:

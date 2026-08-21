@@ -174,10 +174,10 @@ def test_lexical_mode_never_constructs_the_embedder(store, embedder):
 def test_lexical_mode_never_runs_the_knn(store, embedder, monkeypatch):
     _seed(store)
     calls: list[int] = []
-    original = store._vec_obs_ids
+    original = store._vec_obs_scored
     monkeypatch.setattr(
         store,
-        "_vec_obs_ids",
+        "_vec_obs_scored",
         lambda e, k: (calls.append(k), original(e, k))[1],
     )
     aggregator_query(

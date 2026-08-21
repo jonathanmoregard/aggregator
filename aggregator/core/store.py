@@ -3496,11 +3496,24 @@ class Store:
         )
         return counts
 
-    def _vec_obs_ids(self, query_embedding: np.ndarray, k: int) -> list[str]:
+    def _vec_obs_scored(
+        self, query_embedding: np.ndarray, k: int
+    ) -> list[tuple[str, float]]:
         """Vector KNN over ``vec_observations``.
 
-        Returns top-K ``obs_id`` ordered by ascending distance — best match
-        first, which is the order RRF expects.
+        Returns top-K ``(obs_id, distance)`` ordered by ascending distance —
+        best match first, which is the order RRF expects.
+
+        THE DISTANCE COMES BACK, AND THAT IS THE WHOLE REASON FOR THE NAME.
+        This method used to be ``_vec_obs_ids`` and selected the id column
+        alone, so sqlite-vec computed the distance, ``ORDER BY`` used it, and
+        then it was thrown away one layer below the only caller that needs it —
+        which left ``hybrid.vector_floor``, criterion D's per-arm abstention
+        rule, fully implemented, fully tested and never executed on any
+        production path. RENAMED rather than re-typed: a stale caller now dies
+        with ``AttributeError`` instead of silently treating ``(id, distance)``
+        tuples as ids, which is hashable, fuses without complaint, and matches
+        nothing.
 
         ``AND model = ?`` IS LOAD-BEARING, not a filter for tidiness. Two
         models coexist in this table by design, and their vectors are not
@@ -3513,7 +3526,7 @@ class Store:
         c = self._c()
         rows = c.execute(
             """
-            SELECT obs_id
+            SELECT obs_id, distance
             FROM vec_observations
             WHERE embedding MATCH ?
               AND model = ?
@@ -3522,16 +3535,19 @@ class Store:
             """,
             (query_embedding.astype("float32").tobytes(), model, k),
         ).fetchall()
-        return [r["obs_id"] for r in rows]
+        return [(r["obs_id"], float(r["distance"])) for r in rows]
 
-    def _vec_record_ids(self, query_embedding: np.ndarray, k: int) -> list[str]:
-        """Vector KNN over ``vec_records``. Same contract as ``_vec_obs_ids``,
-        including the load-bearing ``AND model = ?``."""
+    def _vec_record_scored(
+        self, query_embedding: np.ndarray, k: int
+    ) -> list[tuple[str, float]]:
+        """Vector KNN over ``vec_records``. Same contract as
+        ``_vec_obs_scored``, including the returned distance and the
+        load-bearing ``AND model = ?``."""
         model = self._require_vector_readable()
         c = self._c()
         rows = c.execute(
             """
-            SELECT stable_id
+            SELECT stable_id, distance
             FROM vec_records
             WHERE embedding MATCH ?
               AND model = ?
@@ -3540,7 +3556,7 @@ class Store:
             """,
             (query_embedding.astype("float32").tobytes(), model, k),
         ).fetchall()
-        return [r["stable_id"] for r in rows]
+        return [(r["stable_id"], float(r["distance"])) for r in rows]
 
     # -- ingest state: the per-source high-water mark ----------------------
 

@@ -137,7 +137,7 @@ def test_a_knn_read_only_sees_the_model_it_asked_for(store):
         embedding=_unit(1),  # identical vector, foreign space
     )
 
-    hits = store._vec_obs_ids(_unit(1), k=10)
+    hits = [i for i, _ in store._vec_obs_scored(_unit(1), k=10)]
     assert hits == ["o0"], hits
 
 
@@ -289,7 +289,7 @@ def test_a_second_model_is_invisible_until_it_completes(tmp_path, monkeypatch):
 
     assert second.serving_embedding_model() is None
     with pytest.raises(VectorIndexUnavailableError) as e:
-        second._vec_obs_ids(_unit(0), k=5)
+        second._vec_obs_scored(_unit(0), k=5)
     assert "still being built" in str(e.value)
 
 

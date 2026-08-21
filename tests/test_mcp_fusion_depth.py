@@ -98,8 +98,8 @@ def test_the_mcp_vector_arm_uses_the_shared_fusion_depth(store, embedder):
 @pytest.mark.parametrize(
     ("dsl", "method"),
     [
-        ("source:sessions voting", "_vec_obs_ids"),
-        ("source:github voting", "_vec_record_ids"),
+        ("source:sessions voting", "_vec_obs_scored"),
+        ("source:github voting", "_vec_record_scored"),
     ],
 )
 def test_the_vector_arm_is_asked_for_150_candidates(

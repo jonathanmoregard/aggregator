@@ -178,7 +178,7 @@ def test_a_foreign_vec_table_of_the_wrong_dimension_never_serves_a_query(tmp_pat
     # No ``Dimension mismatch`` escapes: the write is refused, not attempted.
     assert store.upsert_vec_observations([("o1", _unit(_VEC_DIM))]) == 0
     with pytest.raises(VectorIndexUnavailableError):
-        store._vec_obs_ids(_unit(_VEC_DIM), k=5)
+        store._vec_obs_scored(_unit(_VEC_DIM), k=5)
     # And the row stays in the backlog rather than being marked embedded.
     assert {r["obs_id"] for r in store.select_unembedded("observations")} == {"o1"}
 
@@ -197,7 +197,7 @@ def test_a_wrong_width_table_is_repaired_once_consent_is_given(tmp_path):
 
     _seed_obs(again, "o1")
     assert again.upsert_vec_observations([("o1", _unit(_VEC_DIM))]) == 1
-    assert again._vec_obs_ids(_unit(_VEC_DIM), k=5) == ["o1"]
+    assert [i for i, _ in again._vec_obs_scored(_unit(_VEC_DIM), k=5)] == ["o1"]
 
 
 def test_b_foreign_vectors_of_the_right_dimension_are_not_adopted(tmp_path):
@@ -211,7 +211,7 @@ def test_b_foreign_vectors_of_the_right_dimension_are_not_adopted(tmp_path):
     with pytest.raises(VectorIndexUnavailableError):
         store.count_vec_rows("observations")
     with pytest.raises(VectorIndexUnavailableError):
-        store._vec_obs_ids(_unit(_VEC_DIM), k=5)
+        store._vec_obs_scored(_unit(_VEC_DIM), k=5)
     assert store.vector_index_state()["state"] == "unavailable"
 
 
@@ -322,7 +322,7 @@ def test_a_changed_model_refuses_to_serve_the_index_it_did_not_write(
     assert "NOTHING WAS DELETED" in str(e.value)
     assert "unset AGGREGATOR_EMBED_BACKEND" in str(e.value)
     with pytest.raises(VectorIndexUnavailableError):
-        again._vec_obs_ids(_unit(_VEC_DIM), k=3)
+        again._vec_obs_scored(_unit(_VEC_DIM), k=3)
 
     raw = _raw_vec_conn(db)
     assert raw.execute("SELECT COUNT(*) FROM vec_observations").fetchone()[0] == 1
@@ -349,7 +349,7 @@ def test_the_previous_models_index_still_serves_its_own_process(
     back = Store(db_path=db)
     back.migrate()
     assert back.has_embedded_rows("observations") is True
-    assert back._vec_obs_ids(_unit(_VEC_DIM), k=3) == ["o1"]
+    assert [i for i, _ in back._vec_obs_scored(_unit(_VEC_DIM), k=3)] == ["o1"]
 
 
 def test_a_changed_model_discards_the_index_when_consent_is_given(tmp_path):
@@ -408,7 +408,7 @@ def test_an_empty_foreign_table_is_repaired_without_consent(tmp_path):
 
     _seed_obs(store, "o1")
     assert store.upsert_vec_observations([("o1", _unit(_VEC_DIM))]) == 1
-    assert store._vec_obs_ids(_unit(_VEC_DIM), k=5) == ["o1"]
+    assert [i for i, _ in store._vec_obs_scored(_unit(_VEC_DIM), k=5)] == ["o1"]
 
 
 def test_migration_without_sqlite_vec_stamps_nothing_and_still_serves_fts(
@@ -535,7 +535,7 @@ def test_a_read_only_store_refuses_a_mismatched_index_too(tmp_path, monkeypatch)
     with pytest.raises(VectorIndexUnavailableError):
         ro.has_embedded_rows("observations")
     with pytest.raises(VectorIndexUnavailableError):
-        ro._vec_obs_ids(_unit(_VEC_DIM), k=5)
+        ro._vec_obs_scored(_unit(_VEC_DIM), k=5)
 
 
 def test_a_read_only_store_serves_a_matching_index(tmp_path):
@@ -550,4 +550,4 @@ def test_a_read_only_store_serves_a_matching_index(tmp_path):
 
     ro = Store(db_path=db, read_only=True)
     assert ro.has_embedded_rows("observations") is True
-    assert ro._vec_obs_ids(_unit(_VEC_DIM), k=5) == ["o1"]
+    assert [i for i, _ in ro._vec_obs_scored(_unit(_VEC_DIM), k=5)] == ["o1"]

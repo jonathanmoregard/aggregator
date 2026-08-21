@@ -134,7 +134,7 @@ def test_a_row_that_comes_back_from_a_rebuild_keeps_its_vector(store):
     )
 
     assert store.count_vec_rows("observations") == 1
-    assert store._vec_obs_ids(_unit(1), k=5) == ["o1"]
+    assert [i for i, _ in store._vec_obs_scored(_unit(1), k=5)] == ["o1"]
 
 
 def test_a_record_that_comes_back_keeps_its_vector(store):

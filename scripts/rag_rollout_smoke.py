@@ -1345,14 +1345,22 @@ def cmd_measure(args: argparse.Namespace) -> int:
                 fts = set(store._fts_obs_ids(q)) | set(store._fts_ids(q))
             except sqlite3.OperationalError as e:
                 fts, fts_err = set(), str(e)
-            vec_obs = store._vec_obs_ids(qv, 50)
-            vec_rec = store._vec_record_ids(qv, 50)
+            # The RAW arm, deliberately un-floored: this report exists to show
+            # what the vector arm proposes before ``hybrid.vector_floor`` has
+            # its say, and ``scope_o``/``scope_r`` below are the floored answer
+            # to compare it against.
+            vec_obs = [i for i, _ in store._vec_obs_scored(qv, 50)]
+            vec_rec = [i for i, _ in store._vec_record_scored(qv, 50)]
             vec_raw = [("observations", i) for i in vec_obs] + [
                 ("records", i) for i in vec_rec
             ]
             vec = set(_widen_chunk_ids(vec_obs + vec_rec))
-            scope_o = _fused_id_scope(store, "observations", q, qv) or frozenset()
-            scope_r = _fused_id_scope(store, "records", q, qv) or frozenset()
+            # UNPACKED, not truthiness-tested. ``_fused_id_scope`` returns
+            # ``(scope, vec_hits, lexical_support)``; the old one-value form
+            # here predates that and would have raised on ``set()`` of a tuple
+            # holding a list. Caught while wiring the distance floor above.
+            scope_o = _fused_id_scope(store, "observations", q, qv)[0] or frozenset()
+            scope_r = _fused_id_scope(store, "records", q, qv)[0] or frozenset()
             hybrid = set(scope_o) | set(scope_r)
             extra = vec - fts
             rows.append(
