@@ -369,11 +369,15 @@ def test_a_raising_fts_arm_degrades_to_the_vector_arm_alone(seeded, monkeypatch)
 
     monkeypatch.setattr(seeded, "_fts_obs_ids", boom)
     monkeypatch.setattr(mcp_mod, "_widen_chunk_ids", lambda ids: list(ids))
-    scope, vec_hits = mcp_mod._fused_id_scope(
+    scope, vec_hits, lexical_support = mcp_mod._fused_id_scope(
         seeded, "observations", "power-on", object(), frozen=["o0", "o1"]
     )
     assert scope == frozenset({"o0", "o1"})
     assert vec_hits == ["o0", "o1"]
+    # Criterion D's third return value. The answer stands, and it says so:
+    # a result set the keyword arm never corroborated is exactly the shape a
+    # no-answer query produces, so degrading has to be reportable.
+    assert lexical_support is False
 
 
 def test_a_raising_fts_arm_is_logged_loudly(seeded, monkeypatch, caplog):

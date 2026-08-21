@@ -353,8 +353,44 @@ def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
 # the same function the same question, so "when does hybrid run" is one
 # readable predicate rather than a condition copied four times and drifting.
 
+#: Which arms answer a free-text query. ``hybrid`` is the default and the only
+#: one an ordinary caller should use.
+#:
+#: THE OTHER TWO ARE A CORRECTNESS TOOL, NOT A CONVENIENCE. Rank fusion has a
+#: weakest-link failure the fused answer cannot show you: fusing a strong arm
+#: with a weak one can score WORSE than the strong arm alone (measured on
+#: TOUCHE at 0.650 nDCG@10 lexical-alone against 0.604 fused), because a weak
+#: arm's rank-1 document collects the full ``1/(k+1)`` credit whether or not it
+#: is relevant — and neither more depth nor a heavier reranker repairs it. The
+#: only way to see that condition is to run each arm on its own, against the
+#: same query, and compare. Without these modes it is undiagnosable.
+_SEARCH_MODES = ("hybrid", "lexical", "vector")
+
 _embedder: object | None = None
 _reranker: object | None = None
+
+
+class _VectorModeUnavailableError(RuntimeError):
+    """``search_mode='vector'`` was asked for and the vector arm cannot run.
+
+    RAISED RATHER THAN DEGRADED, which inverts this module's rule everywhere
+    else. The default path falls back to FTS5 whenever the vector arm is
+    missing, and that is right for a user who would rather have keyword results
+    than an error. It is wrong here: the whole point of the mode is to attribute
+    an answer to one arm, so quietly answering from the other one files the
+    keyword arm's rows under "vector" and makes a broken vector index look like
+    a working one. That is the empty-result-looks-like-success shape, arrived at
+    by being helpful.
+
+    Carries its own remediation text because the causes are different problems
+    with different fixes — nothing embedded yet, no extension, a dead model —
+    and a single generic message would send the operator to the wrong one.
+    """
+
+    def __init__(self, reason: str, remediation: str):
+        super().__init__(reason)
+        self.reason = reason
+        self.remediation = remediation
 
 
 @contextlib.contextmanager
@@ -470,12 +506,18 @@ def _widen_chunk_ids(vec_ids: list[str]) -> list[str]:
 
 
 def _vector_arm_engaged(
-    store: Store, kind: str, ast: QueryAST, pinned: bool | None
+    store: Store,
+    kind: str,
+    ast: QueryAST,
+    pinned: bool | None,
+    search_mode: str = "hybrid",
 ) -> bool:
     """The single hybrid-vs-FTS5 decision, for every path.
 
-    Three inputs, in priority order:
+    Four inputs, in priority order:
 
+    0. **``search_mode='lexical'`` → never.** The caller is excluding this arm
+       deliberately, so nothing below may re-enable it.
     1. **No free text → never.** A pure-filter query (``source:``, ``from:``,
        ``session:``) has nothing to embed, so it must not construct the model
        or touch the vector tables.
@@ -488,7 +530,14 @@ def _vector_arm_engaged(
     Step 3 asks ``has_embedded_rows`` and NOT ``count_vec_rows``: the exact
     count is a linear scan of the vec0 table (~70 ms at the live cache's 400k
     vectors) and this runs on every text query. See the store method.
+
+    ``search_mode='vector'`` DOES NOT SHORT-CIRCUIT HERE. It still has to pass
+    steps 1-3, because "the caller wants only the vector arm" and "the vector
+    arm can run" are different questions and the second one is this function's.
+    The refusal is raised by ``_apply_hybrid``, where the reason is known.
     """
+    if search_mode == "lexical":
+        return False
     if not ast.text:
         return False
     if pinned is not None:
@@ -520,7 +569,8 @@ def _fused_id_scope(
     text: str,
     embedding: object,
     frozen: list[str] | None = None,
-) -> tuple[frozenset[str] | None, list[str]]:
+    search_mode: str = "hybrid",
+) -> tuple[frozenset[str] | None, list[str], bool]:
     """RRF-fuse the two arms into a candidate id set, or ``None`` for FTS5-only.
 
     THE FTS5 ARM IS PASSED IN WHOLE AND THE VECTOR ARM IS CAPPED AT
@@ -546,9 +596,18 @@ def _fused_id_scope(
     candidates — and ordering stays the caller's existing contract.
     Relevance ordering is available, opt-in and bounded, via ``rerank=True``.
 
-    Returns ``(scope, vec_hits)``. ``vec_hits`` is what the page token freezes:
-    hand it back as ``frozen`` on a continuation and the KNN is not re-run at
-    all, so the candidate set cannot move while the caller pages through it.
+    ``search_mode='vector'`` DROPS THE KEYWORD ARM from the fusion rather than
+    skipping the fusion: ``rrf_fuse`` over one arm is that arm's own ranking,
+    so there is no second code path to keep in step with this one.
+
+    Returns ``(scope, vec_hits, lexical_support)``. ``vec_hits`` is what the
+    page token freezes: hand it back as ``frozen`` on a continuation and the
+    KNN is not re-run at all, so the candidate set cannot move while the caller
+    pages through it. ``lexical_support`` says whether the keyword arm found
+    anything at all, which is the confidence signal ``_note_confidence`` reads
+    — a fused set the keyword arm never corroborated is exactly the shape a
+    no-answer query produces, because the KNN returns its ``k`` nearest
+    neighbours whether or not any of them is relevant.
     """
     if frozen is not None:
         vec_hits = frozen
@@ -559,31 +618,68 @@ def _fused_id_scope(
                 if kind == "observations"
                 else store._vec_record_ids(embedding, _VECTOR_ARM_K)
             )
-        except VectorIndexUnavailableError:
+        except VectorIndexUnavailableError as e:
             log.info(
                 "vector arm unavailable for %r; answering from FTS5 alone", kind
             )
-            return None, []
-        except Exception:  # noqa: BLE001 — the vector arm degrades, never fails
+            if search_mode == "vector":
+                raise _VectorModeUnavailableError(
+                    f"search_mode='vector' cannot run: the vector index is "
+                    f"unavailable for {kind!r} ({e})",
+                    "Run `aggregator embed --catchup --source both` to build "
+                    "the vector index, or re-run this query with "
+                    "search_mode='lexical' (or the default 'hybrid') to answer "
+                    "it from the keyword arm. Answering a vector-mode query "
+                    "from FTS5 would report the keyword arm's rows as the "
+                    "vector arm's.",
+                ) from e
+            return None, [], False
+        except Exception as e:  # noqa: BLE001 — the arm degrades, never fails
             log.exception(
                 "vector arm failed for %r; answering from FTS5 alone", kind
             )
-            return None, []
+            if search_mode == "vector":
+                raise _VectorModeUnavailableError(
+                    f"search_mode='vector' cannot run: the vector arm failed "
+                    f"for {kind!r} ({type(e).__name__}: {e})",
+                    "Check the cache with `aggregator status`, then re-run "
+                    "this query with search_mode='hybrid' to answer it from "
+                    "the keyword arm meanwhile.",
+                ) from e
+            return None, [], False
     vec_ids = _widen_chunk_ids(vec_hits)
     if not vec_ids:
-        return None, []
+        if search_mode == "vector":
+            raise _VectorModeUnavailableError(
+                f"search_mode='vector' returned no candidates for {kind!r}: "
+                f"the vector index holds nothing this query can reach",
+                "Run `aggregator embed --catchup --source both` and check "
+                "`aggregator status` for how much of the corpus is embedded. "
+                "A partially embedded corpus answers vector-mode queries from "
+                "the fraction that is done, and an empty one cannot answer "
+                "them at all.",
+            )
+        return None, [], False
     try:
         fts_ids = (
-            store._fts_obs_ids(text)
-            if kind == "observations"
+            [] if search_mode == "vector"
+            else store._fts_obs_ids(text) if kind == "observations"
             else sorted(store._fts_ids(text))
         )
     except sqlite3.OperationalError:
-        # Already surfaced to the caller by the probe in ``aggregator_query``;
-        # here it just means the keyword arm contributes nothing.
+        # NOT surfaced anywhere else. The probe in ``aggregator_query`` runs
+        # the same statement, so in practice it fails first and the query never
+        # reaches here — but "in practice" is a lock that has to still be held
+        # a few milliseconds later, and if it was released in between then this
+        # is the only place the caller learns the keyword arm dropped out.
+        # ``lexical_support=False`` is what carries that into the response.
+        log.warning(
+            "keyword arm failed for %r after a healthy probe; answering from "
+            "the vector arm alone", kind, exc_info=True,
+        )
         fts_ids = []
     scope = frozenset(doc_id for doc_id, _ in rrf_fuse(fts_ids, vec_ids))
-    return scope, list(vec_hits)
+    return scope, list(vec_hits), bool(fts_ids)
 
 
 def _apply_hybrid(
@@ -593,8 +689,9 @@ def _apply_hybrid(
     pinned: bool | None,
     embedding: object | None = None,
     frozen: list[str] | None = None,
-) -> tuple[QueryAST, bool, list[str]]:
-    """Return ``(ast, engaged, vec_hits)`` — the AST the store should run.
+    search_mode: str = "hybrid",
+) -> tuple[QueryAST, bool, list[str], bool]:
+    """Return ``(ast, engaged, vec_hits, lexical_support)``.
 
     When the vector arm engages, the free text is replaced by the fused id
     set: the arms have already been evaluated and RRF has already merged them,
@@ -606,23 +703,73 @@ def _apply_hybrid(
     supply the vector it already computed. Omitted, it is computed here — and
     NOT computed at all when ``frozen`` already supplies the hits, which makes
     a continuation both cheaper and, more importantly, stable.
+
+    ``lexical_support`` is ``True`` when the keyword arm contributed at least
+    one id. On the FTS5-only route it is ``True`` by definition — that route IS
+    the keyword arm — so the flag only ever reports something a caller could
+    not already infer when the vector arm ran.
+
+    Raises ``_VectorModeUnavailableError`` under ``search_mode='vector'`` whenever
+    the arm cannot run. Every other mode degrades to FTS5 in silence, which is
+    the correct trade for a user and the wrong one for a diagnosis.
     """
-    if not _vector_arm_engaged(store, kind, ast, pinned):
-        return ast, False, []
+    if not _vector_arm_engaged(store, kind, ast, pinned, search_mode):
+        if search_mode == "vector":
+            raise _VectorModeUnavailableError(
+                f"search_mode='vector' cannot run for {kind!r}: "
+                + (
+                    "this query has no free text to embed"
+                    if not ast.text
+                    else "nothing in this ontology is embedded yet"
+                ),
+                "The vector arm needs free text AND an embedded corpus. Add "
+                "search terms, or run `aggregator embed --catchup --source "
+                "both` and check `aggregator status` for per-source progress. "
+                "Re-run with the default search_mode='hybrid' to answer from "
+                "the keyword arm meanwhile.",
+            )
+        return ast, False, [], True
     if frozen is None:
         if embedding is None:
             embedding = _query_embedding(ast.text or "")
         if embedding is None:
-            return ast, False, []
-    scope, vec_hits = _fused_id_scope(
-        store, kind, ast.text or "", embedding, frozen
+            if search_mode == "vector":
+                raise _VectorModeUnavailableError(
+                    "search_mode='vector' cannot run: the query could not be "
+                    "embedded, so there is no vector to search with",
+                    "Run `aggregator embed --seed-models` if the embedding "
+                    "model's weights are missing, then retry. Re-run with the "
+                    "default search_mode='hybrid' to answer from the keyword "
+                    "arm meanwhile.",
+                )
+            return ast, False, [], True
+    scope, vec_hits, lexical_support = _fused_id_scope(
+        store, kind, ast.text or "", embedding, frozen, search_mode
     )
     if scope is None:
-        return ast, False, []
-    return replace(ast, text=None, id_scope=scope), True, vec_hits
+        return ast, False, [], True
+    return replace(ast, text=None, id_scope=scope), True, vec_hits, lexical_support
 
 
 # --- rerank -----------------------------------------------------------------
+
+
+def _note_confidence(
+    result: dict[str, Any],
+    query_text: str | None,
+    search_mode: str,
+    lexical_support: bool,
+) -> dict[str, Any]:
+    """Say which arms answered, in the caller's own response.
+
+    ONLY FOR FREE-TEXT QUERIES. A pure-filter query ran no retrieval arm at
+    all, so naming the mode the caller happened to pass would describe work
+    that did not happen. Absence here means "no arm ran", which is a different
+    fact from any of the three modes and must not be spelled as one of them.
+    """
+    if query_text:
+        result["search_mode"] = search_mode
+    return result
 
 
 def _rerank_doc(item: dict[str, Any]) -> str:
@@ -781,7 +928,9 @@ def _note_rerank(
 # structurally, and frozen hits may not travel without one.
 
 
-def _query_fingerprint(ast: QueryAST, drilldown: bool) -> str:
+def _query_fingerprint(
+    ast: QueryAST, drilldown: bool, search_mode: str = "hybrid"
+) -> str:
     """Identify the query a page token was minted for.
 
     OVER THE PARSED AST, NOT THE dsl STRING. ``source:github pr`` and
@@ -804,6 +953,10 @@ def _query_fingerprint(ast: QueryAST, drilldown: bool) -> str:
       offset indexes (session cards vs observation rows). Same hazard, same
       mechanism, one boolean away; leaving it out would keep exactly one
       argument that can still hand back a plausible wrong page.
+    * ``search_mode`` — it decides which ARMS produce the candidate set, so
+      the three modes address three different row sets for the same dsl. It
+      belongs with ``drilldown`` and not with ``rerank``: rerank reorders a
+      page already selected, this one selects it.
 
     WHAT IS DELIBERATELY NOT IN IT:
 
@@ -832,6 +985,7 @@ def _query_fingerprint(ast: QueryAST, drilldown: bool) -> str:
             "active_from": _iso_or_none(ast.active_from),
             "active_to": _iso_or_none(ast.active_to),
             "drilldown": bool(drilldown),
+            "search_mode": search_mode,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -1414,6 +1568,7 @@ def aggregator_query(
     page_token: str | None = None,
     drilldown: bool = False,
     rerank: bool = False,
+    search_mode: str = "hybrid",
     _store: Store | None = None,
 ) -> dict[str, Any]:
     """Search the user's own history — past Claude Code sessions, subagent
@@ -1488,6 +1643,27 @@ def aggregator_query(
               only the order of the first few — so the cheap call is the
               right default, and this is worth paying only when the ranking
               itself is the answer you need and you can afford to wait.
+      search_mode: which retrieval arms answer free text. ``"hybrid"``
+              (default) fuses both. ``"lexical"`` runs the keyword (FTS5) arm
+              alone. ``"vector"`` runs the semantic arm alone.
+
+              A DIAGNOSTIC, NOT A TUNING KNOB — leave it at the default unless
+              you are investigating retrieval itself. Fusing a strong arm with
+              a weak one can score WORSE than the strong arm alone, and the
+              fused answer cannot show you that; running each arm separately
+              against the same query is the only way to see which one is
+              contributing noise.
+
+              ``"vector"`` REFUSES rather than degrading. Every other path
+              here falls back to keyword search when the vector index is
+              missing; this one returns ``ok: False``, because answering a
+              vector-mode query from FTS5 would report the keyword arm's rows
+              as the semantic arm's. It also refuses a query with no free
+              text, which has nothing to embed.
+
+              Ignored by pure-filter queries (no free text) — they run no
+              retrieval arm at all, and the response then carries no
+              ``search_mode`` key rather than claiming one.
 
     Free text is answered by a hybrid retriever — keyword (FTS5) and semantic
     (vector) arms fused with RRF — whenever the vector index has been built on
@@ -1521,6 +1697,10 @@ def aggregator_query(
       says which. Reranking degrades to the recency ordering rather than
       failing the call, so this flag is the only way to tell the two apart:
       the rows are identical either way.
+
+      ``search_mode`` echoes which arms answered, and appears only when the
+      query carried free text — a pure-filter query ran no arm, and naming one
+      would describe work that did not happen.
 
       ``reranked_count`` appears under the same condition and says HOW FAR
       DOWN THE PAGE THE RANKING GOES. Only the head of a page is scored — a
@@ -1577,6 +1757,17 @@ def aggregator_query(
             "reason": f"unknown fields mode: {fields!r}",
             "remediation": "Use fields='summary' (default) or fields='full'.",
         }
+    if search_mode not in _SEARCH_MODES:
+        return {
+            "ok": False,
+            "reason": f"unknown search_mode: {search_mode!r}",
+            "remediation": (
+                "Use search_mode='hybrid' (default, both arms fused), "
+                "'lexical' (keyword/FTS5 arm alone) or 'vector' (semantic arm "
+                "alone). The single-arm modes exist to diagnose which arm is "
+                "contributing noise; leave the default alone otherwise."
+            ),
+        }
     # RERANK NEEDS THE BODIES, AND SUMMARY MODE DOES NOT RETURN THEM.
     # ``_rerank_doc`` scores the result ITEM, and an item's ``content`` is
     # empty unless ``fields='full'`` — so under the default this handed the
@@ -1621,7 +1812,7 @@ def aggregator_query(
     # parsed, before ``_apply_hybrid`` rewrites ``text`` into an ``id_scope``,
     # so what is checked on the way in is byte-identical to what the paths
     # mint on the way out.
-    fingerprint = _query_fingerprint(ast, drilldown)
+    fingerprint = _query_fingerprint(ast, drilldown, search_mode)
     if cursor.fingerprint is not None and cursor.fingerprint != fingerprint:
         return _query_changed_refusal(cursor.fingerprint, fingerprint)
 
@@ -1629,8 +1820,13 @@ def aggregator_query(
     try:
         return _dispatch(
             store, ast, mode, fields, page_size, cursor, drilldown, rerank,
-            fingerprint,
+            fingerprint, search_mode,
         )
+    # The one refusal that is raised rather than returned, because the
+    # condition is discovered four call frames down inside the retrieval the
+    # per-path handlers wrap. See ``_VectorModeUnavailableError``.
+    except _VectorModeUnavailableError as e:
+        return {"ok": False, "reason": e.reason, "remediation": e.remediation}
     # THE LAST STRUCTURED-ERROR BACKSTOP. Every per-path handler below guards
     # the store call it wraps, and the routing that runs BEFORE those handlers
     # — ``_apply_hybrid`` -> ``_vector_arm_engaged`` -> ``has_embedded_rows``
@@ -1658,17 +1854,18 @@ def _dispatch(
     drilldown: bool,
     rerank: bool,
     fingerprint: str,
+    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     """Route a parsed, validated query to the path that answers it."""
     if mode == "sessions":
         return _query_sessions_path(
             store, ast, fields, page_size, cursor, drilldown, rerank,
-            fingerprint=fingerprint,
+            fingerprint=fingerprint, search_mode=search_mode,
         )
     if mode == "records":
         return _query_records_path(
             store, ast, fields, page_size, cursor, rerank,
-            fingerprint=fingerprint,
+            fingerprint=fingerprint, search_mode=search_mode,
         )
     if mode == "mismatch_sessions_on_records":
         return _mismatch_response(
@@ -1694,7 +1891,8 @@ def _dispatch(
         )
     # mode == "union"
     return _query_union_path(
-        store, ast, fields, page_size, cursor, rerank, fingerprint=fingerprint
+        store, ast, fields, page_size, cursor, rerank,
+        fingerprint=fingerprint, search_mode=search_mode,
     )
 
 
@@ -1718,15 +1916,17 @@ def _query_records_path(
     rerank: bool = False,
     *,
     fingerprint: str,
+    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
-    ast, hybrid, vec_hits = _apply_hybrid(
+    ast, hybrid, vec_hits, lexical_support = _apply_hybrid(
         store,
         "records",
         ast,
         cursor.pin_for("records"),
         frozen=(cursor.frozen or {}).get("records"),
+        search_mode=search_mode,
     )
     try:
         page_plus_one = store.query(ast, limit=page_size + 1, offset=offset)
@@ -1764,6 +1964,7 @@ def _query_records_path(
             fingerprint,
             {"records": vec_hits} if hybrid else None,
         )
+    _note_confidence(result, query_text, search_mode, lexical_support)
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -1777,15 +1978,17 @@ def _query_sessions_path(
     rerank: bool = False,
     *,
     fingerprint: str,
+    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
-    ast, hybrid, vec_hits = _apply_hybrid(
+    ast, hybrid, vec_hits, lexical_support = _apply_hybrid(
         store,
         "observations",
         ast,
         cursor.pin_for("observations"),
         frozen=(cursor.frozen or {}).get("observations"),
+        search_mode=search_mode,
     )
     frozen_out = {"observations": vec_hits} if hybrid else None
     if drilldown:
@@ -1823,6 +2026,7 @@ def _query_sessions_path(
             _attach_next_page_token(
                 result, offset + page_size, hybrid, fingerprint, frozen_out
             )
+        _note_confidence(result, query_text, search_mode, lexical_support)
         return _note_rerank(result, rerank, rr_count, rr_notice)
 
     try:
@@ -1876,6 +2080,7 @@ def _query_sessions_path(
         _attach_next_page_token(
             result, offset + page_size, hybrid, fingerprint, frozen_out
         )
+    _note_confidence(result, query_text, search_mode, lexical_support)
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -1888,6 +2093,7 @@ def _query_union_path(
     rerank: bool = False,
     *,
     fingerprint: str,
+    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     """UNION mode: no source hint, no ontology-specific keys.
 
@@ -1932,30 +2138,38 @@ def _query_union_path(
     # caller is paging: neither ontology needs the model or the index again.
     embedding = None
     needs_embedding = any(
-        _vector_arm_engaged(store, kind, ast, cursor.pin_for(kind))
+        _vector_arm_engaged(store, kind, ast, cursor.pin_for(kind), search_mode)
         and frozen_in.get(kind) is None
         for kind in ("records", "observations")
     )
     if needs_embedding:
         embedding = _query_embedding(ast.text or "")
-    rec_ast, rec_hybrid, rec_hits = _apply_hybrid(
+    rec_ast, rec_hybrid, rec_hits, rec_lexical = _apply_hybrid(
         store,
         "records",
         ast,
         cursor.pin_for("records"),
         embedding,
         frozen_in.get("records"),
+        search_mode,
     )
-    sess_ast, sess_hybrid, sess_hits = _apply_hybrid(
+    sess_ast, sess_hybrid, sess_hits, sess_lexical = _apply_hybrid(
         store,
         "observations",
         ast,
         cursor.pin_for("observations"),
         embedding,
         frozen_in.get("observations"),
+        search_mode,
     )
     query_text = ast.text
     hybrid = rec_hybrid or sess_hybrid
+    # EITHER ontology corroborating is enough. Union mode asks one question of
+    # two tables, and a keyword hit in either one is keyword support for the
+    # answer the caller receives; requiring both would report low confidence on
+    # every query whose subject only exists in one ontology, which is most of
+    # them.
+    lexical_support = rec_lexical or sess_lexical
     # Each ontology's hits are frozen SEPARATELY. They backfill at different
     # speeds — records finish in minutes, observations take weeks — so one
     # shared snapshot would let the faster table drift under the slower one.
@@ -2040,6 +2254,7 @@ def _query_union_path(
         _attach_next_page_token(
             result, offset + page_size, hybrid, fingerprint, frozen_out or None
         )
+    _note_confidence(result, query_text, search_mode, lexical_support)
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -2251,6 +2466,7 @@ async def _tool_aggregator_query(
     page_token: str | None = None,
     drilldown: bool = False,
     rerank: bool = False,
+    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     return aggregator_query(
         dsl=dsl,
@@ -2259,6 +2475,7 @@ async def _tool_aggregator_query(
         page_token=page_token,
         drilldown=drilldown,
         rerank=rerank,
+        search_mode=search_mode,
     )
 
 
