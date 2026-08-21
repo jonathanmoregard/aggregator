@@ -167,7 +167,9 @@ def test_the_weight_fetch_command_named_in_a_remediation_exists(capsys):
 
     mcp._get_reranker, saved = (lambda: Dead()), mcp._get_reranker
     try:
-        _items, reranked, notice = _maybe_rerank([{"content": "x"}], "q", True)
+        _items, reranked, notice, standout = _maybe_rerank(
+            [{"content": "x"}], "q", True
+        )
     finally:
         mcp._get_reranker = saved
 
@@ -175,4 +177,9 @@ def test_the_weight_fetch_command_named_in_a_remediation_exists(capsys):
     # and ``rerank_applied`` is a view of it. Nothing was ranked here.
     assert reranked == 0
     assert "aggregator embed --seed-models" in notice
+    # Criterion D's fourth value. ``None``, not ``False``: the model produced
+    # no scores, so it has no opinion about whether anything was relevant, and
+    # reading a dead model as "nothing stood out" would invent an answer out
+    # of a failure.
+    assert standout is None
     assert "--seed-models" in _cli_help("embed", capsys)

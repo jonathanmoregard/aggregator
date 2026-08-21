@@ -117,6 +117,47 @@ def relative_z(
     return [sign * (v - mean) / spread for v in values]
 
 
+#: How far above its own page a reranker score must stand for the page to
+#: count as containing an answer.
+#:
+#: SAME EXTREME-VALUE ARGUMENT AS ``VECTOR_FLOOR_Z``, different sample size.
+#: The cross-encoder scores one page window (20 documents here), and the
+#: largest of 20 draws from any smooth distribution sits about 1.9 standard
+#: deviations above its own mean whether or not any of them is relevant. 2.5 is
+#: the first round bar above that. Unlike the vector floor this only ever adds
+#: a caveat to a response, never removes a row, so being wrong costs a hedge
+#: rather than an answer.
+RERANK_STANDOUT_Z = 2.5
+
+
+def has_standout(
+    values: Sequence[float],
+    *,
+    higher_is_better: bool,
+    z_threshold: float,
+) -> bool | None:
+    """Does anything in ``values`` stand out from the rest? ``None`` = can't say.
+
+    THREE-VALUED ON PURPOSE. "Too few scores to judge" is not "nothing was
+    relevant", and a caller that collapsed them would report low confidence for
+    a three-hit page that simply had nothing to compare against.
+
+    NO SPREAD ANSWERS ``False``, WHICH IS THE OPPOSITE OF WHAT
+    :func:`vector_floor` DOES WITH THE SAME INPUT, and the asymmetry is
+    deliberate rather than an oversight. A cross-encoder that scored twenty
+    documents identically has told you something: none of them stands out. That
+    is worth reporting. The floor's answer to the same evidence is to keep
+    every candidate, because it DELETES rows and a wrong deletion costs the
+    user a document they know exists. Reporting a hedge costs a sentence.
+    """
+    if len(values) < VECTOR_FLOOR_MIN_SAMPLE:
+        return None
+    zs = relative_z(values, higher_is_better=higher_is_better)
+    if zs is None:
+        return False
+    return max(zs) >= z_threshold
+
+
 def vector_floor(
     scored: Sequence[tuple[str, float]],
     *,

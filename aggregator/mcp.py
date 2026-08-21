@@ -123,7 +123,12 @@ from aggregator.core.dsl import DSLError, format_help, parse
 # the ones that never run a vector query. They are imported inside
 # ``_get_embedder`` / ``_get_reranker``; ``tests/test_mcp_cold_start.py``
 # fails if that ever regresses. ``hybrid`` is pure Python and free.
-from aggregator.core.hybrid import FUSION_ARM_DEPTH, rrf_fuse
+from aggregator.core.hybrid import (
+    FUSION_ARM_DEPTH,
+    RERANK_STANDOUT_Z,
+    has_standout,
+    rrf_fuse,
+)
 from aggregator.core.scrub import scrub
 from aggregator.core.store import (
     CHAT_ORIGINS,
@@ -759,16 +764,80 @@ def _note_confidence(
     query_text: str | None,
     search_mode: str,
     lexical_support: bool,
+    rerank_standout: bool | None = None,
 ) -> dict[str, Any]:
-    """Say which arms answered, in the caller's own response.
+    """Say which arms answered and whether the answer is trusted.
 
     ONLY FOR FREE-TEXT QUERIES. A pure-filter query ran no retrieval arm at
     all, so naming the mode the caller happened to pass would describe work
-    that did not happen. Absence here means "no arm ran", which is a different
-    fact from any of the three modes and must not be spelled as one of them.
+    that did not happen, and claiming confidence would assert a judgement
+    nobody made. Absence here means "no arm ran", which is a different fact
+    from any of the three modes and must not be spelled as one of them.
+
+    ``low_confidence`` IS ALWAYS PRESENT WHEN IT APPLIES, INCLUDING WHEN IT IS
+    ``False``. An absent key is unfalsifiable from the caller's side — it reads
+    exactly like a server that predates the feature — and this is a claim about
+    the answer, so it has to be stated even when the claim is "fine". That is
+    the opposite discipline from ``_note_rerank``, whose keys answer a question
+    only the rerank caller asked; every free-text caller has this one.
+
+    THREE SIGNALS, AND NONE OF THEM IS THE FUSED SCORE. RRF scores are not
+    probabilities and carry no absolute meaning across queries, so thresholding
+    them is the one thing the design forbids. What is read instead:
+
+    1. **Nothing came back.** The query abstained. Reported as low confidence
+       rather than as a bare empty page, because an agent cannot otherwise tell
+       "we looked and there is nothing" from "the index is not built yet".
+    2. **The keyword arm corroborated none of it.** The vector arm returns its
+       ``k`` nearest neighbours whether or not any of them is relevant — a
+       recipe corpus answers a question about German stock-option taxation with
+       five recipes — so a set with no lexical support at all is the shape a
+       no-answer query produces. Only meaningful in ``hybrid`` mode: in
+       ``vector`` mode the caller excluded the keyword arm on purpose, and
+       repeating that back as a warning would be noise.
+    3. **The reranker ran and found nothing that stands out.** The report's
+       preferred abstention signal, and the weakest one HERE, because the
+       cross-encoder is off by default at ~13.7 s per pair on this hardware.
+       ``None`` means it did not run or produced no scores, which is not the
+       same as "nothing was relevant" and must not be read as it.
+
+    NOTHING IS TRUNCATED. The page comes back whole with a flag on it. An agent
+    handed a shorter page cannot distinguish a confident short answer from a
+    hedged long one, and silently dropping rows is how a recall tool starts
+    hiding documents the user knows are in there.
     """
-    if query_text:
-        result["search_mode"] = search_mode
+    if not query_text:
+        return result
+    result["search_mode"] = search_mode
+    reasons: list[str] = []
+    if not result.get("total"):
+        reasons.append(
+            "nothing matched this query on either arm, so this is an "
+            "abstention rather than a short answer"
+        )
+    else:
+        if search_mode == "hybrid" and not lexical_support:
+            reasons.append(
+                "the keyword arm matched none of these rows — they come from "
+                "the semantic arm alone, which returns its nearest neighbours "
+                "whether or not any of them is relevant"
+            )
+        if rerank_standout is False:
+            reasons.append(
+                "the reranker scored this page and found nothing that stands "
+                "out from the rest of it"
+            )
+    result["low_confidence"] = bool(reasons)
+    if not reasons:
+        return result
+    reason = "; ".join(reasons)
+    result["low_confidence_reason"] = reason
+    notice = (
+        f"LOW CONFIDENCE: {reason}. Treat these rows as candidates rather "
+        f"than as an answer, and say so if you report them."
+    )
+    prior = result.get("notice")
+    result["notice"] = f"{notice} {prior}" if prior else notice
     return result
 
 
@@ -786,10 +855,18 @@ def _rerank_doc(item: dict[str, Any]) -> str:
 
 def _maybe_rerank(
     items: list[dict[str, Any]], query: str | None, rerank: bool
-) -> tuple[list[dict[str, Any]], int, str | None]:
+) -> tuple[list[dict[str, Any]], int, str | None, bool | None]:
     """Reorder the head of a page by cross-encoder relevance.
 
-    Returns ``(items, reranked, notice)``. ``reranked`` is HOW MANY leading
+    Returns ``(items, reranked, notice, standout)``. ``standout`` is criterion
+    D's reranker-score signal: ``True`` when some document on the page scored
+    clearly above the rest, ``False`` when none did, and ``None`` when the
+    question could not be asked — the reranker did not run, it failed, or the
+    page was too short to compare scores across. ``None`` is NOT ``False``:
+    "the model died" and "nothing was relevant" are opposite facts, and
+    collapsing them would invent an answer out of a failure.
+
+    ``reranked`` is HOW MANY leading
     items were scored and reordered — 0 whenever the caller asked for
     reranking and the ordering they got is not reranked, and ``notice`` then
     says why, in the caller's own response.
@@ -823,7 +900,7 @@ def _maybe_rerank(
     nothing to do: degrading is fine, degrading invisibly is not.
     """
     if not rerank:
-        return items, 0, None
+        return items, 0, None, None
     if not query:
         # Nothing to score documents against. Reported rather than assumed
         # obvious: a caller that filtered by source and asked for relevance
@@ -833,9 +910,9 @@ def _maybe_rerank(
             "rerank did NOT apply: this query has no free text, so there is "
             "nothing to score documents against. Results are in the default "
             "recency order."
-        )
+        ), None
     if not items:
-        return items, 0, None
+        return items, 0, None, None
     window = items[:_RERANK_WINDOW]
     try:
         scores = _get_reranker().score(query, [_rerank_doc(it) for it in window])
@@ -849,11 +926,19 @@ def _maybe_rerank(
             f"themselves are unaffected: reranking never changes which "
             f"results you get. Run `aggregator embed --seed-models` if the "
             f"cross-encoder's weights are missing."
-        )
+        ), None
     order = sorted(
         range(len(window)), key=lambda i: scores[i], reverse=True
     )
-    return [window[i] for i in order] + items[_RERANK_WINDOW:], len(window), None
+    standout = has_standout(
+        list(scores), higher_is_better=True, z_threshold=RERANK_STANDOUT_Z
+    )
+    return (
+        [window[i] for i in order] + items[_RERANK_WINDOW:],
+        len(window),
+        None,
+        standout,
+    )
 
 
 def _note_rerank(
@@ -1702,6 +1787,18 @@ def aggregator_query(
       query carried free text — a pure-filter query ran no arm, and naming one
       would describe work that did not happen.
 
+      ``low_confidence`` appears under the same condition and is ALWAYS
+      present there, including when it is ``False``: it is a claim about the
+      answer, so it is stated rather than left to be inferred from a missing
+      key. ``True`` means one of three things, and ``low_confidence_reason``
+      says which — nothing matched at all; the rows came from the semantic arm
+      with no keyword corroboration (a ``k``-nearest search returns ``k``
+      results whether or not any of them is relevant); or the reranker ran and
+      found nothing on the page that stood out. NOTHING IS TRUNCATED when it
+      is set: the page comes back whole and flagged, because a shorter page
+      cannot be told apart from a confident short answer. Treat a flagged page
+      as candidates rather than as an answer, and say so when reporting it.
+
       ``reranked_count`` appears under the same condition and says HOW FAR
       DOWN THE PAGE THE RANKING GOES. Only the head of a page is scored — a
       cross-encoder pass is the 4.5 min — so ``records[:reranked_count]`` are in
@@ -1944,7 +2041,9 @@ def _query_records_path(
     has_more = len(page_plus_one) > page_size
     page_records = page_plus_one[:page_size]
     items = [_record_to_item(_scrub_record(r), fields) for r in page_records]
-    items, rr_count, rr_notice = _maybe_rerank(items, query_text, rerank)
+    items, rr_count, rr_notice, rr_standout = _maybe_rerank(
+        items, query_text, rerank
+    )
     result: dict[str, Any] = {
         "ok": True,
         "mode": "records",
@@ -1964,7 +2063,9 @@ def _query_records_path(
             fingerprint,
             {"records": vec_hits} if hybrid else None,
         )
-    _note_confidence(result, query_text, search_mode, lexical_support)
+    _note_confidence(
+        result, query_text, search_mode, lexical_support, rr_standout
+    )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -2010,7 +2111,9 @@ def _query_sessions_path(
         has_more = len(page_plus_one) > page_size
         page_obs = page_plus_one[:page_size]
         items = [_observation_to_item(o, fields) for o in page_obs]
-        items, rr_count, rr_notice = _maybe_rerank(items, query_text, rerank)
+        items, rr_count, rr_notice, rr_standout = _maybe_rerank(
+            items, query_text, rerank
+        )
         result: dict[str, Any] = {
             "ok": True,
             "mode": "observations",
@@ -2026,7 +2129,9 @@ def _query_sessions_path(
             _attach_next_page_token(
                 result, offset + page_size, hybrid, fingerprint, frozen_out
             )
-        _note_confidence(result, query_text, search_mode, lexical_support)
+        _note_confidence(
+            result, query_text, search_mode, lexical_support, rr_standout
+        )
         return _note_rerank(result, rerank, rr_count, rr_notice)
 
     try:
@@ -2063,7 +2168,9 @@ def _query_sessions_path(
         match_count = store.count_observations(session_scoped)
         preview = _session_body_preview(store, session_scoped, fields, subject)
         items.append(_session_to_item(s, fields, subject, match_count, preview))
-    items, rr_count, rr_notice = _maybe_rerank(items, query_text, rerank)
+    items, rr_count, rr_notice, rr_standout = _maybe_rerank(
+        items, query_text, rerank
+    )
     result = {
         "ok": True,
         "mode": "sessions",
@@ -2080,7 +2187,9 @@ def _query_sessions_path(
         _attach_next_page_token(
             result, offset + page_size, hybrid, fingerprint, frozen_out
         )
-    _note_confidence(result, query_text, search_mode, lexical_support)
+    _note_confidence(
+        result, query_text, search_mode, lexical_support, rr_standout
+    )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -2235,7 +2344,9 @@ def _query_union_path(
             items.append(
                 _session_to_item(obj, fields, subject, match_count, preview)
             )
-    items, rr_count, rr_notice = _maybe_rerank(items, query_text, rerank)
+    items, rr_count, rr_notice, rr_standout = _maybe_rerank(
+        items, query_text, rerank
+    )
 
     result: dict[str, Any] = {
         "ok": True,
@@ -2254,7 +2365,9 @@ def _query_union_path(
         _attach_next_page_token(
             result, offset + page_size, hybrid, fingerprint, frozen_out or None
         )
-    _note_confidence(result, query_text, search_mode, lexical_support)
+    _note_confidence(
+        result, query_text, search_mode, lexical_support, rr_standout
+    )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
