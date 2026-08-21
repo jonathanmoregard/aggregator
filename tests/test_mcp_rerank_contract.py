@@ -17,16 +17,18 @@ The observation route is the pure case: every document is the same literal
 string, so the ordering is noise by construction. The others are not empty but
 are no better a deal, and this is the part worth being precise about — they
 rank on ``subject``, which the response ALREADY returns to the caller. A
-47-second cross-encoder pass over fields the caller is holding in its hand
+multi-minute cross-encoder pass over fields the caller is holding in its hand
 buys nothing it could not compute for free.
 
 The decision is to refuse, not to auto-upgrade ``fields``. Auto-upgrading
 would change the caller's payload shape behind its back — summary and full
-items differ in more than one key — and would still cost the 47 s. Refusing
-costs nothing at all: it happens before any retrieval runs.
+items differ in more than one key — and would still cost the whole pass.
+Refusing costs nothing at all: it happens before any retrieval runs.
 
-Measured cost of the thing being refused: 47 s median, 59 s worst case per
-call on this CPU, against 0.65 s for the same query without it.
+Measured cost of the thing being refused, re-measured 2026-08-21 over 12 real
+pages from a read-only snapshot of the live cache: 273 s median, 304 s p95 per
+call on this CPU, against 0.65 s for the same query without it. See
+``mcp._RERANK_WINDOW``.
 """
 
 from __future__ import annotations

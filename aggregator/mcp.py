@@ -53,10 +53,17 @@ closeable from here. What bounds it:
   false. ``_downloads_denied`` now removes the variable across both model
   constructions.
 
-What is NOT bounded, and is the sharper end of this in practice: the model is
-~2 GB RSS and there is no ``MemoryMax`` on the editor's process. Availability,
-not code execution, is the realistic failure — the same shape as the page-token
-decompression bomb fixed above, arrived at legitimately.
+Availability, not code execution, is the realistic failure here — the same
+shape as the page-token decompression bomb fixed above, arrived at
+legitimately. IT WAS NOT A HYPOTHETICAL. The model is ~2 GB RSS at rest, but
+the pass over it was unbounded in sequence length: measuring one real page
+that held a 25941-token record OOM-killed the process at 20.2 GB RSS and
+9.4 GB of swap. On this surface that is the user's editor dying because they
+asked a question. ``rerank.MAX_PAIR_TOKENS`` now caps each pair at 512 tokens,
+so the peak is a function of ``_RERANK_WINDOW`` and that cap rather than of
+the longest document the corpus happens to contain. There is still no
+``MemoryMax`` on the editor's process, and that part remains uncloseable from
+here.
 
 Routing: two ontologies, one DSL surface.
 
@@ -151,14 +158,34 @@ _VECTOR_ARM_K = 50
 # How many hits of a page the cross-encoder reorders when ``rerank=True``.
 # A latency budget, not a quality knob.
 #
-# MEASURED, AND THE ORIGINAL ESTIMATE WAS OPTIMISTIC BY ROUGHLY 8x. The
-# 300 ms/pair figure this constant was sized against holds for short pairs;
-# on real corpus rows — a whole observation or record body against the query
-# — Task M measured ``rerank=True`` at 47 s median and 59 s worst case per
-# query on this CPU (20 pairs, Qwen3-Reranker-0.6B, no GPU), against 0.65 s
-# for the same query without it. So the flag is a background/batch facility
-# on this hardware, not something to hold an interactive turn open for, and
-# the number to shrink if that changes is this one.
+# RE-MEASURED 2026-08-21 ON A READ-ONLY SNAPSHOT OF THE REAL 505k-OBSERVATION
+# CACHE, and the previously recorded figure did not reproduce. 12 real pages
+# from the golden query set, 20 pairs each, ``fields='full'``,
+# Qwen3-Reranker-0.6B on this CPU (i7-1365U, no GPU), each page scored in its
+# own process under a 10 GB cgroup cap:
+#
+#                        pages done   wall P50   wall P95   median doc
+#   before this wave        9 / 12      128 s      190 s      189 tok
+#   as it ships now        12 / 12      273 s      304 s      546 tok
+#
+# READ BOTH COLUMNS TOGETHER OR THE COMPARISON INVERTS. The three pages the
+# old configuration did not finish are the EXPENSIVE ones — each held a
+# 25941-token record, the batch padded to it, and the process was OOM-killed
+# (20.2 GB RSS, 9.4 GB swap, uncapped). So "128 s" is the median of the pages
+# that happened not to contain a long document, and the old tail was not slow
+# but ABSENT. ``rerank.MAX_PAIR_TOKENS`` bounds it, and every page now
+# completes. The median moved the other way because the documents are real:
+# session cards used to be scored against their own subject (see
+# ``_session_body_preview``), so the old median was cheap and meaningless.
+#
+# THE STAGE CANNOT BE MADE INTERACTIVE BY TUNING THIS NUMBER. ~13.7 s per
+# (query, document) pair means even a window of 1 misses a 500 ms budget by
+# 27x. Closing that needs a ~25x smaller cross-encoder (a MiniLM-class or
+# int8-ONNX reranker); none is in the local model cache and this codebase does
+# not download weights on the recall path. 20 is kept because it is already
+# inside the "at most 50 candidates into the reranker" band the retrieval
+# literature gives, and cutting it further would trade ranking quality for a
+# target that stays out of reach either way.
 _RERANK_WINDOW = 20
 
 # THE PAGE TOKEN IS CALLER-CONTROLLED INPUT, NOT SERVER STATE. It looks like
@@ -616,7 +643,7 @@ def _maybe_rerank(
 
     A COUNT AND NOT A BOOLEAN, because the boolean could not answer the
     question the caller actually has. This reorders at most ``_RERANK_WINDOW``
-    items — a latency budget, 47 s median per pass — while a page holds up to
+    items — a latency budget, 273 s median per pass — while a page holds up to
     200, and the reordered rows are byte-for-byte indistinguishable from the
     untouched ones below them. So ``rerank_applied: true`` on a 40-hit page
     described 20 ranked rows and 20 recency-ordered ones with a single word,
@@ -638,7 +665,7 @@ def _maybe_rerank(
     nicety is the wrong trade. WHAT CHANGED IS THAT IT IS NO LONGER SILENT.
     The failure used to go to the log and nowhere else, and a page in recency
     order is indistinguishable from a page in reranked order, so the caller
-    waited ~47 s for an ordering, did not get it, and was not told. That is
+    waited minutes for an ordering, did not get it, and was not told. That is
     the same shape as an ingest that stops and looks like an ingest with
     nothing to do: degrading is fine, degrading invisibly is not.
     """
@@ -1432,17 +1459,21 @@ def aggregator_query(
               full cost for that ordering.
 
               EXPENSIVE — DO NOT SET THIS IN AN INTERACTIVE TURN. Measured
-              against real corpus bodies on this machine (CPU, no GPU):
-              **47 s median, 59 s worst case per call**, versus 0.65 s for
-              the same query without it, plus a one-off model load on first
-              use. It is a batch/offline facility here, not an interactive
-              one.
+              2026-08-21 against real corpus bodies on this machine (CPU, no
+              GPU), over 12 real pages of 20 hits each from a snapshot of the
+              live cache: **273 s median, 304 s at p95 per call** — about
+              4.5 minutes — against 0.65 s for the same query without it, plus
+              a one-off model load on first use. That is ~13.7 s per
+              (query, document) pair, so no smaller ``page_size`` makes it
+              interactive; it is a batch/offline facility here. The figure
+              this docstring carried before was an order of magnitude lower
+              and did not reproduce — see ``_RERANK_WINDOW`` for the table.
 
               THE BATCH SURFACE IS ``aggregator query --rerank``, run from a
-              terminal, which is where a 47-second wait belongs and where the
-              operator can see it happening. That flag also refuses out loud
-              when the cross-encoder's weights cannot be loaded, rather than
-              handing back an unranked page. Its weights come from
+              terminal, which is where a multi-minute wait belongs and where
+              the operator can see it happening. That flag also refuses out
+              loud when the cross-encoder's weights cannot be loaded, rather
+              than handing back an unranked page. Its weights come from
               ``aggregator embed --seed-models``, the only path that fetches
               them.
 
@@ -1487,7 +1518,7 @@ def aggregator_query(
 
       ``reranked_count`` appears under the same condition and says HOW FAR
       DOWN THE PAGE THE RANKING GOES. Only the head of a page is scored — a
-      cross-encoder pass is the 47 s — so ``records[:reranked_count]`` are in
+      cross-encoder pass is the 4.5 min — so ``records[:reranked_count]`` are in
       relevance order and ``records[reranked_count:]`` are in the default
       recency order, and nothing about the rows themselves distinguishes the
       two. Read the seam from this number rather than assuming a window size;
@@ -1547,13 +1578,13 @@ def aggregator_query(
     # ``score()``: on the drilldown route all 3 documents were the single
     # literal string ``'user\n\n'``, an ordering over nothing; on the other
     # routes the documents differed but carried only ``subject``, which the
-    # response already returns to the caller. Either way the 47 s median buys
-    # nothing.
+    # response already returns to the caller. Either way the multi-minute pass
+    # buys nothing.
     #
     # REFUSED RATHER THAN AUTO-UPGRADED TO ``fields='full'``. Auto-upgrading
     # would change the payload shape behind the caller's back — full items
     # carry wrapped bodies that summary items do not — and would still spend
-    # the 47 s the caller has not been told about. Refusing spends nothing:
+    # the minutes the caller has not been told about. Refusing spends nothing:
     # this runs before any retrieval.
     if rerank and fields != "full":
         return {
@@ -1561,7 +1592,7 @@ def aggregator_query(
             "reason": (
                 f"rerank=True needs document bodies to score, and "
                 f"fields={fields!r} does not return them — the cross-encoder "
-                f"would rank on an empty body, at ~47 s per call"
+                f"would rank on an empty body, at ~4.5 min per call"
             ),
             "remediation": (
                 "Re-call with fields='full' (CLI: --fields full) to rerank "

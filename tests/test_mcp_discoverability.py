@@ -93,14 +93,20 @@ def test_search_description_has_use_and_dont_use_guidance():
 
 
 def test_search_description_states_the_measured_cost_of_rerank():
-    """A parameter whose real cost is 70x its documented cost is a trap.
+    """A parameter whose real cost is 400x its documented cost is a trap.
 
-    ``rerank=True`` was documented as "roughly 300 ms per hit", so a caller
-    reading the tool schema would reasonably set it inside an interactive
-    turn. Task M measured it against real corpus bodies at **47 s median,
-    59 s worst** per call on this CPU, versus 0.65 s for the same query
-    without it. The caller reads THIS string and nothing else before
-    deciding, so the number in it has to be the measured one.
+    ``rerank=True`` was first documented as "roughly 300 ms per hit", so a
+    caller reading the tool schema would reasonably set it inside an
+    interactive turn. That was replaced by Task M's "47 s median", and THAT
+    did not reproduce either: re-measured 2026-08-21 over 12 real pages of 20
+    hits from a read-only snapshot of the live cache, the shipped stage costs
+    **273 s median / 304 s p95** per call on this CPU, versus 0.65 s without.
+
+    The caller reads THIS string and nothing else before deciding, so the
+    number in it has to be the current measured one. Twice now the figure here
+    has been optimistic by an order of magnitude, which is why this test pins
+    it rather than trusting review — but it pins the ORDER, not the digits, so
+    honest re-measurement does not have to fight it.
     """
     desc = _tools(build_server())[SEARCH_TOOL_NAME].description or ""
     _, _, rerank_doc = desc.partition("rerank:")
@@ -108,10 +114,19 @@ def test_search_description_states_the_measured_cost_of_rerank():
     assert "300 ms" not in rerank_doc, (
         "the rerank docs still quote the falsified 300 ms/hit estimate"
     )
-    assert "47 s" in rerank_doc, (
-        "the rerank docs must quote the measured per-call cost (47 s median) "
-        "so a caller can tell an interactive call from a batch one. If this "
-        "was re-measured, update the number here and at _RERANK_WINDOW."
+    assert "47 s" not in rerank_doc, (
+        "the rerank docs still quote the falsified 47 s median; it was "
+        "re-measured at 273 s on the real index"
+    )
+    assert "273 s" in rerank_doc, (
+        "the rerank docs must quote the measured per-call cost so a caller "
+        "can tell an interactive call from a batch one. If this was "
+        "re-measured, update the number here and at _RERANK_WINDOW."
+    )
+    assert "minute" in rerank_doc, (
+        "seconds-with-three-digits reads as small at a glance; the docs must "
+        "also say it in minutes, which is the unit that stops an LLM caller "
+        "setting this in an interactive turn"
     )
 
 

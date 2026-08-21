@@ -1,7 +1,7 @@
 """``rerank_applied: true`` did not say how much of the page was ranked.
 
 ``_maybe_rerank`` reorders at most ``_RERANK_WINDOW`` = 20 items — a latency
-budget, since a cross-encoder pass costs 47 s median on this CPU — while a
+budget, since a cross-encoder pass costs 273 s median on this CPU — while a
 page holds up to 200 (summary) or 40 (full). So the response could carry 40
 hits of which 20 were scored, and the only thing it said about that was
 ``rerank_applied: true``.
