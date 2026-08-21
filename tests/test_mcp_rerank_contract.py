@@ -1,4 +1,16 @@
-"""``rerank=True`` must not spend 47 seconds ranking text it was never given.
+"""``rerank=True`` must not spend minutes ranking text it was never given.
+
+THE TITLE USED TO QUOTE "47 seconds" AND THAT FIGURE IS FALSIFIED. b8c00ea
+corrected the body of this file and missed the line above it, which is exactly
+how a retracted number outlives its retraction: it sits in the one place nobody
+re-reads. 47 s was an artifact of the very bug described below — the reranker
+was scoring session cards against their own subject lines, so it was timing
+short strings and calling the result the cost of ranking documents. Re-measured
+2026-08-21 over 12 real pages from a read-only snapshot of the live cache:
+273 s median, 304 s p95, ~13.7 s per (query, document) pair, reranker OFF by
+default. 0.65 s is the no-rerank baseline and is CORRECT — it never involved
+the reranker, so the bug could not touch it.
+
 
 ``_rerank_doc`` builds the string the cross-encoder scores out of the result
 ITEM, not out of the stored row — and an item's ``content`` is deliberately
