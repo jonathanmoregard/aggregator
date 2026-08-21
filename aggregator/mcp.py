@@ -123,7 +123,7 @@ from aggregator.core.dsl import DSLError, format_help, parse
 # the ones that never run a vector query. They are imported inside
 # ``_get_embedder`` / ``_get_reranker``; ``tests/test_mcp_cold_start.py``
 # fails if that ever regresses. ``hybrid`` is pure Python and free.
-from aggregator.core.hybrid import rrf_fuse
+from aggregator.core.hybrid import FUSION_ARM_DEPTH, rrf_fuse
 from aggregator.core.scrub import scrub
 from aggregator.core.store import (
     CHAT_ORIGINS,
@@ -140,20 +140,26 @@ _DEFAULT_PAGE_SIZE_SUMMARY = 200
 _DEFAULT_PAGE_SIZE_FULL = 40
 
 # How many neighbours the vector arm contributes per query. The FTS5 arm is
-# NOT capped — see ``_fused_id_scope`` for why that asymmetry is deliberate.
+# NOT capped — see ``_fused_id_scope`` for why that asymmetry is deliberate,
+# and note that "150 per arm" is a FLOOR, which an uncapped arm satisfies.
 #
-# A COUNT IS THE ONLY LIMIT: there is no distance floor, on purpose. Task M
-# measured the cosine-distance distributions on a copy of the live cache and
-# found the two populations inseparable at production scale — the nearest
-# IRRELEVANT chunk sits at ~0.55 once the index holds the full corpus's 422k
-# chunks, which is the median distance of the documents only the vector arm
-# can reach. Any cutoff that suppresses a no-answer query there also throws
-# away more than half the vector arm's unique recall, and on a personal
-# recall tool a false "nothing found" is the worse failure. The measured
-# distributions and the reasoning are in
-# ``tests/test_mcp_hybrid.py::test_a_warm_vector_arm_returns_neighbours_even_for_an_unrelated_query``;
-# the harness that produced them is ``scripts/rag_rollout_smoke.py``.
-_VECTOR_ARM_K = 50
+# READ FROM ``hybrid`` RATHER THAN DECLARED HERE. This module carried its own
+# 50 while ``aggregator.evals.search`` carried its own 150, so the pipeline
+# the eval harness measured was not the pipeline this server served, and the
+# harness could have reported a clean run over a configuration nobody uses.
+# Depth is also not a latency knob: below roughly 50 per arm RRF degenerates,
+# because too few documents appear in both lists for the cross-arm agreement
+# signal to fire at all.
+#
+# A COUNT IS STILL THE ONLY LIMIT ON THIS PATH, and that is now a gap rather
+# than a decision. ``hybrid.vector_floor`` is the per-arm distance floor the
+# design calls for, and it cannot be wired from here: ``Store._vec_obs_ids``
+# orders by distance and then selects the id column alone, so the number the
+# floor reads is computed by sqlite-vec and discarded one layer down. Until
+# those reads return ``(id, distance)`` the vector arm contributes its k
+# nearest neighbours however far away they are, and the only abstention on
+# this path is the low-confidence signal ``_note_confidence`` attaches.
+_VECTOR_ARM_K = FUSION_ARM_DEPTH
 
 # How many hits of a page the cross-encoder reorders when ``rerank=True``.
 # A latency budget, not a quality knob.

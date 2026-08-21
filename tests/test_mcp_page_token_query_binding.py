@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 
 from aggregator.core.store import Store
-from aggregator.mcp import aggregator_query
+from aggregator.mcp import _VECTOR_ARM_K, aggregator_query
 from aggregator.sources.base import ObservationRow, SessionRow
 
 # Two orthogonal topics. The stub embedder puts each on its own axis, so a
@@ -36,11 +36,14 @@ from aggregator.sources.base import ObservationRow, SessionRow
 # other — which is what makes "the wrong query's neighbours" visible.
 _AXES = {"voting": 0, "governance": 0, "quadratic": 0, "pigeon": 1, "roost": 1}
 
-# Bigger than ``_VECTOR_ARM_K``. Below the cap the KNN returns the entire
-# corpus for ANY query, so the two queries' vector arms would be the same set
-# and the injection would be invisible. The bug only shows above the cap, which
-# is also the only size the live cache ever has.
-_PER_TOPIC = 50
+# DERIVED FROM THE ARM'S DEPTH, not a literal beside it. The seed has to put
+# the CORPUS (two topics) above the cap while leaving ONE topic exactly at it:
+# below the cap the KNN returns the whole corpus for any query, so both
+# queries' vector arms would be the same set and the injection would be
+# invisible. Criterion G raised the depth from 50 to 150 and this file was the
+# only place in the suite where a hardcoded 50 quietly voided the premise —
+# every assertion still passed, against a test that no longer tested anything.
+_PER_TOPIC = _VECTOR_ARM_K
 
 
 class StubEmbedder:
@@ -154,11 +157,11 @@ def _ids(result) -> list[str]:
 def test_a_token_minted_for_one_query_is_refused_by_another(store, embedder):
     """THE REPRO.
 
-    ``governance`` mints a token whose payload freezes 50 voting-topic vector
-    hits. Handing it back with ``dsl='pigeon'`` fused those 50 ids into the
-    pigeon query's candidate set and answered at an offset cut from the voting
-    query's ordering — ``ok: True``, no notice, rows a pigeon query cannot
-    reach.
+    ``governance`` mints a token whose payload freezes a full arm's worth of
+    voting-topic vector hits. Handing it back with ``dsl='pigeon'`` fused those
+    ids into the pigeon query's candidate set and answered at an offset cut
+    from the voting query's ordering — ``ok: True``, no notice, rows a pigeon
+    query cannot reach.
     """
     _seed_two_topics(store)
 
@@ -221,7 +224,10 @@ def test_the_same_query_still_pages_through_its_own_token(store, embedder):
     _seed_two_topics(store)
     seen: list[str] = []
     token = None
-    for _ in range(6):
+    # Bounded by the corpus rather than by a literal page count: the page size
+    # is fixed and the seed size follows ``_VECTOR_ARM_K``, so a hardcoded
+    # number of iterations stops covering the set the moment the depth moves.
+    for _ in range(2 * _PER_TOPIC // 20 + 2):
         page = aggregator_query(
             "governance", page_size=20, page_token=token, _store=store
         )
@@ -230,6 +236,7 @@ def test_the_same_query_still_pages_through_its_own_token(store, embedder):
         token = page.get("next_page_token")
         if not token:
             break
+    assert token is None, "pagination did not terminate within the corpus"
     assert len(seen) == len(set(seen)), f"row served twice: {seen}"
     assert set(seen) == {f"s-v{i}" for i in range(_PER_TOPIC)}
 
