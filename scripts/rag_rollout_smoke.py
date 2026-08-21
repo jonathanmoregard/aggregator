@@ -981,7 +981,36 @@ def store_fts_all(db: Path, text: str) -> list[str]:
     Uncapped on purpose: this is used to decide whether FTS5 can reach a
     document at all, and a top-K view would call a document unreachable
     merely because it ranked 11th.
+
+    THE SHIPPED WHITELIST, for the same reason :func:`_fts_ranked` uses it and
+    then some. This bound raw user text to ``MATCH`` until now, and against the
+    509k-row snapshot six of seven realistic queries raised —
+    ``power-on`` ("no such column: on"), ``#42``, ``cache.db``, ``C++ 17``,
+    ``nixos-rebuild``, ``sqlite-vec``; only ``quadratic voting`` came back. The
+    caller turned every one of those into an empty exclusion set, so the
+    ``cosine_distance.vector_only_relevant`` distribution — the one a distance
+    floor is judged against — was computed with six sevenths of its "already
+    reachable by FTS5" filter missing, and looked entirely normal.
+
+    Sanitizing only SOME of the sites is how this defect survived two previous
+    fixes; ``tests/test_fts5_match_site_enumeration.py`` now enumerates them
+    from the source rather than from anybody's memory.
+
+    An empty rewrite means "no word characters at all", and the store runs NO
+    MATCH in that case. Reproduced rather than approximated: ``MATCH ''`` is a
+    different question, and an unconstrained MATCH would mark every document
+    reachable-by-FTS5 and empty the same population from the other direction.
+
+    Raises ``sqlite3.OperationalError`` and does not catch it. After the
+    rewrite a failure cannot be a syntax error, so it is a lock or a corrupt
+    index — a fact about the CACHE, and one the caller must not receive
+    disguised as a query with no lexical matches.
     """
+    from aggregator.core.store import fts5_match_query
+
+    match_expr = fts5_match_query(text)
+    if not match_expr:
+        return []
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     try:
@@ -991,7 +1020,7 @@ def store_fts_all(db: Path, text: str) -> list[str]:
             "JOIN observations o ON o.rowid = f.rowid WHERE obs_fts MATCH ?",
             "SELECT stable_id AS i FROM records_fts WHERE records_fts MATCH ?",
         ):
-            out.extend(r["i"] for r in conn.execute(sql, (text,)))
+            out.extend(r["i"] for r in conn.execute(sql, (match_expr,)))
         return out
     finally:
         conn.close()
@@ -1236,11 +1265,17 @@ def cmd_distances(args: argparse.Namespace) -> int:
     qq = 1.0 - (qmat @ qmat.T)
     vector_only: list[float] = []
     vector_only_pairs = 0
+    #
+    # NOTHING IS CAUGHT HERE. An emptied ``fts_b`` does not fail — it quietly
+    # stops excluding, so every BM25-reachable document is counted as
+    # vector-only and the distribution below shifts toward the distances of
+    # documents the lexical arm already had. That is the exact failure that hid
+    # the raw-MATCH bug in ``store_fts_all`` for two rounds: six of seven real
+    # queries raised, all six were turned into ``set()``, and the JSON came out
+    # looking like a measurement. A cache that cannot answer a MATCH cannot
+    # produce this number at all, and saying so is the only honest option.
     for i, b in enumerate(queries):
-        try:
-            fts_b = set(store_fts_all(db, b))
-        except sqlite3.OperationalError:
-            fts_b = set()
+        fts_b = set(store_fts_all(db, b))
         for j, a in enumerate(queries):
             if i == j or float(qq[i, j]) > args.paraphrase_max:
                 continue

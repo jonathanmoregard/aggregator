@@ -3,8 +3,17 @@
 THE SCRIPT IS NOT A GATE AND THIS FILE DOES NOT MAKE IT ONE. Its own docstring
 is explicit: it needs a multi-GB copy of a real cache to say anything, so it
 can never be a pytest test. What this file pins is narrower and cheap — that
-the ONE helper standing between a raw query string and ``MATCH`` is the shipped
+BOTH helpers standing between a raw query string and ``MATCH`` are the shipped
 one. Nothing else here touches the script.
+
+THERE ARE TWO, AND AN EARLIER VERSION OF THIS DOCSTRING SAID THERE WAS ONE.
+``_fts_ranked`` (via ``fts_obs_ranked``/``fts_rec_ranked``) was fixed and
+covered here; ``store_fts_all`` was not, and its only caller swallowed the
+resulting ``OperationalError`` into an empty set, so six of seven realistic
+queries failed against a real snapshot with nothing going red. The claim was
+load-bearing: it is what a later reader consults to decide whether the class
+of defect is closed. ``tests/test_fts5_match_site_enumeration.py`` now derives
+the list of helpers mechanically instead of asserting it in prose.
 
 WHY IT EARNS A TEST AT ALL. The script produces rollout facts with a shelf
 life: "34% of real queries return ok:false" came out of it, and that number is
@@ -131,3 +140,101 @@ def test_a_genuinely_broken_index_still_comes_back_as_an_error(smoke, conn):
 
     assert hits == []
     assert error is not None and "obs_fts" in error
+
+
+# --- the SECOND helper: store_fts_all ----------------------------------------
+#
+# It opens its own connection from a path rather than taking one, so it needs a
+# file, and it queries BOTH ontologies, so it needs both tables.
+
+
+@pytest.fixture
+def db_file(tmp_path):
+    """A two-ontology cache small enough to build in a millisecond."""
+    path = tmp_path / "cache.db"
+    c = sqlite3.connect(str(path))
+    c.executescript(
+        """
+        CREATE TABLE observations (obs_id TEXT PRIMARY KEY, body TEXT);
+        CREATE VIRTUAL TABLE obs_fts USING fts5(
+            body, content='observations', content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE VIRTUAL TABLE records_fts USING fts5(
+            stable_id UNINDEXED, source UNINDEXED, subject, body, tags,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        """
+    )
+    c.execute(
+        "INSERT INTO observations(rowid, obs_id, body) VALUES (1, ?, ?)",
+        ("o1", "the power-on self test writes to cache.db"),
+    )
+    c.execute("INSERT INTO obs_fts(rowid, body) SELECT rowid, body FROM observations")
+    c.execute(
+        "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("gh:1", "github", "power-on", "sqlite-vec and C++ 17 notes", ""),
+    )
+    c.commit()
+    c.close()
+    return path
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["power-on", "#42", "cache.db", "C++ 17", "nixos-rebuild", "sqlite-vec"],
+)
+def test_store_fts_all_answers_the_queries_that_used_to_raise(smoke, db_file, query):
+    """THE REPRO, at the exact shape measured against the 509k-row snapshot.
+
+    Driven through the shipped function, six of these seven raised — ``power-on``
+    'no such column: on', ``#42`` 'fts5: syntax error near "#"', and so on — and
+    only ``quadratic voting`` survived. Every one of them is an ordinary thing a
+    person types.
+    """
+    smoke.store_fts_all(db_file, query)
+
+
+def test_store_fts_all_uses_the_shipped_sanitizer_and_not_a_copy(
+    smoke, db_file, monkeypatch
+):
+    """Same substitution check as its sibling, for the same reason: a local
+    copy of the whitelist is how the two helpers drift apart again."""
+    seen: list[str] = []
+    real = store_mod.fts5_match_query
+
+    def spy(text):
+        seen.append(text)
+        return real(text)
+
+    monkeypatch.setattr(store_mod, "fts5_match_query", spy)
+    smoke.store_fts_all(db_file, "power-on")
+
+    assert seen == ["power-on"], seen
+
+
+def test_store_fts_all_reaches_both_ontologies(smoke, db_file):
+    """Uncapped across obs AND records — the exclusion it feeds is "can FTS5
+    reach this document at all", and missing one ontology understates it."""
+    assert set(smoke.store_fts_all(db_file, "power-on")) == {"o1", "gh:1"}
+
+
+def test_store_fts_all_matches_nothing_for_an_all_punctuation_query(smoke, db_file):
+    """Not everything. An unconstrained MATCH would mark every document
+    'already reachable by FTS5' and empty the vector-only population from the
+    other direction."""
+    assert smoke.store_fts_all(db_file, "!!! ...") == []
+
+
+def test_store_fts_all_still_raises_when_the_index_is_broken(smoke, db_file):
+    """Fail loudly. After the rewrite a failure cannot be a syntax error, so it
+    is a lock or a corrupt index — a fact about the CACHE, and one that must
+    not reach the caller disguised as a query with no matches."""
+    c = sqlite3.connect(str(db_file))
+    c.execute("DROP TABLE obs_fts")
+    c.commit()
+    c.close()
+
+    with pytest.raises(sqlite3.OperationalError):
+        smoke.store_fts_all(db_file, "power-on")
