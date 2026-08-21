@@ -58,6 +58,7 @@ from typing import Any
 from aggregator.core.chunk import chunk_body
 from aggregator.core.embed import MODEL_DOWNLOAD_ENV, Embedder, downloads_allowed
 from aggregator.core.store import (
+    EMBED_BACKLOG_ORDER,
     EmptyRebuildRefusedError,
     Store,
 )
@@ -539,12 +540,25 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     # index, and the date a human was first told. Nothing here is a count
     # summary — a quarantine you cannot name is one you cannot fix.
     known_faults = store.fault_summary()
+    # WHICH SOURCES THE VECTOR ARM CAN ACTUALLY ANSWER FOR. The backfill is a
+    # measured 25-30 days on this hardware and runs in the user's chosen order
+    # (dropbox, substack, claude-web/chatgpt, sessions, subagents, then the
+    # rest), so for most of its life this cache is PARTIALLY embedded — and a
+    # source nobody has reached yet returns exactly what a finished source with
+    # nothing on the topic returns: no vector hits. This is where those two are
+    # told apart, per source, by name.
+    #
+    # Read here rather than added to ``aggregator_capabilities``: that surface
+    # is on the MCP connect path, and 0.3 s of GROUP BY belongs on a command a
+    # human typed.
+    embedding_progress = store.embed_progress_by_source()
     if args.json:
         caps["ticktick_uncovered_projects"] = uncovered
         caps["stale_input_markers"] = stale_inputs
         caps["ingest_state"] = ingest_state
         caps["held_records"] = held_records
         caps["known_faults"] = known_faults
+        caps["embedding_progress"] = embedding_progress
         print(json.dumps(caps, indent=2, default=str))
         return 0
     print(f"cache_path: {caps['cache_path']}")
@@ -554,6 +568,13 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     for s in caps["sources"]:
         fresh = caps["freshness"].get(s, "n/a")
         print(f"  {s}: last_updated={fresh}")
+    print("embedding progress by source (highest priority first):")
+    for row in embedding_progress:
+        print(
+            f"  {row['source']}: {row['state']} — {row['embedded']}/{row['total']} "
+            f"embedded, {row['pending']} pending, {row['skipped']} nothing to "
+            f"embed, {row['errors']} held ({row['kind']})"
+        )
     print("ingest windows (per-source high-water marks):")
     for name in sorted(SOURCE_CURSORS):
         cursor = SOURCE_CURSORS[name]
@@ -1804,9 +1825,7 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
             print("another embed worker is running; exiting")
             return 0
 
-        kinds = (
-            ["observations", "records"] if args.source == "both" else [args.source]
-        )
+        plan = _embed_plan(args.source)
         outcome = _EmbedOutcome()
         ledger = PoisonLedger(store)
         # BEFORE any row is selected: a claim left on disk means the previous
@@ -1832,11 +1851,27 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
             # untouched. Which signal the process could handle is exactly the
             # crash/shutdown distinction, so it is the one being read.
             with graceful_shutdown() as stop:
-                for kind in kinds:
-                    _embed_backlog(
-                        store, embedder, kind, args, ledger, outcome, stop
+                # ONCE PER ONTOLOGY, ABOVE THE WALK. See ``_requeue_due_rows``:
+                # the walk visits an ontology up to four times, and a requeue
+                # inside it would make "no row is retried by the run that held
+                # it" depend on the backoff outlasting a pass.
+                for kind in dict.fromkeys(k for k, _ in plan):
+                    _requeue_due_rows(store, ledger, kind)
+                for kind, source in plan:
+                    worked = _embed_backlog(
+                        store, embedder, kind, args, ledger, outcome, stop,
+                        source=source,
                     )
+                    if outcome.interrupted:
+                        break
+                    # ``--once`` IS ONE BATCH, NOT ONE PER GROUP — and it has to
+                    # skip PAST the groups that are already drained, or a
+                    # finished dropbox starves everything ranked behind it and
+                    # the priority order becomes a deadlock.
+                    if args.once and worked:
+                        break
             _flip_completed_pointer(store, args, outcome)
+            _report_embed_progress(store)
         except (EmbedderUnhealthyError, EmbedStoreUnavailableError) as e:
             # ANNOUNCE FIRST, THEN ABORT. Rows attributed earlier in this run
             # passed their own health probe and have ledger entries already
@@ -2297,6 +2332,87 @@ def _embed_ledger_source(kind: str) -> str:
     return f"embed:{kind}"
 
 
+def _embed_plan(source_arg: str) -> list[tuple[str, str]]:
+    """The ``(kind, source)`` groups this run drains, IN PRIORITY ORDER.
+
+    THE USER'S 2026-08-21 DIRECTIVE, executed. ``dropbox -> blog -> llm ->
+    claude code``, then the sources they did not rank. The worker used to loop
+    over ontologies — all observations, then all records — and no ordering
+    inside ``select_unembedded`` could have produced the user's sequence,
+    because it cuts across the ontologies: two records sources come before
+    every observation and four more come after. So the loop is over the plan
+    and the ontology is a property of each step.
+
+    That matters at the scale this runs at. The full backfill is a measured
+    25-30 days of continuous CPU; under the old loop dropbox — the source the
+    user put FIRST — queued behind 505k observations, which is weeks.
+
+    ``--source observations|records`` still narrows to one ontology, and
+    narrowing does not flatten: the surviving groups keep their relative order.
+    """
+    if source_arg == "both":
+        return list(EMBED_BACKLOG_ORDER)
+    return [(k, s) for k, s in EMBED_BACKLOG_ORDER if k == source_arg]
+
+
+def _report_embed_progress(store: Store, out=None) -> None:
+    """Print how far each source has got. The answer to the question asked.
+
+    "Which sources are fully embedded" is what a user wants to know about a
+    multi-week backfill, and a global percentage cannot answer it: one "62%"
+    is compatible with dropbox untouched and with dropbox finished, which are
+    opposite answers to "can I search my notes yet".
+
+    EVERY GROUP IS LISTED, INCLUDING THE EMPTY ONES. A source holding no rows
+    and a source fully embedded return the same zero vector hits for every
+    query, so ``empty`` is printed as its own word rather than rolled into
+    ``complete`` or omitted. Same reason the states are the ones
+    ``Store.vector_index_state`` already uses.
+
+    One grouped query per ontology — measured at 0.29 s over the live corpus
+    snapshot's 505k observations — so a 30-minute timer can afford it once per
+    run. Best-effort: a progress display must never be the thing that fails a
+    run that embedded rows successfully.
+    """
+    out = out or sys.stdout
+    try:
+        rows = store.embed_progress_by_source()
+    except Exception as e:  # noqa: BLE001 - reporting must not fail the run
+        print(f"embedding progress unavailable: {e}", file=sys.stderr)
+        return
+    print("embedding progress by source (highest priority first):", file=out)
+    for row in rows:
+        print(
+            f"  {row['source']}: {row['state']} — {row['embedded']}/{row['total']} "
+            f"embedded, {row['pending']} pending, {row['skipped']} nothing to "
+            f"embed, {row['errors']} held ({row['kind']})",
+            file=out,
+        )
+
+
+def _requeue_due_rows(store: Store, ledger: PoisonLedger, kind: str) -> None:
+    """Put back the rows whose backoff has expired. ONCE PER RUN, PER ONTOLOGY.
+
+    A row that failed left the backlog under ``embedding_state = 'error'``, so
+    ``select_unembedded`` cannot see it and no amount of draining would ever
+    try it again. Putting the due ones back is what makes the hold a RETRY
+    rather than a deletion.
+
+    IT LIVES HERE, ABOVE THE PRIORITY WALK, and that placement is the whole
+    reason it is its own function. It used to sit at the top of
+    ``_embed_backlog``, which was called once per ontology; the walk calls that
+    up to eight times per run, so leaving it there would have re-asked the
+    ledger for due rows in the middle of the run that set some of them aside.
+    ``PoisonLedger.due`` filters on ``next_attempt_at``, so nothing would
+    actually have been requeued early — but "a row cannot be requeued into the
+    same run that just held it" would have gone from a structural guarantee to
+    a coincidence of the backoff being longer than one pass.
+    """
+    due = ledger.due(_embed_ledger_source(kind))
+    if due:
+        store.requeue_embedding(kind, sorted(due))
+
+
 def _embed_backlog(
     store: Store,
     embedder: Embedder,
@@ -2305,35 +2421,39 @@ def _embed_backlog(
     ledger: PoisonLedger,
     outcome: _EmbedOutcome,
     stop: Callable[[], bool] | None = None,
-) -> None:
-    """Drain the backlog in bounded batches (``--catchup``) or do one (``--once``).
+    source: str | None = None,
+) -> bool:
+    """Drain one backlog group in bounded batches. Returns WHETHER IT WORKED.
 
     Chunked and checkpointed for the same reason ingest is: each batch commits
     its vectors and its watermark before the next one starts, so a kill at any
     moment costs at most one batch and the next run resumes where this stopped.
 
-    FIRST, THE ROWS WHOSE BACKOFF HAS EXPIRED. A row that failed left the
-    backlog under ``embedding_state = 'error'``, so ``select_unembedded``
-    cannot see it and no amount of draining would ever try it again. Putting
-    the due ones back is what makes the hold a RETRY rather than a deletion,
-    and it happens once per run rather than per batch so a row cannot be
-    requeued into the same run that just set it aside.
+    ``source`` NAMES ONE GROUP OF ``EMBED_BACKLOG_ORDER``. Resumability inside a
+    group needs nothing extra: the backlog is a LEFT JOIN, so a run killed
+    halfway through dropbox asks the same question next time and gets what it
+    had not reached. Mid-source resume and between-source resume are the same
+    mechanism.
+
+    THE RETURN VALUE IS FOR ``--once``. That flag means one batch, and the walk
+    visits up to eight groups — so the caller has to be able to tell "this
+    group did a batch" from "this group was already empty". Without it, --once
+    either does eight batches or stops dead at the first finished source and
+    never reaches the ones behind it.
     """
-    source = _embed_ledger_source(kind)
-    due = ledger.due(source)
-    if due:
-        store.requeue_embedding(kind, sorted(due))
     stalls = 0
+    worked = False
     while True:
         if stop is not None and stop():
             outcome.interrupted = True
-            return
-        rows = store.select_unembedded(kind, limit=args.batch_size)
+            return worked
+        rows = store.select_unembedded(kind, limit=args.batch_size, source=source)
         if not rows:
-            return
+            return worked
         moved = _embed_batch(store, embedder, kind, rows, ledger, outcome, stop)
+        worked = True
         if args.once:
-            return
+            return worked
         # THE TERMINATION ARGUMENT. Every other exit from this loop is "the
         # backlog is empty"; this one is "the backlog is not emptying".
         #
@@ -2355,7 +2475,7 @@ def _embed_backlog(
         stalls += 1
         if stalls >= _MAX_STALLED_BATCHES:
             outcome.stalled = True
-            return
+            return worked
 
 
 def _chunk_sha(text: str) -> str:
@@ -2858,7 +2978,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "embed every unembedded row, then exit, in bounded per-batch "
             "committed chunks — this is what the systemd timer runs (with "
-            "--source both), and what to run by hand against a stalled index"
+            "--source both), and what to run by hand against a stalled index. "
+            "Sources are drained in priority order — "
+            + " then ".join(s for _, s in EMBED_BACKLOG_ORDER[:6])
+            + ", then everything unranked — and each is finished before the "
+            "next begins, so `aggregator status` says which are searchable "
+            "today rather than one percentage for the whole corpus"
         ),
     )
     mode.add_argument(
@@ -2897,7 +3022,9 @@ def build_parser() -> argparse.ArgumentParser:
         # "fixed" it believed otherwise.
         default="both",
         help=(
-            "which ontology to embed (default: both, matching the timer unit)"
+            "which ontology to embed (default: both, matching the timer unit). "
+            "This narrows the priority walk; it does not flatten it — the "
+            "surviving sources keep their relative order"
         ),
     )
     p_embed.add_argument(

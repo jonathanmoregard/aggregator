@@ -139,8 +139,11 @@ def _race_in_the_select_window(store, monkeypatch):
     real = store.select_unembedded
     fired: list[int] = []
 
-    def racing_select(kind, limit=500):
-        rows = real(kind, limit=limit)
+    def racing_select(kind, limit=500, model=None, source=None):
+        # The scope is forwarded, not swallowed: the worker drains one priority
+        # group at a time, and a stub that ignored ``source`` would hand every
+        # group the whole backlog and race a different row than the one named.
+        rows = real(kind, limit=limit, model=model, source=source)
         if rows and not fired:
             fired.append(1)
             store.upsert_entities([_obs("target", _NEW, 9)])

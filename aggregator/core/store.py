@@ -236,6 +236,82 @@ SCRUB_FINGERPRINT = "presidio+gitleaks/v1"
 # capabilities, and the MCP routing layer stay in lockstep.
 CHAT_ORIGINS = ("chatgpt", "claude-web")
 
+#: The group holding every source the user did not rank. Bracketed so it can
+#: never collide with a real source name, and printable, because it appears in
+#: ``aggregator status`` next to the ranked ones.
+EMBED_REST = "(other)"
+
+#: THE ORDER THE VECTOR ARM IS FILLED IN. User directive, 2026-08-21, verbatim:
+#: ``dropbox -> blog -> llm -> claude code``.
+#:
+#: The full backfill is a measured 25-30 days of continuous CPU on this
+#: hardware and the FTS5 arm serves throughout, so this ordering is the whole
+#: difference between the vector arm being useful in week one and in week five.
+#: It is not a tuning detail and it is not the obvious order: the proposal put
+#: claude-code sessions FIRST, on the theory that the agent's own history is
+#: what gets searched most, and the user put them LAST. Take it as given.
+#:
+#: Category names map to cache source names as recorded in
+#: session-constraints.md — an assumption, because the user named categories:
+#: ``blog`` is ``substack``; ``llm`` is ``claude-web`` plus ``chatgpt`` (which
+#: has no rows in this cache today and is listed anyway, so the day an export
+#: lands it is already ranked); ``claude code`` is ``sessions`` then
+#: ``subagents``.
+#:
+#: IT SPANS BOTH ONTOLOGIES, which is exactly why the worker cannot drain
+#: "observations, then records": two records sources come before every
+#: observation and four more come after. The pairs are ordered, and the worker
+#: walks them in this sequence.
+#:
+#: ``EMBED_REST`` LAST, AND IT IS NOT A DUMPING GROUND. The user ranked four
+#: categories and said nothing about github, research, ticktick or sota-watch;
+#: unranked means later, not unimportant. Its real job is that the groups
+#: PARTITION the backlog: a row belonging to no group would never be selected,
+#: never embedded, and never reported missing.
+EMBED_BACKLOG_ORDER: tuple[tuple[str, str], ...] = (
+    ("records", "dropbox"),
+    ("records", "substack"),
+    ("observations", "claude-web"),
+    ("observations", "chatgpt"),
+    ("observations", "sessions"),
+    ("observations", "subagents"),
+    ("records", EMBED_REST),
+    ("observations", EMBED_REST),
+)
+
+#: Records sources the order names explicitly. Everything else is ``EMBED_REST``.
+_RANKED_RECORD_SOURCES = tuple(
+    source
+    for kind, source in EMBED_BACKLOG_ORDER
+    if kind == "records" and source != EMBED_REST
+)
+
+#: ``sessions.origin`` values the order names explicitly, for the observations
+#: side of the same question.
+_RANKED_OBS_ORIGINS = ("claude-code", "claude-web", "chatgpt")
+
+#: Maps one observation row to its backfill source, in SQL, from the session
+#: that owns it. Observations have no ``source`` column: which product a
+#: transcript came from is ``sessions.origin``, and session-vs-subagent is
+#: ``sessions.kind``. Written once and reused by the backlog query and the
+#: progress tally, so the two can never disagree about which rows are whose —
+#: which would show up as a source reporting more embedded rows than it has.
+_OBS_SOURCE_CASE = f"""
+    CASE
+      WHEN s.origin = 'claude-code' AND s.kind = 'session'  THEN 'sessions'
+      WHEN s.origin = 'claude-code' AND s.kind = 'subagent' THEN 'subagents'
+      WHEN s.origin IN ('claude-web', 'chatgpt') THEN s.origin
+      ELSE '{EMBED_REST}'
+    END
+"""
+
+#: The same mapping for records, where the column is right there.
+_REC_SOURCE_CASE = (
+    "CASE WHEN r.source IN ("
+    + ",".join(f"'{s}'" for s in _RANKED_RECORD_SOURCES)
+    + f") THEN r.source ELSE '{EMBED_REST}' END"
+)
+
 # Tables whose primary key ``existing_ids`` may probe, and that key's column.
 # Allowlist, not a hint: the table name is interpolated into SQL.
 _PK_BY_TABLE = {
@@ -2704,10 +2780,67 @@ class Store:
             f"(started {state['started_at']})."
         )
 
+    @staticmethod
+    def _embed_source_clause(kind: str, source: str) -> tuple[str, str, list]:
+        """``(extra join, extra WHERE, params)`` narrowing a backlog to one group.
+
+        The SAME predicate the progress tally groups by, expressed as a filter
+        — both are derived from ``_OBS_SOURCE_CASE`` / ``_REC_SOURCE_CASE`` so
+        "which rows are dropbox's" has one definition. Two definitions here
+        would show up as a source reporting more rows embedded than it holds,
+        which is the shape of bug that makes a progress display worse than none.
+
+        AN UNKNOWN NAME RAISES. Silently selecting nothing would read as "that
+        source is fully embedded" to every caller above — a typo in a source
+        name turning into a clean bill of health for a source nobody touched.
+        """
+        if kind == "observations":
+            join = "JOIN sessions s ON s.session_id = o.session_id"
+            if source == "sessions":
+                return join, "s.origin = 'claude-code' AND s.kind = 'session'", []
+            if source == "subagents":
+                return join, "s.origin = 'claude-code' AND s.kind = 'subagent'", []
+            if source in CHAT_ORIGINS:
+                return join, "s.origin = ?", [source]
+            if source == EMBED_REST:
+                marks = ",".join("?" * len(_RANKED_OBS_ORIGINS))
+                return join, f"s.origin NOT IN ({marks})", list(_RANKED_OBS_ORIGINS)
+        elif kind == "records":
+            if source in _RANKED_RECORD_SOURCES:
+                return "", "r.source = ?", [source]
+            if source == EMBED_REST:
+                marks = ",".join("?" * len(_RANKED_RECORD_SOURCES))
+                return "", f"r.source NOT IN ({marks})", list(_RANKED_RECORD_SOURCES)
+        else:
+            raise ValueError(f"unknown kind: {kind!r}")
+        raise ValueError(
+            f"unknown embed source {source!r} for kind {kind!r}; expected one "
+            f"of {[s for k, s in EMBED_BACKLOG_ORDER if k == kind]}. Selecting "
+            f"nothing for an unrecognised name would read as 'that source is "
+            f"fully embedded'."
+        )
+
     def select_unembedded(
-        self, kind: str, limit: int = 500, model: str | None = None
+        self,
+        kind: str,
+        limit: int = 500,
+        model: str | None = None,
+        source: str | None = None,
     ) -> list[sqlite3.Row]:
         """The embed worker's backlog: rows with no vector under ``model``.
+
+        ``source`` NARROWS IT TO ONE GROUP OF ``EMBED_BACKLOG_ORDER``, which is
+        how the user's 2026-08-21 priority is actually executed: the worker
+        walks the groups in order and drains each before starting the next.
+        ``None`` is the whole backlog and stays the default, because plenty of
+        callers legitimately want "what is left" without caring whose it is.
+
+        RESUMABLE MID-SOURCE FALLS OUT OF THE LEFT JOIN and needs nothing else.
+        A run killed halfway through dropbox comes back, asks the same
+        question, and gets the rows it had not reached — no cursor, no ledger,
+        nothing to fall out of step. That is the same property the unscoped
+        form already had, narrowed; adding a per-source cursor would have
+        reintroduced exactly the second source of truth this design removed.
 
         A QUERY, NOT A LEDGER — rule 3 of the reference design, and the reason
         this is a LEFT JOIN against ``chunk_embeddings`` rather than a scan of
@@ -2745,41 +2878,51 @@ class Store:
         which ``select_unembedded`` never returns again. See
         ``commit_embed_batch``, which is where the value is spent.
         """
+        if kind not in ("observations", "records"):
+            raise ValueError(f"unknown kind: {kind!r}")
         c = self._c()
         model = model or self.embedding_model
+        # Raises for an unknown source BEFORE any SQL is built, so a typo
+        # cannot come back as an empty backlog.
+        extra_join, extra_where, extra_params = (
+            self._embed_source_clause(kind, source) if source is not None else ("", "", [])
+        )
+        scope = f"  AND ({extra_where}) " if extra_where else ""
         if kind == "observations":
             return list(
                 c.execute(
-                    "SELECT o.obs_id AS obs_id, o.body AS body, "
+                    "SELECT o.obs_id AS obs_id, o.body AS body, "  # noqa: S608 - allowlisted literals
                     "       o.src_hash AS src_hash "
                     "FROM observations o "
+                    f"{extra_join} "
                     "LEFT JOIN chunk_embeddings e "
                     "  ON e.owner_id = o.obs_id AND e.kind = 'observations' "
                     "  AND e.model = ? "
                     "WHERE e.chunk_id IS NULL "
                     "  AND o.embedding_state IS NOT 'skip' "
                     "  AND o.embedding_state IS NOT 'error' "
+                    f"{scope}"
                     "ORDER BY o.ts DESC LIMIT ?",
-                    (model, limit),
+                    (model, *extra_params, limit),
                 )
             )
-        if kind == "records":
-            return list(
-                c.execute(
-                    "SELECT r.stable_id AS stable_id, r.subject AS subject, "
-                    "       r.body AS body, r.src_hash AS src_hash "
-                    "FROM records r "
-                    "LEFT JOIN chunk_embeddings e "
-                    "  ON e.owner_id = r.stable_id AND e.kind = 'records' "
-                    "  AND e.model = ? "
-                    "WHERE e.chunk_id IS NULL "
-                    "  AND r.embedding_state IS NOT 'skip' "
-                    "  AND r.embedding_state IS NOT 'error' "
-                    "ORDER BY r.updated_at DESC LIMIT ?",
-                    (model, limit),
-                )
+        return list(
+            c.execute(
+                "SELECT r.stable_id AS stable_id, r.subject AS subject, "  # noqa: S608 - allowlisted literals
+                "       r.body AS body, r.src_hash AS src_hash "
+                "FROM records r "
+                f"{extra_join} "
+                "LEFT JOIN chunk_embeddings e "
+                "  ON e.owner_id = r.stable_id AND e.kind = 'records' "
+                "  AND e.model = ? "
+                "WHERE e.chunk_id IS NULL "
+                "  AND r.embedding_state IS NOT 'skip' "
+                "  AND r.embedding_state IS NOT 'error' "
+                f"{scope}"
+                "ORDER BY r.updated_at DESC LIMIT ?",
+                (model, *extra_params, limit),
             )
-        raise ValueError(f"unknown kind: {kind!r}")
+        )
 
     def mark_embedded(
         self,
@@ -3164,6 +3307,143 @@ class Store:
             (model, kind),
         ).fetchone()
         return row is not None
+
+    def embed_progress_by_source(self, model: str | None = None) -> list[dict]:
+        """How far the backfill has got, PER SOURCE, in priority order.
+
+        "Which sources are fully embedded" is the question a user actually asks
+        of a 25-30 day backfill, and a global percentage cannot answer it. A
+        single "62% embedded" is compatible with dropbox being untouched and
+        with dropbox being finished, and those are opposite answers to "can I
+        search my notes yet".
+
+        One row per entry in :data:`EMBED_BACKLOG_ORDER`, in that order, always
+        all of them — a source with nothing in it still gets a row, because
+        omitting it is how "no rows here" becomes indistinguishable from "not
+        reached yet". Each carries ``kind``, ``source``, ``total``,
+        ``embedded``, ``skipped``, ``errors``, ``pending`` and a ``state``.
+
+        ``state`` USES THE SAME VOCABULARY AS :meth:`vector_index_state`, for
+        the same reasons, one source at a time:
+
+        * ``empty``       — the source holds no rows at all. NEVER ``complete``:
+          a source with nothing in it and a source fully embedded return the
+          same zero vector hits for every query, and telling them apart is the
+          whole point of this method.
+        * ``not_started`` — rows are waiting and none has a vector yet.
+        * ``in_progress`` — some embedded, some still pending.
+        * ``degraded``    — nothing pending and yet rows are missing, because
+          the worker set them aside as ``'error'``. Waiting cannot fix it,
+          which is exactly why it may not be reported as ``complete``.
+        * ``complete``    — every row either embedded or legitimately skipped.
+
+        FOUR QUERIES, NOT FOUR PER SOURCE. Grouped in SQL rather than looped in
+        Python: measured on the live corpus snapshot (505k observations, 4.3k
+        records) the observations tally is 0.29 s and the records tally 0.01 s,
+        where thirty-two separate counts would have made ``aggregator status``
+        something an operator learns not to run.
+
+        DELIBERATELY NOT PART OF ``capabilities()``. That is the MCP connect
+        path, and 0.3 s of GROUP BY belongs on a command someone typed, not on
+        every client handshake.
+
+        ``embedded`` COMES OFF ``chunk_embeddings`` AND IS KEYED ON THE MODEL,
+        never off ``embedding_state``: the column cannot say which model
+        embedded a row, so after a model change it would report a complete
+        index for an embedding space holding nothing. Same reasoning as the
+        backlog query, and it must be the same answer or the two disagree
+        about the same source.
+        """
+        model = model or self._stamped_model() or self.embedding_model
+        c = self._c()
+        totals: dict[tuple[str, str], dict[str, int]] = {
+            (kind, source): {
+                "total": 0,
+                "embedded": 0,
+                "skipped": 0,
+                "errors": 0,
+            }
+            for kind, source in EMBED_BACKLOG_ORDER
+        }
+
+        def bucket(kind: str, source: str) -> dict[str, int]:
+            # An unrecognised source cannot happen — both CASE expressions end
+            # in ELSE EMBED_REST — but answering into a discarded dict would be
+            # the one way this method could under-report, so it is spelled out.
+            return totals.setdefault(
+                (kind, source),
+                {"total": 0, "embedded": 0, "skipped": 0, "errors": 0},
+            )
+
+        for kind, alias, sql_case, tally_from, embedded_from in (
+            (
+                "observations",
+                "o",
+                _OBS_SOURCE_CASE,
+                "observations o JOIN sessions s ON s.session_id = o.session_id",
+                "chunk_embeddings e "
+                "JOIN observations o ON o.obs_id = e.owner_id "
+                "JOIN sessions s ON s.session_id = o.session_id",
+            ),
+            (
+                "records",
+                "r",
+                _REC_SOURCE_CASE,
+                "records r",
+                "chunk_embeddings e JOIN records r ON r.stable_id = e.owner_id",
+            ),
+        ):
+            for row in c.execute(
+                f"SELECT {sql_case} AS src, {alias}.embedding_state AS st, "  # noqa: S608 - allowlisted literals
+                f"COUNT(*) AS n FROM {tally_from} GROUP BY src, st"
+            ):
+                entry = bucket(kind, str(row["src"]))
+                n = int(row["n"])
+                entry["total"] += n
+                if row["st"] == "skip":
+                    entry["skipped"] += n
+                elif row["st"] == "error":
+                    entry["errors"] += n
+            if not _table_present(c, "chunk_embeddings"):
+                continue
+            for row in c.execute(
+                f"SELECT {sql_case} AS src, COUNT(DISTINCT e.owner_id) AS n "  # noqa: S608 - allowlisted literals
+                f"FROM {embedded_from} "
+                "WHERE e.model = ? AND e.kind = ? GROUP BY src",
+                (model, kind),
+            ):
+                bucket(kind, str(row["src"]))["embedded"] += int(row["n"])
+
+        out: list[dict] = []
+        for kind, source in EMBED_BACKLOG_ORDER:
+            entry = totals[(kind, source)]
+            pending = max(
+                0,
+                entry["total"]
+                - entry["embedded"]
+                - entry["skipped"]
+                - entry["errors"],
+            )
+            if entry["total"] == 0:
+                state = "empty"
+            elif pending == 0 and entry["errors"] == 0:
+                state = "complete"
+            elif pending == 0:
+                state = "degraded"
+            elif entry["embedded"] == 0:
+                state = "not_started"
+            else:
+                state = "in_progress"
+            out.append(
+                {
+                    "kind": kind,
+                    "source": source,
+                    "state": state,
+                    "pending": pending,
+                    **entry,
+                }
+            )
+        return out
 
     def count_embedding_states(self, kind: str) -> dict[str, int]:
         """Tally of ``embedding_state`` for ``kind``: the backfill watermark.

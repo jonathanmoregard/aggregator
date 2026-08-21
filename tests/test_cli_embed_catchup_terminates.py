@@ -97,14 +97,21 @@ class _NeverCommits(Store):
         super().__init__(*a, **kw)
         self.selects = 0
 
-    def select_unembedded(self, kind, limit=500):
+    def select_unembedded(self, kind, limit=500, model=None, source=None):
+        # ``source`` and ``model`` are forwarded rather than dropped: the
+        # worker walks the priority groups (EMBED_BACKLOG_ORDER), so swallowing
+        # the scope here would hand every group the whole backlog and the
+        # runaway counter would be measuring a different loop than the one
+        # under test.
         self.selects += 1
         if self.selects > _RUNAWAY:
             raise AssertionError(
                 f"--catchup re-selected the same backlog {self.selects} times "
                 f"without writing a row: the loop has no termination argument"
             )
-        return super().select_unembedded(kind, limit=limit)
+        return super().select_unembedded(
+            kind, limit=limit, model=model, source=source
+        )
 
     def commit_embed_batch(self, kind, **kw):
         # Everything the worker offers is rejected by the guard.
