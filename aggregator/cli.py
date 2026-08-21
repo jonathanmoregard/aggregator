@@ -549,8 +549,8 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     # told apart, per source, by name.
     #
     # Read here rather than added to ``aggregator_capabilities``: that surface
-    # is on the MCP connect path, and 0.3 s of GROUP BY belongs on a command a
-    # human typed.
+    # is on the MCP connect path, and a full table scan — 0.27 s warm, 4.3 s
+    # cold on the live corpus — belongs on a command a human typed.
     embedding_progress = store.embed_progress_by_source()
     if args.json:
         caps["ticktick_uncovered_projects"] = uncovered
@@ -2369,10 +2369,11 @@ def _report_embed_progress(store: Store, out=None) -> None:
     ``complete`` or omitted. Same reason the states are the ones
     ``Store.vector_index_state`` already uses.
 
-    One grouped query per ontology — measured at 0.29 s over the live corpus
-    snapshot's 505k observations — so a 30-minute timer can afford it once per
-    run. Best-effort: a progress display must never be the thing that fails a
-    run that embedded rows successfully.
+    Two grouped queries per ontology — measured against a snapshot of the live
+    cache at 0.27 s warm and 4.3 s on a cold page cache — so a 30-minute timer
+    can afford it once per run, at the end, where it costs nothing the embed
+    pass has not already paid. Best-effort: a progress display must never be
+    the thing that fails a run which embedded rows successfully.
     """
     out = out or sys.stdout
     try:

@@ -3338,14 +3338,16 @@ class Store:
         * ``complete``    — every row either embedded or legitimately skipped.
 
         FOUR QUERIES, NOT FOUR PER SOURCE. Grouped in SQL rather than looped in
-        Python: measured on the live corpus snapshot (505k observations, 4.3k
-        records) the observations tally is 0.29 s and the records tally 0.01 s,
-        where thirty-two separate counts would have made ``aggregator status``
-        something an operator learns not to run.
+        Python. Measured end to end against a read-only snapshot of the live
+        cache (505k observations, 4.3k records, 1.3 GB): **0.27 s warm, 4.3 s
+        on a cold page cache** — the cold figure is the first touch of the file
+        in a process and is what an operator pays for the first
+        ``aggregator status`` after a boot. Thirty-two separate counts would
+        have made this something an operator learns not to run.
 
         DELIBERATELY NOT PART OF ``capabilities()``. That is the MCP connect
-        path, and 0.3 s of GROUP BY belongs on a command someone typed, not on
-        every client handshake.
+        path, and a full table scan belongs on a command someone typed, not on
+        every client handshake — least of all the cold one.
 
         ``embedded`` COMES OFF ``chunk_embeddings`` AND IS KEYED ON THE MODEL,
         never off ``embedding_state``: the column cannot say which model
