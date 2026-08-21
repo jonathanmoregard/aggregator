@@ -603,21 +603,47 @@ def _fts_ranked(
 ) -> tuple[list[str], str | None]:
     """``(bm25-ranked hits, error)``. THE ERROR IS RETURNED, NOT SWALLOWED.
 
-    Collapsing "this is not valid FTS5 syntax" into "this query has no
-    matches" would put every malformed query into the no-answer bucket and
-    inflate exactly the number this whole exercise turns on. They are
-    different facts and the caller has to be able to tell them apart.
+    Collapsing "the index is broken" into "this query has no matches" would put
+    a lock or a corrupt table into the no-answer bucket and inflate exactly the
+    number this whole exercise turns on. They are different facts and the
+    caller has to be able to tell them apart.
+
+    IT MEASURES THE SHIPPED PATH, WHICH IS THE ONLY THING WORTH MEASURING.
+    This bound ``text`` to ``MATCH`` raw, and that was correct until b4eab9b:
+    the whole point of the exercise was that ~34% of real queries came back
+    ``ok: false`` from an unescaped MATCH. Now every MATCH binding site in
+    ``aggregator.core.store`` rewrites through :func:`fts5_match_query` first,
+    so a raw bind here would keep reporting a failure rate for a code path that
+    no longer exists — and would report it in the same JSON field, under the
+    same name, to somebody who had no reason to doubt it. A measurement script
+    that has quietly stopped measuring the product is worse than no script.
+
+    THE SHIPPED FUNCTION, NOT A COPY OF IT. Imported inside the call like every
+    other ``aggregator`` import in this file — the module-level form would drag
+    spaCy in through ``core.scrub`` at import time — and looked up per call, so
+    it cannot drift from what the store does.
+
+    An empty rewrite means "no word characters at all", and the store then runs
+    NO MATCH. Reproduced here rather than approximated: ``MATCH ''`` is a
+    different question, and an unconstrained MATCH returning the whole corpus
+    would be the dangerous way to get this wrong in a script whose entire
+    output is hit counts.
 
     ``Store._fts_obs_ids`` returns matches UNRANKED and uncapped, which is
     right for the union it feeds but useless for "the documents this query is
     actually about". Ranking here rather than changing the store keeps the
     production path exactly as shipped.
     """
+    from aggregator.core.store import fts5_match_query
+
+    match_expr = fts5_match_query(text)
+    if not match_expr:
+        return [], None
     try:
         rows = conn.execute(
             f"SELECT {id_col} AS i FROM {table} f {join} "  # noqa: S608
             f"WHERE {table} MATCH ? ORDER BY bm25({table}) LIMIT ?",
-            (text, k),
+            (match_expr, k),
         ).fetchall()
     except sqlite3.OperationalError as e:
         return [], str(e)
@@ -739,7 +765,15 @@ def cmd_pool(args: argparse.Namespace) -> int:
                 "no_answer_with_fts_hits": sum(
                     1 for v in no_answer.values() if v["obs"] or v["rec"]
                 ),
-                "queries_with_fts_syntax_error": sum(
+                # RENAMED WITH THE THING IT COUNTS. It was
+                # ``queries_with_fts_syntax_error``, and after b4eab9b a syntax
+                # error is not a thing a user query can cause: every string
+                # reaching MATCH is whitelisted first. What survives is a lock,
+                # a corrupt index or a missing table, so a non-zero value here
+                # is now an infrastructure fault and not a tokenizer story. The
+                # old key would have kept reading as "N% of queries are still
+                # malformed" while meaning something else entirely.
+                "queries_with_fts_index_error": sum(
                     1 for v in per_query.values() if v["error"]
                 ),
                 "queries_with_zero_fts_no_error": sum(
@@ -1371,9 +1405,16 @@ def cmd_measure(args: argparse.Namespace) -> int:
             ),
         }
 
+    # ``*_syntax_error`` RENAMED TO ``*_index_error`` throughout, for the same
+    # reason as in ``cmd_sample``: the lexical arm rewrites user text through
+    # ``fts5_match_query`` before it reaches MATCH, so a syntax error is no
+    # longer reachable from a query. A non-zero count here means the index
+    # itself is unavailable. The old name is the number this whole script is
+    # famous for producing ("~34% of real queries error"), which is exactly why
+    # leaving it pointed at a different quantity would be believed.
     report = {
         "real_queries_total": sum(1 for r in rows if r["group"] == "real"),
-        "fts5_syntax_errors": sum(
+        "fts5_index_errors": sum(
             1 for r in rows if r["group"] == "real" and r["fts_error"]
         ),
         "self_referential_obs_in_corpus": len(selfref),
@@ -1386,7 +1427,7 @@ def cmd_measure(args: argparse.Namespace) -> int:
             "real_fts_ok": agg(
                 lambda r: r["group"] == "real" and not r["fts_error"]
             ),
-            "real_fts_syntax_error": agg(
+            "real_fts_index_error": agg(
                 lambda r: r["group"] == "real" and r["fts_error"]
             ),
             "no_answer": agg(lambda r: r["group"] == "no_answer"),
