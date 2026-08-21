@@ -1,9 +1,12 @@
 """Freeze a baseline, re-run it later, report drift. The CLI entry point.
 
-TODO(cli-wiring): ``aggregator/cli.py`` is owned by another change this wave.
-Wire ``aggregator.evals.harness.retrieval_regression_command`` in as
-``aggregator retrieval-regression [freeze|run] [--mode] [--drift-threshold]``
-once that lands. Nothing in this package imports ``cli``.
+``retrieval_regression_command`` is reached as ``aggregator
+retrieval-regression [freeze|run] [--mode] [--drift-threshold]``; the argparse
+half lives in ``aggregator/cli.py`` and is a translation and nothing more.
+NOTHING IN THIS PACKAGE IMPORTS ``cli``, and the dependency stays one-way so
+the harness is runnable from a test or a REPL without an argparse tree and
+nine source constructors behind it. Pinned in
+``tests/test_cli_retrieval_regression.py``.
 
 THE ORDER OF OPERATIONS IS THE WHOLE VALUE. Freeze BEFORE changing retrieval,
 re-run AFTER, and the diff between the two runs is evidence. Freeze after the

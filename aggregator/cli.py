@@ -61,6 +61,14 @@ from aggregator.core.store import (
     EmptyRebuildRefusedError,
     Store,
 )
+
+# ONE DIRECTION ONLY: the CLI depends on the eval package, never the reverse.
+# ``aggregator.evals`` deliberately imports nothing from here, so the harness
+# stays runnable from a test, a REPL or a future service without dragging nine
+# source constructors and an argparse tree along with it. Pinned in
+# ``tests/test_cli_retrieval_regression.py``.
+from aggregator.evals.harness import retrieval_regression_command
+from aggregator.evals.search import SEARCH_MODES
 from aggregator.imports.ingest_state import (
     POISON_MAX_ATTEMPTS,
     SOURCE_CURSORS,
@@ -620,6 +628,37 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
             )
         print(f"  markers: {default_marker_path()}")
     return 0
+
+
+def _cmd_retrieval_regression(args: argparse.Namespace, store: Store) -> int:
+    """Freeze a retrieval baseline, or re-run it and report drift.
+
+    CRITERION A'S SURFACE. The harness landed before any retrieval change on
+    this branch, on purpose — it is what makes "retrieval got better" a
+    falsifiable claim rather than an assertion — and until now it had no
+    caller. An entry point reachable only from a Python REPL is one nobody runs
+    before a change and nobody runs after it, and the freeze/run ORDER is where
+    all of its value lives: freeze first, change, then run. A baseline frozen
+    afterwards has baselined the bug.
+
+    A THIN TRANSLATION AND NOTHING ELSE. Every decision — which exit code means
+    what, when a drift number is allowed to fail a run, how the report reads —
+    belongs to the harness and is documented there. Duplicating any of it here
+    would give the two surfaces room to disagree.
+
+    ``db_path`` IS THREADED FROM THE STORE THIS PROCESS ALREADY OPENED, not
+    left to the harness's default. ``--cache`` and ``AGGREGATOR_DB`` (and a
+    test's ``_store=``) all move the file the rest of the CLI is talking to,
+    and an eval that silently measured a different cache would be worse than no
+    eval — the whole package exists to stop exactly that class of claim. The
+    harness opens its own READ-ONLY handle on it; nothing here writes.
+    """
+    return retrieval_regression_command(
+        args.action,
+        mode=args.mode,
+        drift_threshold=args.drift_threshold,
+        db_path=store.db_path,
+    )
 
 
 def _commit_after_write(src: Any, errors: list[str]) -> None:
@@ -2691,6 +2730,58 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="print capabilities / freshness")
     st.add_argument("--json", action="store_true")
 
+    rr = sub.add_parser(
+        "retrieval-regression",
+        help=(
+            "freeze a retrieval baseline, or re-run it and report drift "
+            "against the frozen one"
+        ),
+        description=(
+            "THE ORDER IS THE TOOL. Freeze BEFORE changing retrieval, run "
+            "AFTER, and the diff between the two is the evidence. Freeze "
+            "afterwards and you have baselined the bug. Exit 0 clean, 1 a "
+            "regression that needs no labels (a negative query stopped "
+            "abstaining, or mean drift above an explicit --drift-threshold), "
+            "2 the harness could not run."
+        ),
+    )
+    rr.add_argument(
+        "action",
+        nargs="?",
+        default="run",
+        choices=("freeze", "run"),
+        help=(
+            "'run' (default) re-runs the golden set and reports drift; "
+            "'freeze' records today's top-10 ids per query as the baseline "
+            "that later runs are measured against, OVERWRITING any existing "
+            "one for this --mode"
+        ),
+    )
+    rr.add_argument(
+        "--mode",
+        default="lexical",
+        choices=SEARCH_MODES,
+        help=(
+            "which retrieval arm to measure. Baselines are per-mode, so a "
+            "'hybrid' run is compared against a 'hybrid' freeze and never "
+            "against the lexical one. 'hybrid' loads the embedding model and "
+            "REFUSES on a machine with no vector index rather than quietly "
+            "measuring the lexical arm and filing it under hybrid"
+        ),
+    )
+    rr.add_argument(
+        "--drift-threshold",
+        type=float,
+        default=None,
+        help=(
+            "fail (exit 1) when mean drift exceeds this. Off by default and "
+            "deliberately so: drift is DIRECTIONLESS — fixing retrieval scores "
+            "exactly the same drift as breaking it — so a default threshold "
+            "would block every intentional improvement. Pass one when you are "
+            "asserting that a change should NOT move the ranking"
+        ),
+    )
+
     ing = sub.add_parser(
         "ingest", help="run one source's ingest cycle, or --all of them"
     )
@@ -2890,6 +2981,8 @@ def main(
         return _cmd_query(args, store)
     if args.cmd == "status":
         return _cmd_status(args, store)
+    if args.cmd == "retrieval-regression":
+        return _cmd_retrieval_regression(args, store)
     if args.cmd == "ingest":
         usage_error = _ingest_usage_error(args)
         if usage_error is not None:
