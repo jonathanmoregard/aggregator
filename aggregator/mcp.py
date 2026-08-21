@@ -20,8 +20,11 @@ Security invariants (spec §Security):
 1. **No write tools.** Enforced by ``tests/test_mcp_no_write_tools.py``.
 2. **Every record leaves via ``wrap_record``.** No raw bodies escape.
 3. **Scrub on return.** Records + observations re-scrubbed pre-return.
-4. **Structured errors only.** DSL parse errors, FTS5 syntax errors, and any
-   unexpected exception become ``{ok: false, reason, remediation}``.
+4. **Structured errors only.** DSL parse errors, an unreadable cache, and any
+   unexpected exception become ``{ok: false, reason, remediation}``. FTS5
+   syntax errors are NOT in that list any more and the branch that reported
+   them is gone: ``fts5_match_query`` whitelists every string before it
+   reaches MATCH, so malformed query text can no longer be constructed.
 
 KNOWN, ACCEPTED EXPOSURE — ``rerank=True`` RUNS TORCH IN THIS PROCESS.
 
@@ -305,18 +308,22 @@ _FTS_HEALTH_PROBE = "aggregatorftshealthprobe"
 
 
 def _fts_probe_is_healthy(store: Store) -> bool:
-    """Did the FTS probe fail because of the TEXT, or because of the STORE?
+    """Is the index unreadable, or was that one read unlucky?
 
     Asked by re-running the probe with text that is known-good, rather than by
     pattern-matching the SQLite message. Message sniffing would have to
     enumerate every string FTS5 can emit and stay correct as SQLite changes
     them; this asks the database the question directly and takes its answer.
 
-    It matters because the two answers are opposite instructions to the
-    caller. "Your query text is malformed" tells an LLM to rewrite a perfectly
-    good query, over and over, while the real cause — a locked or corrupt
-    cache — goes unmentioned and unfixed. A locked database read as a syntax
-    error is a wrong answer, not a missing one.
+    IT USED TO ASK A DIFFERENT QUESTION — text or store? — and that question no
+    longer has two answers. ``fts5_match_query`` whitelists every string before
+    it reaches MATCH, so a malformed expression cannot be constructed and a
+    failing probe is always the store. What survives is the split WITHIN "the
+    store": a probe that fails twice is a corrupt or permanently unreadable
+    index and needs a human, while one that fails and then succeeds is the
+    ingest timer's write lock, which needs a retry and nothing else. Same
+    condition, opposite instructions to the caller — which is why the second
+    probe is still worth its cost.
 
     Note this cannot lean on ``schema_version()``: ``PRAGMA user_version``
     reads page 1 of the file, so a cache whose CONTENT pages are shredded
@@ -1899,6 +1906,21 @@ def aggregator_query(
         try:
             store.probe_fts(ast.text)
         except sqlite3.DatabaseError as e:
+            # BOTH OUTCOMES ARE A CACHE FAILURE, and there used to be a third.
+            # The other branch reported "FTS5 syntax error in freeform text"
+            # and it is now unreachable: ``fts5_match_query`` whitelists the
+            # text, so every expression reaching MATCH is a sequence of quoted
+            # ``[\p{L}\p{N}]+`` phrases — valid FTS5 by construction, at any
+            # length. Checked empirically as well as by argument: whitelisted
+            # expressions of 50 000 tokens, and a single token of 200 000
+            # characters, all execute without raising. So a probe that raises
+            # is always the STORE, and telling an LLM to rewrite its query
+            # sent it into a loop that could not fix a lock.
+            #
+            # The re-probe survives because it still separates two cache
+            # failures with different answers: a corrupt file needs a human,
+            # and a lock the ingest timer takes every 30 minutes needs a
+            # retry. Same condition, opposite instructions.
             if not _fts_probe_is_healthy(store):
                 return _cache_unavailable_response(
                     f"cache unavailable: the index could not be read at all "
@@ -1906,12 +1928,18 @@ def aggregator_query(
                 )
             return {
                 "ok": False,
-                "reason": f"FTS5 syntax error in freeform text: {e}",
+                "reason": (
+                    f"cache temporarily unavailable: the index failed one read "
+                    f"and answered the next ({type(e).__name__}: {e}), so "
+                    f"another process was holding the lock"
+                ),
                 "remediation": (
-                    "Simplify the freeform text; avoid unbalanced quotes or "
-                    "dangling operators. Call aggregator_capabilities() to see "
-                    "supported keys — moving criteria into keys (source:, "
-                    "session:, agent:) often avoids FTS syntax issues."
+                    "Retry the same query, unchanged, in a few seconds. The "
+                    "ingest timer takes the cache's write lock every 30 "
+                    "minutes and releases it, so this clears on its own. Do "
+                    "NOT rewrite the query text: it is whitelisted before it "
+                    "reaches the index and cannot be malformed, so rephrasing "
+                    "changes nothing and rephrasing cannot release a lock."
                 ),
             }
 

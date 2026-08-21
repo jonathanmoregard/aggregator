@@ -188,6 +188,73 @@ def test_hostile_query_text_on_a_healthy_cache_is_answered_not_refused(healthy_d
     assert aggregator_query("voting", _store=_reader(healthy_db))["total"] > 0
 
 
+def test_a_lock_released_between_the_two_probes_is_still_a_cache_failure(
+    healthy_db, monkeypatch
+):
+    """THE LAST PLACE A CACHE PROBLEM COULD STILL BE CALLED A QUERY PROBLEM.
+
+    ``aggregator_query`` ran ``probe_fts`` and, when it raised, re-probed with
+    known-good text to decide whether the caller's TEXT was at fault. Since the
+    whitelist there is no such thing as malformed text — every string reaching
+    MATCH is a sequence of quoted ``[\\p{L}\\p{N}]+`` phrases, which is valid
+    FTS5 by construction — so the only way to reach that branch was for the
+    first probe to fail and the second to succeed. That is a transient: the
+    ingest timer takes the write lock every 30 minutes and releases it, so a
+    lock held during one probe and gone by the next is a scheduled event.
+
+    It used to be reported as "FTS5 syntax error in freeform text", which told
+    an LLM to rewrite a perfectly good query — repeatedly, since rewriting
+    cannot fix a lock. It has to arrive as what it is.
+    """
+    store = _reader(healthy_db)
+    calls: list[str] = []
+    real = store.probe_fts
+
+    def _flaky(text):
+        calls.append(text)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(text)
+
+    monkeypatch.setattr(store, "probe_fts", _flaky)
+    result = aggregator_query("voting", _store=store)
+    assert len(calls) >= 2, "the health re-probe must still run"
+    assert result["ok"] is False, result
+    assert "fts5" not in result["reason"].lower()
+    assert "syntax" not in result["reason"].lower()
+    assert "cache" in result["reason"].lower()
+    # A transient is retryable and a corrupt file is not, so the two must not
+    # share a remediation.
+    assert "retry" in result["remediation"].lower()
+
+
+def test_no_string_the_module_can_return_still_claims_an_fts5_syntax_error():
+    """Dead error handling is worse than none: it is a branch a reader will
+    reason about and a test will pin, describing a failure the code can no
+    longer produce. Established unreachable empirically as well as by
+    construction — whitelisted expressions of 50 000 tokens and single tokens
+    of 200 000 characters all execute against FTS5 without raising.
+
+    OVER STRING LITERALS AND NOT OVER THE SOURCE TEXT. The comment that
+    explains the removal necessarily quotes the phrase, so a raw substring scan
+    would fail on the documentation of its own fix — and would then be
+    "corrected" by deleting the explanation.
+    """
+    import ast
+    import inspect
+
+    import aggregator.mcp as mcp_mod
+
+    tree = ast.parse(inspect.getsource(mcp_mod))
+    literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    offenders = [s for s in literals if "syntax error in freeform" in s.lower()]
+    assert offenders == [], offenders
+
+
 def test_a_healthy_cache_still_answers(healthy_db):
     result = aggregator_query("voting", _store=_reader(healthy_db))
     assert result["ok"] is True
