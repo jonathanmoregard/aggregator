@@ -2,10 +2,10 @@
 
 ``mcp.aggregator_query``'s own documentation calls ``rerank=True`` a
 background/batch facility and tells callers not to hold an interactive turn
-open for it — 47 s median per call on this machine against 0.65 s without.
-Every surface that exposed it was interactive, and the only non-interactive
-entry point, the CLI, had no flag at all. So the measured advice named a
-place to use the feature that did not exist.
+open for it — **273 s median, 304 s at p95** per call on this machine against
+0.65 s without. Every surface that exposed it was interactive, and the only
+non-interactive entry point, the CLI, had no flag at all. So the measured
+advice named a place to use the feature that did not exist.
 
 AND IT MUST NOT DEGRADE QUIETLY. ``_maybe_rerank`` still catches a rerank
 failure and returns the page in its fused order, which is right for the MCP
@@ -141,7 +141,8 @@ def test_no_reranker_is_built_without_the_flag(tmp_data_home, monkeypatch):
 #
 # THE REPRO. ``rerank=True`` refuses under ``fields='summary'`` because the
 # cross-encoder would score empty bodies (measured: three documents collapsing
-# to the one literal string ``'user\n\n'``) for the same ~47 s. That refusal is
+# to the one literal string ``'user\n\n'``) for the same multi-minute pass.
+# That refusal is
 # right and stands. Its side effect was not: ``--fields`` defaulted to
 # ``summary``, so ``aggregator query "..." --rerank`` — the batch surface's
 # most obvious invocation, the one the MCP tool description points callers at —
@@ -278,3 +279,82 @@ def test_help_says_the_implication_changes_what_is_printed(tmp_data_home, capsys
         "--help does not state the payload consequence of the implication — "
         f"that full mode prints document bodies: {out!r}"
     )
+
+
+# --- the cost figure the operator decides on --------------------------------
+#
+# "47 s median / 59 s worst" was measured while the reranker was scoring
+# SESSION CARDS AGAINST THEIR OWN SUBJECTS — near-empty documents — and while
+# the three pages holding a real long document were being OOM-killed rather
+# than timed. Both are fixed, and the figure was re-measured on a read-only
+# snapshot of the live 505k-observation cache: **273 s median, 304 s p95**,
+# ~13.7 s per (query, document) pair. ``aggregator/mcp.py`` and its tests were
+# corrected in b8c00ea; these three CLI surfaces were left quoting the old
+# number, which is worse than quoting none — an operator who reads "47 s"
+# decides to wait, and then waits four and a half minutes.
+#
+# PINNED AS A RANGE, NOT A DIGIT. What must survive re-measurement is the
+# ORDER OF MAGNITUDE and the unit: a three-digit seconds figure reads as small
+# at a glance, and "minutes" is what actually stops someone reaching for this
+# mid-turn. Same contract as ``test_mcp_discoverability`` — if it is measured
+# again, update both.
+
+
+def _rerank_surfaces(store, monkeypatch, capsys) -> dict[str, str]:
+    """Every string the CLI shows an operator about what ``--rerank`` costs.
+
+    Whitespace-collapsed, because argparse rewraps ``--help`` to the terminal
+    width and a phrase that happens to straddle a line break is not a different
+    claim. The assertions are about what an operator READS.
+    """
+    surfaces = {"refusal": cli._rerank_needs_full_fields()}
+
+    with pytest.raises(SystemExit):
+        cli.main(["query", "--help"])
+    surfaces["help"] = capsys.readouterr().out
+
+    monkeypatch.setattr(cli, "_mcp_get_reranker", lambda: object())
+    monkeypatch.setattr(
+        cli,
+        "_mcp_query",
+        lambda **kw: {"ok": True, "records": [], "total": 0, "mode": "records"},
+    )
+    cli.main(["query", "source:github", "--rerank"], _store=store)
+    surfaces["note"] = capsys.readouterr().err
+    return {k: " ".join(v.split()) for k, v in surfaces.items()}
+
+
+def test_no_cli_surface_quotes_the_falsified_rerank_cost(
+    tmp_data_home, monkeypatch, capsys
+):
+    """THE REPRO for a stale measurement outliving its measurement."""
+    store = Store()
+    _seed(store)
+
+    for name, text in _rerank_surfaces(store, monkeypatch, capsys).items():
+        assert "47 s" not in text and "47-second" not in text, (
+            f"the --rerank {name} still quotes the falsified 47 s median. It "
+            "was measured over session cards scored against their own "
+            "subjects, and over pages whose expensive members were OOM-killed "
+            f"rather than timed. Re-measured: 273 s median, 304 s p95. {text!r}"
+        )
+
+
+def test_the_cli_names_a_wait_measured_in_minutes(
+    tmp_data_home, monkeypatch, capsys
+):
+    """A number is not the point; the unit is. 273 reads small, 4.5 minutes
+    does not, and the decision this text exists to inform is "do I wait?"."""
+    surfaces = _rerank_surfaces(Store(), monkeypatch, capsys)
+
+    for name in ("help", "note"):
+        text = surfaces[name]
+        assert "273 s" in text, (
+            f"the --rerank {name} does not carry the measured median "
+            f"(273 s): {text!r}"
+        )
+        assert "minute" in text, (
+            f"the --rerank {name} states seconds only. A three-digit seconds "
+            "figure reads as small at a glance; the unit is what stops a "
+            f"caller reaching for this mid-turn: {text!r}"
+        )

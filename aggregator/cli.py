@@ -347,8 +347,8 @@ def _rerank_needs_full_fields() -> str:
         "ERROR: --rerank and --fields summary ask for incompatible things.\n"
         "--rerank ranks document BODIES with a cross-encoder, and "
         "--fields summary does not return any — the ranking would be computed "
-        "over empty documents, at ~47 s per query, for an ordering over "
-        "nothing.\n"
+        "over empty documents, at several minutes per query, for an ordering "
+        "over nothing.\n"
         "Re-run with --fields full, or omit --fields entirely (--rerank "
         "supplies --fields full for you), or drop --rerank to keep the "
         "default recency ordering over summaries.\n"
@@ -393,7 +393,8 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         # command prints. What the up-front load still buys is WHEN and WITH
         # WHAT EXIT CODE. Measured on this path with a reranker that loads and
         # then raises while scoring: exit 0, the whole page printed, and the
-        # notice on the line after the last row — an operator who waited ~47 s
+        # notice on the line after the last row — an operator who waited four
+        # and a half minutes
         # reads the report only after scrolling past the results it disclaims,
         # and a script or timer sees a success. Loading first converts that
         # post-work degradation into a pre-work refusal that names its fix and
@@ -410,15 +411,26 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         # "SCORES EVERY HIT" WAS FALSE, and round 3's M4. ``_maybe_rerank``
         # reorders at most ``_RERANK_WINDOW`` items; --page-size defaults to
         # 50. So the flag's most ordinary invocation returned a 40%-ranked page
-        # while the one line the operator reads during the 47-second wait told
-        # them the whole thing had been scored.
+        # while the one line the operator reads during the multi-minute wait
+        # told them the whole thing had been scored.
+        #
+        # AND THE WAIT IT NAMED WAS AN ORDER OF MAGNITUDE SHORT. "47 s median"
+        # was measured while the cross-encoder scored session cards against
+        # their own subjects — near-empty documents — and while the pages
+        # holding a genuinely long document were being OOM-killed instead of
+        # timed. Both are fixed (see ``mcp._RERANK_WINDOW`` for the table), and
+        # the re-measured figure on real bodies is 273 s median / 304 s p95.
+        # The unit is in the sentence on purpose: three digits of seconds reads
+        # as small, and "four and a half minutes" is what an operator actually
+        # decides against.
         print(
             f"note: --rerank scores the first {_RERANK_WINDOW} hits of the "
             f"page with a cross-encoder and reorders those; any hit after them "
-            f"keeps the default recency order. Measured at 47 s median per "
-            f"query on CPU, plus a one-off model load. This is a batch "
-            f"facility. Pass --page-size {_RERANK_WINDOW} or less for a page "
-            f"that is ranked all the way down.",
+            f"keeps the default recency order. Measured at 273 s median and "
+            f"304 s at p95 per query on this CPU — about four and a half "
+            f"minutes — plus a one-off model load. This is a batch facility. "
+            f"Pass --page-size {_RERANK_WINDOW} or less for a page that is "
+            f"ranked all the way down.",
             file=sys.stderr,
         )
     result = _mcp_query(
@@ -2663,8 +2675,9 @@ def build_parser() -> argparse.ArgumentParser:
             f"order — so at the default --page-size 50 most of the page is NOT "
             f"ranked, and the output marks where the ranked part ends. Pass "
             f"--page-size {_RERANK_WINDOW} or less to have the whole page "
-            f"ranked. SLOW — 47 s median per query on this CPU against "
-            f"0.65 s without, plus a one-off model load; this command is the "
+            f"ranked. SLOW — 273 s median and 304 s at p95 per query on this "
+            f"CPU, about four and a half minutes, against 0.65 s without, "
+            f"plus a one-off model load; this command is the "
             f"batch surface that cost is documented for. Refuses out loud if "
             "the weights cannot be loaded rather than returning an unranked "
             "page. IMPLIES --fields full when --fields is not given, because "

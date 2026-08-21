@@ -9,14 +9,19 @@ Two things made that worse than a missing detail:
 
 * the note printed on every ``--rerank`` run claimed it "scores every hit",
   which is not true at any page size above the window — the one line an
-  operator reads while waiting 47 seconds actively told them the wrong thing;
+  operator reads while waiting four and a half minutes actively told them the
+  wrong thing;
 * the rows below the boundary look exactly like the rows above it. A reader
   scrolling a 50-row page has no way to tell that row 21 onwards was never
   scored, so the recency ordering reads as a relevance ordering.
 
 The window itself is not changed here — it lives in ``mcp.py`` and the cost it
-bounds (47 s median for 20 pairs on this CPU) is real. What changes is that the
-page stops lying about which part of it was ranked.
+bounds (re-measured 2026-08-21: 273 s median, 304 s p95 for 20 pairs on this
+CPU, ~13.7 s per pair) is real. The 47 s this file used to quote was measured
+over session cards scored against their own subjects and over pages whose
+expensive members were OOM-killed rather than timed; see ``mcp._RERANK_WINDOW``
+for the table. What changes here is that the page stops lying about which part
+of it was ranked.
 """
 
 import argparse
@@ -151,7 +156,8 @@ def test_no_marker_when_the_rerank_did_not_apply(monkeypatch, capsys):
 
 
 def test_the_help_text_states_the_window(capsys):
-    """A reader choosing --page-size needs the number before they spend 47 s."""
+    """A reader choosing --page-size needs the number before they spend the
+    four and a half minutes a full window costs."""
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["query", "--help"])
