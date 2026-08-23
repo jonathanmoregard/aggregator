@@ -53,6 +53,7 @@ import pytest
 
 from aggregator.cli import main as cli_main
 from aggregator.core import store as store_mod
+from aggregator.core.hybrid import VECTOR_FLOOR_MAX_DISTANCE
 from aggregator.core.store import Store
 from aggregator.mcp import aggregator_capabilities, aggregator_query
 from aggregator.sources.sessions import SessionsSource
@@ -191,6 +192,29 @@ def _stub_vector(text: str) -> np.ndarray:
 #: ``{document name: semantic cluster}``, derived from the bodies rather than
 #: restated, so a corpus edit cannot silently desynchronise the expectations.
 DOC_CLUSTER = {name: int(np.argmax(_stub_vector(body)[:3])) for name, body, _ in CORPUS}
+
+
+def semantic_reach(query: str) -> set[str]:
+    """Session ids a WARM vector arm can still return for ``query``.
+
+    Derived the same way ``DOC_CLUSTER`` and ``FTS_VOTING`` are — from the
+    corpus text and the stub's geometry, never from a previous run of the code
+    under test. The arm proposes its ``k`` nearest and ``hybrid.vector_floor``
+    then drops everything past ``VECTOR_FLOOR_MAX_DISTANCE``. In this space a
+    document in the query's own cluster differs from the query by its salt
+    offset alone (0.01 to 0.09) and a document in any other cluster sits at
+    ``sqrt(2) = 1.414``, so the floor admits exactly one cluster. A blank body
+    never embeds and is therefore reachable by neither arm.
+
+    The test that uses this checks the geometry rather than trusting this
+    paragraph: see ``test_a_warm_index_answers_a_query_that_matches_nothing``.
+    """
+    axis = int(np.argmax(_stub_vector(query)[:3]))
+    return {
+        f"sess-{name}"
+        for name, body, _ in CORPUS
+        if body.strip() and DOC_CLUSTER[name] == axis
+    }
 
 
 class StubEmbedder:
@@ -630,30 +654,66 @@ def test_a_hybrid_page_token_keeps_paging_the_hybrid_result_set(
 
 
 def test_a_warm_index_answers_a_query_that_matches_nothing(corpus, cache, stub_models):
-    """KNOWN, ESCALATED, AND PINNED HERE SO A CHANGE TO IT IS DELIBERATE.
+    """WHAT THE DISTANCE FLOOR IS WORTH, FROM OUTSIDE THE CODE THAT IMPLEMENTS IT.
 
-    The KNN is ``ORDER BY distance LIMIT k`` with no similarity cutoff, so once
-    the index is warm every free-text query comes back with up to
-    ``_VECTOR_ARM_K`` neighbours however far away they are. End to end that
-    reads as: a query no document contains returned nothing before the
-    backfill and returns the entire embedded corpus after it. Recall up,
-    precision down — which is the trade hybrid retrieval IS — but the "no
-    results" answer stops existing along the way, and on a recall tool that
-    answer carries information.
+    The KNN is ``ORDER BY distance LIMIT k`` with no similarity cutoff of its
+    own, so once the index is warm a free-text query no document contains would
+    come back with up to ``_VECTOR_ARM_K`` neighbours however far away they
+    are — and the "no results" answer, which on a recall tool carries
+    information, would stop existing. This test used to pin exactly that: the
+    whole embedded corpus, 8 of 9 documents, for a word nobody wrote. Its
+    docstring pre-registered the change, and this is it.
 
-    ``test_mcp_hybrid.py`` pins the same decision at the unit level; this is
-    what it looks like from outside, which is the level at which somebody
-    notices. If Task M sets a distance floor from the real-cache measurement,
-    THIS is the test to change: the expected count becomes whatever the floor
-    admits, and the change should be visible in a diff rather than absorbed by
-    a loose bound somewhere else.
+    ``hybrid.vector_floor`` now bounds the arm at
+    ``VECTOR_FLOOR_MAX_DISTANCE``, and end to end that reads as: the query's own
+    semantic cluster comes back and the orthogonal clusters do not. The
+    expectation is DERIVED from the corpus (``semantic_reach``) rather than
+    written as a number, and the geometry it rests on is asserted below rather
+    than described — a corpus edit or a change to the constant has to move both
+    together or turn this red.
+
+    WHAT STILL GETS THROUGH, NAMED, because a floor that looked like a
+    relevance filter would be worse than none. Every document that survives
+    here is a *voting* or *ballot* document answering a *governance* query, and
+    not one of them contains the query word — the vector arm is genuinely the
+    only thing that reached them, which is what this file exists to
+    demonstrate. The floor separates far from near; it cannot separate
+    "adjacent" from "relevant", and on the real corpus it cannot separate them
+    at all for an on-domain query with no answer (the measured coincidence
+    floor, 0.978, is closer than a typical relevant document at 1.09 — see
+    ``hybrid.VECTOR_FLOOR_MAX_DISTANCE``). That case is the low-confidence
+    hedge's, not this rule's, and this page carries the hedge: no keyword
+    matched any of these rows.
     """
     assert ingest(corpus) == 0
     assert aggregator_query(SEMANTIC_ONLY_GOVERNANCE)["total"] == 0
 
     assert run_cli(["embed", "--catchup"]) == 0
+    expected = semantic_reach(SEMANTIC_ONLY_GOVERNANCE)
+
+    # The premise of that derivation, checked against the shipped constant: in
+    # this space "same cluster" is inside the floor and "other cluster" is not.
+    # Asserting it here means a stub-geometry edit cannot quietly turn the
+    # expectation below into a restatement of whatever the code now does.
+    query_vec = _stub_vector(SEMANTIC_ONLY_GOVERNANCE)
+    for name, body, _day in CORPUS:
+        if not body.strip():
+            continue
+        distance = float(np.linalg.norm(_stub_vector(body) - query_vec))
+        assert (distance <= VECTOR_FLOOR_MAX_DISTANCE) == (
+            f"sess-{name}" in expected
+        ), (name, distance)
+
     warm = aggregator_query(SEMANTIC_ONLY_GOVERNANCE)
-    assert warm["total"] == 8, "every embedded document; only the blank body has none"
+    assert ids(warm) == expected
+    assert warm["total"] == len(expected)
+    assert len(expected) < sum(1 for _n, b, _d in CORPUS if b.strip()), (
+        "the floor admitted every embedded document, so this test is no longer "
+        "watching it do anything"
+    )
+    # Vector-only, so the page is hedged — see test_mcp_abstention.py.
+    assert warm["search_mode"] == "vector"
+    assert warm["low_confidence"] is True
 
 
 # --- sad path: no sqlite-vec on this machine ---------------------------------

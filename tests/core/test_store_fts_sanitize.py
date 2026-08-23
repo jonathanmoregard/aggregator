@@ -361,6 +361,21 @@ def test_the_vector_arm_is_handed_the_unsanitised_query(seeded, monkeypatch):
 def test_a_raising_fts_arm_degrades_to_the_vector_arm_alone(seeded, monkeypatch):
     """If MATCH raises anyway — a lock, a corrupt index, a future FTS5 — the
     hybrid query answers from the vector arm rather than erroring at the agent.
+
+    AND IT REPORTS THE ARM AS UNAVAILABLE, NOT AS UNMATCHED. This used to come
+    back as a plain empty id set, which ``_note_confidence`` read and turned
+    into "the keyword arm matched none of these rows" — a claim about the
+    DOCUMENTS manufactured out of a failure of the INDEX. An agent reading that
+    cannot tell a corpus with no keyword match from an FTS5 table that fell
+    over, which is the empty-result-looks-like-success failure this project
+    bans by name.
+
+    ``LEXICAL_ARM_UNAVAILABLE`` is equal to ``frozenset()`` and behaves as one
+    everywhere, so nothing downstream has to special-case it to stay correct;
+    only ``is`` tells it apart, and only the sentence changes. It cannot be
+    spelled ``None`` — that already means the FTS5-only route, where every row
+    IS a keyword match, so reusing it would flip a dropped arm to "fully
+    corroborated".
     """
     import aggregator.mcp as mcp_mod
 
@@ -369,15 +384,34 @@ def test_a_raising_fts_arm_degrades_to_the_vector_arm_alone(seeded, monkeypatch)
 
     monkeypatch.setattr(seeded, "_fts_obs_ids", boom)
     monkeypatch.setattr(mcp_mod, "_widen_chunk_ids", lambda ids: list(ids))
-    scope, vec_hits, lexical_support = mcp_mod._fused_id_scope(
+    scope, vec_hits, lexical_ids = mcp_mod._fused_id_scope(
         seeded, "observations", "power-on", object(), frozen=["o0", "o1"]
     )
     assert scope == frozenset({"o0", "o1"})
     assert vec_hits == ["o0", "o1"]
-    # Criterion D's third return value. The answer stands, and it says so:
-    # a result set the keyword arm never corroborated is exactly the shape a
-    # no-answer query produces, so degrading has to be reportable.
-    assert lexical_support is False
+
+    # Identity, because equality cannot carry the distinction — that is the
+    # whole design — and this assertion is what goes red if the state is ever
+    # collapsed back into an ordinary empty set.
+    assert lexical_ids is mcp_mod.LEXICAL_ARM_UNAVAILABLE
+    assert mcp_mod._lexical_arm_failed(lexical_ids) is True
+    # ...and it really is empty for everything that only wants the ids, so the
+    # fusion above and every set operation below it stay correct untouched.
+    assert lexical_ids == frozenset()
+    assert not lexical_ids
+    assert "o0" not in lexical_ids
+    assert mcp_mod._lexical_contributed(lexical_ids) is False
+
+    # A HEALTHY ARM THAT MATCHED NOTHING IS THE OTHER STATE, and the two must
+    # not be the same object — otherwise the sentence above is emitted for a
+    # corpus that was searched correctly and simply had no hit.
+    monkeypatch.setattr(seeded, "_fts_obs_ids", lambda _text: [])
+    _scope, _hits, empty = mcp_mod._fused_id_scope(
+        seeded, "observations", "power-on", object(), frozen=["o0", "o1"]
+    )
+    assert empty == lexical_ids
+    assert empty is not mcp_mod.LEXICAL_ARM_UNAVAILABLE
+    assert mcp_mod._lexical_arm_failed(empty) is False
 
 
 def test_a_raising_fts_arm_is_logged_loudly(seeded, monkeypatch, caplog):

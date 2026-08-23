@@ -19,6 +19,7 @@ matched thousands of rows further down the recency order reported
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -241,6 +242,52 @@ def test_a_drilldown_page_of_vector_only_rows_is_low_confidence(store, embedder)
     assert [r["obs_id"] for r in page1["records"]] == ["o-vec"]
     assert page1["low_confidence"] is True
     assert "keyword" in page1["low_confidence_reason"].lower()
+
+
+# --- a keyword arm that fell over must not be reported as one that missed ---
+
+
+def test_a_dropped_keyword_arm_says_so_instead_of_blaming_the_rows(
+    store, embedder, monkeypatch
+):
+    """THE SENTENCE IS THE CONTRACT, so the test reads the sentence.
+
+    When ``_fts_obs_ids`` raises, the query still answers from the vector arm —
+    a broken index must cost the arm and never the answer. What it must not do
+    is report that as "the keyword arm matched none of these rows", which is a
+    claim about the documents made out of a failure of the index, and leaves an
+    agent unable to tell an unmatched corpus from an FTS5 table that fell over.
+    """
+    _seed(store, [("o-vec", "quadratic voting rollout", True)])
+
+    def boom(_text):
+        raise sqlite3.OperationalError("simulated FTS5 failure")
+
+    monkeypatch.setattr(store, "_fts_obs_ids", boom)
+    result = aggregator_query("source:sessions governance", _store=store)
+    assert result["ok"] is True, result
+    assert _ids(result) == ["s-o-vec"], "the vector arm still has to answer"
+    assert result["low_confidence"] is True
+    reason = result["low_confidence_reason"].lower()
+    assert "unavailable" in reason, reason
+    assert "matched none of these rows" not in reason, reason
+    assert "LOW CONFIDENCE" in result["notice"]
+
+
+def test_a_keyword_arm_that_ran_and_missed_still_blames_the_rows(
+    store, embedder
+):
+    """The other half, and the reason the first one needs a distinct state: an
+    arm that DID run and found nothing must keep the original sentence. A fix
+    that emitted "unavailable" for both would trade one lie for another."""
+    _seed(store, [("o-vec", "quadratic voting rollout", True)])
+    result = aggregator_query("source:sessions governance", _store=store)
+    assert result["ok"] is True, result
+    assert _ids(result) == ["s-o-vec"]
+    assert result["low_confidence"] is True
+    reason = result["low_confidence_reason"].lower()
+    assert "matched none of these rows" in reason, reason
+    assert "unavailable" not in reason, reason
 
 
 # --- signal 3 reaches a page smaller than the rerank window -----------------

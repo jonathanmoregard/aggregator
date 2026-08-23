@@ -729,6 +729,12 @@ def _fused_id_scope(
     while the arm matched 13,650 rows elsewhere reported full confidence. The
     ids let the caller ask about the rows it is actually returning.
 
+    THREE STATES AND NOT TWO, and the third is why
+    :data:`LEXICAL_ARM_UNAVAILABLE` exists: an empty ``frozenset()`` means the
+    keyword arm ran and matched nothing, the singleton means it never ran, and
+    conflating them makes the response tell the agent that its words were
+    checked against these rows when they were not.
+
     ``None`` means the vector arm contributed nothing, so the query answers
     down the FTS5-only route: every row it returns IS a keyword match, and
     there is no id set to compare against. That is a different fact from an
@@ -817,26 +823,38 @@ def _fused_id_scope(
                 ),
             )
         return None, [], None
+    lexical_ids: frozenset[str] = frozenset()
     try:
         fts_ids = (
             [] if search_mode == "vector"
             else store._fts_obs_ids(text) if kind == "observations"
             else sorted(store._fts_ids(text))
         )
+        lexical_ids = frozenset(fts_ids)
     except sqlite3.OperationalError:
-        # NOT surfaced anywhere else. The probe in ``aggregator_query`` runs
-        # the same statement, so in practice it fails first and the query never
-        # reaches here — but "in practice" is a lock that has to still be held
-        # a few milliseconds later, and if it was released in between then this
-        # is the only place the caller learns the keyword arm dropped out.
-        # An empty ``lexical_ids`` is what carries that into the response.
+        # NOT SURFACED ANYWHERE ELSE, AND IT IS A NARROW RACE. The probe in
+        # ``aggregator_query`` runs the same statement, so in practice it fails
+        # first and the query never reaches here — but "in practice" is a lock
+        # that has to still be held a few milliseconds later, and if it was
+        # released in between then this is the only place the caller learns the
+        # keyword arm dropped out. Being rare is exactly why it must not lie
+        # when it happens: a path nobody watches is a path nobody debugs.
+        #
+        # ``LEXICAL_ARM_UNAVAILABLE`` AND NOT ``frozenset()``. Both make the
+        # fusion below behave identically — the arm contributes no ids either
+        # way, which is correct — but only one of them can still say, three
+        # layers up in ``_note_confidence``, that these rows were never checked
+        # against the caller's words. The plain empty set was read as "the
+        # keyword arm matched none of these rows", which is a claim about the
+        # documents made out of a failure of the index.
         log.warning(
             "keyword arm failed for %r after a healthy probe; answering from "
             "the vector arm alone", kind, exc_info=True,
         )
         fts_ids = []
+        lexical_ids = LEXICAL_ARM_UNAVAILABLE
     scope = frozenset(doc_id for doc_id, _ in rrf_fuse(fts_ids, vec_ids))
-    return scope, list(vec_hits), frozenset(fts_ids)
+    return scope, list(vec_hits), lexical_ids
 
 
 def _apply_hybrid(
@@ -909,14 +927,60 @@ def _apply_hybrid(
     return replace(ast, text=None, id_scope=scope), True, vec_hits, lexical_ids
 
 
+class _LexicalArmUnavailable(frozenset):
+    """The keyword arm DID NOT RUN. Not "it ran and matched nothing".
+
+    A ``frozenset`` subclass with no members, so every set operation, truth
+    test and membership check treats it exactly as ``frozenset()`` — nothing
+    downstream has to special-case it to stay correct — while ``is`` still
+    tells it apart. That combination is the point: the state has to be
+    invisible to the arithmetic and visible to the sentence.
+
+    IT EXISTS BECAUSE ``frozenset()`` ALONE ERASED A FAILURE. When
+    ``_fts_obs_ids`` raises, the fused path degrades to the vector arm and the
+    caller keeps its answer, which is right. Reporting that as an ordinary
+    empty id set was not: ``_note_confidence`` read it and told the agent "the
+    keyword arm matched none of these rows", which is false — the arm never
+    looked. An agent cannot then distinguish a corpus with no keyword match
+    from a keyword index that fell over, which is the
+    empty-result-looks-like-success failure this project bans by name, and it
+    collapses the same three-valued discipline criterion D applies everywhere
+    else: ``None`` (unaskable) is not ``False`` (asked, answered no).
+
+    AND IT CANNOT BE SPELLED ``None``, which is already taken by the FTS5-only
+    route — where every row IS a keyword match by construction and
+    :func:`_lexical_on_page` short-circuits to ``True``. Reusing it would flip a
+    dropped arm to "fully corroborated", which is worse than the bug.
+    """
+
+    __slots__ = ()
+
+
+#: The singleton. Compare with ``is``; it is equal to ``frozenset()`` and that
+#: is deliberate, so a caller that only cares about the ids stays correct.
+LEXICAL_ARM_UNAVAILABLE = _LexicalArmUnavailable()
+
+
 def _lexical_contributed(lexical_ids: frozenset[str] | None) -> bool:
     """Did the keyword arm put any candidate into this result set?
 
     ``None`` is the FTS5-only route, where the keyword arm produced the whole
     answer — including when that answer is empty, because the arm still ran and
-    still is the only arm that did.
+    still is the only arm that did. :data:`LEXICAL_ARM_UNAVAILABLE` needs no
+    branch here and gets none: an arm that raised contributed nothing, so the
+    empty-set answer is already the true one.
     """
     return lexical_ids is None or bool(lexical_ids)
+
+
+def _lexical_arm_failed(*lexical_ids: frozenset[str] | None) -> bool:
+    """Did the keyword arm drop out for any ontology in this response?
+
+    ``any`` rather than ``all`` because the report is a warning: in union mode
+    one side's arm can fall over while the other's answers, and a response that
+    is half unchecked has to say so.
+    """
+    return any(ids is LEXICAL_ARM_UNAVAILABLE for ids in lexical_ids)
 
 
 def _lexical_on_page(
@@ -932,6 +996,13 @@ def _lexical_on_page(
 
     ``None`` short-circuits to ``True`` — on the FTS5-only route every row is a
     keyword match by construction, and there is no id set to test.
+
+    :data:`LEXICAL_ARM_UNAVAILABLE` gets NO branch here and answers ``False``
+    like the empty set it is, because "did the keyword arm match a row on this
+    page" is genuinely no when the arm never ran. The distinction lives one
+    layer up, where the answer becomes a SENTENCE: ``_note_confidence`` takes
+    the dropped-arm state as a separate argument and says the true thing
+    instead of this one.
     """
     if lexical_ids is None:
         return True
@@ -958,11 +1029,26 @@ def _lexical_session_ids(
     without it the hedge on the surface an agent actually calls would still be
     answering the corpus-wide question.
     """
-    if lexical_ids is None:
-        return None
+    if lexical_ids is None or lexical_ids is LEXICAL_ARM_UNAVAILABLE:
+        # Both states are about the arm rather than about its ids, and both
+        # have to survive the projection — returning a plain empty set here
+        # would re-erase exactly what ``LEXICAL_ARM_UNAVAILABLE`` exists to
+        # carry.
+        return lexical_ids
     if not lexical_ids or not text:
         return frozenset()
-    roots, exacts = store._fts_hit_scope(text, obs_type)
+    try:
+        roots, exacts = store._fts_hit_scope(text, obs_type)
+    except sqlite3.OperationalError:
+        # The same race one statement later. The page is already computed and
+        # is not in question; only the claim about it is, so the honest answer
+        # is the one that says the keyword arm could not be consulted.
+        log.warning(
+            "keyword arm failed while projecting hits onto session cards; "
+            "reporting the arm as unavailable rather than as unmatched",
+            exc_info=True,
+        )
+        return LEXICAL_ARM_UNAVAILABLE
     return frozenset(roots | exacts)
 
 
@@ -978,6 +1064,7 @@ def _note_confidence(
     *,
     vector_contributed: bool,
     lexical_contributed: bool,
+    lexical_unavailable: bool,
 ) -> dict[str, Any]:
     """Say which arms answered and whether the answer is trusted.
 
@@ -1037,6 +1124,18 @@ def _note_confidence(
        corroborated. The callers compute this over the ids they are about to
        return, in whichever id space that page speaks (see
        ``_lexical_on_page`` and ``_lexical_session_ids``).
+
+       AND "THE ARM MATCHED NOTHING" IS NOT "THE ARM NEVER RAN".
+       ``lexical_unavailable`` is that third state, and it REPLACES the
+       sentence above rather than joining it: when ``_fts_obs_ids`` raises, the
+       query still answers from the vector arm — correctly, a broken index must
+       cost the arm and not the answer — but saying "the keyword arm matched
+       none of these rows" then asserts something about the documents out of a
+       failure of the index, and leaves an agent unable to tell a corpus with
+       no keyword match from an FTS5 table that fell over. It is a narrow race
+       (the probe in ``aggregator_query`` runs the same statement and normally
+       fails first), which is the reason it must be honest rather than a reason
+       to let it lie: nobody watches this path, so nobody would catch it.
     3. **The reranker ran and found nothing that stands out.** The report's
        preferred abstention signal, and the weakest one HERE, because the
        cross-encoder is off by default at ~13.7 s per pair on this hardware.
@@ -1058,14 +1157,26 @@ def _note_confidence(
         else "lexical"
     )
     reasons: list[str] = []
+    if lexical_unavailable:
+        reasons.append(
+            "the keyword arm was UNAVAILABLE for this query — it failed while "
+            "matching, so it contributed nothing and these rows come from the "
+            "semantic arm alone. This is NOT the same as the keyword arm "
+            "finding no match: nothing here has been checked against your "
+            "words at all, and a re-run may answer differently"
+        )
     if not result.get("total"):
         reasons.append(
-            "nothing matched this query on either arm, so this is an "
+            "nothing matched this query on the semantic arm, the only one that "
+            "ran, so this is an abstention rather than a short answer"
+            if lexical_unavailable
+            else "nothing matched this query on either arm, so this is an "
             "abstention rather than a short answer"
         )
     else:
         if (
-            search_mode == "hybrid"
+            not lexical_unavailable
+            and search_mode == "hybrid"
             and result.get("records")
             and not lexical_support
         ):
@@ -2379,6 +2490,7 @@ def _query_records_path(
         rr_standout,
         vector_contributed=hybrid,
         lexical_contributed=_lexical_contributed(lexical_ids),
+        lexical_unavailable=_lexical_arm_failed(lexical_ids),
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -2451,6 +2563,7 @@ def _query_sessions_path(
             rr_standout,
             vector_contributed=hybrid,
             lexical_contributed=_lexical_contributed(lexical_ids),
+            lexical_unavailable=_lexical_arm_failed(lexical_ids),
         )
         return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -2507,17 +2620,21 @@ def _query_sessions_path(
         _attach_next_page_token(
             result, offset + page_size, hybrid, fingerprint, frozen_out
         )
+    lexical_cards = _lexical_session_ids(
+        store, query_text, ast.obs_type, lexical_ids
+    )
     _note_confidence(
         result,
         query_text,
         search_mode,
-        _lexical_on_page(
-            (it["stable_id"] for it in items),
-            _lexical_session_ids(store, query_text, ast.obs_type, lexical_ids),
-        ),
+        _lexical_on_page((it["stable_id"] for it in items), lexical_cards),
         rr_standout,
         vector_contributed=hybrid,
         lexical_contributed=_lexical_contributed(lexical_ids),
+        # ``lexical_cards`` too: the projection runs a SECOND FTS5 statement, so
+        # the arm can drop out there as well, after ``lexical_ids`` came back
+        # healthy a few milliseconds earlier.
+        lexical_unavailable=_lexical_arm_failed(lexical_ids, lexical_cards),
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -2602,16 +2719,6 @@ def _query_union_path(
     )
     query_text = ast.text
     hybrid = rec_hybrid or sess_hybrid
-    # EITHER ontology corroborating is enough. Union mode asks one question of
-    # two tables, and a keyword hit in either one is keyword support for the
-    # answer the caller receives; requiring both would report low confidence on
-    # every query whose subject only exists in one ontology, which is most of
-    # them. Applied per ROW below rather than per ontology, for the reason in
-    # ``_note_confidence``: a page can hold rows from a set whose keyword hits
-    # all sort elsewhere.
-    lexical_contributed = _lexical_contributed(
-        rec_lexical_ids
-    ) or _lexical_contributed(sess_lexical_ids)
     # Each ontology's hits are frozen SEPARATELY. They backfill at different
     # speeds — records finish in minutes, observations take weeks — so one
     # shared snapshot would let the faster table drift under the slower one.
@@ -2646,6 +2753,24 @@ def _query_union_path(
                 "aggregator_capabilities() to confirm the store is healthy."
             ),
         }
+
+    # WHICH ARMS ACTUALLY PUT ROWS IN THIS RESPONSE — computed after both
+    # queries, because in union mode an ontology can engage an arm and still
+    # contribute nothing. EITHER ontology counts: union asks one question of two
+    # tables, and requiring both would report every query whose subject exists
+    # in only one of them as single-armed, which is most of them.
+    #
+    # AN EMPTY ONTOLOGY MUST NOT VOTE. Without the row check, a corpus with no
+    # github records at all reported ``search_mode: "hybrid"`` for a query the
+    # vector arm alone answered out of the sessions table — because the records
+    # side had taken the FTS5-only route and that route "is" the keyword arm.
+    # It ran, it returned nothing, and crediting it is the same defect this
+    # field was fixed to stop: naming an arm that produced none of these rows.
+    sides = ((rec_hybrid, rec_lexical_ids, rec_rows), (sess_hybrid, sess_lexical_ids, sess_rows))
+    vector_contributed = any(engaged and rows for engaged, _lex, rows in sides)
+    lexical_contributed = any(
+        _lexical_contributed(lex) and rows for _engaged, lex, rows in sides
+    )
 
     # Merge: build (sort_ts, kind, obj) tuples and sort desc by sort_ts.
     merged: list[tuple[datetime_like, str, Any]] = []
@@ -2719,8 +2844,11 @@ def _query_union_path(
         search_mode,
         page_lexical_support,
         rr_standout,
-        vector_contributed=hybrid,
+        vector_contributed=vector_contributed,
         lexical_contributed=lexical_contributed,
+        lexical_unavailable=_lexical_arm_failed(
+            rec_lexical_ids, sess_lexical_ids, sess_lexical_cards
+        ),
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
