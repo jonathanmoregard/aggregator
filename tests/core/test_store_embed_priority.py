@@ -36,6 +36,7 @@ WHAT THIS FILE EXISTS TO PREVENT, beyond the ordering itself:
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 
 import numpy as np
@@ -228,6 +229,95 @@ def test_the_groups_partition_the_backlog_exactly(store):
             seen += sorted(_ids(store.select_unembedded(kind, source=source)))
         assert sorted(seen) == sorted(whole), f"{kind}: groups do not cover the backlog"
         assert len(seen) == len(set(seen)), f"{kind}: a row is in two groups"
+
+
+def test_the_schema_is_what_stops_an_orphan_observation_being_written(store):
+    """FIRST DEFENCE, AND IT HOLDS. ``observations.session_id`` is declared
+    ``NOT NULL REFERENCES sessions(session_id)`` and the store opens every
+    connection with ``PRAGMA foreign_keys = ON``, so no path through this API
+    can write an observation whose session row is missing. Pinned here because
+    the two tests below deliberately go around it, and if the constraint were
+    ever dropped they would silently become the only thing left."""
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        store.upsert_entities([_obs("o-orphan", "s-that-was-never-written")])
+
+
+def _write_orphan_around_the_foreign_key(store, obs_id="o-orphan"):
+    """An orphan the way a real cache would acquire one: from OUTSIDE this API.
+
+    ``PRAGMA foreign_keys`` is per-connection and defaults to OFF — the sqlite3
+    CLI, a DB browser, and a hand-written repair script all arrive with it off,
+    and SQLite never re-validates existing rows when a constraint is declared.
+    So a cache someone has poked at by hand can hold this row even though the
+    store itself cannot create it. That is the scenario, and it is why the
+    grouping must not depend on the constraint holding.
+    """
+    c = store._c()
+    c.execute("PRAGMA foreign_keys = OFF")
+    try:
+        c.execute(
+            "INSERT INTO observations "
+            "(obs_id, session_id, root_session_id, type, ts, body, src_hash) "
+            "VALUES (?, ?, ?, 'user', '2026-07-01T08:00:00+00:00', ?, 'deadbeef')",
+            (obs_id, "s-that-was-never-written", "s-that-was-never-written",
+             "a body worth embedding"),
+        )
+        c.commit()
+    finally:
+        c.execute("PRAGMA foreign_keys = ON")
+
+
+def test_an_observation_whose_session_row_is_missing_still_belongs_to_a_group(store):
+    """THE OTHER WAY A ROW BELONGS TO NO GROUP, and the one the CASE cannot fix.
+
+    ``_OBS_SOURCE_CASE`` ends in ``ELSE '(other)'``, so an origin nobody has
+    thought of lands in the catch-all — that is the test above. But the CASE
+    reads ``sessions.origin``, and reaching it at all takes a join. Under an
+    INNER JOIN an observation whose session row is missing matches no branch,
+    including the catch-all, because it never reaches the CASE: it is absent
+    from every group, so the worker never selects it and
+    ``mark_embedding_version_complete`` waits forever on a row nobody can name.
+
+    The foreign key above is what makes this unreachable from inside, and the
+    LEFT JOIN is what makes it survivable from outside. The cost of getting it
+    wrong is not one unembedded row — it is that the embedding version never
+    completes, on a backfill measured in weeks, with nothing naming the cause.
+    """
+    _write_orphan_around_the_foreign_key(store)
+
+    whole = _ids(store.select_unembedded("observations"))
+    assert "o-orphan" in whole, (
+        "the unscoped backlog does not even hold the orphan; the join that "
+        "drops it is upstream of the grouping"
+    )
+    groups = [
+        source
+        for kind, source in EMBED_BACKLOG_ORDER
+        if kind == "observations"
+        and "o-orphan" in _ids(store.select_unembedded("observations", source=source))
+    ]
+    assert groups == [EMBED_REST], (
+        f"an observation with no session row belongs to {groups or 'NO group'}; "
+        f"the groups are documented as a partition of the backlog"
+    )
+
+
+def test_the_progress_tally_counts_a_row_whose_session_row_is_missing(store):
+    """The backlog and the tally must answer the same question. If the tally
+    drops the orphan too, per-source progress reads 100% while the backlog is
+    not empty — a source that says complete and a worker that disagrees."""
+    _write_orphan_around_the_foreign_key(store)
+    obs_rows = store._c().execute("SELECT COUNT(*) AS n FROM observations").fetchone()
+
+    tallied = sum(
+        row["total"]
+        for row in store.embed_progress_by_source()
+        if row["kind"] == "observations"
+    )
+    assert tallied == obs_rows["n"], (
+        f"the tally sees {tallied} observations, the table holds "
+        f"{obs_rows['n']}; the difference is invisible in every progress display"
+    )
 
 
 def test_an_unknown_source_is_refused_rather_than_selecting_nothing(store):

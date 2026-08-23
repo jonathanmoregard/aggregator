@@ -303,6 +303,9 @@ _OBS_SOURCE_CASE = f"""
       WHEN s.origin IN ('claude-web', 'chatgpt') THEN s.origin
       ELSE '{EMBED_REST}'
     END
+    -- Reached through a LEFT JOIN, so ``s.origin`` is NULL for an observation
+    -- whose session row is missing: every WHEN is false and it falls to
+    -- EMBED_REST, which is what keeps the groups a partition.
 """
 
 #: The same mapping for records, where the column is right there.
@@ -2795,7 +2798,15 @@ class Store:
         name turning into a clean bill of health for a source nobody touched.
         """
         if kind == "observations":
-            join = "JOIN sessions s ON s.session_id = o.session_id"
+            # LEFT, so that an observation whose session row is missing still
+            # reaches the CASE and lands in EMBED_REST. The foreign key makes
+            # that row unwritable through this API, but PRAGMA foreign_keys is
+            # per-connection and defaults OFF everywhere else, and SQLite never
+            # re-validates existing rows — so a cache someone has repaired by
+            # hand can hold one. Under an INNER JOIN it would belong to no
+            # group at all: never selected, never embedded, never reported
+            # missing, and blocking mark_embedding_version_complete forever.
+            join = "LEFT JOIN sessions s ON s.session_id = o.session_id"
             if source == "sessions":
                 return join, "s.origin = 'claude-code' AND s.kind = 'session'", []
             if source == "subagents":
@@ -2803,8 +2814,17 @@ class Store:
             if source in CHAT_ORIGINS:
                 return join, "s.origin = ?", [source]
             if source == EMBED_REST:
+                # ``s.origin IS NULL`` is the orphan. It has to be spelled out:
+                # ``NOT IN`` is NULL for a NULL left-hand side, which is not
+                # true, so the catch-all would drop exactly the row it exists
+                # to catch. The ranked branches need no such clause — their
+                # equalities are false for NULL, which is what they want.
                 marks = ",".join("?" * len(_RANKED_OBS_ORIGINS))
-                return join, f"s.origin NOT IN ({marks})", list(_RANKED_OBS_ORIGINS)
+                return (
+                    join,
+                    f"(s.origin IS NULL OR s.origin NOT IN ({marks}))",
+                    list(_RANKED_OBS_ORIGINS),
+                )
         elif kind == "records":
             if source in _RANKED_RECORD_SOURCES:
                 return "", "r.source = ?", [source]
@@ -3382,10 +3402,13 @@ class Store:
                 "observations",
                 "o",
                 _OBS_SOURCE_CASE,
-                "observations o JOIN sessions s ON s.session_id = o.session_id",
+                # LEFT for the same reason the backlog's join is LEFT: a tally
+                # that drops the orphan reports a source 100% embedded while
+                # the worker still has the row. See _embed_source_clause.
+                "observations o LEFT JOIN sessions s ON s.session_id = o.session_id",
                 "chunk_embeddings e "
                 "JOIN observations o ON o.obs_id = e.owner_id "
-                "JOIN sessions s ON s.session_id = o.session_id",
+                "LEFT JOIN sessions s ON s.session_id = o.session_id",
             ),
             (
                 "records",
