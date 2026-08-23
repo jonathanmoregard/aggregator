@@ -80,7 +80,7 @@ def test_the_rrf_constant_is_unchanged():
 
 def test_relative_z_scores_a_clear_outlier_far_above_the_rest():
     values = [0.05] + [0.60 + i * 0.001 for i in range(40)]
-    zs = relative_z(values, higher_is_better=False)
+    zs = relative_z(values, higher_is_better=False, min_sample=VECTOR_FLOOR_MIN_SAMPLE)
     assert zs is not None
     assert zs[0] > 5.0
     assert all(z < 1.0 for z in zs[1:])
@@ -90,7 +90,7 @@ def test_relative_z_scores_a_clear_outlier_far_above_the_rest():
 def test_relative_z_finds_no_outlier_in_a_no_answer_tail(tail):
     """The shape a no-answer query produces: the k nearest neighbours are all
     about equally far away, because 'nearest' is not 'relevant'."""
-    zs = relative_z(tail, higher_is_better=False)
+    zs = relative_z(tail, higher_is_better=False, min_sample=VECTOR_FLOOR_MIN_SAMPLE)
     assert zs is not None
     assert max(zs) < VECTOR_FLOOR_Z
 
@@ -105,14 +105,14 @@ def test_the_reference_designs_1_5_bar_sits_inside_the_noise_floor(tail):
     therefore below the noise floor and abstains on nothing. Pinned as a
     failing case so the constant cannot drift back without this showing up.
     """
-    zs = relative_z(tail, higher_is_better=False)
+    zs = relative_z(tail, higher_is_better=False, min_sample=VECTOR_FLOOR_MIN_SAMPLE)
     assert zs is not None
     assert max(zs) > 1.5
 
 
 def test_relative_z_flips_for_scores_where_higher_is_better():
     values = [0.9] + [0.1 + i * 0.001 for i in range(40)]
-    zs = relative_z(values, higher_is_better=True)
+    zs = relative_z(values, higher_is_better=True, min_sample=VECTOR_FLOOR_MIN_SAMPLE)
     assert zs is not None
     assert zs[0] > 5.0
 
@@ -121,13 +121,13 @@ def test_relative_z_refuses_a_sample_too_small_to_estimate_a_spread():
     """``None`` is 'undecidable', which is not the same answer as 'no outlier'
     and must not share a representation with it — a caller that read 0.0 here
     would abstain on a corpus it simply has not measured."""
-    assert relative_z([0.1, 0.9], higher_is_better=False) is None
+    assert relative_z([0.1, 0.9], higher_is_better=False, min_sample=VECTOR_FLOOR_MIN_SAMPLE) is None
 
 
 def test_relative_z_refuses_a_sample_with_no_spread_at_all():
     """Every candidate equidistant: the rule has no discriminating power, and
     reporting a z of 0 for each would read as 'measured, nothing stands out'."""
-    assert relative_z([0.5] * 40, higher_is_better=False) is None
+    assert relative_z([0.5] * 40, higher_is_better=False, min_sample=VECTOR_FLOOR_MIN_SAMPLE) is None
 
 
 # --- the floor --------------------------------------------------------------

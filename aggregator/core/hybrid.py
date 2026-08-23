@@ -31,8 +31,10 @@ than the function.
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Sequence
+from statistics import NormalDist
 
 #: The RRF constant (Cormack et al., SIGIR 2009). CONFIRMED CORRECT by the
 #: reference design and deliberately separated from ``FUSION_ARM_DEPTH``
@@ -89,13 +91,21 @@ VECTOR_FLOOR_MIN_SAMPLE = 20
 
 
 def relative_z(
-    values: Sequence[float], *, higher_is_better: bool
+    values: Sequence[float], *, higher_is_better: bool, min_sample: int
 ) -> list[float] | None:
     """Per-query z-scores, oriented so bigger always means better.
 
     Returns one z per input value, or ``None`` when the sample cannot support
-    the estimate — fewer than :data:`VECTOR_FLOOR_MIN_SAMPLE` values, or no
-    spread at all.
+    the estimate — fewer than ``min_sample`` values, or no spread at all.
+
+    ``min_sample`` IS THE CALLER'S TO STATE, and is required rather than
+    defaulted for a reason that already bit once. It used to default to
+    :data:`VECTOR_FLOOR_MIN_SAMPLE`, so :func:`has_standout` — a rule about
+    cross-encoder scores, with nothing to do with the vector floor — inherited
+    the vector floor's 20, which happened to equal ``mcp._RERANK_WINDOW``, a
+    latency budget. The reranker signal was therefore ``None`` on every page
+    under 20 rows, and one latency tweak away from being ``None`` forever. A
+    shared default is how two unrelated rules end up with one knob.
 
     ``None`` AND NOT A LIST OF ZEROS. "Undecidable" and "measured, nothing
     stands out" are opposite facts and must not share a representation: a
@@ -108,7 +118,7 @@ def relative_z(
     is the other orientation. One primitive rather than two near-identical
     ones, because the two would drift.
     """
-    if len(values) < VECTOR_FLOOR_MIN_SAMPLE:
+    if len(values) < min_sample:
         return None
     spread = statistics.pstdev(values)
     if spread == 0.0:
@@ -118,26 +128,88 @@ def relative_z(
     return [sign * (v - mean) / spread for v in values]
 
 
-#: How far above its own page a reranker score must stand for the page to
-#: count as containing an answer.
+#: How much a reranker score has to beat its own page's NULL MAXIMUM by before
+#: it counts as standing out.
 #:
-#: SAME EXTREME-VALUE ARGUMENT AS ``VECTOR_FLOOR_Z``, different sample size.
-#: The cross-encoder scores one page window (20 documents here), and the
-#: largest of 20 draws from any smooth distribution sits about 1.9 standard
-#: deviations above its own mean whether or not any of them is relevant. 2.5 is
-#: the first round bar above that. Unlike the vector floor this only ever adds
-#: a caveat to a response, never removes a row, so being wrong costs a hedge
-#: rather than an answer.
-RERANK_STANDOUT_Z = 2.5
+#: THE HALF OF THE OLD ``RERANK_STANDOUT_Z = 2.5`` THAT WAS ACTUALLY A CHOICE.
+#: That constant was derived as "the largest of 20 draws from any smooth
+#: distribution sits about 1.9 standard deviations above its own mean whether
+#: or not any of them is relevant; 2.5 is the first round bar above that" — a
+#: null term (1.87, see :func:`expected_max_z`) plus 0.63 of headroom. Only the
+#: headroom is a judgement; the null term is a fact about the sample size, and
+#: freezing the pair at ``n = 20`` made the bar too strict on a short page and
+#: too loose on a long one. ``_maybe_rerank`` scores ``min(len(items), window)``
+#: documents, so it was already being applied at sizes it was not derived for.
+RERANK_STANDOUT_MARGIN = 0.63
+
+
+def expected_max_z(n: int) -> float:
+    """Where the largest of ``n`` draws sits, in sd above their own mean.
+
+    WITH NOTHING RELEVANT AMONG THEM — this is the null, and it is the number a
+    standout has to beat. Blom's plotting position, the standard approximation
+    to the expected value of the largest normal order statistic: it gives 1.87
+    at ``n = 20``, which is the "about 1.9" the shipped constant was built on.
+
+    Grows with ``n``, which is the whole point: a fixed bar over a variable
+    window silently changes what it is asserting every time the page size
+    changes.
+    """
+    if n < 2:
+        return 0.0
+    return NormalDist().inv_cdf((n - 0.375) / (n + 0.25))
+
+
+def standout_z_threshold(n: int) -> float:
+    """The bar for a page of ``n`` scored documents."""
+    return expected_max_z(n) + RERANK_STANDOUT_MARGIN
+
+
+def _smallest_judgeable_sample() -> int:
+    """The smallest page this rule can answer ``True`` about for real reasons.
+
+    TWO CONDITIONS, BOTH ABOUT THE SAME HEADROOM. A standout has to clear the
+    null maximum by :data:`RERANK_STANDOUT_MARGIN`; and the sample has to be
+    large enough that clearing it is not the same thing as BEING the largest
+    value the sample can hold. That ceiling is ``sqrt(n-1)`` — the z of one
+    value among ``n-1`` identical others — and a page of identical
+    cross-encoder scores is not a thing that happens, so a bar within a hair of
+    it is a bar nothing can clear. Requiring the same margin between the bar
+    and the ceiling is what keeps ``True`` reachable rather than theoretical.
+
+    DERIVED AT IMPORT AND NOT WRITTEN DOWN, so it cannot drift away from the
+    margin it comes from; ``tests/core/test_rerank_standout.py`` pins the value
+    and both conditions.
+    """
+    n = 2
+    while math.sqrt(n - 1) < standout_z_threshold(n) + RERANK_STANDOUT_MARGIN:
+        n += 1
+        if n > 1_000:  # pragma: no cover — the loop converges by n≈9
+            raise RuntimeError("no sample size satisfies the standout margin")
+    return n
+
+
+#: Fewer scored documents than this and :func:`has_standout` answers ``None``.
+RERANK_STANDOUT_MIN_SAMPLE = _smallest_judgeable_sample()
+
+#: What the rule resolves to at a full ``mcp._RERANK_WINDOW`` page — the value
+#: that used to be hard-coded for every page. Kept as a reference point for the
+#: docs and pinned by a test; nothing reads it to make a decision.
+RERANK_STANDOUT_Z = standout_z_threshold(20)
 
 
 def has_standout(
     values: Sequence[float],
     *,
     higher_is_better: bool,
-    z_threshold: float,
+    z_threshold: float | None = None,
 ) -> bool | None:
     """Does anything in ``values`` stand out from the rest? ``None`` = can't say.
+
+    ``z_threshold`` defaults to :func:`standout_z_threshold` FOR THIS SAMPLE.
+    Passing one overrides it, which is the escape hatch for a caller with its
+    own calibration — but the default is the rule, and it is a function rather
+    than a constant because the null it has to beat moves with the sample size.
 
     THREE-VALUED ON PURPOSE. "Too few scores to judge" is not "nothing was
     relevant", and a caller that collapsed them would report low confidence for
@@ -151,12 +223,17 @@ def has_standout(
     every candidate, because it DELETES rows and a wrong deletion costs the
     user a document they know exists. Reporting a hedge costs a sentence.
     """
-    if len(values) < VECTOR_FLOOR_MIN_SAMPLE:
+    if len(values) < RERANK_STANDOUT_MIN_SAMPLE:
         return None
-    zs = relative_z(values, higher_is_better=higher_is_better)
+    bar = standout_z_threshold(len(values)) if z_threshold is None else z_threshold
+    zs = relative_z(
+        values,
+        higher_is_better=higher_is_better,
+        min_sample=RERANK_STANDOUT_MIN_SAMPLE,
+    )
     if zs is None:
         return False
-    return max(zs) >= z_threshold
+    return max(zs) >= bar
 
 
 def vector_floor(
@@ -195,7 +272,11 @@ def vector_floor(
     user knows the document exists, and a tool that hides it is a tool they
     stop trusting. Abstention has to be evidence, not the absence of it.
     """
-    zs = relative_z([d for _, d in scored], higher_is_better=False)
+    zs = relative_z(
+        [d for _, d in scored],
+        higher_is_better=False,
+        min_sample=VECTOR_FLOOR_MIN_SAMPLE,
+    )
     if zs is None:
         return [doc_id for doc_id, _ in scored]
     return [doc_id for (doc_id, _), z in zip(scored, zs, strict=True) if z >= z_threshold]

@@ -111,7 +111,7 @@ import logging
 import os
 import sqlite3
 import zlib
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -128,7 +128,6 @@ from aggregator.core.dsl import DSLError, format_help, parse
 # fails if that ever regresses. ``hybrid`` is pure Python and free.
 from aggregator.core.hybrid import (
     FUSION_ARM_DEPTH,
-    RERANK_STANDOUT_Z,
     has_standout,
     rrf_fuse,
     vector_floor,
@@ -676,7 +675,7 @@ def _fused_id_scope(
     embedding: object,
     frozen: list[str] | None = None,
     search_mode: str = "hybrid",
-) -> tuple[frozenset[str] | None, list[str], bool]:
+) -> tuple[frozenset[str] | None, list[str], frozenset[str] | None]:
     """RRF-fuse the two arms into a candidate id set, or ``None`` for FTS5-only.
 
     THE FTS5 ARM IS PASSED IN WHOLE AND THE VECTOR ARM IS CAPPED AT
@@ -716,14 +715,24 @@ def _fused_id_scope(
     skipping the fusion: ``rrf_fuse`` over one arm is that arm's own ranking,
     so there is no second code path to keep in step with this one.
 
-    Returns ``(scope, vec_hits, lexical_support)``. ``vec_hits`` is what the
+    Returns ``(scope, vec_hits, lexical_ids)``. ``vec_hits`` is what the
     page token freezes: hand it back as ``frozen`` on a continuation and the
     KNN is not re-run at all, so the candidate set cannot move while the caller
-    pages through it. ``lexical_support`` says whether the keyword arm found
-    anything at all, which is the confidence signal ``_note_confidence`` reads
-    — a fused set the keyword arm never corroborated is exactly the shape a
-    no-answer query produces, because the KNN returns its ``k`` nearest
-    neighbours whether or not any of them is relevant.
+    pages through it.
+
+    ``lexical_ids`` IS THE KEYWORD ARM'S ID SET AND NOT A BOOLEAN, and that is
+    the fix for a hedge that read the corpus while claiming to describe a page.
+    ``bool(fts_ids)`` cannot answer the question ``_note_confidence`` asks,
+    because the fused scope is a strict SUPERSET of ``fts_ids`` — so "the
+    keyword arm corroborated none of the candidate set" is only ever true when
+    the arm matched nothing anywhere, and a page of vector-only rows served
+    while the arm matched 13,650 rows elsewhere reported full confidence. The
+    ids let the caller ask about the rows it is actually returning.
+
+    ``None`` means the vector arm contributed nothing, so the query answers
+    down the FTS5-only route: every row it returns IS a keyword match, and
+    there is no id set to compare against. That is a different fact from an
+    empty ``frozenset()``, which means the keyword arm ran and matched nothing.
     """
     floored_out = 0
     if frozen is not None:
@@ -750,7 +759,7 @@ def _fused_id_scope(
                     "from FTS5 would report the keyword arm's rows as the "
                     "vector arm's.",
                 ) from e
-            return None, [], False
+            return None, [], None
         except Exception as e:  # noqa: BLE001 — the arm degrades, never fails
             log.exception(
                 "vector arm failed for %r; answering from FTS5 alone", kind
@@ -763,7 +772,7 @@ def _fused_id_scope(
                     "this query with search_mode='hybrid' to answer it from "
                     "the keyword arm meanwhile.",
                 ) from e
-            return None, [], False
+            return None, [], None
         # CRITERION D, ON THE DEFAULT PATH. The floor runs here and nowhere
         # else: before fusion, on the one arm whose scores mean something
         # relative to each other, and never on the fused RRF score.
@@ -807,7 +816,7 @@ def _fused_id_scope(
                     "cannot answer them at all."
                 ),
             )
-        return None, [], False
+        return None, [], None
     try:
         fts_ids = (
             [] if search_mode == "vector"
@@ -820,14 +829,14 @@ def _fused_id_scope(
         # reaches here — but "in practice" is a lock that has to still be held
         # a few milliseconds later, and if it was released in between then this
         # is the only place the caller learns the keyword arm dropped out.
-        # ``lexical_support=False`` is what carries that into the response.
+        # An empty ``lexical_ids`` is what carries that into the response.
         log.warning(
             "keyword arm failed for %r after a healthy probe; answering from "
             "the vector arm alone", kind, exc_info=True,
         )
         fts_ids = []
     scope = frozenset(doc_id for doc_id, _ in rrf_fuse(fts_ids, vec_ids))
-    return scope, list(vec_hits), bool(fts_ids)
+    return scope, list(vec_hits), frozenset(fts_ids)
 
 
 def _apply_hybrid(
@@ -838,8 +847,8 @@ def _apply_hybrid(
     embedding: object | None = None,
     frozen: list[str] | None = None,
     search_mode: str = "hybrid",
-) -> tuple[QueryAST, bool, list[str], bool]:
-    """Return ``(ast, engaged, vec_hits, lexical_support)``.
+) -> tuple[QueryAST, bool, list[str], frozenset[str] | None]:
+    """Return ``(ast, engaged, vec_hits, lexical_ids)``.
 
     When the vector arm engages, the free text is replaced by the fused id
     set: the arms have already been evaluated and RRF has already merged them,
@@ -852,10 +861,11 @@ def _apply_hybrid(
     NOT computed at all when ``frozen`` already supplies the hits, which makes
     a continuation both cheaper and, more importantly, stable.
 
-    ``lexical_support`` is ``True`` when the keyword arm contributed at least
-    one id. On the FTS5-only route it is ``True`` by definition — that route IS
-    the keyword arm — so the flag only ever reports something a caller could
-    not already infer when the vector arm ran.
+    ``lexical_ids`` is the set of ids the keyword arm matched, or ``None`` on
+    the FTS5-only route — that route IS the keyword arm, so every row it
+    returns is a keyword match and there is nothing to compare against. See
+    ``_fused_id_scope`` for why this is an id set rather than the boolean it
+    used to be.
 
     Raises ``_VectorModeUnavailableError`` under ``search_mode='vector'`` whenever
     the arm cannot run. Every other mode degrades to FTS5 in silence, which is
@@ -876,7 +886,7 @@ def _apply_hybrid(
                 "Re-run with the default search_mode='hybrid' to answer from "
                 "the keyword arm meanwhile.",
             )
-        return ast, False, [], True
+        return ast, False, [], None
     if frozen is None:
         if embedding is None:
             embedding = _query_embedding(ast.text or "")
@@ -890,13 +900,70 @@ def _apply_hybrid(
                     "default search_mode='hybrid' to answer from the keyword "
                     "arm meanwhile.",
                 )
-            return ast, False, [], True
-    scope, vec_hits, lexical_support = _fused_id_scope(
+            return ast, False, [], None
+    scope, vec_hits, lexical_ids = _fused_id_scope(
         store, kind, ast.text or "", embedding, frozen, search_mode
     )
     if scope is None:
-        return ast, False, [], True
-    return replace(ast, text=None, id_scope=scope), True, vec_hits, lexical_support
+        return ast, False, [], None
+    return replace(ast, text=None, id_scope=scope), True, vec_hits, lexical_ids
+
+
+def _lexical_contributed(lexical_ids: frozenset[str] | None) -> bool:
+    """Did the keyword arm put any candidate into this result set?
+
+    ``None`` is the FTS5-only route, where the keyword arm produced the whole
+    answer — including when that answer is empty, because the arm still ran and
+    still is the only arm that did.
+    """
+    return lexical_ids is None or bool(lexical_ids)
+
+
+def _lexical_on_page(
+    ids_on_page: Iterable[str], lexical_ids: frozenset[str] | None
+) -> bool:
+    """Did the keyword arm match any of the rows the caller is holding?
+
+    THE QUESTION THE HEDGE CLAIMS TO ANSWER, and the corpus-wide
+    ``bool(fts_ids)`` it used to ask cannot: the fused scope is a superset of
+    the keyword arm's ids, so a page is a recency-ordered window over a set
+    where keyword-matched and vector-only rows are interleaved, and a page can
+    hold none of the former while the arm matched thousands.
+
+    ``None`` short-circuits to ``True`` — on the FTS5-only route every row is a
+    keyword match by construction, and there is no id set to test.
+    """
+    if lexical_ids is None:
+        return True
+    return any(row_id in lexical_ids for row_id in ids_on_page)
+
+
+def _lexical_session_ids(
+    store: Store,
+    text: str | None,
+    obs_type: str | None,
+    lexical_ids: frozenset[str] | None,
+) -> frozenset[str] | None:
+    """Project the keyword arm's OBSERVATION hits up to session-card ids.
+
+    The sessions path returns cards, not observations, so the arm's obs ids are
+    not comparable to the ``stable_id`` of a row on the page. ``_fts_hit_scope``
+    is the same helper the store itself uses to decide which cards the FTS5-only
+    route would surface, so this cannot drift from what "the keyword arm matched
+    this card" means everywhere else.
+
+    ONE EXTRA FTS5 MATCH PER PAGE, and only on the sessions path with the vector
+    arm engaged: the hybrid route replaced ``ast.text`` with the fused id scope,
+    so the store never computes this scope for itself. Paid deliberately —
+    without it the hedge on the surface an agent actually calls would still be
+    answering the corpus-wide question.
+    """
+    if lexical_ids is None:
+        return None
+    if not lexical_ids or not text:
+        return frozenset()
+    roots, exacts = store._fts_hit_scope(text, obs_type)
+    return frozenset(roots | exacts)
 
 
 # --- rerank -----------------------------------------------------------------
@@ -908,8 +975,28 @@ def _note_confidence(
     search_mode: str,
     lexical_support: bool,
     rerank_standout: bool | None = None,
+    *,
+    vector_contributed: bool,
+    lexical_contributed: bool,
 ) -> dict[str, Any]:
     """Say which arms answered and whether the answer is trusted.
+
+    ``search_mode`` NAMES THE ARMS THAT PRODUCED THESE ROWS, NOT THE MODE THE
+    CALLER ASKED FOR. It used to echo the request back, while this docstring and
+    the tool's own said it "echoes which arms answered" — so on a cold vector
+    index a default query answered by FTS5 alone came back
+    ``{"search_mode": "hybrid"}``, telling the caller only what they had already
+    typed. That is not an edge case here: the embedding backfill is a measured
+    25-30 days of CPU, so "indexed but not embedded" is the normal state of most
+    of this corpus for weeks at a time, and an agent choosing whether to trust a
+    semantic result has no other way to find out.
+
+    The value is derived from which arms CONTRIBUTED CANDIDATES: both is
+    ``hybrid``, the KNN alone is ``vector``, and everything else is ``lexical``
+    — which covers the vector arm not engaging, the caller excluding it, and the
+    degenerate case where neither arm found anything, since the keyword arm is
+    the one that ran. A requested mode that could not run therefore never
+    appears in the response, which is the whole point.
 
     ONLY FOR FREE-TEXT QUERIES. A pure-filter query ran no retrieval arm at
     all, so naming the mode the caller happened to pass would describe work
@@ -931,13 +1018,25 @@ def _note_confidence(
     1. **Nothing came back.** The query abstained. Reported as low confidence
        rather than as a bare empty page, because an agent cannot otherwise tell
        "we looked and there is nothing" from "the index is not built yet".
-    2. **The keyword arm corroborated none of it.** The vector arm returns its
-       ``k`` nearest neighbours whether or not any of them is relevant — a
-       recipe corpus answers a question about German stock-option taxation with
-       five recipes — so a set with no lexical support at all is the shape a
-       no-answer query produces. Only meaningful in ``hybrid`` mode: in
+    2. **The keyword arm corroborated none of THESE ROWS.** The vector arm
+       returns its ``k`` nearest neighbours whether or not any of them is
+       relevant — a recipe corpus answers a question about German stock-option
+       taxation with five recipes — so rows with no lexical support are the
+       shape a no-answer query produces. Only meaningful in ``hybrid`` mode: in
        ``vector`` mode the caller excluded the keyword arm on purpose, and
        repeating that back as a warning would be noise.
+
+       ``lexical_support`` IS ABOUT THE PAGE AND NOT ABOUT THE CORPUS, which is
+       the fix for a sentence that never matched its predicate. It used to be
+       ``bool(fts_ids)`` — did the uncapped keyword arm match anything, anywhere
+       — and that can only be false when the arm matched nothing at all, because
+       the fused scope contains every id the arm returned. A page is a
+       recency-ordered window over that scope, so a caller could hold twenty-one
+       rows the keyword arm never saw while the arm had matched 13,650 rows
+       elsewhere in the same result set, and be told the answer was
+       corroborated. The callers compute this over the ids they are about to
+       return, in whichever id space that page speaks (see
+       ``_lexical_on_page`` and ``_lexical_session_ids``).
     3. **The reranker ran and found nothing that stands out.** The report's
        preferred abstention signal, and the weakest one HERE, because the
        cross-encoder is off by default at ~13.7 s per pair on this hardware.
@@ -951,7 +1050,13 @@ def _note_confidence(
     """
     if not query_text:
         return result
-    result["search_mode"] = search_mode
+    result["search_mode"] = (
+        "hybrid"
+        if vector_contributed and lexical_contributed
+        else "vector"
+        if vector_contributed
+        else "lexical"
+    )
     reasons: list[str] = []
     if not result.get("total"):
         reasons.append(
@@ -959,7 +1064,11 @@ def _note_confidence(
             "abstention rather than a short answer"
         )
     else:
-        if search_mode == "hybrid" and not lexical_support:
+        if (
+            search_mode == "hybrid"
+            and result.get("records")
+            and not lexical_support
+        ):
             reasons.append(
                 "the keyword arm matched none of these rows — they come from "
                 "the semantic arm alone, which returns its nearest neighbours "
@@ -1073,9 +1182,11 @@ def _maybe_rerank(
     order = sorted(
         range(len(window)), key=lambda i: scores[i], reverse=True
     )
-    standout = has_standout(
-        list(scores), higher_is_better=True, z_threshold=RERANK_STANDOUT_Z
-    )
+    # NO THRESHOLD PASSED, DELIBERATELY. The bar depends on how many documents
+    # were scored, and this line is the one place that knows: it is
+    # ``min(len(items), _RERANK_WINDOW)``, not the window. Handing over a
+    # constant is what made the signal assert the wrong thing on short pages.
+    standout = has_standout(list(scores), higher_is_better=True)
     return (
         [window[i] for i in order] + items[_RERANK_WINDOW:],
         len(window),
@@ -1927,9 +2038,13 @@ def aggregator_query(
       failing the call, so this flag is the only way to tell the two apart:
       the rows are identical either way.
 
-      ``search_mode`` echoes which arms answered, and appears only when the
-      query carried free text — a pure-filter query ran no arm, and naming one
-      would describe work that did not happen.
+      ``search_mode`` names the arms that CONTRIBUTED THESE ROWS, which is not
+      necessarily the mode you asked for: a ``hybrid`` request answered by FTS5
+      alone — the normal state of this cache while the embedding backfill runs
+      — comes back ``lexical``, and one answered by the KNN alone comes back
+      ``vector``. It appears only when the query carried free text; a
+      pure-filter query ran no arm, and naming one would describe work that did
+      not happen.
 
       ``low_confidence`` appears under the same condition and is ALWAYS
       present there, including when it is ``False``: it is a claim about the
@@ -2210,7 +2325,7 @@ def _query_records_path(
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
-    ast, hybrid, vec_hits, lexical_support = _apply_hybrid(
+    ast, hybrid, vec_hits, lexical_ids = _apply_hybrid(
         store,
         "records",
         ast,
@@ -2257,7 +2372,13 @@ def _query_records_path(
             {"records": vec_hits} if hybrid else None,
         )
     _note_confidence(
-        result, query_text, search_mode, lexical_support, rr_standout
+        result,
+        query_text,
+        search_mode,
+        _lexical_on_page((it["stable_id"] for it in items), lexical_ids),
+        rr_standout,
+        vector_contributed=hybrid,
+        lexical_contributed=_lexical_contributed(lexical_ids),
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -2276,7 +2397,7 @@ def _query_sessions_path(
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
-    ast, hybrid, vec_hits, lexical_support = _apply_hybrid(
+    ast, hybrid, vec_hits, lexical_ids = _apply_hybrid(
         store,
         "observations",
         ast,
@@ -2323,7 +2444,13 @@ def _query_sessions_path(
                 result, offset + page_size, hybrid, fingerprint, frozen_out
             )
         _note_confidence(
-            result, query_text, search_mode, lexical_support, rr_standout
+            result,
+            query_text,
+            search_mode,
+            _lexical_on_page((it["obs_id"] for it in items), lexical_ids),
+            rr_standout,
+            vector_contributed=hybrid,
+            lexical_contributed=_lexical_contributed(lexical_ids),
         )
         return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -2381,7 +2508,16 @@ def _query_sessions_path(
             result, offset + page_size, hybrid, fingerprint, frozen_out
         )
     _note_confidence(
-        result, query_text, search_mode, lexical_support, rr_standout
+        result,
+        query_text,
+        search_mode,
+        _lexical_on_page(
+            (it["stable_id"] for it in items),
+            _lexical_session_ids(store, query_text, ast.obs_type, lexical_ids),
+        ),
+        rr_standout,
+        vector_contributed=hybrid,
+        lexical_contributed=_lexical_contributed(lexical_ids),
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -2446,7 +2582,7 @@ def _query_union_path(
     )
     if needs_embedding:
         embedding = _query_embedding(ast.text or "")
-    rec_ast, rec_hybrid, rec_hits, rec_lexical = _apply_hybrid(
+    rec_ast, rec_hybrid, rec_hits, rec_lexical_ids = _apply_hybrid(
         store,
         "records",
         ast,
@@ -2455,7 +2591,7 @@ def _query_union_path(
         frozen_in.get("records"),
         search_mode,
     )
-    sess_ast, sess_hybrid, sess_hits, sess_lexical = _apply_hybrid(
+    sess_ast, sess_hybrid, sess_hits, sess_lexical_ids = _apply_hybrid(
         store,
         "observations",
         ast,
@@ -2470,8 +2606,12 @@ def _query_union_path(
     # two tables, and a keyword hit in either one is keyword support for the
     # answer the caller receives; requiring both would report low confidence on
     # every query whose subject only exists in one ontology, which is most of
-    # them.
-    lexical_support = rec_lexical or sess_lexical
+    # them. Applied per ROW below rather than per ontology, for the reason in
+    # ``_note_confidence``: a page can hold rows from a set whose keyword hits
+    # all sort elsewhere.
+    lexical_contributed = _lexical_contributed(
+        rec_lexical_ids
+    ) or _lexical_contributed(sess_lexical_ids)
     # Each ontology's hits are frozen SEPARATELY. They backfill at different
     # speeds — records finish in minutes, observations take weeks — so one
     # shared snapshot would let the faster table drift under the slower one.
@@ -2537,6 +2677,21 @@ def _query_union_path(
             items.append(
                 _session_to_item(obj, fields, subject, match_count, preview)
             )
+    # Page-scoped lexical support, computed over ``window`` rather than
+    # ``items`` because the two halves speak different id spaces: a record row
+    # is a ``stable_id`` the keyword arm returns directly, a session card is a
+    # session id the arm's observation hits have to be projected onto. The
+    # merged item list no longer says which is which.
+    sess_lexical_cards = _lexical_session_ids(
+        store, query_text, sess_ast.obs_type, sess_lexical_ids
+    )
+    page_lexical_support = any(
+        _lexical_on_page(
+            [obj.stable_id if kind == "record" else obj.session_id],
+            rec_lexical_ids if kind == "record" else sess_lexical_cards,
+        )
+        for _ts, kind, obj in window
+    )
     items, rr_count, rr_notice, rr_standout = _maybe_rerank(
         items, query_text, rerank
     )
@@ -2559,7 +2714,13 @@ def _query_union_path(
             result, offset + page_size, hybrid, fingerprint, frozen_out or None
         )
     _note_confidence(
-        result, query_text, search_mode, lexical_support, rr_standout
+        result,
+        query_text,
+        search_mode,
+        page_lexical_support,
+        rr_standout,
+        vector_contributed=hybrid,
+        lexical_contributed=lexical_contributed,
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
