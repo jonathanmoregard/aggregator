@@ -454,6 +454,13 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         drilldown=args.drilldown,
         rerank=args.rerank,
         _store=store,
+        # THE ZERO-RESULT LOG IS WRITTEN FROM HERE, AND ONLY FROM HERE.
+        # ``aggregator_query`` defaults it off so the MCP surface — annotated
+        # readOnlyHint=True, and advertised to the client as writing nothing —
+        # keeps that promise. This command is a human at a terminal or at
+        # Raycast, in a process that already writes; a question a person asked
+        # and got nothing for is exactly what the golden set wants.
+        _log_misses=True,
     )
     if args.json:
         print(json.dumps(result, indent=2, default=str))

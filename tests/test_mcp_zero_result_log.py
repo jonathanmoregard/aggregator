@@ -14,6 +14,19 @@ It is co-located with whichever cache is being served, so in production it IS
 ``$XDG_DATA_HOME/aggregator/retrieval_eval.db`` — the same file
 ``default_eval_db_path`` resolves — while a test or a scratch cache gets its
 own beside itself instead of writing into the developer's home.
+
+EVERY CALL BELOW PASSES ``_log_misses=True``, because this file is about the
+WRITER, and the writer is the CLI (``aggregator query``). The MCP tool leaves
+the flag at its default and therefore writes nothing — it is annotated
+``readOnlyHint: True`` and the client instructions promise as much. That half
+is pinned in ``tests/test_mcp_no_write_tools.py``
+(``test_the_search_tool_writes_nothing_to_disk``), which drives the registered
+coroutine and sweeps the directory afterwards.
+
+The flag is passed even by the tests that assert NOTHING is logged. Without it
+they would pass with the entire suppression rule deleted — a filter-only query
+and an ontology mismatch would look "not logged" simply because no caller was
+writing at all.
 """
 
 from __future__ import annotations
@@ -72,7 +85,9 @@ def _misses(tmp_path) -> list[dict]:
 
 
 def test_a_zero_result_text_query_is_logged(store, tmp_path):
-    result = aggregator_query("beef wellington recipe", _store=store)
+    result = aggregator_query(
+        "beef wellington recipe", _store=store, _log_misses=True
+    )
     assert result["ok"] is True and result["total"] == 0, result
     misses = _misses(tmp_path)
     assert [m["query_text"] for m in misses] == ["beef wellington recipe"]
@@ -83,12 +98,14 @@ def test_the_log_records_which_arms_were_asked(store, tmp_path):
     """A miss under ``lexical`` and a miss under ``hybrid`` are different
     facts about the pipeline, and a log that cannot tell them apart cannot say
     whether the vector arm would have found it."""
-    aggregator_query("beef wellington", search_mode="lexical", _store=store)
+    aggregator_query(
+        "beef wellington", search_mode="lexical", _store=store, _log_misses=True
+    )
     assert _misses(tmp_path)[0]["mode"] == "lexical"
 
 
 def test_a_query_that_found_something_is_not_logged(store, tmp_path):
-    result = aggregator_query("voting", _store=store)
+    result = aggregator_query("voting", _store=store, _log_misses=True)
     assert result["total"] > 0, result
     assert _misses(tmp_path) == []
 
@@ -97,14 +114,14 @@ def test_a_filter_only_query_is_never_logged(store, tmp_path):
     """The log feeds a RETRIEVAL golden set. A filter that matched no rows is a
     fact about the corpus, not about ranking, and freezing it as a golden query
     would measure nothing."""
-    result = aggregator_query("source:github", _store=store)
+    result = aggregator_query("source:github", _store=store, _log_misses=True)
     assert result["total"] == 0, result
     assert _misses(tmp_path) == []
 
 
 def test_nothing_is_written_until_something_misses(store, tmp_path):
     """The happy path must not pay a second database's open+migrate."""
-    aggregator_query("voting", _store=store)
+    aggregator_query("voting", _store=store, _log_misses=True)
     assert not (tmp_path / "retrieval_eval.db").exists()
 
 
@@ -113,14 +130,18 @@ def test_an_ontology_mismatch_is_not_logged_as_a_miss(store, tmp_path):
     filter families cannot both apply, not because retrieval failed. Freezing
     it into the golden set would pin a query that can never return a row, and
     it would score as a permanent abstention nobody can fix."""
-    result = aggregator_query("source:github session:abc voting", _store=store)
+    result = aggregator_query(
+        "source:github session:abc voting", _store=store, _log_misses=True
+    )
     assert result["ok"] is True and result["total"] == 0, result
     assert "do not apply" in result["notice"]
     assert _misses(tmp_path) == []
 
 
 def test_a_refused_query_is_not_logged_as_a_miss(store, tmp_path):
-    result = aggregator_query("voting", fields="bogus", _store=store)
+    result = aggregator_query(
+        "voting", fields="bogus", _store=store, _log_misses=True
+    )
     assert result["ok"] is False
     assert _misses(tmp_path) == []
 
@@ -128,8 +149,8 @@ def test_a_refused_query_is_not_logged_as_a_miss(store, tmp_path):
 def test_repeated_misses_all_land(store, tmp_path):
     """Append-only and not deduplicated on purpose: how OFTEN a query misses is
     the signal for which misses are worth freezing."""
-    aggregator_query("beef wellington", _store=store)
-    aggregator_query("beef wellington", _store=store)
+    aggregator_query("beef wellington", _store=store, _log_misses=True)
+    aggregator_query("beef wellington", _store=store, _log_misses=True)
     assert len(_misses(tmp_path)) == 2
 
 
@@ -144,7 +165,7 @@ def test_a_broken_miss_log_is_reported_and_does_not_cost_the_answer(
         raise OSError("read-only file system")
 
     monkeypatch.setattr("aggregator.evals.db.EvalStore.__init__", _boom)
-    result = aggregator_query("beef wellington", _store=store)
+    result = aggregator_query("beef wellington", _store=store, _log_misses=True)
     assert result["ok"] is True, result
     assert result["total"] == 0
     assert "zero-result" in result["notice"].lower()

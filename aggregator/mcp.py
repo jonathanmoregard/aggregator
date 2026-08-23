@@ -507,6 +507,32 @@ def _log_search_miss(store: Store, query_text: str, search_mode: str) -> str | N
     the only production writer of ``search_misses``; ``suggest_from_misses``
     surfaces the accumulated list at the end of every regression run.
 
+    THE CLI PATH REACHES IT AND THE MCP SURFACE DOES NOT, which is why
+    ``aggregator_query`` guards the call with ``_log_misses`` and defaults it
+    to False. It used to run on every zero-result query regardless of caller,
+    including from ``aggregator_search_memory`` — a tool annotated
+    ``readOnlyHint: True``, on a server whose client instructions say "Nothing
+    on this surface writes", appending the user's raw query text to a second
+    database on disk. Two written contracts said otherwise: the design spec's
+    §Security ("MCP has no write tools in v1. Not now, not 'just in case.'
+    Adding any later requires a documented human-approve gate + a separate
+    credential") and the RAG design's "Read-only MCP invariant preserved: the
+    MCP surface never calls embed writes. The embed worker runs from the CLI
+    path exclusively." The behaviour moved to match them, by the same rule the
+    embed worker already follows. ``readOnlyHint`` is what a client consults
+    to decide what may run unattended, so it has to be true, and the loop
+    loses nothing that matters: ``aggregator query`` is the Raycast target and
+    the human's own recall surface, and a question a PERSON asked and got
+    nothing for is the better golden-set candidate anyway.
+
+    THE DEFAULT IS OFF, NOT ON, so a future caller has to opt into writing. A
+    default-on flag with one opt-out would put this back the moment somebody
+    adds a second read-only entry point and does not think about it — and not
+    thinking about it is exactly how the first one happened. The eval harness's
+    own search adapter calls ``aggregator_query`` with default arguments on
+    purpose (``evals/search.py``), so it inherits the safe answer and stops
+    feeding its own golden queries back into the miss log.
+
     A SEPARATE DATABASE, BESIDE THE CACHE BEING SERVED. Never inside
     ``cache.db`` — the eval store refuses that name outright — because the
     harness must not migrate the artifact it measures, and a baseline has to
@@ -1772,6 +1798,7 @@ def aggregator_query(
     rerank: bool = False,
     search_mode: str = "hybrid",
     _store: Store | None = None,
+    _log_misses: bool = False,
 ) -> dict[str, Any]:
     """Search the user's own history — past Claude Code sessions, subagent
     runs, and everything else ingested into the local cache — from one
@@ -2057,7 +2084,12 @@ def aggregator_query(
             store, ast, mode, fields, page_size, cursor, drilldown, rerank,
             fingerprint, search_mode,
         )
-        # ZERO-RESULT LOGGING, at the one place every route passes through.
+        # ZERO-RESULT LOGGING, at the one place every route passes through —
+        # AND OFF UNLESS THE CALLER IS A WRITER. ``_log_misses`` defaults to
+        # False, so the MCP tool adapter, which passes it nothing, cannot
+        # write; ``aggregator query`` (Raycast's target, and the human's own
+        # recall surface) passes True. See ``_log_search_miss`` for why the
+        # default is this way round rather than the convenient way round.
         #
         # Only for free text: the log feeds a RETRIEVAL golden set, and a
         # filter that matched no rows is a fact about the corpus rather than
@@ -2070,7 +2102,8 @@ def aggregator_query(
         # would pin a query no change can ever make return a row, and it would
         # then score as a permanent abstention nobody can act on.
         missed = (
-            ast.text
+            _log_misses
+            and ast.text
             and result.get("ok")
             and not result.get("total")
             and not mode.startswith("mismatch_")
