@@ -32,6 +32,7 @@ from aggregator.core.hybrid import (
     RERANK_STANDOUT_Z,
     expected_max_z,
     has_standout,
+    relative_z,
     standout_z_threshold,
 )
 
@@ -132,3 +133,47 @@ def test_an_explicit_threshold_still_overrides_the_derived_one():
     derivation is a default rather than a wall."""
     scores = _spiked(10)
     assert has_standout(scores, higher_is_better=True, z_threshold=99.0) is False
+
+
+# --- the primitive underneath -----------------------------------------------
+#
+# ``relative_z`` used to live under the vector floor as well; the floor is an
+# absolute distance now (see ``test_hybrid_abstention.py``), so ``has_standout``
+# is its only caller and its tests belong here.
+
+
+def test_relative_z_scores_a_clear_outlier_far_above_the_rest():
+    values = [0.05] + [0.60 + i * 0.001 for i in range(40)]
+    zs = relative_z(values, higher_is_better=False, min_sample=20)
+    assert zs is not None
+    assert zs[0] > 5.0
+    assert all(z < 1.0 for z in zs[1:])
+
+
+def test_relative_z_flips_for_scores_where_higher_is_better():
+    values = [0.9] + [0.1 + i * 0.001 for i in range(40)]
+    zs = relative_z(values, higher_is_better=True, min_sample=20)
+    assert zs is not None
+    assert zs[0] > 5.0
+
+
+def test_relative_z_refuses_a_sample_smaller_than_the_caller_asked_for():
+    """``None`` is 'undecidable', which is not the same answer as 'no outlier'
+    and must not share a representation with it — a caller that read 0.0 here
+    would abstain on a corpus it simply has not measured."""
+    assert relative_z([0.1, 0.9], higher_is_better=False, min_sample=20) is None
+
+
+def test_relative_z_refuses_a_sample_with_no_spread_at_all():
+    """Every value identical: the rule has no discriminating power, and
+    reporting a z of 0 for each would read as 'measured, nothing stands out'."""
+    assert relative_z([0.5] * 40, higher_is_better=False, min_sample=20) is None
+
+
+def test_relative_z_has_no_minimum_of_its_own_to_fall_back_on():
+    """The finding this file opens with, at the primitive: a shared default is
+    what let a latency budget decide when a quality signal was allowed to
+    speak. Every caller now states its own minimum, so there is nothing to
+    inherit by accident."""
+    with pytest.raises(TypeError):
+        relative_z([0.1] * 40, higher_is_better=False)

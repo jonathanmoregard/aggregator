@@ -17,6 +17,16 @@ ABSTENTION LIVES HERE TOO, AND IT IS PER-ARM ON PURPOSE. See
 may threshold the FUSED score, so the only place a floor can go is
 before fusion, on an arm whose scores mean something on their own.
 
+THAT FLOOR IS AN ABSOLUTE DISTANCE AS OF 2026-08-23, and the rule it replaced
+is worth knowing about because its failure shape is easy to rebuild. A
+z-score over the arm's own candidates looks scale-free and self-calibrating,
+and it is neither: the candidates ARE the extreme left tail of the corpus
+distance distribution, and the relevant documents among them ARE the spread
+the z-score divides by. So the bar rose with the evidence and the arm
+abstained more the more the corpus knew. Anything derived from the window's
+own moments has that defect; ``VECTOR_FLOOR_MAX_DISTANCE`` carries the
+measurements and ``scripts/vector_floor_calibration.py`` reproduces them.
+
 ``vector_floor``'s PRODUCTION CALLER IS ``mcp._fused_id_scope``, which applies
 it to ``Store._vec_obs_scored`` / ``_vec_record_scored`` on every default query
 before the arms are fused and before the page token freezes the survivors. It
@@ -51,43 +61,110 @@ RRF_K = 60
 #: the one parameter that bounds what fusion is able to do.
 FUSION_ARM_DEPTH = 150
 
-#: How far above its own candidate set a vector neighbour must stand to
-#: survive :func:`vector_floor`, in standard deviations.
+#: How far a vector neighbour may be from the query and still count as a
+#: candidate: L2 distance between unit-normalized 768-dim Qwen3 embeddings,
+#: which is what ``sqlite-vec`` returns. ``1.00`` is exactly cosine 0.50 —
+#: ``d = sqrt(2 - 2·cos)`` — so the rule reads "at least half-aligned".
 #:
-#: A RELATIVE THRESHOLD AND NOT A COSINE CONSTANT. 0.7 is a folk default, not
-#: a calibrated value, and it presumes one distance scale across the corpus —
-#: which this corpus does not have. Chat-transcript chunks and three-line task
-#: items land in different parts of the distance distribution, so a constant
-#: that abstains correctly for one silently deletes the other. A z-score has
-#: no constant about the corpus in it: it asks only whether anything in THIS
-#: candidate set stands out from the rest of THIS candidate set.
+#: AN ABSOLUTE FLOOR, REPLACING A PER-WINDOW Z-SCORE THAT WAS BACKWARDS.
+#: The rule used to ask whether a neighbour stood ``VECTOR_FLOOR_Z = 3.0``
+#: standard deviations below the mean of its own candidate set. Its derivation
+#: modelled that set as a sample of the corpus distance distribution when the
+#: set is, by construction, the extreme left tail of one — the 150 nearest of
+#: ~400k — and the error ran in the worst possible direction: THE RELEVANT
+#: DOCUMENTS ARE THE SPREAD. Every relevant neighbour that arrives raises the
+#: window's standard deviation and lowers its mean, so the bar rises with the
+#: evidence and the arm abstains MORE the more the corpus knows. Monte Carlo
+#: over the window the arm actually produces, 300 trials, all three background
+#: shapes: a no-answer window cleared the z=3.0 bar (so the arm answered) in
+#: 99% of gaussian and skewed corpora, while a corpus holding 60 relevant
+#: documents emptied the arm 9-58% of the time. Corroborated on real
+#: Qwen3 vectors over real cache text: 150-document pools with 25 lexical hits
+#: kept 5, 3 and 2 of them.
 #:
-#: 3.0 AND NOT THE 1.5 THE REFERENCE DESIGN SUGGESTS, and the reason is an
-#: extreme-value fact about the window this rule reads rather than a taste
-#: difference. The candidates are the ``k`` NEAREST neighbours — already the
-#: extreme left tail of the corpus distance distribution — so the best of them
-#: is BY CONSTRUCTION well below its own window's mean whether or not the query
-#: has an answer. For a smooth no-answer tail the minimum lands about 1.7 sd
-#: below the window mean if the tail is uniform and about 2.4 sd below it if
-#: the tail is normal, both of which clear a 1.5 bar. A 1.5 threshold therefore
-#: sits inside the noise floor and abstains on nothing; it is pinned as a
-#: failing case in ``tests/core/test_hybrid_abstention.py``. 3.0 is the first
-#: round bar above that noise floor. It is DERIVED, NOT CALIBRATED — the
-#: argument above is an extreme-value one about the shape of the window, and no
-#: number in it came off the real index. Recalibrating it needs labels, which
-#: the golden set does not have yet; ``aggregator retrieval-regression --mode
-#: mcp`` is the surface that will score a change to it when they arrive.
-VECTOR_FLOOR_Z = 3.0
-
-#: Fewer candidates than this and :func:`vector_floor` does not fire.
+#: WHY THE HETEROGENEITY OBJECTION THAT MOTIVATED THE Z-SCORE DOES NOT HOLD.
+#: The old comment argued that "a 40-turn chat transcript chunk and a 3-line
+#: TickTick item do not sit on the same distance scale", so no constant could
+#: serve both. Measured, they do: over 228 real cache documents spanning every
+#: source, the background distance to an off-domain query pooled to
+#: mu=1.275 sd=0.072, and the per-query spread was 0.03-0.07 — the scale is
+#: set by the query, not by the document's length or source. What DOES move
+#: with the query is the LOCATION: an answerable query's background sits at
+#: ~1.21 and an unanswerable one's at ~1.33, and that separation is the signal
+#: this floor reads.
 #:
-#: A spread estimated from a handful of points is noise, and a floor that
-#: fires on noise produces "search got smarter and stopped finding the thing I
-#: know is in there" — the failure that ends a recall tool's usefulness. The
-#: production arm returns ``FUSION_ARM_DEPTH`` candidates, an order of
-#: magnitude above this, so the guard only ever covers corpora too small to
-#: have a distribution in the first place.
-VECTOR_FLOOR_MIN_SAMPLE = 20
+#: HOW 1.00 WAS CHOSEN — ``scripts/vector_floor_calibration.py``, both
+#: subcommands, 2026-08-23:
+#:
+#: * ``spot-check`` measured the space. Three queries whose subject IS in the
+#:   corpus put their lexical hits at min 0.79/0.91/0.95 and their background
+#:   at min 1.02/1.06/1.13. Three off-domain queries (beef wellington,
+#:   medieval Portuguese maritime law, a raglan sweater pattern) put their
+#:   NEAREST of the same 228 documents at 1.20/1.21/1.26. A floor at 1.00
+#:   therefore empties the arm for all three unanswerable queries and keeps
+#:   1-3 real neighbours for each answerable one, on real vectors.
+#: * ``simulate`` scaled that to the corpus. For an off-domain query the
+#:   nearest of 400k background documents lands at 1.172 (gaussian tail) or
+#:   1.271 (uniform); 1.00 sits 0.17 below the closer of those, so the
+#:   no-answer arm empties in 100% of trials under both. For an ON-DOMAIN
+#:   query with no answer the same figure is 0.978, which 1.00 does NOT clear
+#:   — see the fail-open note below, that is deliberate.
+#: * A second ``spot-check`` over 37 PRODUCTION-SIZED chunks (bodies of 3000+
+#:   characters, which the first sample had few of) put the same six queries
+#:   within 0.03 of the same places: off-domain nearest 1.262/1.278/1.293,
+#:   on-domain background 1.203-1.263. So the constant is not an artefact of
+#:   the short bodies that dominate this cache. It did move the LEXICAL hits up
+#:   by about 0.04 — a 4000-character chunk that mentions the subject once is
+#:   mostly about something else — which is the recall this floor gives away,
+#:   named rather than hidden.
+#:
+#: AN INDEPENDENT MEASUREMENT AGREES, AND IT IS THE STRICTER OF THE TWO. Task
+#: M ran ``scripts/rag_rollout_smoke.py`` over a copy of the live cache with 88
+#: queries from the user's own recorded searches plus 10 verified-absent
+#: subjects, and reported COSINE distances (``d = sqrt(2·c)``): the nearest
+#: irrelevant chunk moves from 0.61 at 5k chunks to 0.55 at the 422k the full
+#: backfill produces — L2 1.05. So on a warm corpus a floor at or above L2 1.05
+#: can never fire, which is what caps this constant from above; 1.00 sits 0.05
+#: inside it. The same measurement prices the trade: documents reachable ONLY
+#: by the vector arm sit at cosine p25 0.41 / p50 0.54, so a floor at cosine
+#: 0.50 keeps roughly their closest 45% and gives up the rest. That cost is
+#: real, it is the reason the previous round shipped no floor at all, and it is
+#: accepted here because the alternative — an arm that answers every
+#: unanswerable query with its ``k`` nearest coincidences — is the failure the
+#: rule exists for. ``tests/test_mcp_hybrid.py`` carries the full table.
+#:
+#: THE TWO ESTIMATES DISAGREE BY 0.12 AND 1.00 IS UNDER BOTH. The spot-check
+#: plus simulation put the no-answer neighbour at L2 1.17; the smoke run puts
+#: it at 1.05. Both are extrapolations — 228 documents can resolve a 1-in-228
+#: tail and the arm reads a 1-in-400k one, and the smoke run extrapolated from
+#: ~500 chunks — so the constant takes the stricter and leaves margin under it
+#: rather than splitting the difference. On the sample that was actually
+#: measured rather than extrapolated, 1.00 sits ~0.20 clear on both sides: the
+#: nearest real off-domain neighbour landed at 1.204 and the closest real
+#: relevant documents at 0.786-0.953.
+#:
+#: WHAT IT COSTS ON A WARM CORPUS: the on-domain retrieval window spans about
+#: 0.978-1.041, so 1.00 also drops the weaker half of that window — the rows
+#: RRF ranks last — and it does NOT empty the arm for an on-domain query with
+#: no answer, whose nearest coincidence is 0.978. That case is left to the
+#: ``low_confidence`` hedge in ``mcp._note_confidence``, which reports a page
+#: the keyword arm never corroborated.
+#:
+#: WHAT THIS NUMBER DEPENDS ON, so a reviewer knows when it is void: the
+#: embedding model (``Qwen/Qwen3-Embedding-0.6B`` MRL-truncated to 768 and
+#: L2-normalized) and nothing else. Not the corpus size — an absolute floor
+#: never reads the window — and not the document mix, per the measurement
+#: above. Change the model and this must be re-derived; ``store`` partitions
+#: the vector tables by model id, so the two spaces cannot silently mix.
+#:
+#: IT CANNOT YET BE CALIBRATED AGAINST A REAL POPULATED INDEX. No cache has
+#: embeddings in it: the backfill is a measured 25-30 days of CPU and has not
+#: run. So the evidence is simulation over the modelled retrieval window plus
+#: spot checks that embed real cache text on demand — not a query against a
+#: warm index, and not labelled relevance. ``aggregator retrieval-regression
+#: --mode mcp`` is the surface that will score a change to it once labels
+#: exist.
+VECTOR_FLOOR_MAX_DISTANCE = 1.00
 
 
 def relative_z(
@@ -100,12 +177,13 @@ def relative_z(
 
     ``min_sample`` IS THE CALLER'S TO STATE, and is required rather than
     defaulted for a reason that already bit once. It used to default to
-    :data:`VECTOR_FLOOR_MIN_SAMPLE`, so :func:`has_standout` — a rule about
-    cross-encoder scores, with nothing to do with the vector floor — inherited
-    the vector floor's 20, which happened to equal ``mcp._RERANK_WINDOW``, a
-    latency budget. The reranker signal was therefore ``None`` on every page
-    under 20 rows, and one latency tweak away from being ``None`` forever. A
-    shared default is how two unrelated rules end up with one knob.
+    ``VECTOR_FLOOR_MIN_SAMPLE = 20``, a constant belonging to the vector
+    floor's since-replaced z-score rule, so :func:`has_standout` — a rule about
+    cross-encoder scores, with nothing to do with the vector arm — inherited
+    that 20, which happened to equal ``mcp._RERANK_WINDOW``, a latency budget.
+    The reranker signal was therefore ``None`` on every page under 20 rows, and
+    one latency tweak away from being ``None`` forever. A shared default is how
+    two unrelated rules end up with one knob.
 
     ``None`` AND NOT A LIST OF ZEROS. "Undecidable" and "measured, nothing
     stands out" are opposite facts and must not share a representation: a
@@ -215,13 +293,11 @@ def has_standout(
     relevant", and a caller that collapsed them would report low confidence for
     a three-hit page that simply had nothing to compare against.
 
-    NO SPREAD ANSWERS ``False``, WHICH IS THE OPPOSITE OF WHAT
-    :func:`vector_floor` DOES WITH THE SAME INPUT, and the asymmetry is
-    deliberate rather than an oversight. A cross-encoder that scored twenty
-    documents identically has told you something: none of them stands out. That
-    is worth reporting. The floor's answer to the same evidence is to keep
-    every candidate, because it DELETES rows and a wrong deletion costs the
-    user a document they know exists. Reporting a hedge costs a sentence.
+    NO SPREAD ANSWERS ``False``, NOT ``None``. A cross-encoder that scored
+    twenty documents identically has told you something: none of them stands
+    out. That is worth reporting, and it costs a sentence — unlike
+    :func:`vector_floor`, which deletes rows, so a wrong call there costs the
+    user a document they know exists.
     """
     if len(values) < RERANK_STANDOUT_MIN_SAMPLE:
         return None
@@ -239,13 +315,29 @@ def has_standout(
 def vector_floor(
     scored: Sequence[tuple[str, float]],
     *,
-    z_threshold: float = VECTOR_FLOOR_Z,
+    max_distance: float = VECTOR_FLOOR_MAX_DISTANCE,
 ) -> list[str]:
-    """Drop vector neighbours that are not outliers in their own candidate set.
+    """Drop vector neighbours that are simply too far from the query.
 
     ``scored`` is ``(id, distance)`` in the arm's own order (ascending
     distance, best first); the surviving ids come back in that same order, so
     fusion downstream sees an unchanged ranking with fewer members.
+
+    EVERY CANDIDATE IS JUDGED ALONE, AND THAT IS THE PROPERTY THAT MATTERS.
+    Nothing here reads the other candidates, so adding a document to the window
+    can never evict one that was already surviving, and the probability that
+    the arm comes back empty is therefore NON-INCREASING in the number of
+    relevant documents the corpus holds. The rule this replaced read the
+    window's own mean and standard deviation, which the relevant documents are
+    part of, so more evidence made it abstain more often — see
+    :data:`VECTOR_FLOOR_MAX_DISTANCE` for the measurements, and
+    ``tests/core/test_hybrid_abstention.py`` for the monotonicity property
+    asserted against both rules.
+
+    IT IS ALSO WHAT THE REFERENCE IMPLEMENTATIONS DO. Weaviate exposes
+    ``distance`` / ``certainty`` on the vector operand, Qdrant a
+    ``score_threshold``; both are absolute, per-vector, and neither derives a
+    cutoff from the result set. The z-score was the hand-rolled deviation.
 
     THE FAILURE THIS EXISTS TO FIX, named: vector search is a ranking
     primitive and is neutral about whether the neighbours are relevant. A
@@ -266,20 +358,22 @@ def vector_floor(
     so no universal threshold is meaningful for them. Adding a symmetric
     keyword floor would look tidier and be wrong.
 
-    FAILS OPEN, and says so out loud. When the rule cannot decide — too few
-    candidates, or no spread among them — every candidate is kept. On a
-    personal recall tool a false "nothing found" is the worse failure: the
-    user knows the document exists, and a tool that hides it is a tool they
-    stop trusting. Abstention has to be evidence, not the absence of it.
+    FAILS OPEN, AND THE THRESHOLD IS WHERE IT IS FOR THAT REASON. On a personal
+    recall tool a false "nothing found" is the worse failure: the user knows the
+    document exists, and a tool that hides it is a tool they stop trusting. So
+    the number is set to catch the case the rule is named for — a query whose
+    subject is nowhere in the corpus, whose nearest neighbour of 400k lands at
+    1.17 — and to fail open on the case it cannot honestly decide: an ON-DOMAIN
+    query with no answer, whose nearest coincidence lands at 0.978, which is
+    CLOSER than a typical genuinely relevant document (mu 1.09). Those two
+    populations overlap in this embedding space, measurably, and no absolute
+    floor can separate them. Sitting above the overlap keeps the documents;
+    sitting below it would delete them to catch a case the evidence does not
+    support catching. There is no minimum-sample guard any more because there
+    is nothing to estimate: a lone candidate is judged by the same number as a
+    window of 150.
     """
-    zs = relative_z(
-        [d for _, d in scored],
-        higher_is_better=False,
-        min_sample=VECTOR_FLOOR_MIN_SAMPLE,
-    )
-    if zs is None:
-        return [doc_id for doc_id, _ in scored]
-    return [doc_id for (doc_id, _), z in zip(scored, zs, strict=True) if z >= z_threshold]
+    return [doc_id for doc_id, distance in scored if distance <= max_distance]
 
 
 def rrf_fuse(

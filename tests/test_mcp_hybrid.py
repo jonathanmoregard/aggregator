@@ -306,23 +306,31 @@ def test_both_arms_empty_returns_an_ok_empty_result(store, embedder):
     assert result["total"] == 0
 
 
-def test_a_warm_vector_arm_returns_neighbours_even_for_an_unrelated_query(
-    store, embedder
-):
+def test_a_warm_vector_arm_abstains_on_a_query_nothing_is_near(store, embedder):
     """KNOWN BEHAVIOUR, PINNED HERE SO IT IS A DECISION AND NOT A SURPRISE.
 
-    KNN has no distance floor: ``ORDER BY distance LIMIT k`` returns the k
-    nearest rows however far away they are. So once the vector index is warm,
-    a query that matches nothing at all still comes back with up to
-    ``_VECTOR_ARM_K`` semantic neighbours, where the FTS5-only path returned
+    KNN has no distance floor of its own: ``ORDER BY distance LIMIT k`` returns
+    the k nearest rows however far away they are. So once the vector index is
+    warm, a query that matches nothing at all comes back with up to
+    ``_VECTOR_ARM_K`` semantic neighbours where the FTS5-only path returned
     zero. Recall goes up and precision goes down, which is the trade hybrid
-    retrieval IS, but the floor of "no results" disappears with it.
+    retrieval IS, but the floor of "no results" disappears with it — unless
+    something puts it back.
 
-    TASK M MEASURED IT AND SETTLED IT: NO FIXED FLOOR. The measurement ran
-    real Qwen3 embeddings against a copy of the live cache
-    (``scripts/rag_rollout_smoke.py``), 88 queries mined from the user's own
-    recorded ``search_memory`` calls plus 10 queries on subjects verified
-    absent from the corpus. Cosine distances:
+    ``hybrid.vector_floor`` IS WHAT PUTS IT BACK, and this test now pins that
+    rather than its absence. The stub's unrelated document sits on an
+    orthogonal axis, L2 1.414, well beyond ``VECTOR_FLOOR_MAX_DISTANCE`` = 1.0,
+    so the arm empties and the query falls through to the untouched FTS5 path —
+    which matches nothing either. Zero results, and a ``low_confidence`` flag
+    saying so.
+
+    THE MEASUREMENT BELOW IS WHY THE FLOOR SITS WHERE IT DOES, and it is the
+    reason it is not higher. It ran real Qwen3 embeddings against a copy of the
+    live cache (``scripts/rag_rollout_smoke.py``), 88 queries mined from the
+    user's own recorded ``search_memory`` calls plus 10 queries on subjects
+    verified absent from the corpus. COSINE distances — the floor is written in
+    the L2 that sqlite-vec returns, and ``d = sqrt(2·c)`` converts between
+    them, so the floor's 1.0 is a cosine distance of 0.50:
 
     ==================================  =====  =====  =====  =====
     population                             p5    p25    p50    p95
@@ -336,29 +344,33 @@ def test_a_warm_vector_arm_returns_neighbours_even_for_an_unrelated_query(
     the reason is scale: the nearest IRRELEVANT chunk moves closer as the
     corpus grows — 0.61 at 5k chunks, 0.60 at 10k, 0.57 at 100k, and **0.55
     at the 422k chunks the full backfill produces**. That lands at the median
-    of the documents only the vector arm can reach. So any floor low enough
-    to suppress a no-answer query at production scale also discards more than
-    half of the vector arm's entire unique contribution, and the margin keeps
-    shrinking as the corpus grows.
+    of the documents only the vector arm can reach.
 
-    The asymmetry decides the rest: on a personal recall tool a false
-    "nothing found" is worse than a few weak extra hits, so a filter that
-    trades >50% of the vector arm's unique recall for a partial reduction in
-    noise is the wrong trade in the wrong direction. Shipping without a floor
-    is therefore deliberate, not deferred.
+    SO THE FLOOR HAS TO SIT UNDER 0.55 COSINE (L2 1.05) TO ABSTAIN AT ALL AT
+    PRODUCTION SCALE, and everything it drops on the way down is real recall.
+    It ships at cosine 0.50 / L2 1.00, which is inside that ceiling by 0.05 and
+    keeps roughly the closest 45% of the documents only the vector arm can
+    reach (between the p25 of 0.41 and the p50 of 0.54 above). That is a
+    deliberate, expensive trade and the numbers here are why the constant is
+    not higher: at L2 1.05 and above the rule can never fire on a warm corpus,
+    which is a floor in name only. The independent calibration in
+    ``hybrid.VECTOR_FLOOR_MAX_DISTANCE`` — 228 real cache documents embedded on
+    demand, 2026-08-23 — put the no-answer neighbour further out still (L2
+    1.17), so 1.00 clears both estimates.
 
-    What the floor would have bought is instead bounded by two properties
-    that already hold: the FTS5 arm is uncapped into RRF, so hybrid results
-    are a strict superset of keyword results and no floor is needed to
-    protect them; and the noise a no-answer query returns is concentrated in
-    a handful of hub documents (the same rows recur across unrelated
-    no-answer queries), which is a hubness problem, not a threshold problem.
+    Two properties bound what the floor can cost, and both still hold: the
+    FTS5 arm is uncapped into RRF, so hybrid results are a strict superset of
+    keyword results and nothing the floor drops can take a keyword match with
+    it; and the noise a no-answer query returns is concentrated in a handful of
+    hub documents (the same rows recur across unrelated no-answer queries),
+    which is a hubness problem the floor only partly touches.
     """
     _seed_sessions(store, [("o1", "quadratic voting", 1)])
     _embed(store, "observations", [("o1", "quadratic voting")])
     result = aggregator_query("nonexistentterm", _store=store)
     assert result["ok"] is True
-    assert result["total"] == 1
+    assert result["total"] == 0
+    assert result["low_confidence"] is True
 
 
 def test_a_half_embedded_corpus_still_serves_the_unembedded_rows(store, embedder):

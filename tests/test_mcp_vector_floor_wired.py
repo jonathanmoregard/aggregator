@@ -19,6 +19,13 @@ A DISTANT NEIGHBOUR IS NOT A MISS AT THE TOOL BOUNDARY, and the tests say so:
 when the floor empties the vector arm the query still answers from FTS5, so the
 result stays a superset of keyword search. The floor can only ever remove
 vector-ONLY candidates.
+
+THE RULE ITSELF IS AN ABSOLUTE DISTANCE AS OF 2026-08-23 —
+``VECTOR_FLOOR_MAX_DISTANCE = 1.0``, i.e. cosine 0.5 — replacing a per-window
+z-score whose derivation was backwards. That is argued and measured in
+``tests/core/test_hybrid_abstention.py``; what this file cares about is
+unchanged, namely that whatever the rule is, it runs on the default path and
+changes the answer.
 """
 
 from __future__ import annotations
@@ -29,16 +36,18 @@ import numpy as np
 import pytest
 
 import aggregator.mcp as mcp
-from aggregator.core.hybrid import VECTOR_FLOOR_MIN_SAMPLE
+from aggregator.core.hybrid import VECTOR_FLOOR_MAX_DISTANCE
 from aggregator.core.store import Store
 from aggregator.sources.base import ObservationRow, SessionRow
 
 _TS = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
 _DIM = 768
 
-# 20 far neighbours + 1 near one. ``VECTOR_FLOOR_MIN_SAMPLE`` is 20, so a
-# smaller set would fail open and the floor's decision would never be visible.
-_FAR = VECTOR_FLOOR_MIN_SAMPLE
+# Enough far neighbours that a rule which only fired on a populated window
+# would still fire here. The floor no longer has a minimum sample — see
+# ``test_a_two_document_corpus_is_floored_like_any_other`` — so this number is
+# now about readability rather than about reaching a threshold.
+_FAR = 20
 
 
 def _unit(axis: int) -> np.ndarray:
@@ -53,9 +62,12 @@ class StubEmbedder:
 
     Every query embeds to ``e0``, which is exactly the near document's vector
     and orthogonal to every far one — so the candidate distances are ``0.0``
-    once and ``sqrt(2)`` twenty times. Those 21 values put the near document at
-    z = 4.47 and every far one at z = -0.22 against ``VECTOR_FLOOR_Z = 3.0``:
-    one survivor, twenty dropped, and no reliance on a real embedding space.
+    once and ``sqrt(2) = 1.414`` twenty times. Against
+    ``VECTOR_FLOOR_MAX_DISTANCE = 1.0`` that is one survivor and twenty
+    dropped, with no reliance on a real embedding space. Orthogonal is the
+    right stand-in for "unrelated": 1.414 is past where the measured off-domain
+    background sits (~1.33), so the far cluster is unambiguously beyond the
+    floor rather than near it.
     """
 
     def __init__(self):
@@ -161,12 +173,16 @@ def test_the_floor_drops_the_distant_neighbours_from_the_answer(store, embedder)
     assert _ids(result) == {"s-o-near"}
 
 
-def test_a_small_candidate_set_still_answers(store, embedder):
-    """FAILS OPEN, and the default path inherits that.
+def test_a_two_document_corpus_is_floored_like_any_other(store, embedder):
+    """THE BEHAVIOUR CHANGE WHEN THE MECHANISM CHANGED, and it is deliberate.
 
-    Below ``VECTOR_FLOOR_MIN_SAMPLE`` there is no distribution to judge, and a
-    floor that fired on noise would produce "search got smarter and stopped
-    finding the thing I know is in there".
+    The z-score rule passed everything through below 20 candidates, because it
+    estimated a spread and a spread from two points is noise. An absolute
+    distance estimates nothing: an orthogonal document is just as far from the
+    query in a two-document corpus as in a 400k one, and keeping it because the
+    index happens to be small would make the answer depend on the size of the
+    backfill rather than on the query. Fail-open now lives in WHERE the
+    threshold sits, not in a sample-size escape hatch.
     """
     _add(store, "o-near", "quadratic voting rollout")
     store.upsert_vec_observations([("o-near", _unit(0))])
@@ -177,7 +193,30 @@ def test_a_small_candidate_set_still_answers(store, embedder):
 
     result = mcp.aggregator_query("source:sessions governance", _store=store)
     assert result["ok"] is True, result
-    assert _ids(result) == {"s-o-near", "s-o-far"}
+    assert _ids(result) == {"s-o-near"}
+
+
+def test_a_neighbour_just_inside_the_floor_survives(store, embedder):
+    """The floor has to be readable at the tool boundary in both directions, or
+    the tests above only prove that ORTHOGONAL documents are dropped — which
+    any threshold below 1.414 would do, including a broken one."""
+    _add(store, "o-mid", "adjacent but not identical")
+    v = np.zeros(_DIM, dtype=np.float32)
+    # cos = 0.6 -> d = sqrt(2 - 1.2) = 0.894, inside the 1.0 floor.
+    v[0] = 0.6
+    v[1] = float(np.sqrt(1.0 - 0.36))
+    assert float(np.linalg.norm(v - _unit(0))) < VECTOR_FLOOR_MAX_DISTANCE
+    store.upsert_vec_observations([("o-mid", v)])
+    store.mark_embedded("observations", ["o-mid"], state="ok")
+    for i in range(_FAR):
+        obs_id = f"o-far-{i:02d}"
+        _add(store, obs_id, f"unrelated pigeon husbandry note {i}")
+        store.upsert_vec_observations([(obs_id, _unit(2 + i))])
+        store.mark_embedded("observations", [obs_id], state="ok")
+
+    result = mcp.aggregator_query("source:sessions governance", _store=store)
+    assert result["ok"] is True, result
+    assert _ids(result) == {"s-o-mid"}
 
 
 def test_a_floored_out_arm_still_returns_the_keyword_rows(store, embedder):

@@ -32,6 +32,16 @@ from aggregator.sources.base import ObservationRow, SessionRow
 _TS = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
 _AXES = {"voting": 0, "governance": 0, "pigeon": 1}
 
+# WHY "PIGEON" IS NOT ORTHOGONAL TO "VOTING" ANY MORE. The vector arm has an
+# absolute distance floor (``hybrid.VECTOR_FLOOR_MAX_DISTANCE`` = 1.0, i.e.
+# cosine 0.5), so a document on a fully orthogonal axis sits at L2 1.414 and is
+# dropped before fusion ever sees it. A "vector-only result set" fixture built
+# that way would be testing the floor and reporting it as a test of the hedge:
+# the page would come back empty and ``low_confidence`` would be true for the
+# wrong reason. Cosine 0.6 (L2 0.894) is inside the floor, so the neighbour
+# survives, no keyword matches it, and the hedge is what decides the outcome.
+_NEAR_COS = 0.6
+
 
 class StubEmbedder:
     """No real model, ever — an earlier round named one in a test and pulled
@@ -43,7 +53,11 @@ class StubEmbedder:
         lowered = (text or "").lower()
         for word, axis in _AXES.items():
             if word in lowered:
-                v[axis] = 1.0
+                if axis == 0:
+                    v[0] = 1.0
+                else:
+                    v[0] = _NEAR_COS
+                    v[axis] = float(np.sqrt(1.0 - _NEAR_COS**2))
                 return v
         v[2] = 1.0
         return v
@@ -160,9 +174,9 @@ def test_a_query_that_finds_nothing_says_so_explicitly(store, embedder):
 
 def test_a_vector_only_result_set_is_low_confidence(store, embedder):
     """THE REPRO for the recipe case. ``pigeon`` matches no word in the corpus,
-    but the KNN returns its nearest neighbour anyway — and without a distance
-    floor that neighbour is served with no indication that nothing about it
-    matched."""
+    but the KNN returns its nearest neighbour anyway — and it is close enough to
+    clear the distance floor, so the floor does not save this one. The hedge is
+    what tells the caller that nothing about the row matched their words."""
     _seed(store, [("o1", "quadratic voting is a governance mechanism")])
     result = aggregator_query("source:sessions pigeon", _store=store)
     assert result["ok"] is True, result

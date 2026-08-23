@@ -32,6 +32,17 @@ _DIM = 768
 _AXES = {"quadratic": 0, "pigeon": 1}
 
 
+# The off-axis direction is TILTED toward axis 0 rather than orthogonal to it,
+# and that is load-bearing since the vector arm gained an absolute distance
+# floor (``hybrid.VECTOR_FLOOR_MAX_DISTANCE`` = 1.0, i.e. cosine 0.5): a truly
+# orthogonal document sits at L2 1.414 and is dropped before fusion, so the
+# pigeon row would vanish and this module would quietly stop demonstrating the
+# thing it exists for — an id the mcp mode returns and the lexical mode cannot.
+# Cosine 0.6 (L2 0.894) is semantically adjacent, lexically disjoint, and
+# inside the floor, which is the case the mcp mode is meant to cover.
+_NEAR_COS = 0.6
+
+
 class StubEmbedder:
     """Deterministic keyword->axis embedder. Never names a real model."""
 
@@ -41,7 +52,11 @@ class StubEmbedder:
         lowered = (text or "").lower()
         for word, axis in _AXES.items():
             if word in lowered:
-                v[axis] = 1.0
+                if axis == 0:
+                    v[0] = 1.0
+                else:
+                    v[0] = _NEAR_COS
+                    v[axis] = float(np.sqrt(1.0 - _NEAR_COS**2))
                 return v
         v[2] = 1.0
         return v
@@ -323,9 +338,12 @@ def test_mcp_mode_returns_the_ids_the_server_returned(store, monkeypatch):
     #
     # ``s-o3`` IS THE WHOLE ARGUMENT FOR THIS MODE. The pigeon document shares
     # no word with the query; the lexical mode returns {o1, o2} and cannot ever
-    # return it. It is here because the server's vector arm proposed it and the
-    # floor failed open on a 3-candidate sample — production behaviour, in a
-    # module the other two modes cannot see.
+    # return it. It is here because the server's vector arm proposed it and it
+    # is inside the per-arm distance floor — production behaviour, in a module
+    # the other two modes cannot see. It used to survive for a different
+    # reason, that the z-score floor failed open below 20 candidates; the floor
+    # is an absolute distance now and has no sample-size escape hatch, so the
+    # fixture states the distance instead of relying on the arm being short.
     assert set(hits) == {"s-o1", "s-o2", "s-o3"}
     assert set(lexical_search_fn(store)("quadratic", 50)) == {"o1", "o2"}
 

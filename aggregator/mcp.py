@@ -161,9 +161,9 @@ _DEFAULT_PAGE_SIZE_FULL = 40
 #
 # A COUNT IS NOT THE ONLY LIMIT ON THIS PATH. ``k`` bounds how many neighbours
 # the arm proposes; ``hybrid.vector_floor``, applied in ``_fused_id_scope``,
-# decides how many of them are far enough above their own candidate set to be
-# worth fusing. Both are needed: a k-nearest search always returns k, however
-# irrelevant the k-th is.
+# decides how many of them are close enough to the query to be worth fusing at
+# all. Both are needed: a k-nearest search always returns k, however irrelevant
+# the k-th is.
 _VECTOR_ARM_K = FUSION_ARM_DEPTH
 
 # How many hits of a page the cross-encoder reorders when ``rerank=True``.
@@ -702,10 +702,10 @@ def _fused_id_scope(
     Relevance ordering is available, opt-in and bounded, via ``rerank=True``.
 
     THE PER-ARM DISTANCE FLOOR IS APPLIED HERE, and this is its only caller.
-    ``hybrid.vector_floor`` drops neighbours that do not stand out from their
-    own candidate set, before fusion and never on the fused score — an RRF
-    score has no absolute meaning across queries, so thresholding it would be
-    thresholding a number that does not mean anything. It runs before
+    ``hybrid.vector_floor`` drops neighbours further from the query than
+    ``VECTOR_FLOOR_MAX_DISTANCE``, before fusion and never on the fused score —
+    an RRF score has no absolute meaning across queries, so thresholding it
+    would be thresholding a number that does not mean anything. It runs before
     ``vec_hits`` is returned for the page token to freeze, so a continuation is
     cut from the same set as page 1, and it can only ever remove vector-ONLY
     candidates: when it empties the arm this returns ``None`` and the query
