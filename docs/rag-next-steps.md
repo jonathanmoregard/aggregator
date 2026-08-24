@@ -82,12 +82,8 @@ is possible.**
 
 ## Open questions that do not depend on the index
 
-- **The attachment gap.** 112,385 rows — 22% of the corpus — carry no text in
-  any column, verified by dumping full rows. Nothing is *lost* between cache and
-  model (rows with a non-blank body that the chunker rejects number zero, and
-  the keyword arm is equally blind to them since `obs_fts` indexes `body` and
-  nothing else). The question is upstream: **should ingest be capturing
-  attachment content at all?** Retrieval cannot answer it.
+- **The attachment subtypes ingest throws away.** Scoped below — it is a small
+  ingest change, not the 22%-of-the-corpus question it first looked like.
 - **The FTS5 tokenizer change is one decision, not two.**
   `tokenize="unicode61 tokenchars '-'"` must land *with* `-` added to the
   sanitizer whitelist. Measured: with `-` in the index but not the whitelist,
@@ -101,3 +97,83 @@ is possible.**
 - **The ~12 pre-existing read-path `sqlite3.OperationalError` swallows in
   `store.py`.** This diff added none. Whether they deserve their own branch is
   undecided.
+
+## The `attachment` rows: keep them, fix 2.5% of them
+
+This started as "22% of the corpus carries no text — is that a coverage gap?"
+It is not, and the framing was the error. Recorded here because the number is
+alarming and invites the wrong fix.
+
+**Where they come from.** All 116,862 of them are Claude Code session and
+subagent JSONL, `origin='claude-code'`, lines with `type: "attachment"`. The
+payload sits under a top-level `attachment` key; ingest maps nothing from that
+key to `body`, so the cache keeps the row's provenance and drops the content.
+
+**They are edges, not documents.** Measured on the live cache: **115,613 rows
+name an attachment row as their `parent_obs_id`, and 37,712 of those are real
+messages** — 24,618 `assistant`, 9,725 `user`, 3,127 `tool_use`, 242 `system`.
+Deleting the attachment rows severs the thread between those messages and what
+preceded them. They carry no `model`, no token counts, no `tool_name`, no
+`tool_use_id`: structural nodes with a timestamp, and they cost **~21.5 MB of
+~708 MB — 3% of storage for 22.4% of the rows**, because the bodies are empty.
+
+Collapsing them transitively (re-pointing each child at the attachment's own
+parent) is possible, and is the wrong trade: it rewrites history and erases the
+fact that context *was injected at that point in the turn*, which is precisely
+the signal wanted when reconstructing why an agent did something. Not worth 3%
+of disk.
+
+**What is actually inside them.** Full scan, all 10,956 transcripts, 0
+unreadable, 148,437 attachment lines (`scripts/attachment_payload_census.py
+--all`). Not a sample — two sampled runs disagreed on the headline ratio (2.4%
+at 400 files, 4.7% at 120), which is why this was run whole:
+
+| `attachment.type` | rows | % | MB raw | mean text |
+|---|---|---|---|---|
+| `hook_success` | 63,903 | 43.1% | 113.0 | 1.2 KB |
+| `hook_additional_context` | 30,288 | 20.4% | 32.8 | 0.6 KB |
+| `skill_listing` | 11,654 | 7.9% | **240.6** | 20 KB |
+| `deferred_tools_delta` | 8,940 | 6.0% | 36.7 | 3.7 KB |
+| `task_reminder` | 8,586 | 5.8% | 7.4 | 0.4 KB |
+| `total_tokens_reminder` | 6,972 | 4.7% | 3.5 | 49 B |
+| `mcp_instructions_delta` | 5,600 | 3.8% | 9.1 | 1.2 KB |
+| `agent_listing_delta` | 3,115 | 2.1% | 12.1 | 3.4 KB |
+| `async_hook_response` | 1,875 | 1.3% | 1.3 | 213 B |
+| **`queued_command`** | 1,433 | 1.0% | 5.9 | 3.6 KB |
+| **`edited_text_file`** | 864 | 0.6% | 5.7 | 5.8 KB |
+| **`nested_memory`** | 416 | 0.3% | 6.5 | 15.3 KB |
+| **`file`** | 388 | 0.3% | 2.4 | 5.7 KB |
+| **`invoked_skills`** | 54 | 0.0% | 1.1 | 21.1 KB |
+| **`plan_file_reference`** | 3 | 0.0% | 0.0 | 6.3 KB |
+| *(20 further plumbing subtypes)* | | | | |
+
+**97.9% is harness plumbing repeated near-verbatim across every session.**
+`skill_listing` alone is **240.6 MB — 11,654 copies of the same catalogue**, and
+the single largest payload class by bytes in the whole set. Embedding that bulk
+would not close a coverage gap, it would **poison the vector arm**: tens of
+thousands of near-duplicate chunks, after which semantic queries start returning
+the skills listing. Near-duplicate contamination is a known dense-retrieval
+failure and this corpus is unusually rich in it.
+
+**The actual defect, and it is small.** The six content-bearing subtypes are
+**3,155 rows — 2.1% of attachments**, and their payload is discarded rather than
+written to `body`. A pasted file, an edited buffer, a memory file, a referenced
+plan: currently unfindable by *either* arm. `plan_file_reference` is in on
+payload rather than frequency — 3 rows, 6.3 KB each.
+
+That is the change worth making, in `aggregator/sources/sessions.py`, as its own
+ingest commit — deliberately **not** folded into the retrieval branch, whose
+diff is settled and green. Everything else stays exactly as it is: empty
+structural nodes, excluded from both arms, doing their job.
+
+The census refuses to bucket a subtype it does not recognise, on the same
+principle as the FTS5 MATCH scanner. It earned that on its first full run,
+surfacing five subtypes no sample had shown — `plan_file_reference` (promoted to
+content-bearing) plus `auto_mode`, `plan_mode`, `plan_mode_exit` and `directory`
+(mode markers, 5–195 bytes, classified as plumbing). Re-run it before writing
+the ingest filter; new harness releases mint new subtypes.
+
+**One loose end, deliberately not chased here.** The scan found 148,437
+attachment lines on disk against 116,862 rows in the cache — a ~31.6k gap. That
+is an ingest-coverage question (transcripts not yet ingested, or `src_hash`
+dedup), not a retrieval one, and it belongs with the ingest commit above.
