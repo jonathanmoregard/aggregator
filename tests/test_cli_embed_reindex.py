@@ -162,9 +162,22 @@ def test_yes_scripts_the_prompt_but_still_reports(
     assert store.select_unembedded("observations", limit=10) == []
 
 
-def test_reindex_with_nothing_to_delete_does_not_prompt(tmp_path, capsys):
-    """A cold index is adopted for free; a prompt there teaches 'y' reflexes."""
-    _ = tmp_path
+def test_reindex_with_nothing_to_delete_does_not_prompt(
+    tmp_path, monkeypatch, capsys
+):
+    """A cold index is adopted for free; a prompt there teaches 'y' reflexes.
+
+    STUBS THE EMBEDDER like every other test that runs past the consent gate,
+    and this one needs it MOST: the other reindex tests either refuse (rc 1,
+    returning before ``Embedder()`` is reached) or run against the
+    ``mismatched`` fixture, while this one walks the whole cold-start path.
+    Without the stub it built a real embedder, which resolves weights through
+    the HF cache — so it passed on any machine that had run the backfill and
+    failed in CI, where the cache is empty and downloads are refused by design.
+    A test whose verdict depends on the developer's model cache is not testing
+    the thing it names.
+    """
+    _stub_embedder(monkeypatch)
     store = Store(db_path=tmp_path / "cache.db")
     rc = _cmd_embed(_ns(reindex=True), _store=store)
     out = capsys.readouterr()
