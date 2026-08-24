@@ -192,7 +192,30 @@ def test_the_harness_models_the_rule_that_actually_ships():
     """The Monte Carlo below is only evidence if it exercises the shipped
     function. ``_assert_matches_shipped`` imports ``hybrid.vector_floor`` and
     fails if the harness has drifted into modelling something else."""
-    calib._assert_matches_shipped(VECTOR_FLOOR_MAX_DISTANCE)
+    verdict = calib._assert_matches_shipped(VECTOR_FLOOR_MAX_DISTANCE)
+    assert "agrees" in verdict.lower(), verdict
+
+
+def test_the_harness_refuses_to_vouch_for_a_floor_it_did_not_model():
+    """The check used to be a tautology, and it printed a headline.
+
+    ``_assert_matches_shipped`` built its probe out of its OWN argument, so the
+    same number sat on both sides of the comparison and it passed for any value.
+    ``simulate --max-distance 0.5`` therefore modelled a floor at half the
+    shipped one and still printed "shipped hybrid.vector_floor agrees with the
+    rule modelled here" — the one line in that output a reader would quote as
+    evidence for the constant.
+
+    Sweeping hypothetical floors is a real use of this script, so the fix is not
+    to forbid the flag but to stop the run from vouching for a number it never
+    touched. The verdict has to NAME the shipped constant when it disagrees,
+    because the reader's next question is what the real one is.
+    """
+    hypothetical = VECTOR_FLOOR_MAX_DISTANCE / 2
+    assert hypothetical != VECTOR_FLOOR_MAX_DISTANCE, "the repro needs two values"
+    verdict = calib._assert_matches_shipped(hypothetical)
+    assert "agrees" not in verdict.lower(), verdict
+    assert str(VECTOR_FLOOR_MAX_DISTANCE) in verdict, verdict
 
 
 # --- a no-answer window empties the arm, whatever shape it has --------------
@@ -240,6 +263,74 @@ def test_the_floor_fails_open_on_a_heavier_tail_than_measured():
     """
     window = _skewed_window(FUSION_ARM_DEPTH, _HEAVY_TAIL_LO, _HEAVY_TAIL_HI)
     assert vector_floor(_scored(window)) != []
+
+
+#: The pooled OFF-DOMAIN background — what an unanswerable query's neighbours
+#: look like, and the default ``simulate`` runs on. Recall is measured against
+#: BOTH this and ``_ON_DOMAIN_BG``; see the test below for why that matters.
+_OFF_DOMAIN_BG = (1.33, 0.034)
+
+#: The recall table in ``hybrid.VECTOR_FLOOR_MAX_DISTANCE``'s docstring, as
+#: (low, high) bounds per background and shape. Widened from the measured
+#: values by ~0.05 so Monte Carlo noise at 120 trials cannot flap the suite,
+#: and NOT widened enough to let one row drift into the other's territory —
+#: which is the whole point of pinning them together.
+_DOCUMENTED_RECALL = {
+    ("off-domain", "gaussian"): (0.10, 0.25),
+    ("off-domain", "uniform"): (0.09, 0.24),
+    ("off-domain", "skewed-tail"): (0.15, 0.32),
+    ("on-domain", "gaussian"): (0.40, 0.65),
+    ("on-domain", "uniform"): (0.16, 0.34),
+    ("on-domain", "skewed-tail"): (0.90, 1.00),
+}
+
+
+@pytest.mark.parametrize("background", ["off-domain", "on-domain"])
+def test_the_recall_cost_in_the_docstring_is_the_one_the_harness_reports(
+    background,
+):
+    """THE NUMBER IN THE PROSE HAS TO BE THE NUMBER THE HARNESS PRINTS — AND
+    THE PROSE HAS TO SAY WHICH RUN OF THE HARNESS IT MEANS.
+
+    ``hybrid.py`` priced the floor at "roughly their closest 45%" and cited this
+    harness. Run with no arguments the harness reports 0.15-0.25, so the prose
+    read as the friendlier of two numbers. It was not: ``simulate``'s defaults
+    use ``--bg-mu 1.33``, the OFF-DOMAIN background, because the question it
+    exists to answer is abstention. Recall is the opposite question — it only
+    arises for a query that HAS answers, whose background measured ~1.21 — and a
+    nearer background crowds the window, pushing the more distant relevant
+    documents out of it and raising the fraction of the rest that clear the
+    floor. The gap was a background mismatch, not a contradiction.
+
+    Both rows are pinned, and pinned SEPARATELY, because the failure being
+    prevented is quoting one of them as if it were the other. The spread inside
+    a single row is itself large (on-domain: 0.25 uniform to 1.00 skewed-tail),
+    which is why the docstring carries a table instead of a number.
+    """
+    bg = _OFF_DOMAIN_BG if background == "off-domain" else _ON_DOMAIN_BG
+    counts = (3, 10, 30, 60)
+    for shape in calib.SHAPES:
+        lo, hi = _DOCUMENTED_RECALL[(background, shape)]
+        curve = calib.recall_curve(
+            _shipped_rule,
+            shape=shape,
+            bg_mu=bg[0],
+            bg_sigma=bg[1],
+            rel_mu=_RELEVANT[0],
+            rel_sigma=_RELEVANT[1],
+            relevant_counts=counts,
+            trials=120,
+            seed=20260823,
+        )
+        for m in counts:
+            assert lo <= curve[m] <= hi, (
+                f"{background} / {shape} m={m}: the floor keeps "
+                f"{curve[m]:.2f} of the relevant documents in the window, "
+                f"outside the {lo:.2f}-{hi:.2f} that "
+                f"hybrid.VECTOR_FLOOR_MAX_DISTANCE's docstring table reports. "
+                f"Either the constant moved or the table is stale — the two "
+                f"have to be fixed together."
+            )
 
 
 # --- the property the old rule violated -------------------------------------

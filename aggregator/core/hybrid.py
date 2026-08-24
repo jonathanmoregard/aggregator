@@ -103,12 +103,22 @@ FUSION_ARM_DEPTH = 150
 #:   NEAREST of the same 228 documents at 1.20/1.21/1.26. A floor at 1.00
 #:   therefore empties the arm for all three unanswerable queries and keeps
 #:   1-3 real neighbours for each answerable one, on real vectors.
-#: * ``simulate`` scaled that to the corpus. For an off-domain query the
-#:   nearest of 400k background documents lands at 1.172 (gaussian tail) or
-#:   1.271 (uniform); 1.00 sits 0.17 below the closer of those, so the
-#:   no-answer arm empties in 100% of trials under both. For an ON-DOMAIN
-#:   query with no answer the same figure is 0.978, which 1.00 does NOT clear
-#:   — see the fail-open note below, that is deliberate.
+#: * ``simulate`` scaled that to the corpus, over THREE background shapes, and
+#:   the third one is the reason this bullet lists all of them. For an
+#:   off-domain query the nearest of 400k background documents lands at 1.173
+#:   (gaussian tail) or 1.271 (uniform), and 1.00 sits 0.17 below the closer of
+#:   those, so the no-answer arm empties in 100% of trials under both. Under
+#:   the SKEWED (gumbel-min) tail the same figure is 0.996 — below the floor —
+#:   and the no-answer arm empties in only 43% of trials, i.e. it FAILS TO
+#:   ABSTAIN 57% of the time. That shape is the harness's own declared
+#:   pessimistic case, so quoting the two friendly shapes as the headline was
+#:   the reporting error, not the constant: the rule declines to bet against a
+#:   tail that 228 real documents do not support (they measured
+#:   ``(mu-min)/sigma`` at 2.6-3.4, where gaussian predicts 2.86 and gumbel-min
+#:   3.78), and ``test_the_floor_fails_open_on_a_heavier_tail_than_measured``
+#:   pins the fail-open direction as deliberate rather than as a guarantee.
+#:   For an ON-DOMAIN query with no answer the figure is 0.978, which 1.00 also
+#:   does NOT clear — same fail-open note, same deliberate choice.
 #: * A second ``spot-check`` over 37 PRODUCTION-SIZED chunks (bodies of 3000+
 #:   characters, which the first sample had few of) put the same six queries
 #:   within 0.03 of the same places: off-domain nearest 1.262/1.278/1.293,
@@ -125,13 +135,48 @@ FUSION_ARM_DEPTH = 150
 #: irrelevant chunk moves from 0.61 at 5k chunks to 0.55 at the 422k the full
 #: backfill produces — L2 1.05. So on a warm corpus a floor at or above L2 1.05
 #: can never fire, which is what caps this constant from above; 1.00 sits 0.05
-#: inside it. The same measurement prices the trade: documents reachable ONLY
-#: by the vector arm sit at cosine p25 0.41 / p50 0.54, so a floor at cosine
-#: 0.50 keeps roughly their closest 45% and gives up the rest. That cost is
-#: real, it is the reason the previous round shipped no floor at all, and it is
-#: accepted here because the alternative — an arm that answers every
-#: unanswerable query with its ``k`` nearest coincidences — is the failure the
-#: rule exists for. ``tests/test_mcp_hybrid.py`` carries the full table.
+#: inside it.
+#:
+#: WHAT THE FLOOR COSTS IN RECALL, AND WHY THE HARNESS PRINTS A SMALLER NUMBER
+#: THAN THIS PARAGRAPH. The task-M smoke run puts documents reachable ONLY by
+#: the vector arm at cosine-distance p25 0.41 / p50 0.54, so a floor at cosine
+#: 0.50 sits just under their median and keeps roughly their closest 45%.
+#: Running ``scripts/vector_floor_calibration.py simulate`` with no arguments
+#: reports 0.15-0.25 instead, and the 3x gap is NOT a disagreement — it is the
+#: BACKGROUND. That subcommand's defaults are ``--bg-mu 1.33``, the pooled
+#: OFF-DOMAIN background, because the question it is built to answer is
+#: abstention: whether a query with no answer comes back empty. Recall is the
+#: opposite question and only arises when the query DOES have an answer, whose
+#: background was measured at ~1.21. A nearer background crowds the retrieval
+#: window, which pushes the more distant relevant documents out of it entirely
+#: and raises the fraction of those remaining that clear the floor.
+#:
+#: Measured both ways, shipped rule, 400 trials, relevant mu=1.09 sd=0.09
+#: (fraction of the relevant documents IN THE WINDOW that survive):
+#:
+#: ===================  ==========  =========  ============
+#: background           gaussian    uniform    skewed-tail
+#: ===================  ==========  =========  ============
+#: off-domain mu=1.33   0.15-0.18   0.14-0.17  0.20-0.25
+#: on-domain  mu=1.21   0.47-0.57   0.22-0.26  1.00
+#: ===================  ==========  =========  ============
+#:
+#: So 45% is the right order of magnitude for the case it describes — it lands
+#: inside the on-domain gaussian cell — and the honest statement is that the
+#: cost ranges from about a fifth to essentially nothing depending on how heavy
+#: the corpus's left tail turns out to be. What was wrong here before was
+#: quoting one cell of that table with a citation to a harness whose default
+#: invocation prints a different one, which reads as the friendlier of two
+#: numbers until you run it. ``P(d <= 1.00 | mu=1.09, sd=0.09) = 0.1587`` is the
+#: window-free floor of the whole table, quoted because it is the number a
+#: reader will derive by hand and wonder about: it ignores the window, so it
+#: understates every row above.
+#: ``tests/core/test_hybrid_abstention.py`` pins both rows.
+#:
+#: That cost is real, it is the reason the previous round shipped no floor at
+#: all, and it is accepted here because the alternative — an arm that answers
+#: every unanswerable query with its ``k`` nearest coincidences — is the failure
+#: the rule exists for. ``tests/test_mcp_hybrid.py`` carries the full table.
 #:
 #: THE TWO ESTIMATES DISAGREE BY 0.12 AND 1.00 IS UNDER BOTH. The spot-check
 #: plus simulation put the no-answer neighbour at L2 1.17; the smoke run puts

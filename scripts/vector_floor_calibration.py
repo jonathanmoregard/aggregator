@@ -152,15 +152,44 @@ def keep_zscore(dists: np.ndarray, z_threshold: float) -> np.ndarray:
     return z >= z_threshold
 
 
-def _assert_matches_shipped(max_distance: float) -> None:
-    """The harness must exercise the SHIPPED function, not a lookalike."""
-    from aggregator.core.hybrid import vector_floor
+def _assert_matches_shipped(max_distance: float) -> str:
+    """The harness must exercise the SHIPPED function, at the SHIPPED constant.
+
+    TWO CHECKS, AND ONLY THE FIRST ONE USED TO HAPPEN. Probing
+    ``vector_floor`` with a threshold built out of ``max_distance`` proves the
+    shipped function still implements an absolute-distance rule — and proves
+    nothing whatever about the number. It is the same argument on both sides of
+    the comparison, so it passed for any value: ``--max-distance 0.5`` simulated
+    a floor at half the shipped one and still printed "shipped ... agrees",
+    which is exactly the sentence a reader would quote as evidence for the
+    constant that ships.
+
+    ``--max-distance`` stays, because sweeping hypothetical floors is what this
+    script is for. What changes is that a run which models something other than
+    :data:`~aggregator.core.hybrid.VECTOR_FLOOR_MAX_DISTANCE` now says so, and
+    says it where the agreement claim used to be. Returns the verdict rather
+    than printing it so a test can read it.
+    """
+    from aggregator.core.hybrid import VECTOR_FLOOR_MAX_DISTANCE, vector_floor
 
     probe = [("a", max_distance - 1e-6), ("b", max_distance + 1e-6)]
     kept = vector_floor(probe, max_distance=max_distance)
     assert kept == ["a"], (
         f"scripts/vector_floor_calibration.py models a rule the shipped "
         f"hybrid.vector_floor no longer implements (kept {kept!r})"
+    )
+    if max_distance != VECTOR_FLOOR_MAX_DISTANCE:
+        return (
+            f"NOTE: this run modelled a floor at d<={max_distance}, which is "
+            f"NOT the one that ships (VECTOR_FLOOR_MAX_DISTANCE = "
+            f"{VECTOR_FLOOR_MAX_DISTANCE}). Every number above describes that "
+            f"hypothetical floor. Do not quote this run as evidence for the "
+            f"shipped constant."
+        )
+    return (
+        f"shipped hybrid.vector_floor agrees with the rule modelled here, and "
+        f"this run modelled the shipped VECTOR_FLOOR_MAX_DISTANCE = "
+        f"{VECTOR_FLOOR_MAX_DISTANCE}."
     )
 
 
@@ -403,8 +432,7 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     )
 
     if not args.skip_shipped_check:
-        _assert_matches_shipped(args.max_distance)
-        print("\nshipped hybrid.vector_floor agrees with the rule modelled here.")
+        print("\n" + _assert_matches_shipped(args.max_distance))
     return 0
 
 
