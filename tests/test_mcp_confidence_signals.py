@@ -27,7 +27,7 @@ import pytest
 
 from aggregator.core.store import Store
 from aggregator.mcp import aggregator_query
-from aggregator.sources.base import ObservationRow, SessionRow
+from aggregator.sources.base import ObservationRow, Record, SessionRow
 
 _TS = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
 _AXES = {"voting": 0, "governance": 0, "pigeon": 1}
@@ -324,3 +324,179 @@ def test_a_ten_row_reranked_page_with_a_winner_is_not_hedged(
     assert result["ok"] is True, result
     assert result["reranked_count"] == 10
     assert result["low_confidence"] is False
+
+
+# --- ONE DEFINITION OF "WHICH ARM ANSWERED" ---------------------------------
+#
+# The wave-5 review found four findings that are one defect: the confidence
+# surface grew three different scopes for that question and never reconciled
+# them. The reconciliation this file pins:
+#
+#   search_mode        which arms put rows into THIS RESULT SET (the fused
+#                      scope). Result-set scope, NOT page scope, so that it is
+#                      stable while a caller paginates.
+#   low_confidence     the keyword hedge, about THIS PAGE. Page scope, because
+#                      a corpus-wide predicate can only be false when the arm
+#                      matched nothing anywhere.
+#   the dropped-arm    about the ARM, per ontology consulted. "It raised" is
+#   sentence           not "it ran and missed", and one ontology's failure does
+#                      not speak for another's success.
+#
+# The two scopes differ on purpose. What was wrong was that nothing said so and
+# the three code paths disagreed about the first one.
+
+
+def test_an_engaged_vector_arm_that_returned_no_rows_is_not_credited(
+    store, embedder
+):
+    """MEDIUM-3. ``vector_contributed`` was the arm ENGAGING, not the arm
+    producing rows, on the records and sessions paths — while ``88d7c86`` had
+    added exactly that row-gate to the union path and left the other two alone.
+    One query shape, three paths, three answers.
+
+    THE REPRO IS AN EMPTY RESULT SET WITH THE ARM ENGAGED. A date filter the
+    embedded row cannot satisfy leaves the vector arm engaged (there is free
+    text and there are embedded rows), its candidate in the fused scope, and
+    nothing at all in the response. The sessions path then reported
+    ``search_mode: 'vector'`` for a page with no rows on it — an arm named as
+    having produced rows that do not exist — while the union path, on the same
+    corpus and the same text, said ``lexical``.
+    """
+    _seed(store, [("o-vec", "quadratic voting rollout", True)])
+    scoped = aggregator_query(
+        "source:sessions governance from:2027-01-01", _store=store
+    )
+    union = aggregator_query("governance from:2027-01-01", _store=store)
+    assert scoped["ok"] is True and union["ok"] is True, (scoped, union)
+    assert scoped["total"] == 0 and union["total"] == 0, (scoped, union)
+    assert scoped["search_mode"] == union["search_mode"], (
+        "the same query text over the same corpus must not get a different "
+        f"answer from two paths: sessions={scoped['search_mode']!r} "
+        f"union={union['search_mode']!r}"
+    )
+    assert scoped["search_mode"] == "lexical", (
+        "no arm put a row in this result set, and the degenerate case is "
+        "declared to be 'lexical' — naming the vector arm claims rows that "
+        "are not there"
+    )
+
+
+def test_search_mode_is_stable_across_pages_and_the_hedge_is_not(
+    store, embedder
+):
+    """MEDIUM-4. The docstring header said ``search_mode`` "NAMES THE ARMS THAT
+    PRODUCED THESE ROWS" and four lines later said it is "derived from which
+    arms CONTRIBUTED CANDIDATES" — the page and the result set, in one
+    paragraph, for one field. One response asserted both "hybrid produced these
+    rows" and "the keyword arm matched none of these rows".
+
+    THE DECISION, PINNED HERE RATHER THAN ARGUED: ``search_mode`` is
+    result-set-scoped and the hedge is page-scoped, and they are allowed to
+    disagree because they answer different questions. This test is what makes
+    that a property instead of a preference — under a page-scoped
+    ``search_mode`` page 1 would say ``vector`` and page 2 ``lexical`` for one
+    query, and an agent paginating would watch the retrieval mode flicker.
+    """
+    _seed(
+        store,
+        [
+            ("o-vec", "quadratic voting rollout", True),
+            ("o-lex", "governance working notes", False),
+        ],
+    )
+    page1 = aggregator_query(
+        "source:sessions governance", page_size=1, _store=store
+    )
+    page2 = aggregator_query(
+        "source:sessions governance",
+        page_size=1,
+        page_token=page1["next_page_token"],
+        _store=store,
+    )
+    assert _ids(page1) == ["s-o-vec"] and _ids(page2) == ["s-o-lex"], (
+        page1,
+        page2,
+    )
+    assert page1["search_mode"] == page2["search_mode"] == "hybrid", (
+        "both arms put rows in this result set on both pages; the field "
+        "describes the result set and must not move with the window"
+    )
+    assert page1["low_confidence"] is True
+    assert page2["low_confidence"] is False, (
+        "the hedge is the page-scoped one and MUST move with the window"
+    )
+
+
+def test_a_failed_card_projection_does_not_erase_a_keyword_arm_that_matched(
+    store, embedder, monkeypatch
+):
+    """MEDIUM-1. ``_lexical_session_ids`` returned ``LEXICAL_ARM_UNAVAILABLE``
+    when the CARD PROJECTION raised, even though ``lexical_ids`` had come back
+    healthy and non-empty a few milliseconds earlier.
+
+    The arm ran. It matched this very row. What failed is the second statement
+    that maps its observation hits up to session-card ids — so the true answer
+    is "we cannot tell whether the arm matched THESE CARDS", and the response
+    used to say "nothing here has been checked against your words at all",
+    which is a claim about the whole corpus made out of a projection failure.
+    """
+    _seed(store, [("o-lex", "governance working notes", True)])
+
+    def boom(_text, _obs_type=None):
+        raise sqlite3.OperationalError("simulated FTS5 failure in the projection")
+
+    monkeypatch.setattr(store, "_fts_hit_scope", boom)
+    result = aggregator_query("source:sessions governance", _store=store)
+    assert result["ok"] is True, result
+    assert _ids(result) == ["s-o-lex"], "the page is not in question, only the claim"
+    reason = (result.get("low_confidence_reason") or "").lower()
+    assert "has been checked against your words at all" not in reason, (
+        "the keyword arm ran and matched this row; only the projection onto "
+        f"card ids failed. reason={reason!r}"
+    )
+    assert "matched none of these rows" not in reason, (
+        f"nor did it miss them — that is the other lie. reason={reason!r}"
+    )
+
+
+def test_one_ontologys_dropped_arm_does_not_speak_for_the_other(
+    store, embedder, monkeypatch
+):
+    """MEDIUM-2. ``_lexical_arm_failed`` used ``any`` across every ontology in
+    the response, so in union mode one side falling over made the whole response
+    say "nothing here has been checked against your words at all" — while the
+    other side had run, matched, and put the corroborated rows on the page.
+
+    Here the records side's keyword arm raises and the sessions side's answers.
+    The sentence has to be true of the rows actually returned.
+    """
+    _seed(store, [("o-vec", "quadratic voting rollout", True)])
+    store.upsert(
+        [
+            Record(
+                stable_id="github:o/r:1",
+                source="github",
+                subject="governance rollout plan",
+                body="governance rollout plan and the vote weighting change",
+                created_at=_TS,
+                updated_at=_TS,
+            )
+        ]
+    )
+
+    def boom(_text):
+        raise sqlite3.OperationalError("simulated FTS5 failure on the sessions side")
+
+    monkeypatch.setattr(store, "_fts_obs_ids", boom)
+    result = aggregator_query("governance", _store=store)
+    assert result["ok"] is True, result
+    assert result["mode"] == "union", result
+    assert "github:o/r:1" in _ids(result), (
+        "the records side answers through the FTS5-only route, so its row on "
+        f"this page IS a keyword match by construction: {_ids(result)}"
+    )
+    reason = (result.get("low_confidence_reason") or "").lower()
+    assert "has been checked against your words at all" not in reason, (
+        "one ontology's arm fell over; the other ran, matched, and put a "
+        f"corroborated row on this very page. reason={reason!r}"
+    )
