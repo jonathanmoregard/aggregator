@@ -11,6 +11,13 @@ Hugging Face cache (`Qwen/Qwen3-Embedding-0.6B` @ `97b0c614…`, 1.2 GB, present
 before this work started — nothing was downloaded). Probe:
 `scripts/measure_embed_rate.py`.
 
+**Revised 2026-08-24.** The rate below (~40 tok/s) held up. The *backfill
+estimate* built on it did not: it assumed the embeddable-row count and the mean
+body length, and both were wrong. Those two sections now carry counted numbers
+from `scripts/embedding_token_bill.py`, which exists so that every figure in
+this file is a command a reader can re-run rather than a number they have to
+trust. The int8 lever is closed by measurement in the same pass.
+
 ## Hardware
 
 | | |
@@ -118,16 +125,49 @@ therefore "documented with the real number and the reason", not "fixed".**
 
 ## What that means for the backfill
 
-At ~19 s per full-size chunk and ~40 tokens/s:
+**This section used to be an estimate built on two assumptions, and both were
+wrong in the direction that made the backfill look tractable.** It said ~240k
+embeddable rows ("roughly half" of 483k) and offered "≈14 days if the mean body
+is nearer 200 tokens" as the optimistic bound. The bill has since been COUNTED
+rather than assumed — tokenizer only, no forward passes, over the read-only
+snapshot of the live cache — by `scripts/embedding_token_bill.py total`:
 
-* ~483k observation rows, of which roughly half have empty or whitespace-only
-  bodies and are marked `skip` without touching the model;
-* so ~240k embeddable rows, at ≥1 chunk each;
-* **≈ 55 days** if every row fills a 4000-character chunk, **≈ 14 days** if the
-  mean body is nearer 200 tokens.
+| | measured | previously assumed |
+|---|---|---|
+| rows | 509,411 | ~483k |
+| embeddable | **330,765 (64.9%)** | ~240k ("roughly half") |
+| chunks | 438,929 | — |
+| tokens | **189,405,443** | — |
+| mean tokens/chunk | 423 observations, 866 records | ~200 (guessed) |
+| **at the measured 40 tok/s** | **54.8 days** | 14-55 days |
 
-The project's 25-30 day figure sits inside that range. It was not a bad
-estimate and there is no missing 100x to recover.
+So the true figure is the TOP of the old range, not the middle: there is no
+14-day case. The 25-30 day estimate this file was written to check is now the
+one that looks optimistic, and the reason is the mean chunk — 423 tokens, not
+the ~200 that was guessed.
+
+### The order is what matters, not the total
+
+54.8 days is the wrong number to plan against, because the backfill runs in a
+priority order the user set (`dropbox -> blog -> llm -> claude code`) and the
+FTS5 arm serves the whole corpus throughout. What matters is when the vector arm
+becomes useful, which is a PREFIX of this table.
+`scripts/embedding_token_bill.py by-source`, day columns **cumulative**:
+
+| group | tokens | @40 t/s (measured) | @176 t/s (300M, est) | @530 t/s (33M, est) |
+|---|---|---|---|---|
+| dropbox | 3.8M | 1.09 | 0.25 | 0.08 |
+| substack | 0.2M | 1.15 | 0.26 | 0.09 |
+| claude-web | 9.8M | 3.99 | 0.91 | 0.30 |
+| sessions | 116.8M | 37.80 | 8.59 | 2.85 |
+| subagents | 55.8M | 53.93 | 12.26 | 4.07 |
+| github/research/sota-watch/ticktick | 3.0M | 54.80 | 12.46 | 4.14 |
+
+**91% of the 54.8 days is `sessions` + `subagents` — the two sources the user
+deliberately ranked LAST.** Everything ranked ahead of them finishes in about 4
+days on the model that ships today, unchanged. Only the 40 tok/s column is
+measured; the other two are scaled by non-embedding parameter count and are
+estimates, quoted to size a decision and not to be planned against.
 
 ## What was actually made cheaper
 
@@ -150,14 +190,43 @@ changes, all from criterion E:
   multi-week outage, which is why three review rounds were spent building
   consent gates in front of the delete instead.
 
+## int8 dynamic quantization is dead on this hardware — measured
+
+This was listed below as "typically 2-4x on CPU". It is not, here. Measured with
+`scripts/embedding_token_bill.py bench-int8` over the CACHED weights (torch
+2.13, quantized engine `x86`, no download, no new packages):
+
+| chunk size | speedup | cos(fp32, int8) |
+|---|---|---|
+| 1800 chars (~420 tokens) | **1.01x** | ~1.0 |
+| 4000 chars (~804 tokens) | **1.06x** | ~1.0 |
+
+The geometry does not move, which would have been the thing to worry about —
+`hybrid.VECTOR_FLOOR_MAX_DISTANCE` is calibrated in this embedding space — but
+that only matters if the speedup is real, and 1.06x is not. Dynamic
+quantization helps when the model is memory-bandwidth-bound in its `Linear`
+layers; at 804 tokens on a 15 W part this workload is compute-bound instead.
+
+**This falsifies the cheap lever and leaves only the expensive one.** The three
+open items below were meant to be three independent shots at the problem; two of
+them are now closed by measurement, so the model itself is the only remaining
+lever on the 40 tok/s.
+
 ## Open, and the user's to decide
 
-Not taken here, because each is a dependency or quality decision rather than a
-bug fix, and all three have the right order of magnitude:
-
-* a smaller embedding model (the 20x term) — costs MTEB-Code, which is why this
-  one was chosen;
-* int8 dynamic quantization or an ONNX Runtime export — typically 2-4x on CPU,
-  and would change the version string, so it is a full re-embed to adopt;
-* the `gguf` Q4_K_M backend already in the tree — needs its repository
-  revision pinned and verified first.
+* **A smaller embedding model — now the ONLY lever.** Costs MTEB-Code, which is
+  why the current one was chosen. Note the trap: the 20x-class models
+  (MiniLM-L6 and friends) have a **256-token maximum sequence** while our chunks
+  are ~804 tokens, so they would silently embed the first third of every chunk.
+  A model that keeps this chunk geometry (≥804-token window, 768 dims) is
+  100-140M parameters, i.e. ~4-5x, not 20x. Any swap is a full re-embed and
+  requires re-deriving the abstention floor, since `_QUANTIZATION` and the model
+  id are both in the version string.
+* **The `gguf` Q4_K_M backend already in the tree** — still needs its repository
+  revision pinned (`QWEN3_EMBEDDING_GGUF_REVISION is None`) and verified. Its
+  plausible 3-5x overlaps with what int8 was supposed to deliver, and int8
+  measured 1.06x, so the same compute-bound argument applies and this should be
+  weighed accordingly rather than assumed.
+* ~~int8 dynamic quantization or an ONNX Runtime export~~ — **closed by
+  measurement**, see the section above. ONNX Runtime is untested and would be a
+  separate measurement, not a continuation of this one.
