@@ -1074,6 +1074,29 @@ def _lexical_session_ids(
     so the store never computes this scope for itself. Paid deliberately —
     without it the hedge on the surface an agent actually calls would still be
     answering the corpus-wide question.
+
+    THE COST, NAMED RATHER THAN LEFT AS "ONE EXTRA MATCH". The scan is
+    CORPUS-WIDE AND UNCAPPED: it is the same statement the FTS5-only route runs,
+    so it returns every card the query matches anywhere in the cache, not just
+    the ones on this page. Measured on the live 505k-row cache, the worst of the
+    86 golden queries projects to 13,650 ids for a page showing 20. That is one
+    additional full-text scan per page of a paginated session search, and it
+    scales with the corpus rather than with the page.
+
+    A LIMIT WOULD BREAK THE THING IT PAYS FOR, which is why there is not one.
+    The question being answered is "did the keyword arm match ANY of the rows on
+    this page", and the page is a recency-ordered window over a fused scope in
+    which keyword-matched and vector-only cards are interleaved. Capping the
+    projection at N ids answers a different question — "did it match any of the
+    first N cards it happened to return" — and answers it wrongly in exactly the
+    case the hedge exists for: a page deep in the recency order whose
+    corroborating hits sort past the cap would be reported as uncorroborated,
+    which is the false-hedge mirror of the corpus-wide bug this replaced. A
+    correct optimisation is a scoped statement (project only the ids ON this
+    page) rather than a truncated one; it needs a store-side query that does not
+    exist yet, and it is not worth inventing before the vector arm has an index
+    to make this path common. Until then the honest trade is a real scan for a
+    true sentence.
     """
     if lexical_ids is None or lexical_ids is LEXICAL_ARM_UNAVAILABLE:
         # Both states are about the arm rather than about its ids, and both
