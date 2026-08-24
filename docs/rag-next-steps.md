@@ -21,6 +21,43 @@ with the measurements each step depends on, so the work can be picked up cold.
 So nothing in the vector arm can be exercised against real data yet, and two
 open questions below are blocked on that rather than on any code in the PR.
 
+## What "CI green" does and does not cover
+
+The first CI run on this branch failed one test, and chasing it turned up
+something structural worth stating.
+
+**The failure.** `test_reindex_with_nothing_to_delete_does_not_prompt` built a
+real `Embedder`, which resolves weights through the HuggingFace cache. It passed
+on any machine that had run a backfill and failed in CI, where the cache is
+empty and downloads are refused by design. Fixed by stubbing the embedder, as
+every sibling on that path already did. Not a production defect: building the
+embedder before `migrate()` is deliberate, because the provenance stamp carries
+the quantization and chunker version and neither is knowable from the
+environment.
+
+**The structural part.** With a cold model cache, **11 tests skip rather than
+run** — all of `tests/core/test_embed.py`, `test_embed_query_instruction.py` and
+`test_rerank.py`. They skip loudly, with the reason attached, which is the right
+call: downloading weights in CI is exactly the failure this repo has a guard
+against. But the consequence is that **CI has never executed the embedder or the
+reranker**, and a green tick there says nothing about either. Only a local run
+against a warm cache covers them.
+
+Two practical consequences. Run the gate locally with `HF_HOME` pointed at an
+empty directory when the question is "does this pass in CI" — a warm cache
+silently answers a different question, which is how the bug above survived a
+green local gate. And run it warm when the question is "does the embedder still
+work", because cold skips 11 of the tests that would tell you.
+
+**A known flake, pre-existing.** `tests/core/test_store.py::
+test_two_processes_concurrent_writes_succeed` joins two spawned writers with a
+fixed `timeout=30`. On a loaded box the child has not finished importing, so
+`exitcode` is `None` and the assertion reports a concurrency failure that did
+not happen. It predates this branch (last touched by `847ac74`), passes 3/3 when
+run idle, and passed in CI and in the warm gate. It conflates "the writers
+deadlocked" with "the machine was busy"; worth separating those, in its own
+commit.
+
 ## Embedding model: decided
 
 **Ship as-is on `Qwen3-Embedding-0.6B`** (decided 2026-08-24). No swap.
