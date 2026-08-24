@@ -5,11 +5,18 @@ THE NUMBER IN ``docs/embedding-throughput.md`` HAS TO BE RE-RUNNABLE. That file
 originally estimated the bill from a row count and an assumed mean body length
 ("~240k embeddable rows", "≈14 days if the mean body is nearer 200 tokens").
 Both halves were wrong, and wrong in the direction that made the backfill look
-tractable: the real corpus is 64.9% embeddable, not ~50%, and the real mean is
+tractable: the real corpus is 65.2% embeddable, not ~50%, and the real mean is
 423 tokens per chunk for observations and 866 for records. This script is what
 replaced the assumption, and it lives here rather than in a scratch directory
 because a document that cites a measurement nobody can re-run is a document
 that will drift from it.
+
+THE ONE THING TO GET RIGHT HERE IS WHAT THE EMBEDDER ACTUALLY SEES. Observations
+embed their body alone; RECORDS embed ``subject + "\n\n" + body`` (``cli.py``'s
+backlog loop). Counting the record bill from ``body`` alone reports 1,242
+title-only rows — mostly TickTick tasks with no notes — as unembeddable, when
+every one of them is indexed on its title. See :func:`_embed_text`; this file
+shipped with that bug for one commit.
 
 Three subcommands:
 
@@ -81,7 +88,22 @@ SELECT CASE
        o.body AS body
 FROM observations o LEFT JOIN sessions s ON s.session_id = o.session_id
 """
-_REC_SQL = "SELECT source AS src, body FROM records"
+_REC_SQL = "SELECT source AS src, subject, body FROM records"
+
+
+def _embed_text(kind: str, row: sqlite3.Row) -> str:
+    """The string the embedder would actually see for this row.
+
+    MUST TRACK ``cli.py``'s backlog loop, and the records branch is the reason
+    this is a function rather than a column in the SQL. Observations embed their
+    body alone; RECORDS embed ``subject + "\\n\\n" + body``, so a record with an
+    empty body and a real subject (a TickTick task with no notes — 1,176 of
+    them) IS embeddable. Counting the body alone reported those as skipped and
+    undercounted the records bill.
+    """
+    if kind == "observations":
+        return row["body"] or ""
+    return f"{row['subject']}\n\n{row['body']}"
 
 
 def _tokenizer():
@@ -116,7 +138,7 @@ def cmd_total(args: argparse.Namespace) -> int:
         t0 = time.time()
         for row in con.execute(sql):
             bucket["rows"] += 1
-            body = row["body"]
+            body = _embed_text(kind, row)
             if not body or not body.strip():
                 continue
             chunks = chunk_body(body)
@@ -139,7 +161,7 @@ def cmd_total(args: argparse.Namespace) -> int:
             bucket["tokens"] += _count_tokens(tok, batch)
 
     account("observations", "SELECT body FROM observations")
-    account("records", "SELECT body FROM records")
+    account("records", "SELECT subject, body FROM records")
 
     grand = {
         key: sum(b[key] for b in totals.values())
@@ -182,12 +204,12 @@ def cmd_by_source(args: argparse.Namespace) -> int:
         bill[src]["tokens"] += _count_tokens(tok, batch)
         pending[src] = []
 
-    for sql in (_OBS_SQL, _REC_SQL):
+    for kind, sql in (("observations", _OBS_SQL), ("records", _REC_SQL)):
         for row in con.execute(sql):
             src = str(row["src"])
             b = bill.setdefault(src, {"rows": 0, "chunks": 0, "tokens": 0})
             b["rows"] += 1
-            body = row["body"]
+            body = _embed_text(kind, row)
             if not body or not body.strip():
                 continue
             chunks = chunk_body(body)

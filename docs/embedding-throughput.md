@@ -135,9 +135,9 @@ snapshot of the live cache — by `scripts/embedding_token_bill.py total`:
 | | measured | previously assumed |
 |---|---|---|
 | rows | 509,411 | ~483k |
-| embeddable | **330,765 (64.9%)** | ~240k ("roughly half") |
-| chunks | 438,929 | — |
-| tokens | **189,405,443** | — |
+| embeddable | **332,007 (65.2%)** | ~240k ("roughly half") |
+| chunks | 440,198 | — |
+| tokens | **189,453,589** | — |
 | mean tokens/chunk | 423 observations, 866 records | ~200 (guessed) |
 | **at the measured 40 tok/s** | **54.8 days** | 14-55 days |
 
@@ -145,6 +145,39 @@ So the true figure is the TOP of the old range, not the middle: there is no
 14-day case. The 25-30 day estimate this file was written to check is now the
 one that looks optimistic, and the reason is the mean chunk — 423 tokens, not
 the ~200 that was guessed.
+
+### The 35% that is not embeddable is not a coverage gap
+
+65.2% invites the question "what happens to the other third?", so it is
+answered here rather than left to be re-derived. Measured per row, the skipped
+177,404 rows break down as:
+
+| bucket | rows | what it is |
+|---|---|---|
+| `attachment` | 112,385 | structural markers. `body` is `''` and **no other column holds text** — the content was never in the cache to begin with |
+| `assistant` | 49,236 | turns whose entire payload was a tool call. The call itself is a separate `tool_use` row, and those are **100% embeddable** |
+| `system` | 12,889 | system/meta turns, empty body |
+| `tool_result` | 2,665 | empty results |
+| `progress` | 228 | progress markers |
+| `user` | 1 | one empty prompt |
+
+**Every row that contains text is embedded.** The count of rows whose body is
+non-empty but which the chunker rejects is **zero** — there is no content being
+silently dropped between the cache and the model. And there is no asymmetry
+between the arms: `obs_fts` indexes `body` and nothing else, so an empty-body
+observation is invisible to the keyword arm too. A row skipped here was never
+findable by any means.
+
+**Records are 100% embeddable** (4,293 of 4,293), because the embedder feeds the
+model `subject + "\n\n" + body` for that table — so a TickTick task with a title
+and no notes is indexed on its title. That is worth stating because it is easy
+to get wrong when counting: measuring the record bill from `body` alone reports
+1,242 of them as skipped and undercounts the record tokens by 48k.
+
+The one genuinely open question this leaves is upstream of retrieval: whether
+`attachment` observations *should* be carrying text that ingest is not
+capturing. That is an ingest question, not an indexing one, and nothing in the
+retrieval path can answer it.
 
 ### The order is what matters, not the total
 
