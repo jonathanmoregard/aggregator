@@ -599,6 +599,19 @@ and for records:
 
 - [ ] **Step D4: Load sqlite-vec extension in `_c()`**
 
+> **SUPERSEDED 2026-08-17 — do NOT implement as written below.** The
+> unconditional load is a defect: every read in this product goes through
+> `Store`, including `aggregator_search_memory`, which has no vector
+> dependency at all. An extension that is missing, ABI-mismatched, or blocked
+> by a python built without `enable_load_extension` would then take FTS5 recall
+> down with the optional half of the feature. As shipped, the load is
+> best-effort — see `Store._try_load_sqlite_vec`, `Store.vector_available` and
+> `VectorIndexUnavailableError` in `aggregator/core/store.py`, and
+> `tests/core/test_store_vector_degrade.py`. Vector DDL is skipped when the
+> extension is absent, vector writes no-op without advancing the watermark,
+> vector reads raise by name, and FTS5 keeps serving. Kept below for the
+> record only.
+
 Modify `Store._c()` right after `self._conn.execute("PRAGMA foreign_keys = ON;")`:
 
 ```python

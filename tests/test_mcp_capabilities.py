@@ -189,6 +189,109 @@ def test_capabilities_registers_sota_watch_like_github(tmp_data_home):
     assert caps["counts"]["sota-watch"] == 2
 
 
+# --- v5: vector-index state reaches the MCP surface -----------------------
+
+
+def test_capabilities_exposes_vector_index(tmp_data_home):
+    """Task L: a caller must be able to see, from the tool surface alone,
+    whether hybrid retrieval is warm on this cache."""
+    store = Store()
+    _seed(store)
+    caps = aggregator_capabilities(_store=store)
+    assert "vector_index" in caps
+    vi = caps["vector_index"]
+    assert vi["available"] is True
+    assert vi["state"] == "not_started"
+    assert vi["observations"]["pending"] == 1
+    assert vi["observations"]["vectors"] == 0
+
+
+def test_capabilities_vector_index_distinguishes_unavailable_from_unembedded(
+    tmp_data_home, monkeypatch
+):
+    """The two situations that would otherwise both render as "0 embedded"."""
+    import sqlite3
+
+    from aggregator.core import store as store_mod
+
+    unembedded = aggregator_capabilities(_store=_seeded_store())["vector_index"]
+
+    def _boom(conn):
+        raise sqlite3.OperationalError("simulated sqlite-vec ABI mismatch")
+
+    monkeypatch.setattr(store_mod, "_load_sqlite_vec", _boom)
+    monkeypatch.setattr(store_mod, "_VEC_LOAD_WARNED", False)
+    broken = aggregator_capabilities(_store=_seeded_store())["vector_index"]
+
+    assert unembedded["state"] == "not_started"
+    assert broken["state"] == "unavailable"
+    assert unembedded != broken
+
+
+def _seeded_store():
+    store = Store()
+    _seed(store)
+    return store
+
+
+# --- the enumeration a caller reads must match what the code emits --------
+#
+# Two docstrings enumerate the ``vector_index`` states: ``aggregator_capabilities``
+# (which IS the MCP tool description a caller reads before acting) and
+# ``Store.vector_index_state`` (which the first one restates). Chunk N added
+# ``degraded`` to the code and neither enumeration noticed, so a caller reading
+# the tool description would conclude the state did not exist. Asserted together
+# and in one place, because they are one invariant with two copies.
+
+
+def _states_the_store_can_report() -> set[str]:
+    """Every literal ``state`` value ``vector_index_state`` can return.
+
+    Read out of the production source, NOT listed here: a hand-maintained list
+    in a test is the same artefact as the hand-maintained list in a docstring.
+    It would go stale in the same way, at the same moment, and for the same
+    reason — which is exactly what happened.
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(Store.vector_index_state)
+    return set(re.findall(r'^\s*state = "([a-z_]+)"$', src, re.MULTILINE))
+
+
+def test_the_state_extraction_itself_has_teeth():
+    """Without this, a refactor that breaks the regex makes the two tests
+    below pass vacuously — a doc guard that guards nothing is worse than none,
+    because it is also believed."""
+    states = _states_the_store_can_report()
+    assert states >= {
+        "unavailable",
+        "empty",
+        "complete",
+        "degraded",
+        "not_started",
+        "backfilling",
+    }, f"state extraction found only {sorted(states)}"
+
+
+def test_capabilities_docstring_documents_every_state_it_can_report():
+    documented = aggregator_capabilities.__doc__ or ""
+    missing = sorted(s for s in _states_the_store_can_report() if s not in documented)
+    assert not missing, (
+        f"aggregator_capabilities' docstring — the MCP tool description a "
+        f"caller reads — does not name these states it can return: {missing}"
+    )
+
+
+def test_vector_index_state_docstring_documents_every_state_it_can_report():
+    documented = Store.vector_index_state.__doc__ or ""
+    missing = sorted(s for s in _states_the_store_can_report() if s not in documented)
+    assert not missing, (
+        f"Store.vector_index_state's docstring does not name these states it "
+        f"returns: {missing}"
+    )
+
+
 def test_capabilities_help_includes_dsl_syntax(tmp_data_home):
     store = Store()
     _seed(store)

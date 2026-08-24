@@ -25,7 +25,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from aggregator.core.store import Store
+from aggregator.core.store import SCHEMA_VERSION, Store
 from aggregator.sources.base import ObservationRow, Record, SessionRow
 
 TS = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
@@ -255,7 +255,7 @@ def test_v3_to_v4_upgrades_in_place_and_self_heals(tmp_path):
     s2 = Store(tmp_path / "cache.db")
     s2.migrate()
     try:
-        assert s2.schema_version() == 4
+        assert s2.schema_version() == SCHEMA_VERSION
         # Nothing matches a NULL fingerprint, so the first pass rewrites.
         assert s2.upsert_entities([session(), observation()]) == 0
         assert s2.upsert([record()]) == 0

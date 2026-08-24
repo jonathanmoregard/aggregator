@@ -562,6 +562,21 @@ class PoisonLedger:
     def __init__(self, store: Store) -> None:
         self._store = store
 
+    def entries(self, source: str) -> dict[str, HeldRecord]:
+        """Every record this ledger holds for ``source``, due or not.
+
+        The raw set the two policy views below are cut from, and what a caller
+        asks when the question is "has this record failed before?" rather than
+        "may I attempt it now?" — the embed worker needs the first to decide
+        whether a failure is news, and the second to decide what to run.
+        """
+        return {
+            entry.record_key: entry
+            for entry in (
+                _held_from_row(row) for row in self._store.read_poison(source)
+            )
+        }
+
     def held(self, source: str, *, now: datetime | None = None) -> dict[str, HeldRecord]:
         """The records this run must NOT attempt, keyed by record key.
 
@@ -570,13 +585,29 @@ class PoisonLedger:
         (and is released) or is held again with a longer delay.
         """
         moment = now or datetime.now(UTC)
-        out: dict[str, HeldRecord] = {}
-        for row in self._store.read_poison(source):
-            entry = _held_from_row(row)
-            due = entry.next_retry_at
-            if due is None or due > moment:
-                out[entry.record_key] = entry
-        return out
+        return {
+            key: entry
+            for key, entry in self.entries(source).items()
+            if entry.next_retry_at is None or entry.next_retry_at > moment
+        }
+
+    def due(self, source: str, *, now: datetime | None = None) -> dict[str, HeldRecord]:
+        """The exact complement of :meth:`held` — rows whose retry time arrived.
+
+        A source that FILTERS its input (the ingest legs) only ever needs
+        ``held``: it walks everything and skips what it is told to. A source
+        that reads a QUEUE needs this one, because the embed worker's backlog
+        query cannot see a held row at all — the row was marked ``'error'`` to
+        get it out of ``select_unembedded``, and something has to put it back.
+        Terminal rows are excluded here for the same reason they are included
+        in ``held``: never attempted again is the whole meaning of terminal.
+        """
+        moment = now or datetime.now(UTC)
+        return {
+            key: entry
+            for key, entry in self.entries(source).items()
+            if entry.next_retry_at is not None and entry.next_retry_at <= moment
+        }
 
     def hold(
         self,
