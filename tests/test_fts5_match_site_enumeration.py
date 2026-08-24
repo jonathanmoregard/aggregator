@@ -26,6 +26,17 @@ makes the enumeration complete rather than merely long: it asserts that the
 three buckets cover the whole set, so a new MATCH shape (a differently-named
 FTS table, an f-string that interpolates a table variable under another name,
 a MATCH built by concatenation) cannot pass silently. It forces a decision.
+
+AND THEN THE SCANNER ITSELF HAD THE SAME CLASS OF HOLE, which is the fourth
+instance and the reason the last section of this file exists. ``_MATCH_WORD``
+was case-SENSITIVE, so ``WHERE obs_fts match ?`` — valid SQLite, raw user text,
+a real FTS5 MATCH — was collected by nothing and classified by nothing. Every
+test above still passed, because every test above asserts something about the
+literals the scanner FOUND. A mechanical enumeration is only worth what its
+collector is worth, so the collector is now itself tested, against planted
+sites in shapes nobody here wrote: lowercase, mixed case, lowercase inside an
+f-string, lowercase sqlite-vec. That is the difference between "we parse the
+source" and "we would catch it".
 """
 
 from __future__ import annotations
@@ -40,26 +51,73 @@ _REPO = Path(__file__).resolve().parents[1]
 _SCANNED_DIRS = ("aggregator", "scripts")
 
 #: The SQL keyword, as a word. ``rematch``/``obj.match`` are not it.
-_MATCH_WORD = re.compile(r"(?<![\w.])MATCH(?![\w])")
+#:
+#: CASE-INSENSITIVE, AND THAT IS THE WHOLE POINT OF THE FLAG. This pattern
+#: shipped without ``re.IGNORECASE`` and the omission was a one-character hole
+#: straight through the completeness property: ``WHERE obs_fts match ?`` is
+#: valid SQLite, binds raw user text to a real FTS5 MATCH, and was collected by
+#: nothing and classified by nothing, so the file went green on a smuggled site.
+#: SQLite does not care about the case of a keyword and neither may this.
+#: ``test_the_scanner_is_not_defeated_by_lowercasing_the_operator`` plants one
+#: of each shape.
+_MATCH_WORD = re.compile(r"(?<![\w.])MATCH(?![\w])", re.IGNORECASE)
 
 #: An FTS5 site: the left operand of ``MATCH`` is an FTS5 table. Both the
 #: literal table names this project uses and the f-string form the smoke
 #: script builds. A NEW table name matching ``\w+_fts`` is picked up
 #: automatically; anything else falls through to the unclassified bucket.
-_FTS_SITE = re.compile(r"(?:\b\w*_fts\b|\{table\})\s+MATCH\b")
+#:
+#: Case-insensitive for the same reason as ``_MATCH_WORD``, and it has to move
+#: WITH it: collecting a lowercase site while the bucket regexes stayed
+#: case-sensitive would drop every one of them into the unclassified bucket, so
+#: the file would go red on real, correctly-sanitized statements and the fix
+#: would be reverted within a day.
+_FTS_SITE = re.compile(r"(?:\b\w*_fts\b|\{table\})\s+MATCH\b", re.IGNORECASE)
 
 #: A sqlite-vec KNN site: the left operand is the ``embedding`` column and the
 #: bound parameter is a float32 blob, never user text.
-_VEC_SITE = re.compile(r"\bembedding\s+MATCH\b")
+_VEC_SITE = re.compile(r"\bembedding\s+MATCH\b", re.IGNORECASE)
 
 #: Literals that mention MATCH but are not SQL at all. Frozen deliberately:
 #: adding one is a decision, not a formality.
+#:
+#: THE PRICE OF CASE-INSENSITIVITY, MEASURED BEFORE IT WAS PAID. Matching any
+#: case also collects ordinary English containing the word "match", which then
+#: has to be classified here. Counted over every non-docstring string literal in
+#: ``aggregator/`` and ``scripts/`` at the time this landed: the flag added
+#: exactly ONE literal to the set, and the confidence-surface work in the same
+#: wave added a second. Two declared entries is a cheaper guarantee than a
+#: scanner with a hole in it, and the alternative — a heuristic that only reads
+#: lowercase MATCH when the literal "looks like SQL" — was rejected because the
+#: shape it would miss is ``f"... {table} match '{q}'"``, i.e. precisely the
+#: interpolated-user-text injection this file exists to catch.
 _NOT_SQL = {
     (
         "aggregator/core/store.py",
         "Store._fts_rows",
         "FTS5 MATCH failed for %r (rewritten to %r) — the lexical arm "
         "contributes nothing to this query",
+    ),
+    # Both of these are sentences shown to the AGENT, in ``low_confidence_reason``.
+    # They say "no match" / "DID match" about the keyword arm in English and
+    # touch no SQL at all.
+    (
+        "aggregator/mcp.py",
+        "_note_confidence",
+        "the keyword arm was UNAVAILABLE for this query — it failed while "
+        "running, so it contributed nothing and these rows come from the "
+        "semantic arm alone. This is NOT the same as the keyword arm finding "
+        "no match: nothing here has been checked against your words at all, "
+        "and a re-run may answer differently",
+    ),
+    (
+        "aggregator/mcp.py",
+        "_note_confidence",
+        "the keyword arm ran and DID match rows for this query, but the second "
+        "lookup that maps its hits onto these session cards failed, so whether "
+        "it corroborated the rows on this page is UNKNOWN. This is weaker than "
+        "either 'corroborated' or 'not corroborated' — a re-run may answer "
+        "differently",
     ),
 }
 
@@ -175,17 +233,30 @@ class _Collector(ast.NodeVisitor):
         # Do not descend: its Constant parts are the same literal.
 
 
+def _collect(rel: str, source: str) -> tuple[list[_MatchLiteral], dict[str, set[str]]]:
+    """Run the collector over ONE module's source.
+
+    Split out of :func:`_scan` so the scanner can be pointed at a synthetic
+    module. A scanner is a claim about what it would catch, and the only way to
+    check that claim is to hand it something it is supposed to catch — see
+    ``test_the_scanner_is_not_defeated_by_lowercasing_the_operator``, which
+    exists because it was.
+    """
+    tree = ast.parse(source)
+    collector = _Collector(rel, _docstring_ids(tree))
+    collector.visit(tree)
+    return collector.found, collector.calls
+
+
 def _scan() -> tuple[list[_MatchLiteral], dict[str, dict[str, set[str]]]]:
     literals: list[_MatchLiteral] = []
     calls: dict[str, dict[str, set[str]]] = {}
     for directory in _SCANNED_DIRS:
         for file in sorted((_REPO / directory).rglob("*.py")):
             rel = file.relative_to(_REPO).as_posix()
-            tree = ast.parse(file.read_text())
-            collector = _Collector(rel, _docstring_ids(tree))
-            collector.visit(tree)
-            literals.extend(collector.found)
-            calls[rel] = collector.calls
+            found, per_file = _collect(rel, file.read_text())
+            literals.extend(found)
+            calls[rel] = per_file
     return literals, calls
 
 
@@ -393,4 +464,102 @@ def test_no_operational_error_on_the_match_path_is_swallowed_into_an_empty_resul
     assert not offenders, (
         "sqlite3.OperationalError from the FTS5 MATCH path swallowed into an "
         f"empty result, with nothing logged, raised or returned: {offenders}"
+    )
+
+
+# --- the scanner's own teeth ------------------------------------------------
+#
+# Everything above asserts things about THIS repo. Nothing above asserts that
+# the scanner would catch a site it has never seen, and that is the only
+# property the file is actually selling: "a site nobody thought of lands in no
+# bucket and this file goes red". The tests below hand it sites nobody thought
+# of.
+
+#: One smuggled FTS5 site per shape, all of them valid SQLite. ``MATCH`` is a
+#: keyword and SQLite does not care about its case, so every one of these binds
+#: raw text to a real FTS5 MATCH; none of them calls the sanitizer.
+_SMUGGLED = {
+    "lowercase operator": (
+        'def sneak(con, q):\n'
+        '    return con.execute("SELECT obs_id FROM obs_fts WHERE obs_fts match ?", (q,))\n'
+    ),
+    "mixed case operator": (
+        'def sneak(con, q):\n'
+        '    return con.execute("SELECT obs_id FROM obs_fts WHERE obs_fts Match ?", (q,))\n'
+    ),
+    "lowercase in an f-string": (
+        'def sneak(con, q, table):\n'
+        '    return con.execute(f"SELECT rowid FROM {table} WHERE {table} match ?", (q,))\n'
+    ),
+    "lowercase vec KNN": (
+        'def sneak(con, v):\n'
+        '    return con.execute("SELECT rowid FROM vec0 WHERE embedding match ?", (v,))\n'
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_SMUGGLED))
+def test_the_scanner_is_not_defeated_by_lowercasing_the_operator(shape):
+    """THE HOLE THIS FILE SHIPPED WITH, and it was one character wide.
+
+    ``_MATCH_WORD`` was ``re.compile(r"(?<![\\w.])MATCH(?![\\w])")`` — case
+    SENSITIVE. ``WHERE obs_fts match ?`` is valid SQLite, binds raw user text to
+    a real FTS5 MATCH, and was collected by nothing and classified by nothing,
+    so the completeness property the module docstring sells ("a site nobody
+    thought of lands in no bucket and this file goes red") silently did not hold
+    for it. Demonstrated by planting exactly these shapes: lowercase went green,
+    the same site with the operator uppercased went red.
+
+    No site in the repo exploited it, so this was a hole in the guarantee rather
+    than a live bug — which is the reason to fix it rather than a reason not to:
+    the guarantee is the whole product here.
+    """
+    found, _calls = _collect("scripts/smuggled.py", _SMUGGLED[shape])
+    assert found, (
+        f"the {shape} site was collected by nothing — it is invisible to every "
+        "other test in this file, including the completeness property"
+    )
+    lit = found[0]
+    assert _FTS_SITE.search(lit.text) or _VEC_SITE.search(lit.text), (
+        f"the {shape} site was collected but fell in no bucket: {lit.text!r}"
+    )
+
+
+def test_a_smuggled_site_is_held_to_the_whitelist_rule_like_any_other():
+    """Collected and bucketed is not enough — the rule has to bite.
+
+    The point of classifying a lowercase site as an FTS5 site is that
+    ``test_every_fts5_match_site_is_reached_through_the_whitelist`` then demands
+    its owning function call ``fts5_match_query``. This checks the demand
+    actually fails for a function that does not.
+    """
+    found, calls = _collect(
+        "scripts/smuggled.py", _SMUGGLED["lowercase operator"]
+    )
+    lit = found[0]
+    assert _SANITIZER not in calls.get(lit.func, set()), (
+        "the planted site does not sanitize, so the whitelist rule must be the "
+        "thing that catches it"
+    )
+
+
+def test_prose_that_merely_says_match_is_not_mistaken_for_sql():
+    """The cost of case-insensitivity, bounded and paid deliberately.
+
+    Making the scanner case-insensitive means it also collects ordinary English
+    string literals containing the word "match", which then have to be
+    classified. Measured over ``aggregator/`` and ``scripts/`` when this landed:
+    ONE such literal existed. So the noise is a declared entry in ``_NOT_SQL``,
+    not a reason to keep the hole — but a scanner that classified prose as an
+    FTS5 site would be worse than either, so that is checked here.
+    """
+    source = (
+        'def report():\n'
+        '    return "the keyword arm found no match: nothing was checked"\n'
+    )
+    found, _calls = _collect("aggregator/prose.py", source)
+    assert found, "case-insensitive collection has to see it at all"
+    lit = found[0]
+    assert not _FTS_SITE.search(lit.text) and not _VEC_SITE.search(lit.text), (
+        f"English prose classified as a SQL site: {lit.text!r}"
     )
