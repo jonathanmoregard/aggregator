@@ -395,7 +395,7 @@ def test_the_packer_never_hands_back_an_empty_batch(tmp_path, embedder):
     _add_obs(store, "giant", _body_of(200, "G"), "2026-09-01")
     rows = store.select_unembedded("observations", limit=500)
 
-    assert cli._pack_batch("observations", rows, cap=1) == rows[:1]
+    assert cli._pack_batch("observations", rows, chunk_cap=1) == rows[:1]
 
 
 # --- rows that cost the encoder nothing -------------------------------------

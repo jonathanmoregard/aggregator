@@ -2501,8 +2501,13 @@ def _row_chunk_cost(kind: str, row: sqlite3.Row) -> int:
         return 1
 
 
-def _pack_batch(kind: str, rows: list, cap: int) -> list:
-    """The longest PREFIX of ``rows`` whose chunks fit under ``cap``.
+def _pack_batch(kind: str, rows: list, chunk_cap: int) -> list:
+    """The longest PREFIX of ``rows`` whose chunks fit under ``chunk_cap``.
+
+    The cap is counted in CHUNKS, which the name says because a ROW count —
+    ``args.batch_size`` — is in scope at the only call site and would type-check
+    here without complaint. Swapping the two would silently change what a
+    checkpoint interval is made of, and nothing downstream would notice.
 
     A PREFIX, NOT A SELECTION. ``select_unembedded`` hands back an ordered
     backlog — ``ts DESC``, within one group of ``EMBED_BACKLOG_ORDER`` — and
@@ -2540,7 +2545,7 @@ def _pack_batch(kind: str, rows: list, cap: int) -> list:
     total = 0
     for row in rows:
         cost = _row_chunk_cost(kind, row)
-        if batch and total + cost > cap:
+        if batch and total + cost > chunk_cap:
             break
         batch.append(row)
         total += cost
@@ -2600,7 +2605,7 @@ def _embed_backlog(
         # SELECT can only express the first: chunk count is not a column and
         # cannot be one, since it depends on the chunker's geometry. So the
         # second is applied here, to the SELECT's own result.
-        batch = _pack_batch(kind, rows, _MAX_BATCH_CHUNKS)
+        batch = _pack_batch(kind, rows, chunk_cap=_MAX_BATCH_CHUNKS)
         moved = _embed_batch(store, embedder, kind, batch, ledger, outcome, stop)
         worked = True
         if args.once:
