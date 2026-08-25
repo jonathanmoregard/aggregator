@@ -14,9 +14,20 @@ makes falsifiable claims about two named behaviours in two named files. So
 the assertion is a conditional — if the behaviour is present in the Python,
 the Nix module may not claim its absence.
 
+A third claim in the same comment was false from the start rather than gone
+stale: "A row is sub-second, so 5min is wildly generous on purpose". A row's
+encode is one ``embed_documents`` call over all of that row's chunks and the
+live cache holds rows of 257 chunks — about 86 minutes — so the window does
+not cover a long row and never did. The chunk-bounded-batches branch then put
+the true version ("a ``TimeoutStopSec`` is far shorter than that") in
+``_embed_batch``'s docstring and left the false one standing next to it. The
+third test below pins the comfort, not the number: ``5min`` is a deliberate
+bound on a wedged worker and nothing here argues about its value.
+
 Deliberately narrow. It does not try to validate prose in general; it pins
-the two specific sentences that went stale, in the direction they went stale.
-Neither ``cli.py`` nor ``store.py`` is modified by this test — they are read.
+the three specific sentences that went wrong, in the direction they went
+wrong. Neither ``cli.py`` nor ``store.py`` is modified by this test — they
+are read.
 """
 
 from pathlib import Path
@@ -78,4 +89,76 @@ def test_the_module_does_not_claim_a_commit_ordering_that_was_removed(sources):
             f"ONE transaction — there is no ordering between them to rely on, "
             f"and the failure the ordering guarded against is now impossible "
             f"by construction rather than by sequencing."
+        )
+
+
+#: Wordings that make a row sound short enough for ``TimeoutStopSec`` to cover.
+#: Each is affirmative, so stating the truth in the negative ("a row is not
+#: short") does not trip it — with the deliberate exception of ``sub-second``
+#: itself, which is the literal stale claim and is worth catching even inside a
+#: denial. Say what a row actually costs instead of negating the old word.
+_COMFORTING_ABOUT_ROW_LENGTH = (
+    "sub-second",
+    "subsecond",
+    "a row is short",
+    "rows are short",
+    "a row is quick",
+    "wildly generous",
+    "generous on purpose",
+)
+
+
+def test_the_module_does_not_call_a_row_short_enough_for_the_stop_window(sources):
+    """A row is ONE ``embed_documents`` call, and the 5min window cannot cover it.
+
+    Measured read-only against the live cache at the chunker's
+    ``chunk-4000-400`` geometry and the measured ~20 s per chunk: 1348 rows
+    (1298 observations + 50 records) each exceed 300 s in a single call, and
+    the largest is 257 chunks — about 86 minutes. "A row is sub-second" was
+    three orders of magnitude out.
+
+    The comfort is the dangerous half, not the arithmetic. It reads as a
+    reason not to worry about a stop landing mid-row, and a stop landing
+    mid-row is precisely what escalates to SIGKILL, leaves the claim on disk,
+    and gets ``_blame_crashed_row`` to book a good row into the poison ledger.
+    So this pins two things: the comfort may not come back, and the gap must
+    stay named.
+    """
+    row_is_one_uninterruptible_call = (
+        "fresh = embedder.embed_documents([chunks[i] for i in missing])"
+        in sources["cli"]
+    )
+    assert row_is_one_uninterruptible_call, (
+        "aggregator/cli.py no longer encodes a whole row in one "
+        "embed_documents() call. If the encode became interruptible — a stop "
+        "the encoder itself can reach — then nix/aggregator.nix's "
+        "TimeoutStopSec comment describes a gap that has been closed, and both "
+        "it and this test need rewriting together."
+    )
+    nix = sources["nix"].lower()
+    for comforting in _COMFORTING_ABOUT_ROW_LENGTH:
+        assert comforting not in nix, (
+            f"nix/aggregator.nix has reacquired {comforting!r} in its "
+            f"TimeoutStopSec rationale. A row's encode is one "
+            f"embed_documents() call over every chunk of that row, and the "
+            f"live cache holds 1348 rows over 300 s plus one of 257 chunks "
+            f"(~86 minutes), so no wording that makes a row sound short — or "
+            f"the 5min window sound sufficient for one — is true. The comment "
+            f"has to keep naming the gap instead: a stop mid-row escalates to "
+            f"SIGKILL, the claim survives, and _blame_crashed_row condemns a "
+            f"good row."
+        )
+    # Anchored on the evidence and the admission rather than on the prose
+    # around them, so rewording the paragraph does not fail the test but
+    # deleting either half does.
+    for required in ("257 chunks", "CURRENTLY UNFIXED"):
+        assert required in sources["nix"], (
+            f"nix/aggregator.nix no longer carries {required!r} beside "
+            f"TimeoutStopSec. Both halves have to stay: the measured worst "
+            f"case is what makes 'a row is short' checkable rather than a "
+            f"matter of taste, and the admission is what stops the next "
+            f"reader concluding a stop mid-row is handled. If the corpus was "
+            f"re-measured, update this number here and there together; if the "
+            f"worker learned to interrupt an encode, delete the gap paragraph "
+            f"and this assertion in the same commit."
         )
