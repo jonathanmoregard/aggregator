@@ -806,20 +806,42 @@ in {
           # handler — which the loop reads at a ROW boundary, not a batch one.
           # The rows already embedded are flushed through the same one-shot
           # commit, the in-flight claim on the current row is released, and
-          # the process exits cleanly. A row is sub-second, so 5min is wildly
-          # generous on purpose: it costs nothing on every ordinary stop and
-          # still covers a pathologically long body or a cold model.
+          # the process exits cleanly.
           #
-          # What it PREVENTS, which is no longer just repeated work. The claim
-          # a row leaves on disk is the worker's crash detector: only code
-          # that runs can clear it, so a claim found at startup means the
-          # previous worker died on that row and it gets set aside as poison.
-          # A stop that reaches its boundary clears the claim and is therefore
-          # invisible to that logic. A SIGKILL does not — so a too-short
-          # window would turn every routine `systemctl --user stop`, reboot
-          # and deploy into a good row being condemned, on a backlog measured
-          # in weeks. Losing the batch would be cheap; losing the row from the
-          # index quietly is not.
+          # A LONG ROW OUTLIVES THIS WINDOW, and nothing finite would change
+          # that. A row's encode is a single `embed_documents` call over all of
+          # that row's chunks, and nothing inside the call looks at the stop
+          # flag — the flag is only read once it returns. Measured read-only
+          # against the live cache at the chunker's `chunk-4000-400` geometry
+          # and the measured ~20 s per chunk: 1348 rows (1298 observations + 50
+          # records) each exceed 300 s in one call, and the largest single row
+          # is 257 chunks, about 86 minutes. So 5min is roughly three orders of
+          # magnitude under that tail. It is sized to bound a wedged worker
+          # (see FINITE below), never to let a long row finish.
+          #
+          # That leaves a KNOWN, CURRENTLY UNFIXED gap. Stop the unit while one
+          # of those rows is encoding and systemd escalates to SIGKILL: the
+          # on-disk claim survives, the next run's `_blame_crashed_row` reads
+          # it as a crash and attributes it to that row, and the row is booked
+          # into the poison ledger. Three such stops make it terminal — a good
+          # row dropped from the vector arm permanently. Reproduced against a
+          # real spawned worker and a real SIGTERM→SIGKILL sequence, and it
+          # reproduces identically on `main`, so the batch-bounding work
+          # neither introduced it nor closed it. Changing this number does not
+          # close it either: nothing finite covers an unbounded call. The fix
+          # has to be inside the worker — a stop the encoder itself can reach,
+          # or a crash attribution that can tell a SIGKILL-at-stop from a row
+          # that genuinely killed the process.
+          #
+          # What the window still PREVENTS. The claim a row leaves on disk is
+          # the worker's crash detector: only code that runs can clear it, so a
+          # claim found at startup means the previous worker died on that row
+          # and it gets set aside as poison. A stop that reaches its boundary
+          # clears the claim and is therefore invisible to that logic; a
+          # SIGKILL is not. Shortening this window would spread the gap above
+          # from the long tail to EVERY routine `systemctl --user stop`, reboot
+          # and deploy, on a backlog measured in weeks. Losing the batch would
+          # be cheap; losing the row from the index quietly is not.
           #
           # And it stays FINITE. With TimeoutStartSec=infinity above, a manual
           # stop is the last bound on a wedged worker, so it must itself

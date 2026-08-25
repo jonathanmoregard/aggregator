@@ -2721,6 +2721,16 @@ def _embed_batch(
     covers, so it is the boundary. Whatever embedded before the stop is
     flushed and committed below; the rest stays in the backlog.
 
+    THE ROW BOUNDARY NARROWS THAT WINDOW; IT DOES NOT CLOSE IT. A row is itself
+    one uninterruptible ``embed_documents`` call — the stop flag is not read
+    again until it returns — and the largest row measured in the live cache is
+    257 chunks, about 86 minutes, with 1348 rows over 300 s. A stop landing
+    inside one of those is still SIGKILLed with the claim held, and
+    ``_blame_crashed_row`` then attributes it to a good row. That residual gap
+    is real, pre-dates this batching work, and is unfixed; ``nix/aggregator.nix``
+    documents it beside ``TimeoutStopSec``, which is deliberately not sized to
+    cover a long row.
+
     A ROW THAT MOVED WHILE THE WORKER HELD IT IS NOT MARKED. Ingest sets
     ``embedding_state`` back to NULL and drops a row's vectors whenever its
     body changes — that is the only thing that ever re-embeds an edited row.
