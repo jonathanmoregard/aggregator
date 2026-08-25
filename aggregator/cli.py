@@ -3214,12 +3214,13 @@ def build_parser() -> argparse.ArgumentParser:
             f"{_MAX_BATCH_CHUNKS * _SECONDS_PER_CHUNK // 60} minutes of "
             f"encoder time at the measured ~{_SECONDS_PER_CHUNK} s per "
             f"4000-character chunk (docs/embedding-throughput.md), and that "
-            f"chunk cap is what the interval between durable checkpoints is "
-            f"made of. This flag means exactly what it always did — rows per "
-            f"batch — it simply can no longer lengthen or shorten that "
-            f"interval. What it still bounds is rows the encoder never sees: "
-            f"an empty body costs no chunks, and about a third of the corpus "
-            f"is empty bodies"
+            f"chunk cap is the CEILING on the interval between durable "
+            f"checkpoints. This flag still means what it always did — rows "
+            f"per batch — and a row count low enough to bind first still "
+            f"shortens that interval; what it can no longer do is lengthen it "
+            f"past the ceiling. What it bounds on its own is rows the encoder "
+            f"never sees: an empty body costs no chunks, and about a third of "
+            f"the corpus is empty bodies"
         ),
     )
     p_embed.add_argument(
