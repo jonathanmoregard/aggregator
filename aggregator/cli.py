@@ -1714,9 +1714,10 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     (``embed --catchup --source both``, see ``nix/aggregator.nix``);
     ``--once`` does a single batch and exits, and no deployed unit uses it —
     it is a hand-run probe. This comment used to say the opposite, which was
-    wrong in the direction that costs the most: at batch-size 500 against 483k
-    observations, one batch per 30-minute tick is ~970 ticks, i.e. about three
-    weeks before the last row is even attempted.
+    wrong in the direction that costs the most: a batch is bounded at
+    ``_MAX_BATCH_CHUNKS`` chunks, about fifteen minutes of encoder time, so one
+    batch per 30-minute tick would run a backfill measured in weeks at half
+    speed at best.
 
     Both take an OS-level ``flock`` on ``<cache>.embed.lock``, so a slow
     catchup and a timer tick cannot both consume the same batch. A tick that
@@ -2183,6 +2184,41 @@ _EMBED_HEALTH_PROBE = "aggregator embed health probe"
 #: the cost of not stopping is a worker spinning at full CPU on a laptop.
 _MAX_STALLED_BATCHES = 3
 
+#: The measured cost of one full chunk, in wall-clock seconds. 4000 characters
+#: ≈ 804 tokens at the ~40 tokens/second of ``docs/embedding-throughput.md``.
+#: Named here so the cap below and the ``--help`` sentence describing it are the
+#: same arithmetic rather than two numbers that can drift apart.
+_SECONDS_PER_CHUNK = 20
+
+#: How much ENCODER TIME one checkpointed batch may buy, counted in chunks.
+#:
+#: THE BATCH IS BOUNDED BY CHUNKS BECAUSE THE BILL IS PER CHUNK. ``--batch-size``
+#: bounds rows, and rows differ in chunk count by two orders of magnitude, so
+#: the interval between durable checkpoints was whatever the backlog happened to
+#: hold rather than anything anyone chose. Measured read-only against the live
+#: cache on 2026-08-25, at the chunker's own ``chunk-4000-400`` geometry:
+#: dropbox is 1536 records ≈ 3838 chunks, and the FIRST 500-row batch of it is
+#: ≈1149 chunks — ~6.4 hours before a single vector is written. Confirmed live
+#: rather than inferred: twenty minutes into a run, ``chunk_embeddings`` was
+#: still empty. The 2026-08-16 directive asks for "bounded batches with
+#: committed checkpoints, so a kill at any moment loses at most one chunk"; 6.4
+#: unprotected hours is not that, and it fell out of a unit mismatch.
+#:
+#: FORTY-FIVE, WHICH IS ABOUT FIFTEEN MINUTES at the rate above. That is half
+#: the embed timer's 30-minute period, so an ungraceful death costs at most half
+#: a tick — the largest loss that still reads as "the next tick catches up"
+#: rather than as work thrown away. There is no throughput argument for a bigger
+#: number: one SELECT plus one commit is a few hundred milliseconds against 900
+#: seconds of encoding, i.e. well under 0.1% overhead, and
+#: ``docs/embedding-throughput.md`` measured enlarging the model's own batch at
+#: under 10% and negative past 8, so nothing is being amortised here either.
+#:
+#: A CONSTANT AND NOT A FLAG, like ``_MAX_STALLED_BATCHES`` beside it. It is
+#: derived from a measured rate rather than from a preference: raising it
+#: re-creates the defect it exists to close, and lowering it buys nothing the
+#: overhead arithmetic above has not already given away.
+_MAX_BATCH_CHUNKS = 45
+
 
 def _embedder_is_healthy(embedder: Embedder) -> bool:
     """THE TRANSIENT/PERMANENT DISCRIMINATOR, asked at the moment of failure.
@@ -2421,6 +2457,96 @@ def _requeue_due_rows(store: Store, ledger: PoisonLedger, kind: str) -> None:
         store.requeue_embedding(kind, sorted(due))
 
 
+def _embed_row_text(kind: str, row: sqlite3.Row) -> tuple[str, str]:
+    """The id, and the EXACT text the model will be handed, for one backlog row.
+
+    ONE DEFINITION, TWO CALLERS, which is the whole reason it is a function.
+    ``_embed_batch`` encodes this string; ``_row_chunk_cost`` sizes the batch
+    from it. If the two ever disagreed the cap would be enforced against text
+    nobody embeds. Records are the trap: they go to the model as
+    ``subject + "\\n\\n" + body``, so a records row costs more chunks than its
+    body alone, and a cost function reading ``body`` would under-count every
+    record in the corpus.
+    """
+    if kind == "observations":
+        return row["obs_id"], (row["body"] or "")
+    return row["stable_id"], f"{row['subject']}\n\n{row['body']}"
+
+
+def _row_chunk_cost(kind: str, row: sqlite3.Row) -> int:
+    """What this row will cost the encoder, in chunks. COUNTED, not estimated.
+
+    By actually chunking it, because an estimate that can under-count does not
+    bound anything. ``chunk_body`` has two branches — greedy paragraph packing
+    when every paragraph fits the window, hard windowing otherwise — and a
+    length-based estimate describes only the second. On prose whose paragraphs
+    run just over half a window, packing yields one chunk per paragraph while
+    the arithmetic predicts roughly half that: a ~2x under-count, and a cap that
+    can be exceeded twofold is not a cap. The price of counting exactly is
+    string slicing, against ~20 seconds per chunk of encoding. It does not
+    register.
+
+    A ROW THAT CANNOT BE COUNTED COSTS 1, rather than raising. Every per-row
+    failure in this file is caught inside ``_embed_batch`` precisely so that one
+    bad row costs one row, and moving ``chunk_body`` earlier must not move a
+    raise outside that isolation — a chunker that threw here would abort the
+    whole run on a traceback, which is the shape of the 2026-08-15 doom loop.
+    Costing it 1 is honest as well as safe: a row this cannot chunk is a row the
+    worker cannot embed either, so it will spend no encoder time. It joins the
+    batch, fails there, and is attributed there, exactly as before.
+    """
+    try:
+        return len(chunk_body(_embed_row_text(kind, row)[1]))
+    except Exception:  # noqa: BLE001 - attribution belongs to ``_embed_batch``
+        return 1
+
+
+def _pack_batch(kind: str, rows: list, cap: int) -> list:
+    """The longest PREFIX of ``rows`` whose chunks fit under ``cap``.
+
+    A PREFIX, NOT A SELECTION. ``select_unembedded`` hands back an ordered
+    backlog — ``ts DESC``, within one group of ``EMBED_BACKLOG_ORDER`` — and
+    stepping over a row that does not fit, to reach smaller ones behind it,
+    would let a large row be passed over for as long as small ones keep
+    arriving. Stopping at the first row that does not fit leaves it at the head
+    of the next SELECT, so the queue always moves forward and nothing can be
+    perpetually deferred.
+
+    THE FIRST ROW IS ALWAYS TAKEN, whatever it costs, and that exemption is
+    load-bearing in two directions at once.
+
+    A row is indivisible here. Committing part of its chunks would write
+    ``chunk_embeddings`` rows under its ``owner_id``, and ``select_unembedded``
+    is a LEFT JOIN against that table — the row would read as embedded and
+    nothing would ever come back for the rest of it. So the cap cannot be
+    honoured by splitting; it can only be honoured by refusing, and refusing is
+    the worse bug.
+
+    And an empty batch writes nothing, which ``_embed_backlog`` reads as a
+    stall. Three of those end the run, and ``ts DESC`` puts the same oversized
+    row at the head of the next SELECT — so a packer that refused it would turn
+    the cap into a row filter that strands that row and everything queued behind
+    it, forever, while every count reports the index simply not filling. The cap
+    bounds how many rows are GROUPED. It is not a statement about which rows are
+    eligible.
+
+    Rows with nothing to embed cost 0 and are therefore never rationed by this.
+    Deliberate: about a third of the corpus has an empty body
+    (``docs/embedding-throughput.md``), those rows are marked ``'skip'`` and
+    spend no encoder time at all, and bounding them is what ``--batch-size`` is
+    still for.
+    """
+    batch: list = []
+    total = 0
+    for row in rows:
+        cost = _row_chunk_cost(kind, row)
+        if batch and total + cost > cap:
+            break
+        batch.append(row)
+        total += cost
+    return batch
+
+
 def _embed_backlog(
     store: Store,
     embedder: Embedder,
@@ -2436,6 +2562,14 @@ def _embed_backlog(
     Chunked and checkpointed for the same reason ingest is: each batch commits
     its vectors and its watermark before the next one starts, so a kill at any
     moment costs at most one batch and the next run resumes where this stopped.
+
+    AND THE BATCH IS BOUNDED BY CHUNKS, which is what makes "at most one batch"
+    a number rather than a shrug. ``--batch-size`` bounds the SELECT, but rows
+    differ in chunk count by two orders of magnitude and the encoder is billed
+    per chunk, so a row bound alone left the checkpoint interval to whatever the
+    backlog happened to hold — measured at ~6.4 hours on the first batch of
+    dropbox. ``_pack_batch`` trims the SELECT's result to a prefix that fits
+    ``_MAX_BATCH_CHUNKS``.
 
     ``source`` NAMES ONE GROUP OF ``EMBED_BACKLOG_ORDER``. Resumability inside a
     group needs nothing extra: the backlog is a LEFT JOIN, so a run killed
@@ -2458,7 +2592,16 @@ def _embed_backlog(
         rows = store.select_unembedded(kind, limit=args.batch_size, source=source)
         if not rows:
             return worked
-        moved = _embed_batch(store, embedder, kind, rows, ledger, outcome, stop)
+        # BOUNDED TWICE, because the two bounds answer different questions.
+        # ``--batch-size`` bounds ROWS, which is what keeps a batch of rows that
+        # cost the encoder nothing — empty bodies, about a third of the corpus —
+        # from being unbounded. ``_MAX_BATCH_CHUNKS`` bounds CHUNKS, which is
+        # what the interval between durable checkpoints is actually made of. The
+        # SELECT can only express the first: chunk count is not a column and
+        # cannot be one, since it depends on the chunker's geometry. So the
+        # second is applied here, to the SELECT's own result.
+        batch = _pack_batch(kind, rows, _MAX_BATCH_CHUNKS)
+        moved = _embed_batch(store, embedder, kind, batch, ledger, outcome, stop)
         worked = True
         if args.once:
             return worked
@@ -2477,6 +2620,25 @@ def _embed_backlog(
         # 2026-08-16 shape requires each chunk to commit a checkpoint, which
         # means every pass must either advance the watermark or end the run.
         # A loop that cannot say why it stops is one that can fail to.
+        #
+        # RE-DERIVED FOR THE CHUNK BOUND, not assumed to carry over, because
+        # that argument turns on "the identical batch is selected again" and
+        # ``_pack_batch`` changed what the batch IS. It still holds: packing is
+        # a pure function of the rows the SELECT returned and a constant cap,
+        # and a zero-write pass leaves every one of those rows exactly where it
+        # found them — so the next SELECT returns the same rows and the same
+        # prefix comes out. It also cannot degenerate into a stall of its own
+        # making: the packer never returns an empty batch for a non-empty
+        # SELECT, so every pass still attempts at least one row and a stall
+        # remains evidence about the CAS rather than about the packing.
+        #
+        # THREE IS STILL THE RIGHT NUMBER, and for a slightly sharper reason
+        # than before. Batches are smaller now, so a single concurrent rewrite
+        # can zero a whole one where it used to be diluted across 500 rows —
+        # which makes a stall MORE informative, not less. ``ts DESC`` means
+        # three consecutive zero-write passes are three failures on the same
+        # head row, i.e. a writer holding that row, which is exactly the
+        # condition this bound exists to stop spinning on.
         if moved:
             stalls = 0
             continue
@@ -2546,7 +2708,8 @@ def _embed_batch(
     not "this row is poison".
 
     THE STOP CHECK IS PER ROW, not per batch, and the granularity is the
-    point. A batch is 500 rows and a ``TimeoutStopSec`` is 90 seconds, so
+    point. A batch is up to ``_MAX_BATCH_CHUNKS`` chunks of encoding — about a
+    quarter of an hour — and a ``TimeoutStopSec`` is far shorter than that, so
     "finish the batch in flight" would still be SIGKILLed partway — leaving
     the claim that makes the next run condemn a good row, which is the whole
     thing being fixed. One row is the unit of work here and the unit the claim
@@ -2602,12 +2765,10 @@ def _embed_batch(
         if stop is not None and stop():
             outcome.interrupted = True
             break
-        if kind == "observations":
-            row_id = row["obs_id"]
-            body = row["body"] or ""
-        else:
-            row_id = row["stable_id"]
-            body = f"{row['subject']}\n\n{row['body']}"
+        # THROUGH THE SAME HELPER THE PACKER USED. The batch was sized from
+        # this exact string; reading the body a second way here would let the
+        # cap describe text that never reaches the model.
+        row_id, body = _embed_row_text(kind, row)
         try:
             chunks = chunk_body(body)
             if not chunks:
@@ -3006,8 +3167,9 @@ def build_parser() -> argparse.ArgumentParser:
             "embed a single batch and exit. A HAND-RUN PROBE — no deployed "
             "unit runs this: the timer runs --catchup and the seed unit runs "
             "--seed-models. Useful to watch one batch go through; useless for "
-            "filling the index, since one batch per 30-minute tick is about "
-            "three weeks to first full coverage of this corpus. Use --catchup "
+            "filling the index, since a batch is bounded at about fifteen "
+            "minutes of encoder time, so one per 30-minute tick runs a "
+            "backfill measured in weeks at half speed at best. Use --catchup "
             "for that"
         ),
     )
@@ -3045,7 +3207,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=500,
         dest="batch_size",
-        help="rows per checkpointed batch (default: 500, must be >= 1)",
+        help=(
+            f"rows per checkpointed batch (default: 500, must be >= 1). NO "
+            f"LONGER THE ONLY BOUND, and usually not the one that binds: a "
+            f"batch also stops at {_MAX_BATCH_CHUNKS} chunks, which is about "
+            f"{_MAX_BATCH_CHUNKS * _SECONDS_PER_CHUNK // 60} minutes of "
+            f"encoder time at the measured ~{_SECONDS_PER_CHUNK} s per "
+            f"4000-character chunk (docs/embedding-throughput.md), and that "
+            f"chunk cap is what the interval between durable checkpoints is "
+            f"made of. This flag means exactly what it always did — rows per "
+            f"batch — it simply can no longer lengthen or shorten that "
+            f"interval. What it still bounds is rows the encoder never sees: "
+            f"an empty body costs no chunks, and about a third of the corpus "
+            f"is empty bodies"
+        ),
     )
     p_embed.add_argument(
         "--reindex",

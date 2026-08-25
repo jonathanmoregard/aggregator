@@ -133,11 +133,12 @@ let
   # ExecStart for the timer-driven worker.
   #
   # `--catchup`, not the plan's `--once`. `--once` does a single batch per
-  # tick; at batch-size 500 against the measured 483k-observation corpus that
-  # is ~970 ticks, i.e. ~3 weeks of wall time before the last row is even
-  # attempted, which is a backfill that never finishes for any practical
-  # purpose. `--catchup` drains the backlog in the same bounded,
-  # per-batch-committed chunks and is a fast no-op once the index is warm.
+  # tick, and a batch is bounded at `cli._MAX_BATCH_CHUNKS` chunks — about
+  # fifteen minutes of encoder time — so against a backfill measured in weeks
+  # a 30-minute tick would run at half speed at best, which is a backfill that
+  # never finishes for any practical purpose. `--catchup` drains the backlog in
+  # the same bounded, per-batch-committed chunks and is a fast no-op once the
+  # index is warm.
   # Overlap is already handled by the worker's own flock on
   # `<cache>.embed.lock`: a tick that finds a catchup still running prints one
   # line and exits 0.
@@ -582,12 +583,23 @@ in {
         type = lib.types.ints.positive;
         default = 500;
         description = ''
-          Rows per embed batch. Each batch is a checkpoint: vectors are
-          committed, then `embedding_state` advances, in that order. A
-          kill at any instant therefore costs at most this many rows of
-          recomputation and can never leave the watermark ahead of the
-          data. Bigger batches amortise model overhead; smaller ones
-          shorten the window a SIGTERM can waste.
+          Rows per embed batch, and NO LONGER THE BOUND THAT DECIDES
+          WHAT A KILL COSTS. Each batch is still a checkpoint — its
+          vectors and its watermark land in one transaction, so the
+          watermark can never get ahead of the data — but the size of
+          that checkpoint is bounded by CHUNKS as well as by rows
+          (`cli._MAX_BATCH_CHUNKS`, about fifteen minutes of encoder time
+          at the measured ~20 s per 4000-character chunk). Chunks are
+          what the encoder is billed for, and rows differ in chunk count
+          by two orders of magnitude: at 500 rows of dropbox that
+          mismatch put the first durable checkpoint 6.4 hours away.
+
+          What this option still bounds is rows the encoder never sees.
+          An empty body costs no chunks, and about a third of the corpus
+          is empty bodies, so without a row bound a batch of those would
+          be unbounded. The chunk cap is deliberately not exposed here:
+          it is derived from a measured rate, and a deployment that
+          raised it would re-create the defect it closes.
         '';
       };
 
