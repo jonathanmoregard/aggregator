@@ -459,9 +459,11 @@ def _embed_help(flag: str) -> str:
 def test_the_batch_size_help_says_it_is_no_longer_the_only_bound():
     """A flag whose meaning narrowed has to say so where the operator looks.
 
-    ``--batch-size`` still means rows per batch — it was not redefined — but it
-    is no longer what decides the checkpoint interval, and an operator who
-    tunes it expecting to move that interval gets nothing.
+    ``--batch-size`` still means rows per batch — it was not redefined — and it
+    is no longer the ONLY bound: the chunk cap is a ceiling the flag cannot
+    raise. It can still lower the interval, though, whenever a row count binds
+    before the cap does, so "tuning it does nothing" would be the opposite
+    error and is not what this asserts.
     """
     help_text = _embed_help("--batch-size")
 
