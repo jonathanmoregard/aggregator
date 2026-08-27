@@ -207,6 +207,53 @@ def test_assistant_colon_is_not_a_marker():
     assert classify("user", "ASSISTANT: Eval green. Apply:") == HUMAN
 
 
+# --- the two markers the frozen design set missed ---------------------------
+#
+# Measured on the live cache read-only after the first classifier landed: 888
+# residual-``human`` rows carry a background-task envelope and 342 carry the
+# Stop-hook classifier's own preamble. Neither is in the design's §2.2 set, and
+# ``golden-queries.md`` names both as top pollutants in four fixtures
+# (pol-gymma-ben, pol-unwedged, fn-branch-protection,
+# fn-natural-language-question). Left out, criterion E freezes ranks against a
+# corpus that still calls them the user's words.
+
+
+def test_a_background_task_envelope_is_agent_authored():
+    """The harness relays another agent's result on the user channel.
+
+    Classed ``agent`` rather than ``system`` so the marker route and the
+    structural route give the SAME answer for the same row: ``origin.kind =
+    'task-notification'`` is already in ``_AGENT_ORIGIN_KINDS``. A row whose
+    class flips depending on which route reached it first is worse than either
+    class, because the backfill mixes both routes over one column.
+    """
+    body = "<task-notification>\n<task-id>a934e875</task-id>\n<status>completed</status>"
+    assert classify("user", body) == AGENT
+
+
+def test_the_envelope_outranks_a_client_reminder_wrapped_around_it():
+    """Precedence, and it matches the structural block one layer up.
+
+    The client wraps the relay in its own reminder, so a real row carries both
+    tags. ``agent`` is the inner author and the more specific claim; ``system``
+    would be true of the wrapper and useless about the content.
+    """
+    body = "<system-reminder>\n<task-notification>agent finished</task-notification>\n"
+    assert classify("user", body) == AGENT
+
+
+def test_the_classifier_prompts_own_preamble_is_a_hook_marker():
+    """Distinct from ``ASSISTANT:``, which is deliberately excluded above.
+
+    ``ASSISTANT:`` fires on any body quoting a transcript, a human-pasted one
+    included. This phrase is a role instruction a wrapper program writes to
+    open a headless prompt — a human writing *about* it says "the classifier",
+    not "You are a classifier".
+    """
+    body = "You are a classifier. Read the session below and answer with one word."
+    assert classify("user", body) == HOOK
+
+
 # --- every observation gets classified, not just type='user' ----------------
 
 

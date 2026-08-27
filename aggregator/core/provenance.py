@@ -83,14 +83,29 @@ MACHINE = "machine"
 #: purpose and must stay absent: see the module docstring's 43-of-43.
 _AGENT_ORIGIN_KINDS = frozenset({"task-notification", "coordinator", "peer"})
 
+#: The harness's own envelope around another agent's result, relayed on the
+#: user channel. Classed AGENT, not SYSTEM, so this route and the structural
+#: route agree on the same row: ``task-notification`` is already in
+#: :data:`_AGENT_ORIGIN_KINDS`. A row whose class depends on which route
+#: reached it first is worse than either class, because the backfill mixes both
+#: over one column. Added after the live cache showed 888 such rows sitting in
+#: the ``human`` residual.
+_AGENT_MARKERS = ("<task-notification>",)
+
 #: Substrings that identify a hook-authored prompt riding the human channel.
 #: Closed set, measured. ``ASSISTANT:`` is deliberately NOT here: it fires on
 #: any body quoting a transcript, including one a human pasted, and it is the
 #: marker to drop first whenever precision matters more than recall.
+#:
+#: ``You are a classifier`` was added after the live cache showed 342 such rows
+#: in the residual. It is NOT the ``ASSISTANT:`` failure mode: it is a role
+#: instruction a wrapper program writes to OPEN a headless prompt, and a human
+#: writing about that prompt says "the classifier", not "You are a classifier".
 _HOOK_MARKERS = (
     "You are watching a Claude Code session",
     "Your context was just cleared to make room",
     "You also asked yourself to focus on this first",
+    "You are a classifier",
 )
 
 #: A slash command's own envelope. Unambiguous: the client writes these tags.
@@ -220,6 +235,12 @@ def classify(
         return HOOK
 
     text = body or ""
+    if any(m in text for m in _AGENT_MARKERS):
+        # FIRST, mirroring the structural block above, where the agent claim
+        # also outranks the client one. A real relay arrives wrapped in the
+        # client's own reminder, so the body carries both tags; ``system`` is
+        # true of the wrapper and says nothing about the content.
+        return AGENT
     if any(m in text for m in _COMMAND_MARKERS):
         return COMMAND
     if any(m in text for m in _HOOK_MARKERS):
