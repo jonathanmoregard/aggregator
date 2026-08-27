@@ -285,3 +285,32 @@ def test_the_store_applies_no_default_filter(store):
     """The eval harness and ``_first_user_prompt`` both go through here."""
     assert len(store.query_observations(QueryAST())) == 3
     assert store.count_observations(QueryAST()) == 3
+
+
+# --- the docs say what type: is NOT ----------------------------------------
+#
+# REQUIRED UNTIL EVERY ROW IS CLASSIFIED, and worth keeping afterwards. A model
+# reading `type:user` and quoting the row back as the user's own words is the
+# original incident; the tool description and the server instructions are the
+# two surfaces it reads before ever running a query.
+
+
+def test_the_tool_description_says_type_is_a_transport_role():
+    doc = mcp._tool_aggregator_query.__doc__ or ""
+    assert "TRANSPORT ROLE" in doc
+    assert "by:" in doc
+    assert "provenance" in doc
+
+
+def test_the_server_instructions_say_it_too():
+    text = mcp._INSTRUCTIONS_CORE
+    assert "TRANSPORT ROLE" in text
+    assert "by:human" in text
+
+
+def test_the_readme_says_it_too(repo_root):
+    from pathlib import Path
+
+    text = (Path(repo_root) / "README.md").read_text(encoding="utf-8")
+    assert "transport role" in text.lower()
+    assert "aggregator provenance --backfill" in text
