@@ -97,15 +97,56 @@ let
   rerankModelRepo = "Qwen/Qwen3-Reranker-0.6B";
   rerankModelDir = "models--Qwen--Qwen3-Reranker-0.6B";
 
+  # HOW MANY CORES BACKGROUND EMBEDDING MAY TAKE.
+  #
+  # ONE binding, used for BOTH the thread pools and the cgroup quota below, so
+  # the two cannot drift. That pairing is the whole point: a pool sized larger
+  # than the quota is the worst of the three configurations, because all of
+  # those threads still get scheduled and are then throttled together — full
+  # context-switching and cache-thrash for a fraction of the throughput. Sized
+  # together they are just fewer, faster threads.
+  #
+  # FOUR, on a 12-core machine, because this is an interactive laptop and the
+  # operator can hear it. Measured from the unit's own accounting on
+  # 2026-08-27: `1d 7h 51min` of CPU over `4h 3s` of wall clock — ~8x
+  # parallelism, sustained, which is a fan that never spins down. The
+  # instruction already in place was `Nice=19`, and nice is the wrong
+  # instrument for this: it orders who runs FIRST, not how many run AT ONCE,
+  # so twelve threads at nice 19 still saturate twelve cores and still make
+  # the same heat. It stays, because it is the right instrument for the
+  # different question of who yields when the operator starts typing.
+  #
+  # The backfill is measured in weeks either way; the operator's directive on
+  # 2026-08-27 was explicit that wall clock is the currency to spend here
+  # ("limit it a bit more, even if it takes a bit longer"). Not exposed as a
+  # module option: this is the behaviour of a background indexer on a personal
+  # machine, not a dial anyone should have to find.
+  embedThreads = 4;
+
   # Environment shared by the embed worker and its one-shot seeding sibling.
   # `AGGREGATOR_EMBED_BACKEND=st` pins the safetensors loader; the `gguf`
   # backend needs an optional extra that is not in the deployed closure, and a
   # backend that silently changes under a unit is a debugging trap.
+  #
+  # THE THREE THREAD VARIABLES ARE THREE DIFFERENT POOLS, not belt-and-braces
+  # spellings of one. torch's kernels run on OpenMP (`OMP_NUM_THREADS`), its
+  # BLAS calls can go to MKL (`MKL_NUM_THREADS`), and HuggingFace's fast
+  # tokenizers run a rayon pool of their own (`RAYON_NUM_THREADS`) — which is
+  # why `systemd-cgls` showed 46 tasks under a unit doing one encode at a
+  # time. Capping one leaves the others at the core count.
+  #
+  # They are READ AT IMPORT, so setting them in the unit is what makes them
+  # effective; `aggregator.core.embed._pin_thread_pools` then resizes torch's
+  # separate intra-op pool, which several builds size from the core count
+  # regardless of `OMP_NUM_THREADS`.
   embedBaseEnvironment = [
     "SSL_CERT_FILE=${caBundle}"
     "NIX_SSL_CERT_FILE=${caBundle}"
     "HF_HOME=${hfHome}"
     "AGGREGATOR_EMBED_BACKEND=st"
+    "OMP_NUM_THREADS=${toString embedThreads}"
+    "MKL_NUM_THREADS=${toString embedThreads}"
+    "RAYON_NUM_THREADS=${toString embedThreads}"
   ];
 
   # Shell fragment resolving the HF cache root from whatever HF_HOME the unit
@@ -792,8 +833,30 @@ in {
           ];
           # Background work on an interactive laptop. The embedder is
           # CPU-bound and will happily take every core otherwise.
+          #
+          # NICE ALONE DID NOT DO THIS, and the unit ran for weeks as if it
+          # had. Nice orders who the scheduler picks FIRST; it says nothing
+          # about how many run AT ONCE, so twelve threads at nice 19 saturate
+          # twelve cores whenever nothing else wants them — which, on a
+          # backfill measured in weeks, is most of the time. The measurement
+          # that settled it is in `embedThreads` above: 1d 7h 51min of CPU
+          # over 4h of wall clock.
           Nice = 19;
           IOSchedulingClass = "idle";
+          # THE HARD BOUND, paired with the thread pools in
+          # `embedBaseEnvironment` and derived from the same binding so they
+          # cannot drift apart. The environment variables are a REQUEST — any
+          # library that ignores them, and any subprocess spawned along the
+          # way, is outside them. This is the boundary: it holds whatever the
+          # process does to itself, exactly as `RestrictAddressFamilies` does
+          # for the offline sandbox further down.
+          CPUQuota = "${toString (embedThreads * 100)}%";
+          # And when the operator IS using the machine, yield rather than
+          # merely queue behind them. `CPUWeight` is the cgroup-v2 successor to
+          # nice for contention between cgroups, which is the axis that
+          # actually decides whether typing stutters; nice only orders threads
+          # within one.
+          CPUWeight = 10;
           TimeoutStartSec = cfg.embed.timeoutStartSec;
           # The window between SIGTERM and SIGKILL, and round 2 changed what
           # it buys. This used to say the worker installed no SIGTERM handler

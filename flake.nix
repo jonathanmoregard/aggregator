@@ -403,6 +403,37 @@
               grep -q 'HF_HUB_OFFLINE=1' "$svc" \
                 || fail "aggregator-embed.service is not pinned offline"
 
+              # ---- 4b. The CPU cap is expressed, and expressed COHERENTLY -
+              # 2026-08-27. The unit consumed 1d 7h 51min of CPU over 4h 3s of
+              # wall clock — ~8x parallelism on the operator's laptop, i.e. a
+              # fan that never spins down. `Nice=19` was already set and had
+              # been read for weeks as if it addressed this; it does not, since
+              # nice orders who runs first rather than how many run at once.
+              #
+              # WHAT IS ASSERTED IS THE PAIRING, not either number. A thread
+              # pool larger than the quota is the one configuration that is
+              # worse than doing nothing: every thread is still scheduled and
+              # then throttled together, so the process pays full
+              # context-switching for a fraction of the throughput. They come
+              # from one `embedThreads` binding in nix/aggregator.nix, and this
+              # step is what stops someone editing one of the four sites and
+              # not the others.
+              quota=$(sed -n 's/^CPUQuota=//p' "$svc")
+              [ -n "$quota" ] \
+                || fail "aggregator-embed.service has no CPUQuota — Nice=19 alone does not bound how many cores the embedder takes"
+              case "$quota" in
+                *%) ;;
+                *) fail "aggregator-embed.service CPUQuota=$quota is not a percentage" ;;
+              esac
+              quota_cores=$(( ''${quota%\%} / 100 ))
+              for var in OMP_NUM_THREADS MKL_NUM_THREADS RAYON_NUM_THREADS; do
+                n=$(sed -n "s/^Environment=\"\\?$var=\\([0-9]*\\).*/\\1/p" "$svc")
+                [ -n "$n" ] \
+                  || fail "aggregator-embed.service does not set $var — torch's OpenMP pool, its MKL calls and HuggingFace's rayon tokenizer pool are three separate pools, and an uncapped one saturates every core on its own"
+                [ "$n" = "$quota_cores" ] \
+                  || fail "aggregator-embed.service sets $var=$n but CPUQuota=$quota ($quota_cores cores). A pool wider than the quota is throttled rather than smaller: same context-switching, less throughput. Size them from the one embedThreads binding."
+              done
+
               # ---- 5. Staggered against the ingest timers -----------------
               embed_cal=$(sed -n 's/^OnCalendar=//p' "$units/aggregator-embed.timer")
               [ -n "$embed_cal" ] || fail "embed timer has no OnCalendar"

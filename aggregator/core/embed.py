@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -266,6 +267,83 @@ def configured_model_id(embedder: Embedder | None = None) -> str:
     return _resolve_model_id(backend, None)
 
 
+def _pin_thread_pools(setter: Callable[[int], None] | None = None) -> int | None:
+    """Shrink torch's intra-op pool to the cap the environment asked for.
+
+    Returns the cap applied, or ``None`` when none was.
+
+    WHY THIS EXISTS, MEASURED. ``aggregator-embed.service`` reported **1d 7h
+    51min of CPU time over 4h 3s of wall clock** on 2026-08-27 — ~8x
+    parallelism, sustained, on the operator's daily-driver laptop. The audible
+    result is a fan that never spins down. ``Nice=19`` was already set and is
+    the wrong instrument: nice orders who runs FIRST, not how many run AT
+    ONCE, so twelve threads at nice 19 still saturate twelve cores.
+
+    TWO KNOBS, NOT ONE, AND THE SECOND IS THE REASON THIS FUNCTION IS NOT JUST
+    AN ENVIRONMENT VARIABLE. ``OMP_NUM_THREADS`` sizes the OpenMP pool at
+    import; torch ALSO keeps its own intra-op pool, and on several builds that
+    one is sized from the core count regardless of the variable. Setting only
+    the variable therefore caps some of the parallelism some of the time,
+    which is the worst of the three outcomes because it looks like it worked.
+
+    AND IT SHRINKS THE POOL RATHER THAN THROTTLING IT. Pairing a twelve-thread
+    pool with ``CPUQuota=400%`` does not give a third of the work at a third of
+    the heat: all twelve threads still get scheduled and are throttled
+    together, so the process pays full context-switch and cache-thrash cost for
+    a third of the throughput. Fewer threads under the same quota is strictly
+    better, so the quota and the pool are sized to match in
+    ``nix/aggregator.nix``.
+
+    FAILS OPEN, DELIBERATELY, IN EVERY DIRECTION. An unset variable pins
+    nothing — the MCP server builds an ``Embedder`` too and a query there is
+    one short encode a human is waiting on, so the unit that wants the cap is
+    the unit that sets it. A value that is not a positive integer pins nothing
+    either, because ``set_num_threads(0)`` is not a no-op but undefined
+    behaviour that has been seen to abort, and this runs unattended from a
+    timer where a typo in a unit file must cost the cap, never the backfill.
+    """
+    raw = os.environ.get("OMP_NUM_THREADS")
+    if raw is None:
+        return None
+    try:
+        cap = int(raw.strip())
+    except ValueError:
+        log.warning(
+            "OMP_NUM_THREADS=%r is not an integer; leaving the torch intra-op "
+            "pool at its default. The CPU cap this was meant to apply is NOT "
+            "in effect.",
+            raw,
+        )
+        return None
+    if cap < 1:
+        log.warning(
+            "OMP_NUM_THREADS=%r is not a positive thread count; leaving the "
+            "torch intra-op pool at its default rather than passing it to "
+            "set_num_threads, where it is undefined behaviour.",
+            raw,
+        )
+        return None
+    if setter is None:  # pragma: no cover - exercised via the real torch path
+        try:
+            import torch
+        except ImportError:
+            return None
+        setter = torch.set_num_threads
+    try:
+        setter(cap)
+    except Exception as e:  # noqa: BLE001 - the cap is never worth the run
+        log.warning(
+            "could not pin the torch intra-op pool to %d threads (%s: %s); "
+            "the CPU cap is NOT in effect in-process, though a CPUQuota= on "
+            "the unit still bounds it.",
+            cap,
+            type(e).__name__,
+            e,
+        )
+        return None
+    return cap
+
+
 class Embedder:
     """Single-model embedder. Load once per process, share across writes."""
 
@@ -288,6 +366,12 @@ class Embedder:
         if self.backend == "st":
             from sentence_transformers import SentenceTransformer
 
+            # AFTER the import, which is what makes it worth doing at all.
+            # Importing sentence_transformers imports torch, and torch sizes
+            # its intra-op pool at import time from the visible core count —
+            # so this is the first moment the pool exists to be resized. It is
+            # a no-op unless the environment asked for a cap.
+            _pin_thread_pools()
             self._st_model = SentenceTransformer(
                 self.model_id,
                 cache_folder=str(cache_dir) if cache_dir else None,
