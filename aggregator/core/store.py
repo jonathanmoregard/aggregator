@@ -498,6 +498,19 @@ def fts5_match_query(text: str | None) -> str:
     return " ".join(f'"{t}"' for t in _FTS5_TOKEN_RE.findall(text or ""))
 
 
+def fts5_query_terms(text: str | None) -> list[str]:
+    """The tokens :func:`fts5_match_query` sends to ``MATCH``, unquoted.
+
+    ONE DEFINITION OF "WHAT COUNTS AS A QUERY TERM", shared with the snippet
+    builder in ``mcp.py``. A snippet centred on a term the index did not
+    actually match is a lie about why the row is on the page, and a second
+    tokenizer in another module is how the two drift apart — the same argument
+    that put the FTS5 whitelist in one function rather than at each of its
+    binding sites.
+    """
+    return _FTS5_TOKEN_RE.findall(text or "")
+
+
 def _table_present(c: sqlite3.Connection, table: str) -> bool:
     """Whether ``table`` exists. Probed once per write group, not per row."""
     return (

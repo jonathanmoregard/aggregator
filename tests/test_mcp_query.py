@@ -452,10 +452,13 @@ def test_query_sessions_notice_when_summary(tmp_data_home):
     assert "notice" in result
 
 
-def test_summary_mode_omits_external_content_wrap(tmp_data_home):
-    """M1: summary mode returns hit list without bodies; wrapping the empty
-    body in <ExternalContent> is misleading (looks like real content is
-    present when it isn't). Wrap only in drilldown / fields=full.
+def test_summary_mode_wraps_the_snippet_it_now_returns(tmp_data_home):
+    """M1 skipped the wrapper because summary mode returned an EMPTY body, and
+    an empty ``<ExternalContent>`` block looks like content while holding
+    none. D1 put a body excerpt back, so the reason expired with it: the tool
+    docstring, the server instructions and ``core/wrap.py`` all promise that
+    every body crossing this boundary arrives inside the delimiters, and a
+    snippet is a body.
     """
     store = Store()
     _seed_sessions(store)
@@ -463,8 +466,8 @@ def test_summary_mode_omits_external_content_wrap(tmp_data_home):
         dsl="source:sessions", fields="summary", _store=store
     )
     for rec in result["records"]:
-        assert "<ExternalContent" not in rec["content"], (
-            f"summary mode should not wrap; got: {rec['content']!r}"
+        assert "<ExternalContent" in rec["content"], (
+            f"untrusted body text returned unwrapped; got: {rec['content']!r}"
         )
     # Full mode must still wrap (parity with prior behaviour).
     result_full = aggregator_query(
@@ -472,6 +475,22 @@ def test_summary_mode_omits_external_content_wrap(tmp_data_home):
     )
     for rec in result_full["records"]:
         assert "<ExternalContent" in rec["content"]
+
+
+def test_summary_mode_still_omits_the_wrap_when_there_is_no_body(tmp_data_home):
+    """The other half of M1's rule, and the half that survives: a block that
+    looks like content and holds none is still worse than nothing."""
+    store = Store()
+    store.migrate()
+    store.upsert_entities(
+        [_sess("sess-blank"), _obs("o-blank", "sess-blank", "")]
+    )
+    result = aggregator_query(
+        dsl="source:sessions", fields="summary", drilldown=True, _store=store
+    )
+    assert result["records"]
+    for rec in result["records"]:
+        assert rec["content"] == "", rec
 
 
 def test_records_summary_omits_external_content_wrap(tmp_data_home):

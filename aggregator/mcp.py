@@ -105,10 +105,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import functools
 import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import zlib
 from collections.abc import Iterable, Iterator
@@ -138,6 +140,7 @@ from aggregator.core.store import (
     SCHEMA_VERSION,
     Store,
     VectorIndexUnavailableError,
+    fts5_query_terms,
 )
 from aggregator.core.wrap import wrap_record
 from aggregator.sources.base import ObservationRow, QueryAST, Record, SessionRow
@@ -1985,6 +1988,168 @@ def _scrub_record(r: Record) -> Record:
     return replace(r, subject=scrub(r.subject).text, body=scrub(r.body).text)
 
 
+# --- summary-mode snippets (D1) ---------------------------------------------
+#
+# WHAT SUMMARY MODE USED TO MEAN. ``_observation_to_item`` and
+# ``_session_to_item`` both set ``content = ""`` whenever ``fields != 'full'``,
+# and the notice told the caller to re-call at ``fields='full'`` to see
+# anything. So the default surface — the one that fits in a context window —
+# returned a list of opaque UUIDs and timestamps, and the only way to tell a
+# bullseye from a false positive was the re-call that produced a 282,110-
+# character spill. A count without an excerpt is not a summary.
+#
+# IT WAS NEVER A STORAGE OR PERFORMANCE COST. The full-mode branch two lines
+# above the discard slices ``o.body[:120]`` for its subject with no extra
+# fetch: the body is already on the row. That is why this is fixed in place
+# rather than by adding a third ``fields='snippet'`` mode — there is no
+# optimisation here to preserve.
+
+#: Characters of matching body a summary row carries. Sized against what the
+#: surface is FOR: at ~3.4 characters per token (measured on this corpus's
+#: JSON payloads) 200 characters is ~60 tokens per row, so a page of 20 hits
+#: costs ~1 200 tokens of body — an amount a caller can read inline and still
+#: hold the rest of the task. Wide enough to carry a whole user turn like the
+#: one the field report was hunting for (117 characters), which is the case
+#: this exists to serve.
+_SNIPPET_CHARS = 200
+
+#: Matched terms are marked so a reader can see WHY the row is on the page.
+#: ``[[…]]`` because it is rare in prose, survives JSON without escaping, and
+#: reads unambiguously as an annotation rather than as body text. It is a
+#: DISPLAY AID, not a security boundary: it sits inside the
+#: ``<ExternalContent>`` wrapper, so an adversarial body can contain the same
+#: characters, and nothing downstream may treat it as authenticated.
+_SNIPPET_MARK_OPEN = "[["
+_SNIPPET_MARK_CLOSE = "]]"
+_SNIPPET_ELLIPSIS = "…"
+
+#: Ceiling on how many distinct terms the highlighter compiles into one
+#: pattern. Free text is caller-controlled and unbounded — the FTS5 whitelist
+#: happily accepts a 50 000-token query — and an alternation that size is a
+#: per-row regex cost paid on every row of every page. The terms past this
+#: point are the ones least likely to be the reason a row matched anyway.
+_SNIPPET_MAX_TERMS = 32
+
+#: Runs of whitespace collapse to one space before windowing. A snippet is
+#: read INLINE, in a list of rows; a body carrying forty newlines would spend
+#: its whole budget on them and arrive unreadable.
+_SNIPPET_WS_RE = re.compile(r"\s+")
+
+
+#: What summary mode now tells the caller. The sentence it replaces was
+#: "Re-call with fields=full to include observation bodies" — an instruction
+#: that, followed on a page of compacted sessions, is exactly the 282,110-
+#: character spill this work exists to stop. The replacement describes what is
+#: already in hand and puts the full fetch where it belongs: a deliberate
+#: second step for one row, not the default next move.
+def _summary_snippet_notice(what: str, where: str) -> str:
+    return (
+        f"{what} `content` is a ~{_SNIPPET_CHARS}-character snippet of the "
+        f"body that matched, centred on the first query-term hit, with "
+        f"matched terms marked {_SNIPPET_MARK_OPEN}like this"
+        f"{_SNIPPET_MARK_CLOSE} and elisions marked {_SNIPPET_ELLIPSIS}. "
+        f"READ IT — it is usually the answer. Re-call with fields=full only "
+        f"for the rows where you need {where}; full bodies are unabridged and "
+        f"a page of them is what overruns a context window."
+    )
+
+
+def _snippet_terms(text: str | None) -> tuple[str, ...]:
+    """The query's terms, deduped, in the order the caller typed them.
+
+    Taken from :func:`fts5_query_terms` so the words highlighted here are the
+    words the lexical arm actually matched on. Deriving them separately would
+    let the two tokenizers drift, and a snippet centred on a term the index
+    never matched misrepresents why the row is on the page.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in fts5_query_terms(text):
+        low = t.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(low)
+        if len(out) >= _SNIPPET_MAX_TERMS:
+            break
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=256)
+def _snippet_pattern(terms: tuple[str, ...]) -> re.Pattern[str] | None:
+    """Word-boundary alternation over ``terms``, or ``None`` for no terms.
+
+    Cached because it is otherwise recompiled once per row, and every row on a
+    page shares one query.
+    """
+    if not terms:
+        return None
+    return re.compile(
+        r"\b(?:" + "|".join(re.escape(t) for t in terms) + r")\b",
+        re.IGNORECASE,
+    )
+
+
+def _snippet(body: str | None, terms: tuple[str, ...]) -> str:
+    """A bounded excerpt of ``body``, centred on its first query-term hit.
+
+    Returns ``""`` for a body with nothing in it — the caller must not wrap
+    that, because an empty ``<ExternalContent>`` block looks like content and
+    holds none, which is the thing M1 removed from summary mode in the first
+    place.
+
+    NO HIT IS NOT AN ERROR. A pure-filter query has no terms at all, and a row
+    can also be on the page because the VECTOR arm put it there, with no
+    lexical hit anywhere in its body. Both fall back to the head of the body,
+    which is still strictly more legible than the empty string the caller used
+    to get. The leading ellipsis is what tells the two apart on sight: a
+    snippet that starts mid-body was centred on something.
+    """
+    text = _SNIPPET_WS_RE.sub(" ", body or "").strip()
+    if not text:
+        return ""
+    pattern = _snippet_pattern(terms)
+    hit = pattern.search(text) if pattern else None
+    if hit is None:
+        start = 0
+    else:
+        # Centre the window on the hit, then clamp so a hit near either end
+        # spends the whole budget on real text rather than on padding.
+        slack = max(0, _SNIPPET_CHARS - (hit.end() - hit.start()))
+        start = hit.start() - slack // 2
+    start = max(0, min(start, max(0, len(text) - _SNIPPET_CHARS)))
+    window = text[start : start + _SNIPPET_CHARS]
+    if pattern is not None:
+        window = pattern.sub(
+            lambda m: (
+                f"{_SNIPPET_MARK_OPEN}{m.group(0)}{_SNIPPET_MARK_CLOSE}"
+            ),
+            window,
+        )
+    prefix = _SNIPPET_ELLIPSIS if start > 0 else ""
+    suffix = _SNIPPET_ELLIPSIS if start + _SNIPPET_CHARS < len(text) else ""
+    return f"{prefix}{window}{suffix}"
+
+
+def _wrap_snippet(stable_id: str, source: str, subject: str, snippet: str) -> str:
+    """Wrap a summary-mode snippet as untrusted content, or return ``""``.
+
+    THE WRAPPER IS NOT OPTIONAL NOW THAT THE BLOCK HOLDS TEXT. M1 skipped it
+    in summary mode on the grounds that an empty ``<ExternalContent>`` is
+    cosmetically misleading, and that reasoning was right for an empty string
+    and wrong the moment a body excerpt goes back in: the tool docstring, the
+    server instructions and ``core/wrap.py`` all promise that every body
+    leaving this boundary arrives inside the delimiters. An excerpt is a body.
+    """
+    if not snippet:
+        return ""
+    return wrap_record(
+        Record(
+            stable_id=stable_id, source=source, subject=subject, body=snippet
+        )
+    )
+
+
 def _record_to_item(r: Record, fields: str) -> dict[str, Any]:
     # M1: summary mode has no body, so don't wrap it — an empty
     # <ExternalContent> is cosmetically misleading. Subject already shows
@@ -2011,12 +2176,17 @@ def _session_to_item(
     """One session-level card. ``subject`` = first user prompt (first ~280 char),
     ``matching_observations`` = how many observations match the query.
 
-    ``content`` (M1): empty in summary mode (no body to wrap, subject already
-    shown in the CLI header); in full mode, the wrapped ``body_preview`` the
-    caller supplies — see ``_session_body_preview``, which builds it from the
-    observations that matched. It used to be handed the SUBJECT, which made
-    the card a copy of its own header and gave the cross-encoder a document to
-    score against itself.
+    ``content`` is the wrapped ``body_preview`` the caller supplies — see
+    ``_session_body_preview``, which builds it from the observations that
+    matched: the whole 1 500-character preview in full mode, a
+    ``_SNIPPET_CHARS`` snippet of the first matching observation in summary
+    mode. It used to be handed the SUBJECT, which made the card a copy of its
+    own header and gave the cross-encoder a document to score against itself.
+
+    D1: summary mode used to set ``content = ""`` here, and THAT is what made
+    ``matching_observations: N`` unactionable — a count of turns the caller
+    could not read, on a card whose only other text is its opening prompt.
+    The count says something matched; the snippet says what.
 
     v3: chat-export rows label their card with the origin (``chatgpt`` /
     ``claude-web``) rather than the claude-code kind buckets.
@@ -2033,7 +2203,7 @@ def _session_to_item(
             )
         )
     else:
-        content = ""
+        content = _wrap_snippet(s.session_id, source, subject, body_preview)
     return {
         "stable_id": s.session_id,
         "source": source,
@@ -2051,21 +2221,30 @@ def _session_to_item(
     }
 
 
-def _observation_to_item(o: ObservationRow, fields: str) -> dict[str, Any]:
-    # M1: summary drilldown mode surfaces metadata only; skip the wrap so we
-    # don't emit empty <ExternalContent> blocks. Full mode wraps the actual
-    # observation body (still scrubbed pre-return per spec §Security).
+def _observation_to_item(
+    o: ObservationRow, fields: str, terms: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """One observation row. ``terms`` are the query's terms, for the snippet.
+
+    D1 — THE BLOCKER THIS FIXES. Summary mode used to set ``content = ""``
+    here, which is how a five-row result set carrying the exact answer came
+    back as five opaque UUIDs. Both branches now scrub and wrap the body; they
+    differ only in HOW MUCH of it goes back, which is the whole difference
+    between a summary and a full fetch.
+    """
+    body = scrub(o.body or "").text
+    subject = (o.body[:120] if o.body else o.type)
     if fields == "full":
-        body = scrub(o.body or "").text
         content = wrap_record(
             Record(
                 stable_id=o.obs_id, source="observations",
-                subject=(o.body[:120] if o.body else o.type),
-                body=body,
+                subject=subject, body=body,
             )
         )
     else:
-        content = ""
+        content = _wrap_snippet(
+            o.obs_id, "observations", subject, _snippet(body, terms)
+        )
     return {
         "obs_id": o.obs_id,
         "session_id": o.session_id,
@@ -2637,8 +2816,12 @@ def _query_records_path(
     }
     if fields != "full":
         result["notice"] = (
-            "Content bodies omitted (fields='summary'). "
-            "Re-call with fields=full to include record bodies."
+            "Record bodies omitted (fields='summary') — `subject` is each "
+            "record's title. Records are document-shaped (one row per file, "
+            "PR, post or task), so there is no matching TURN to excerpt the "
+            "way the sessions ontology does. Re-call with fields=full for the "
+            "bodies: the response is bounded by a server-side ceiling and any "
+            "body it has to cut says so in `truncated` / `content_length`."
         )
     if has_more:
         _attach_next_page_token(
@@ -2704,7 +2887,8 @@ def _query_sessions_path(
             }
         has_more = len(page_plus_one) > page_size
         page_obs = page_plus_one[:page_size]
-        items = [_observation_to_item(o, fields) for o in page_obs]
+        terms = _snippet_terms(query_text)
+        items = [_observation_to_item(o, fields, terms) for o in page_obs]
         items, rr_count, rr_notice, rr_standout = _maybe_rerank(
             items, query_text, rerank
         )
@@ -2715,9 +2899,8 @@ def _query_sessions_path(
             "total": total,
         }
         if fields != "full":
-            result["notice"] = (
-                "Observation bodies omitted (fields='summary'). "
-                "Re-call with fields=full to include observation bodies."
+            result["notice"] = _summary_snippet_notice(
+                "Each observation's", "the whole turn"
             )
         if has_more:
             _attach_next_page_token(
@@ -2754,6 +2937,7 @@ def _query_sessions_path(
     has_more = len(page_plus_one) > page_size
     page_sessions = page_plus_one[:page_size]
     items: list[dict[str, Any]] = []
+    terms = _snippet_terms(query_text)
     for s in page_sessions:
         # Per-session subject: first user observation's body (up to 280 chars).
         subject = _first_user_prompt(store, s)
@@ -2768,7 +2952,9 @@ def _query_sessions_path(
         #   session_id match (top_session_id in the AST).
         session_scoped = _count_scope_for(ast, s)
         match_count = store.count_observations(session_scoped)
-        preview = _session_body_preview(store, session_scoped, fields, subject)
+        preview = _session_body_preview(
+            store, session_scoped, fields, subject, terms
+        )
         items.append(_session_to_item(s, fields, subject, match_count, preview))
     items, rr_count, rr_notice, rr_standout = _maybe_rerank(
         items, query_text, rerank
@@ -2780,10 +2966,13 @@ def _query_sessions_path(
         "total": total,
     }
     if fields != "full":
-        result["notice"] = (
-            "Session subject only (fields='summary'). "
-            "Re-call with fields=full to include the first-user-prompt body, "
-            "or with drilldown=True to fetch matching observation rows."
+        result["notice"] = _summary_snippet_notice(
+            "Each session card's", "that session's whole matching preview"
+        ) + (
+            " `subject` is the session's first user prompt, which is usually "
+            "NOT where the match is — that is what `content` and "
+            "`matching_observations` are for. drilldown=True returns the "
+            "matching turns themselves."
         )
     if has_more:
         _attach_next_page_token(
@@ -2971,7 +3160,9 @@ def _query_union_path(
             subject = _first_user_prompt(store, obj)
             session_scoped = _count_scope_for(sess_ast, obj)
             match_count = store.count_observations(session_scoped)
-            preview = _session_body_preview(store, session_scoped, fields, subject)
+            preview = _session_body_preview(
+                store, session_scoped, fields, subject, _snippet_terms(query_text)
+            )
             items.append(
                 _session_to_item(obj, fields, subject, match_count, preview)
             )
@@ -3001,11 +3192,12 @@ def _query_union_path(
         "total": total,
     }
     if fields != "full":
-        result["notice"] = (
-            "Cross-source union (records + sessions). Content bodies "
-            "omitted (fields='summary'). Re-call with fields=full to "
-            "include bodies, or add source:github / source:sessions to "
-            "target a single ontology."
+        result["notice"] = _summary_snippet_notice(
+            "Each session card's", "that session's whole matching preview"
+        ) + (
+            " This is the cross-source union: RECORD-shaped items (the ones "
+            "with `stable_id` and no `kind`) carry `subject` only and no body "
+            "at fields='summary'. Add source:<name> to target one ontology."
         )
     if has_more:
         _attach_next_page_token(
@@ -3089,7 +3281,11 @@ _SESSION_PREVIEW_CHARS = 1500
 
 
 def _session_body_preview(
-    store: Store, scoped: QueryAST, fields: str, subject: str
+    store: Store,
+    scoped: QueryAST,
+    fields: str,
+    subject: str,
+    terms: tuple[str, ...] = (),
 ) -> str:
     """The body of a session card: the observations that actually matched.
 
@@ -3114,8 +3310,16 @@ def _session_body_preview(
     session; with neither, the session's opening turns. That is the evidence a
     cross-encoder needs to judge the card, and what a reader wants to see.
 
-    Summary mode returns "" without querying: ``_session_to_item`` discards the
-    preview there, and this runs once per card on the default surface.
+    SUMMARY MODE READS ONE OBSERVATION AND SNIPPETS IT (D1). It used to return
+    "" without querying at all, on the reasoning that the preview is a
+    full-mode cost the default surface would never show — which was true of
+    the 1 500-character preview and false of the card. A card advertising
+    ``matching_observations: 7`` and showing none of them cannot be acted on,
+    and the caller's only recourse was the ``fields='full'`` re-call that blew
+    the output limit. So the cost is now paid, at the smallest size that
+    answers the question: ONE row, ``limit=1``, snippetted to
+    ``_SNIPPET_CHARS``. That is one more indexed lookup per card on a surface
+    that already runs two (``_first_user_prompt`` and ``count_observations``).
 
     Falls back to the subject when the session yields no usable body — an
     honest degenerate case (there is nothing else in it) rather than an empty
@@ -3126,7 +3330,9 @@ def _session_body_preview(
     returns ``[]`` while the session itself still matched on metadata.
     """
     if fields != "full":
-        return ""
+        rows = store.query_observations(scoped, limit=1)
+        body = scrub(rows[0].body or "").text.strip() if rows else ""
+        return _snippet(body or subject, terms)
     rows = store.query_observations(scoped, limit=_SESSION_PREVIEW_OBSERVATIONS)
     parts: list[str] = []
     used = 0

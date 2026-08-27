@@ -163,12 +163,22 @@ def test_the_card_still_wraps_its_body_as_untrusted_content(store, reranker):
         assert rec["content"].endswith("</ExternalContent>")
 
 
-def test_summary_mode_still_returns_no_body(store):
-    """The preview is a full-mode cost and must not be paid on the default
-    path, where the caller would never see it."""
+def test_summary_mode_does_not_pay_for_the_full_preview(store):
+    """The 1 500-character, five-observation preview is a full-mode cost.
+
+    D1 changed WHAT summary mode returns, not how much it spends: the card
+    now carries a bounded snippet of ONE matching observation, so the caller
+    can act on ``matching_observations`` instead of re-calling at
+    ``fields='full'`` to find out what matched. The concatenated preview stays
+    a full-mode artefact.
+    """
     result = mcp.aggregator_query("quadratic", _store=store)
     for rec in result["records"]:
-        assert rec["content"] == ""
+        assert rec["content"], f"summary card back to an opaque id: {rec!r}"
+        inner = _wrapped_body(f"head\n\n{rec['content']}")
+        assert len(inner) <= mcp._SNIPPET_CHARS * 2, len(inner)
+        # The full preview joins several turns with a ``[type]`` label each.
+        assert "[assistant]" not in inner, inner
 
 
 def test_the_subject_is_still_the_first_user_prompt(store):
