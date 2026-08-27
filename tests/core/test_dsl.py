@@ -192,3 +192,51 @@ def test_format_help_documents_by_and_says_type_is_transport():
     assert "machine" in help_text
     # The docs must say what ``type:`` is not, until every row is classified.
     assert "transport" in help_text.lower()
+
+
+# --- v6: scope: (conjunction unit) -----------------------------------------
+#
+# The grammar half only. The four sites where a missed registration breaks
+# WITHOUT a test failure — the page-token fingerprint, the sessions-vs-records
+# routing predicate, the session-card projection and the fused keyword arm —
+# are pinned in ``tests/test_mcp_conjunction_scope.py``.
+
+
+def test_parse_scope_key():
+    assert parse("scope:session green").scope == "session"
+    assert parse("scope:observation green").scope == "observation"
+
+
+def test_parse_scope_key_is_case_insensitive():
+    assert parse("scope:SESSION green").scope == "session"
+
+
+def test_parse_scope_refuses_an_unknown_value():
+    """Closed enum, same argument as ``by:``: ``scope:sessions`` falling into
+    ``ast.extra`` would leave the default in place and answer a DIFFERENT
+    question in silence, which is worse than an empty page."""
+    with pytest.raises(DSLError) as e:
+        parse("scope:sessions green")
+    assert "sessions" in str(e.value)
+    assert "observation" in str(e.value)
+
+
+def test_scope_is_absent_by_default():
+    """``None`` and not ``'observation'``. Filling in the default would make
+    EVERY ast look like it carries a sessions-ontology key, and records-shaped
+    queries would stop routing to ``records``."""
+    assert parse("source:sessions clickable links").scope is None
+
+
+def test_format_help_documents_scope_and_what_a_quoted_run_means():
+    help_text = format_help(
+        sources=["sessions"],
+        tags_by_source={"sessions": []},
+        date_range=("2026-01-01", "2026-08-27"),
+    )
+    assert "scope:" in help_text
+    assert "observation" in help_text
+    # The default has to be stated, or a caller cannot know what they got.
+    assert "DEFAULT" in help_text
+    # And what quoting does, because that is the other half of "one term".
+    assert "double-quoted" in help_text.lower()

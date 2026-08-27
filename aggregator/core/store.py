@@ -106,6 +106,7 @@ if TYPE_CHECKING:
 from aggregator.core.provenance import MACHINE, MACHINE_VALUES
 from aggregator.core.scrub import scrub
 from aggregator.sources.base import (
+    SCOPE_SESSION,
     ObservationRow,
     QueryAST,
     Record,
@@ -5045,7 +5046,7 @@ class Store:
         c = self._c()
         if ast.text:
             try:
-                obs_ids = self._fts_obs_ids(ast.text)
+                obs_ids = self._scoped_obs_ids(ast)
             except sqlite3.OperationalError as e:
                 log.warning("FTS5 syntax error in query_observations %r: %s", ast.text, e)
                 return []
@@ -5076,7 +5077,7 @@ class Store:
         c = self._c()
         if ast.text:
             try:
-                obs_ids = self._fts_obs_ids(ast.text)
+                obs_ids = self._scoped_obs_ids(ast)
             except sqlite3.OperationalError:
                 return 0
             if not obs_ids:
@@ -5190,6 +5191,77 @@ class Store:
         exacts = {r["sid"] for r in rows if r["sid"]}
         return roots, exacts
 
+    def _session_hit_scope(
+        self,
+        text: str,
+        obs_type: str | None = None,
+        provenance: str | None = None,
+    ) -> tuple[set[str], set[str]]:
+        """``scope:session``: every conjunct satisfied SOMEWHERE under one root.
+
+        The conjuncts are evaluated separately and their session sets are
+        INTERSECTED, which is the whole difference from the default — under
+        ``scope:observation`` a single row has to carry all of them, here one
+        turn may carry "PR link" and a turn three hours later may carry "status
+        report". That is a real question a caller asks ("the session where we
+        discussed both"), and it is the one this ontology could not express at
+        all until now; it is never the default because the answer it gives back
+        is a session, not the moment, and the moment is what recall is for.
+
+        Early-exit on an empty intersection: a conjunct nothing satisfies makes
+        every later query pointless, and with N conjuncts each costing an FTS5
+        scan that saving is the reason a long query stays affordable.
+
+        THE PER-CONJUNCT STATEMENT IS INLINE RATHER THAN IN A HELPER, and that
+        is not a style choice. ``tests/test_fts5_match_site_enumeration.py``
+        requires the function that OWNS an FTS5 ``MATCH`` to be the function
+        that rewrites the text, precisely because "a caller sanitizes it" is the
+        belief that produced three instances of the unescaped-MATCH defect. A
+        helper taking a pre-built ``expr`` would move the statement out from
+        under that rule.
+        """
+        conjuncts = fts5_match_conjuncts(text)
+        if not conjuncts:
+            return set(), set()
+        base = """
+            SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
+            FROM obs_fts f
+            JOIN observations o ON o.rowid = f.rowid
+            WHERE obs_fts MATCH ?
+        """
+        filters = ""
+        extra_params: list = []
+        if obs_type:
+            filters += " AND o.type = ?"
+            extra_params.append(obs_type)
+        if provenance:
+            clause, extra = self._provenance_clause(provenance, "o.provenance")
+            filters += f" AND {clause}"
+            extra_params.extend(extra)
+        roots: set[str] | None = None
+        exacts: set[str] | None = None
+        for expr in conjuncts:
+            rows = self._fts_rows(base + filters, [expr, *extra_params], text)
+            got_roots = {r["root"] for r in rows if r["root"]}
+            got_exacts = {r["sid"] for r in rows if r["sid"]}
+            roots = got_roots if roots is None else roots & got_roots
+            exacts = got_exacts if exacts is None else exacts & got_exacts
+            if not roots and not exacts:
+                return set(), set()
+        return roots or set(), exacts or set()
+
+    def _text_hit_scope(self, ast: QueryAST) -> tuple[set[str], set[str]]:
+        """Whichever conjunction scope the AST asked for. ``scope:`` lives here
+        and not in :meth:`_obs_where` because it is not a row predicate: it
+        changes which ROWS THE TEXT MATCHES, not which of the matched rows
+        survive a filter. Anyone adding a key to the registration list in the
+        design note should read that difference off this method."""
+        if ast.scope == SCOPE_SESSION:
+            return self._session_hit_scope(
+                ast.text or "", ast.obs_type, ast.provenance
+            )
+        return self._fts_hit_scope(ast.text or "", ast.obs_type, ast.provenance)
+
     def _obs_id_hit_scope(
         self,
         obs_ids: Iterable[str],
@@ -5205,6 +5277,16 @@ class Store:
         while a subagent card surfaces only on a hit in its own stream.
         Diverging here would make hybrid and FTS5 answer the same question
         with differently-shaped hit lists.
+
+        ``scope:`` IS DELIBERATELY NOT A PARAMETER HERE, and that is the one
+        place in the v6 registration list where the answer is "nothing to
+        register". This method projects an id set that some arm already
+        produced; the conjunction it was produced by is upstream, and a fused
+        hybrid id set has no conjunct structure left to intersect. Widening
+        happens in :meth:`_text_hit_scope`, which :meth:`_hit_scope` then
+        INTERSECTS with this projection — so a ``scope:session`` query through
+        the hybrid path is widened exactly once, on the lexical side, rather
+        than twice or not at all.
 
         Parameters are chunked because a fused scope can carry thousands of
         ids and SQLite caps host parameters per statement.
@@ -5241,14 +5323,12 @@ class Store:
         filter never widens the result, whichever order the arms arrive in.
         """
         if ast.id_scope is None:
-            return self._fts_hit_scope(ast.text or "", ast.obs_type, ast.provenance)
+            return self._text_hit_scope(ast)
         roots, exacts = self._obs_id_hit_scope(
             ast.id_scope, ast.obs_type, ast.provenance
         )
         if ast.text:
-            fts_roots, fts_exacts = self._fts_hit_scope(
-                ast.text, ast.obs_type, ast.provenance
-            )
+            fts_roots, fts_exacts = self._text_hit_scope(ast)
             roots &= fts_roots
             exacts &= fts_exacts
         return roots, exacts
@@ -5269,6 +5349,52 @@ class Store:
             text,
         )
         return [r["obs_id"] for r in rows]
+
+    def _session_scope_obs_ids(self, text: str, roots: set[str]) -> list[str]:
+        """Observations under ``roots`` matching ANY conjunct.
+
+        THE ROW SET IS WIDER THAN THE DEFAULT AND THAT IS THE POINT. Once a
+        session has qualified by carrying every conjunct somewhere, the turns
+        worth showing are the ones that carry any of them — the turn saying
+        "PR link" and the turn saying "status report" are both part of the
+        answer, and demanding both of each row again would collapse straight
+        back to ``scope:observation``.
+
+        One statement per conjunct rather than an ``OR``-joined expression, so
+        the invariant that only quoted ``\\w+`` runs reach ``MATCH`` survives
+        a widening that had no reason to spend it.
+        """
+        if not roots:
+            return []
+        scope_json = json.dumps(sorted(roots))
+        ids: set[str] = set()
+        for expr in fts5_match_conjuncts(text):
+            rows = self._fts_rows(
+                "SELECT o.obs_id AS obs_id FROM obs_fts f "  # noqa: S608 - placeholders only
+                "JOIN observations o ON o.rowid = f.rowid "
+                "WHERE obs_fts MATCH ? AND "
+                + _json_id_clause("o.root_session_id"),
+                (expr, scope_json),
+                text,
+            )
+            ids.update(r["obs_id"] for r in rows)
+        return sorted(ids)
+
+    def _scoped_obs_ids(self, ast: QueryAST) -> list[str]:
+        """The observation ids the AST's free text matches, in its scope.
+
+        The ONE seam between ``scope:`` and the observations page. Both
+        :meth:`query_observations` and :meth:`count_observations` go through
+        it, because a page and a total computed under different scopes is the
+        "plausible but wrong" answer this module refuses everywhere else.
+        """
+        text = ast.text or ""
+        if ast.scope != SCOPE_SESSION:
+            return self._fts_obs_ids(text)
+        roots, _exacts = self._session_hit_scope(
+            text, ast.obs_type, ast.provenance
+        )
+        return self._session_scope_obs_ids(text, roots)
 
     # -- capabilities -----------------------------------------------------
 
