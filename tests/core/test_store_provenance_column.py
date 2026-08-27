@@ -195,3 +195,69 @@ def test_an_unclassified_row_reads_back_as_none(tmp_path):
     s.upsert_entities([_session(), _obs("o1", "a turn")])
     assert s.query_observations(QueryAST())[0].provenance is None
     s.close()
+
+
+# --- the ``by:`` filter, at the SQL layer ----------------------------------
+
+
+def _seeded(tmp_path) -> Store:
+    s = Store(db_path=tmp_path / "cache.db")
+    s.migrate()
+    s.upsert_entities(
+        [
+            _session(),
+            _obs("o-human", "clickable links please", provenance=HUMAN),
+            _obs("o-hook", "You are watching a Claude Code session", provenance=HOOK),
+            _obs("o-agent", "research the thing", provenance=AGENT),
+            _obs("o-null", "not classified yet"),
+        ]
+    )
+    return s
+
+
+def test_no_filter_returns_every_row(tmp_path):
+    """DEFAULT ABSENT MEANS NO FILTER, exactly like ``type:`` today.
+
+    A default human-only filter would silently drop the machine-authored
+    majority from ``_first_user_prompt``, from the eval baseline and from
+    ``matching_observations`` — a narrowing the caller never asked for and
+    cannot see.
+    """
+    s = _seeded(tmp_path)
+    assert len(s.query_observations(QueryAST())) == 4
+    s.close()
+
+
+def test_by_human_selects_only_the_human_rows(tmp_path):
+    s = _seeded(tmp_path)
+    rows = s.query_observations(QueryAST(provenance=HUMAN))
+    assert [r.obs_id for r in rows] == ["o-human"]
+    assert s.count_observations(QueryAST(provenance=HUMAN)) == 1
+    s.close()
+
+
+def test_by_machine_is_every_non_human_member(tmp_path):
+    s = _seeded(tmp_path)
+    rows = s.query_observations(QueryAST(provenance="machine"))
+    assert sorted(r.obs_id for r in rows) == ["o-agent", "o-hook"]
+    s.close()
+
+
+def test_an_unclassified_row_is_neither_human_nor_machine(tmp_path):
+    """NULL is not a claim. Folding it into either side would invent one."""
+    s = _seeded(tmp_path)
+    for value in (HUMAN, "machine", HOOK, AGENT):
+        assert "o-null" not in {
+            r.obs_id for r in s.query_observations(QueryAST(provenance=value))
+        }
+    s.close()
+
+
+def test_the_store_can_say_the_corpus_is_not_fully_classified(tmp_path):
+    """So an empty ``by:`` page can explain itself instead of looking empty."""
+    s = _seeded(tmp_path)
+    assert s.has_unclassified_observations() is True
+    s._c().execute("UPDATE observations SET provenance = 'human' WHERE provenance IS NULL")
+    s._c().commit()
+    assert s.has_unclassified_observations() is False
+    s.close()

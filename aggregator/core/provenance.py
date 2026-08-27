@@ -75,6 +75,10 @@ PROVENANCE_VALUES: tuple[str, ...] = (HUMAN, AGENT, HOOK, COMMAND, SYSTEM)
 #: ``provenance IS NULL`` — unclassified is not a claim about authorship.
 MACHINE_VALUES: tuple[str, ...] = (AGENT, HOOK, COMMAND, SYSTEM)
 
+#: The DSL shorthand for :data:`MACHINE_VALUES`. A query word, never a stored
+#: value: no row's ``provenance`` column ever holds this string.
+MACHINE = "machine"
+
 #: ``origin.kind`` values that name a machine author. ``human`` is absent on
 #: purpose and must stay absent: see the module docstring's 43-of-43.
 _AGENT_ORIGIN_KINDS = frozenset({"task-notification", "coordinator", "peer"})

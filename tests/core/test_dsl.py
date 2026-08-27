@@ -140,3 +140,55 @@ def test_format_help_lists_sources():
     assert "sessions" in help_text
     assert "github" in help_text
     assert "2026-01-01" in help_text
+
+
+# --- v6: by: (provenance) --------------------------------------------------
+#
+# ONE MORE KEY, AND FIVE MORE PLACES IT HAS TO BE REGISTERED. Three of them
+# break QUIETLY when missed — the page-token fingerprint, the sessions-vs-
+# records routing predicate, and the two hit-scope projections — so those are
+# pinned at the MCP and store layers rather than here. This file owns the
+# grammar half.
+
+
+def test_parse_by_key_maps_to_provenance():
+    assert parse("by:human").provenance == "human"
+    assert parse("by:hook").provenance == "hook"
+
+
+def test_parse_by_key_accepts_the_machine_shorthand():
+    assert parse("by:machine").provenance == "machine"
+
+
+def test_parse_by_key_is_case_insensitive():
+    assert parse("by:HUMAN").provenance == "human"
+
+
+def test_parse_by_key_refuses_an_unknown_value():
+    """A CLOSED ENUM, so a typo is a parse error and not an empty page.
+
+    ``type:`` is deliberately open — its value set is additive — and a typo
+    there returns nothing. ``by:`` has exactly six accepted values, so the same
+    silence would be a bug reported as "there is nothing in my history".
+    """
+    with pytest.raises(DSLError) as e:
+        parse("by:humann")
+    assert "humann" in str(e.value)
+    assert "human" in str(e.value)
+
+
+def test_by_is_absent_by_default():
+    """No implicit filter, ever. Same contract as ``type:``."""
+    assert parse("source:sessions clickable links").provenance is None
+
+
+def test_format_help_documents_by_and_says_type_is_transport():
+    help_text = format_help(
+        sources=["sessions"],
+        tags_by_source={"sessions": []},
+        date_range=("2026-01-01", "2026-08-27"),
+    )
+    assert "by:" in help_text
+    assert "machine" in help_text
+    # The docs must say what ``type:`` is not, until every row is classified.
+    assert "transport" in help_text.lower()

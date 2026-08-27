@@ -103,6 +103,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
 
+from aggregator.core.provenance import MACHINE, MACHINE_VALUES
 from aggregator.core.scrub import scrub
 from aggregator.sources.base import (
     ObservationRow,
@@ -4725,6 +4726,55 @@ class Store:
             params.append(ast.to_date.isoformat())
         return " AND ".join(clauses), params
 
+    @staticmethod
+    def _provenance_clause(provenance: str, column: str = "provenance") -> tuple[str, list]:
+        """``(SQL fragment, params)`` for one ``by:`` value.
+
+        ``machine`` EXPANDS TO THE FOUR NON-HUMAN MEMBERS rather than to
+        ``!= 'human'``, and that difference is the whole point: ``!=`` in
+        SQLite is false against NULL, which would be right by accident today
+        and wrong the moment anyone writes ``NOT (provenance = 'human')``. An
+        explicit ``IN`` says what is meant — a positive machine claim — and
+        keeps unclassified rows out of BOTH sides, where they belong: NULL
+        means nobody has looked, which is not a fact about authorship.
+        """
+        if provenance == MACHINE:
+            marks = ",".join("?" * len(MACHINE_VALUES))
+            return f"{column} IN ({marks})", list(MACHINE_VALUES)
+        return f"{column} = ?", [provenance]
+
+    def _apply_provenance(
+        self, ast: QueryAST, clauses: list[str], params: list
+    ) -> None:
+        """Append the ``by:`` predicate, or nothing at all.
+
+        NOTHING AT ALL IS THE DEFAULT AND STAYS THE DEFAULT. A human-only
+        default here would narrow ``_first_user_prompt`` (which labels every
+        session card), ``count_observations`` (which is
+        ``matching_observations``), ``_session_body_preview`` and the frozen
+        eval baseline — four callers that never asked for a filter, in one
+        edit, invisibly.
+        """
+        if not ast.provenance:
+            return
+        clause, extra = self._provenance_clause(ast.provenance)
+        clauses.append(clause)
+        params.extend(extra)
+
+    def has_unclassified_observations(self) -> bool:
+        """Is any observation still ``provenance IS NULL``?
+
+        ONE INDEXED PROBE, not a count: ``LIMIT 1`` against ``obs_provenance``.
+        It exists so an empty ``by:`` page can say WHY it is empty. Before the
+        backfill has run, every row is NULL and every ``by:`` filter matches
+        nothing — an answer indistinguishable from "you never said that",
+        which is precisely the failure this mission exists to remove.
+        """
+        row = self._c().execute(
+            "SELECT 1 FROM observations WHERE provenance IS NULL LIMIT 1"
+        ).fetchone()
+        return row is not None
+
     def _obs_where(self, ast: QueryAST) -> tuple[str, list]:
         """Build WHERE for an ``observations`` query.
 
@@ -4769,6 +4819,7 @@ class Store:
         if ast.obs_type:
             clauses.append("type = ?")
             params.append(ast.obs_type)
+        self._apply_provenance(ast, clauses, params)
         if ast.from_date:
             clauses.append("ts >= ?")
             params.append(ast.from_date.isoformat())
@@ -5021,9 +5072,12 @@ class Store:
         return f"({root_part} OR {exact_part})", params
 
     def _fts_hit_scope(
-        self, text: str, obs_type: str | None = None
+        self,
+        text: str,
+        obs_type: str | None = None,
+        provenance: str | None = None,
     ) -> tuple[set[str], set[str]]:
-        """FTS text (+ optional obs type) → ``(root_ids, exact_ids)``.
+        """FTS text (+ optional obs type and authorship) → ``(root_ids, exact_ids)``.
 
         ``root_ids``  — distinct ``root_session_id`` of matching obs; used
         to surface top-level session cards (a hit anywhere under the root
@@ -5034,6 +5088,12 @@ class Store:
         Live-model smoke MEDIUM (2026-08-02): the previous root-only
         mapping ignored ``type:`` and surfaced sibling subagents with
         zero own matches.
+
+        ``provenance`` (v6) rides here for the identical reason ``obs_type``
+        does. A card is supposed to surface only on a hit that PASSES the
+        query's filters; a ``by:`` filter left out of this projection would
+        surface cards whose only matching observation the caller just excluded
+        — the same silent over-surfacing, one filter later.
         """
         match_expr = fts5_match_query(text)
         if not match_expr:
@@ -5048,13 +5108,20 @@ class Store:
         if obs_type:
             sql += " AND o.type = ?"
             params.append(obs_type)
+        if provenance:
+            clause, extra = self._provenance_clause(provenance, "o.provenance")
+            sql += f" AND {clause}"
+            params.extend(extra)
         rows = self._fts_rows(sql, params, text)
         roots = {r["root"] for r in rows if r["root"]}
         exacts = {r["sid"] for r in rows if r["sid"]}
         return roots, exacts
 
     def _obs_id_hit_scope(
-        self, obs_ids: Iterable[str], obs_type: str | None = None
+        self,
+        obs_ids: Iterable[str],
+        obs_type: str | None = None,
+        provenance: str | None = None,
     ) -> tuple[set[str], set[str]]:
         """``(root_ids, exact_ids)`` for a set of obs ids — the v5 twin of
         :meth:`_fts_hit_scope`, and it must stay behaviourally identical to it.
@@ -5082,6 +5149,10 @@ class Store:
             if obs_type:
                 sql += " AND type = ?"
                 params.append(obs_type)
+            if provenance:
+                clause, extra = self._provenance_clause(provenance)
+                sql += f" AND {clause}"
+                params.extend(extra)
             for row in c.execute(sql, params):
                 if row["root"]:
                     roots.add(row["root"])
@@ -5097,10 +5168,14 @@ class Store:
         filter never widens the result, whichever order the arms arrive in.
         """
         if ast.id_scope is None:
-            return self._fts_hit_scope(ast.text or "", ast.obs_type)
-        roots, exacts = self._obs_id_hit_scope(ast.id_scope, ast.obs_type)
+            return self._fts_hit_scope(ast.text or "", ast.obs_type, ast.provenance)
+        roots, exacts = self._obs_id_hit_scope(
+            ast.id_scope, ast.obs_type, ast.provenance
+        )
         if ast.text:
-            fts_roots, fts_exacts = self._fts_hit_scope(ast.text, ast.obs_type)
+            fts_roots, fts_exacts = self._fts_hit_scope(
+                ast.text, ast.obs_type, ast.provenance
+            )
             roots &= fts_roots
             exacts &= fts_exacts
         return roots, exacts

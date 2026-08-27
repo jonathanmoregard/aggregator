@@ -232,6 +232,14 @@ class QueryAST:
     * ``top_session_id`` — just the top-level, no subagents.
     * ``agent_id`` — just one subagent.
     * ``obs_type`` — filter observations by type (user/assistant/tool_use/...).
+      A TRANSPORT ROLE, not an authorship claim — see ``provenance``.
+    * ``provenance`` — filter observations by WHO COMPOSED them (``by:``).
+      One of ``aggregator.core.provenance.PROVENANCE_VALUES``, or the
+      shorthand ``'machine'`` for any non-human member. ``None`` means NO
+      FILTER, exactly like ``obs_type``: nothing in this codebase applies a
+      default here, because a default would silently narrow
+      ``_first_user_prompt``, the frozen eval baseline and every
+      ``matching_observations`` count at once.
     * ``active_from``/``active_to`` — activity-window overlap:
       ``first_ts <= active_to AND last_ts >= active_from``. Different from
       ``from_date``/``to_date`` which are point-in-time-created.
@@ -260,6 +268,8 @@ class QueryAST:
     obs_type: str | None = None
     active_from: datetime | None = None
     active_to: datetime | None = None
+    # v6 authorship filter (``by:``). See the class docstring.
+    provenance: str | None = None
     # v5 hybrid retrieval: internal-only id filter. See the class docstring.
     id_scope: frozenset[str] | None = None
 

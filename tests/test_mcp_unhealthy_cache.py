@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from aggregator.core.store import Store
+from aggregator.core.store import SCHEMA_VERSION, Store
 from aggregator.mcp import aggregator_capabilities, aggregator_query
 from aggregator.sources.base import ObservationRow, SessionRow
 
@@ -100,7 +100,7 @@ def corrupt_db(healthy_db):
     # The fixture must not be able to pass vacuously: prove the file really is
     # unreadable, and that the health check really does still pass it.
     probe = Store(db_path=healthy_db, read_only=True)
-    assert probe.schema_version() == 5
+    assert probe.schema_version() == SCHEMA_VERSION
     with pytest.raises(sqlite3.DatabaseError):
         probe.probe_fts("voting")
     probe.close()

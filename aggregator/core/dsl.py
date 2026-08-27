@@ -22,6 +22,7 @@ import re
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 
+from aggregator.core.provenance import MACHINE, PROVENANCE_VALUES
 from aggregator.sources.base import QueryAST
 
 
@@ -43,10 +44,21 @@ class DSLError(ValueError):
 #   active:A..B — sessions whose activity window overlaps [A, B]
 #                 (first_ts <= B AND last_ts >= A). A or B may be omitted:
 #                 ``active:..2026-07-01`` or ``active:2026-07-01..``.
+#
+# v6 authorship key:
+#   by:P        — filter observations by WHO COMPOSED them
+#                 (human|agent|hook|command|system, plus the shorthand
+#                 ``machine`` for any of the four non-human members).
+#                 ``type:`` is the channel a line arrived on; this is the
+#                 author. Absent means NO FILTER, exactly like ``type:``.
 KNOWN_KEYS = {
     "source", "tag", "from", "to",
-    "session", "top", "agent", "type", "active",
+    "session", "top", "agent", "type", "active", "by",
 }
+
+#: Everything ``by:`` accepts. A CLOSED SET, which is why an unknown value is a
+#: parse error rather than an empty page — see ``_parse_provenance``.
+BY_VALUES: tuple[str, ...] = (*PROVENANCE_VALUES, MACHINE)
 
 _TOKEN_RE = re.compile(r"\S+")
 
@@ -84,6 +96,8 @@ def parse(query: str) -> QueryAST:
             ast.agent_id = val
         elif key == "type":
             ast.obs_type = val
+        elif key == "by":
+            ast.provenance = _parse_provenance(val)
         elif key == "active":
             lo, hi = _parse_active_range(val)
             ast.active_from = lo
@@ -93,6 +107,26 @@ def parse(query: str) -> QueryAST:
     if text_bits:
         ast.text = " ".join(text_bits)
     return ast
+
+
+def _parse_provenance(val: str) -> str:
+    """Validate ``by:``. An unknown value is an ERROR, not an empty page.
+
+    ``type:`` is deliberately open — its value set is additive, and the store
+    comment says so — so a typo there returns nothing and that is tolerable.
+    ``by:`` has exactly six accepted values, so the same silence would be
+    indistinguishable from "there is nothing in your history", which is the
+    failure this whole change exists to remove. Naming the accepted set in the
+    error means one round trip instead of a guess.
+    """
+    value = val.strip().lower()
+    if value not in BY_VALUES:
+        raise DSLError(
+            f"bad by: {val!r} is not an authorship class. Use one of "
+            f"{', '.join(BY_VALUES)} — ``machine`` is the shorthand for any of "
+            f"{', '.join(v for v in PROVENANCE_VALUES if v != 'human')}."
+        )
+    return value
 
 
 def _parse_date(val: str, label: str) -> datetime:
@@ -180,6 +214,21 @@ def format_help(
     lines.append(
         "  type:<T>       observations of type user|assistant|tool_use|"
         "tool_result|system|other"
+    )
+    lines.append(
+        "                 NOTE: type: is a TRANSPORT ROLE, not an authorship "
+        "claim. type:user means the line arrived on the user channel; measured, "
+        "59% of those were composed by a machine (hook prompts, headless "
+        "briefs, subagent briefs, slash-command output, client notices). Use "
+        "by: for authorship."
+    )
+    lines.append(
+        f"  by:<P>         WHO COMPOSED the observation: "
+        f"{'|'.join(BY_VALUES)}. 'machine' is any of "
+        f"{'/'.join(v for v in PROVENANCE_VALUES if v != 'human')}; 'human' is "
+        f"a residual (nothing claimed a machine wrote it), never a positive "
+        f"identification. Absent = no filter. Rows not yet classified match "
+        f"NO value of by: — run `aggregator provenance --backfill`."
     )
     lines.append(
         "  active:LO..HI  sessions whose activity window overlaps [LO, HI] "

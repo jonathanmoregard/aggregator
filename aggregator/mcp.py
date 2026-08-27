@@ -134,6 +134,7 @@ from aggregator.core.hybrid import (
     rrf_fuse,
     vector_floor,
 )
+from aggregator.core.provenance import MACHINE_VALUES
 from aggregator.core.scrub import scrub
 from aggregator.core.store import (
     CHAT_ORIGINS,
@@ -1063,6 +1064,7 @@ def _lexical_session_ids(
     text: str | None,
     obs_type: str | None,
     lexical_ids: frozenset[str] | None,
+    provenance: str | None = None,
 ) -> frozenset[str] | None:
     """Project the keyword arm's OBSERVATION hits up to session-card ids.
 
@@ -1110,7 +1112,7 @@ def _lexical_session_ids(
     if not lexical_ids or not text:
         return frozenset()
     try:
-        roots, exacts = store._fts_hit_scope(text, obs_type)
+        roots, exacts = store._fts_hit_scope(text, obs_type, provenance)
     except sqlite3.OperationalError:
         # The same race one statement later — AND A DIFFERENT FACT FROM THE
         # FIRST ONE, which is why it gets its own sentinel. Reaching here means
@@ -1601,6 +1603,10 @@ def _query_fingerprint(
             "top": ast.top_session_id,
             "agent": ast.agent_id,
             "obs_type": ast.obs_type,
+            # ``by:``. It reaches no KNN either, and it changes the row set the
+            # offset is cut from — so a token minted unfiltered and continued
+            # under ``by:human`` would address a position that never existed.
+            "provenance": ast.provenance,
             "active_from": _iso_or_none(ast.active_from),
             "active_to": _iso_or_none(ast.active_to),
             "drilldown": bool(drilldown),
@@ -2052,6 +2058,87 @@ def _summary_snippet_notice(what: str, where: str) -> str:
         f"for the rows where you need {where}; full bodies are unabridged and "
         f"a page of them is what overruns a context window."
     )
+
+
+# --- provenance, said out loud (C) ------------------------------------------
+#
+# THE RECALL PATH IS NOT NARROWED, AND THIS IS WHAT REPLACES THE NARROWING.
+# Filtering to human-authored rows by default was measured as breaking for
+# three in-repo callers — ``_first_user_prompt`` (29% of sampled user turns are
+# hook-class, and headless sessions OPEN with one, so cards would lose their
+# labels), the frozen eval baseline, and ``_count_scope_for`` /
+# ``_session_body_preview``, which would under-count in silence. A result set
+# narrowed behind the caller's back is the "plausible but wrong" failure this
+# module already refuses for page tokens at ``_PageTokenError``.
+#
+# So the machine-authored majority stays on the page and gets NAMED. The
+# caller can then act on it in one move (``by:human``) or read it knowingly,
+# which is the legibility win criterion A is also after — one column and one
+# sentence, rather than a behaviour change nobody can see.
+
+
+def _provenance_notice(items: Sequence[dict[str, Any]]) -> str | None:
+    """What this page's authorship mix is, or ``None`` when there is nothing
+    worth saying.
+
+    TWO DIFFERENT FACTS, AND THEY ARE NOT THE SAME SENTENCE. A row with a
+    machine class was classified and a machine wrote it. A row with
+    ``provenance: null`` has not been classified at all — reporting those as
+    machine (or as human) would be inventing the very claim the residual rule
+    refuses to make. So they get counted separately and the second sentence
+    names the command that fixes it.
+    """
+    if not items:
+        return None
+    machine = sum(1 for it in items if it.get("provenance") in MACHINE_VALUES)
+    unknown = sum(1 for it in items if it.get("provenance") is None)
+    parts: list[str] = []
+    if machine:
+        parts.append(
+            f"Authorship: {machine} of {len(items)} rows on this page were "
+            f"composed by a machine, not by the user — `provenance` on each row "
+            f"says which (agent/hook/command/system). `type:user` is the "
+            f"channel a line arrived on, not who wrote it. Add `by:human` to "
+            f"exclude them, or `by:machine` to see only those."
+        )
+    if unknown:
+        parts.append(
+            f"{unknown} of {len(items)} rows are NOT YET CLASSIFIED "
+            f"(`provenance: null`), so nothing is claimed about who wrote them "
+            f"and no `by:` filter can match them. Run "
+            f"`aggregator provenance --backfill` to classify the corpus."
+        )
+    return " ".join(parts) if parts else None
+
+
+def _note_provenance(
+    result: dict[str, Any], store: Store, ast: QueryAST
+) -> dict[str, Any]:
+    """Attach :func:`_provenance_notice`, and explain an empty ``by:`` page.
+
+    THE EMPTY PAGE IS THE ONE THAT HAD TO BE HANDLED. Before the backfill has
+    run every row is unclassified, so every ``by:`` filter matches nothing —
+    and "0 results" is indistinguishable from "you never said that", which is
+    the exact failure this mission exists to remove. The extra probe is one
+    indexed ``LIMIT 1`` and only runs on a ``by:`` query that came back empty.
+    """
+    items = result.get("records") or []
+    notice = _provenance_notice(items)
+    if not items and ast.provenance and store.has_unclassified_observations():
+        notice = (
+            f"`by:{ast.provenance}` matched nothing, and the corpus is not "
+            f"fully classified: rows whose `provenance` is still null match no "
+            f"`by:` filter at all, so this empty page may mean "
+            f"'not classified yet' rather than 'never said'. Run "
+            f"`aggregator provenance --backfill`, or drop `by:` to see every "
+            f"row."
+        )
+    if not notice:
+        return result
+    prior = result.get("notice")
+    # Leads, like every other notice site here: it describes the page in hand.
+    result["notice"] = f"{notice} {prior}" if prior else notice
+    return result
 
 
 def _snippet_terms(text: str | None) -> tuple[str, ...]:
@@ -2525,6 +2612,13 @@ def _observation_to_item(
         "root_session_id": o.root_session_id,
         "parent_obs_id": o.parent_obs_id,
         "type": o.type,
+        # WHO WROTE IT, beside the snippet that says WHAT it says. ``type``
+        # only names the channel the line arrived on, and 59% of the rows on
+        # the user channel were composed by a machine — so without this a
+        # caller reading a hook-injected classifier prompt has no way to tell
+        # it apart from the user's own words. ``None`` means the row has not
+        # been classified yet and is NOT a claim of human authorship.
+        "provenance": o.provenance,
         "ts": o.ts.isoformat() if o.ts else None,
         "model": o.model,
         "input_tokens": o.input_tokens,
@@ -2572,13 +2666,20 @@ _RECORDS_ONLY_EXTRA_KEYS = {"state", "check", "mergeable"}
 
 
 def _has_sessions_keys(ast: QueryAST) -> bool:
-    """True if the AST carries any sessions-ontology key (top-level attr)."""
+    """True if the AST carries any sessions-ontology key (top-level attr).
+
+    ``provenance`` (``by:``) belongs here because only observations have one.
+    Left out, a bare ``by:human`` would fall through to ``union`` — half of
+    which is ``records``, a table with no authorship column at all — and the
+    caller would get an unfiltered pile of documents for an authorship query.
+    """
     return any(
         [
             ast.session_id,
             ast.top_session_id,
             ast.agent_id,
             ast.obs_type,
+            ast.provenance,
             ast.active_from,
             ast.active_to,
         ]
@@ -2671,10 +2772,22 @@ def aggregator_query(
 
     Args:
       dsl: filter string. Session-ontology keys (session:, top:, agent:,
-           type:, active:) route through the v2 sessions/observations tables.
-           Records-shaped sources fall through to the legacy path.
+           type:, by:, active:) route through the v2 sessions/observations
+           tables. Records-shaped sources fall through to the legacy path.
            Call ``aggregator_capabilities()`` for the live inventory of
            source names and the filter keys each one accepts.
+
+           ``type:`` IS A TRANSPORT ROLE, NOT AN AUTHORSHIP CLAIM. ``type:user``
+           means the line arrived on the user channel, and measured against the
+           vendor's structural fields, 59% of those were composed by a machine:
+           hook-injected classifier prompts, headless SDK briefs, subagent task
+           briefs, slash-command output, client notices. Use ``by:`` for
+           authorship — ``by:human``, ``by:agent``, ``by:hook``, ``by:command``,
+           ``by:system``, or ``by:machine`` for any of the four non-human ones.
+           Absent, it filters nothing: every row comes back and each one carries
+           a ``provenance`` field saying who wrote it. Rows whose
+           ``provenance`` is ``null`` have not been classified yet and match NO
+           ``by:`` value — that is "nobody has looked", not "a human wrote it".
       fields: ``"summary"`` (default) or ``"full"``.
       page_size: cap per page. Defaults to 200 for summary, 40 for full.
       page_token: opaque pagination token from a previous call.
@@ -2765,6 +2878,13 @@ def aggregator_query(
       * ``sessions`` — one card per matching session, with
         ``matching_observations``. Homogeneous.
       * ``observations`` — raw turns, from ``drilldown=True``. Homogeneous.
+        Every item carries ``provenance``: who composed that turn (``human`` /
+        ``agent`` / ``hook`` / ``command`` / ``system``, or ``null`` for not
+        yet classified). ``human`` is a RESIDUAL — nothing claimed a machine
+        wrote it — and never a positive identification, because the vendor
+        exposes no authorship field to make one from. When a page holds
+        machine-authored rows the ``notice`` says how many and how to exclude
+        them; nothing is filtered unless you ask with ``by:``.
 
       EVERY ITEM CARRIES ``truncated`` AND ``content_length``, always, whether
       or not anything was cut. The response is held under a server-side
@@ -3208,6 +3328,10 @@ def _query_sessions_path(
             result["notice"] = _summary_snippet_notice(
                 "Each observation's", "the whole turn"
             )
+        # AFTER the snippet notice and BEFORE the token, so the authorship
+        # sentence leads. It is emitted in full mode too: it is a fact about
+        # WHICH ROWS came back, not about how much of each one is shown.
+        _note_provenance(result, store, ast)
         if has_more:
             _attach_next_page_token(
                 result, offset + page_size, hybrid, fingerprint, frozen_out
@@ -3285,7 +3409,7 @@ def _query_sessions_path(
             result, offset + page_size, hybrid, fingerprint, frozen_out
         )
     lexical_cards = _lexical_session_ids(
-        store, query_text, ast.obs_type, lexical_ids
+        store, query_text, ast.obs_type, lexical_ids, ast.provenance
     )
     _note_confidence(
         result,
@@ -3479,7 +3603,7 @@ def _query_union_path(
     # session id the arm's observation hits have to be projected onto. The
     # merged item list no longer says which is which.
     sess_lexical_cards = _lexical_session_ids(
-        store, query_text, sess_ast.obs_type, sess_lexical_ids
+        store, query_text, sess_ast.obs_type, sess_lexical_ids, sess_ast.provenance
     )
     page_lexical_support = any(
         _lexical_on_page(
