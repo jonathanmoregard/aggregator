@@ -2219,6 +2219,33 @@ _SECONDS_PER_CHUNK = 20
 #: overhead arithmetic above has not already given away.
 _MAX_BATCH_CHUNKS = 45
 
+#: How many chunks may go to the model in ONE ``embed_documents`` call.
+#:
+#: THIS IS WHAT MAKES A STOP REACHABLE. The stop flag is read between calls and
+#: nowhere else, so the largest call is the longest a SIGTERM can go unanswered.
+#: A whole row used to be one call: measured read-only against the live cache at
+#: ``chunk-4000-400``, 1,348 rows exceed 300 s that way and the largest is 257
+#: chunks — about 86 minutes — against a ``TimeoutStopSec`` of 5 minutes. So
+#: systemd escalated to SIGKILL with the claim held, and the next run's
+#: ``_blame_crashed_row`` booked a good row as poison; three of those and the
+#: row is terminal, permanently absent from the vector arm.
+#:
+#: FOUR, which is ~80 seconds at ``_SECONDS_PER_CHUNK``. That leaves the rest of
+#: the 300-second window for the flush and commit that follow, with room to
+#: spare on a machine under load — the number is chosen against the window it
+#: has to fit inside, not for its own sake.
+#:
+#: AND IT COSTS ESSENTIALLY NOTHING, which is why it is not a larger number
+#: hedged with a comment. ``docs/embedding-throughput.md`` measured enlarging
+#: the model's own batch at under 10% and NEGATIVE past 8, so four is already
+#: near the flat part of that curve; the throughput given up is a rounding
+#: error against a backfill measured in weeks, and it buys the difference
+#: between a stop that works and one that loses a row.
+#:
+#: NOT A FLAG, for the same reason as the two constants above: raising it
+#: re-opens the gap it exists to close.
+_MAX_CHUNKS_PER_ENCODE = 4
+
 
 def _embedder_is_healthy(embedder: Embedder) -> bool:
     """THE TRANSIENT/PERMANENT DISCRIMINATOR, asked at the moment of failure.
@@ -2721,15 +2748,24 @@ def _embed_batch(
     covers, so it is the boundary. Whatever embedded before the stop is
     flushed and committed below; the rest stays in the backlog.
 
-    THE ROW BOUNDARY NARROWS THAT WINDOW; IT DOES NOT CLOSE IT. A row is itself
-    one uninterruptible ``embed_documents`` call — the stop flag is not read
-    again until it returns — and the largest row measured in the live cache is
-    257 chunks, about 86 minutes, with 1348 rows over 300 s. A stop landing
-    inside one of those is still SIGKILLed with the claim held, and
-    ``_blame_crashed_row`` then attributes it to a good row. That residual gap
-    is real, pre-dates this batching work, and is unfixed; ``nix/aggregator.nix``
-    documents it beside ``TimeoutStopSec``, which is deliberately not sized to
-    cover a long row.
+    AND IT IS READ INSIDE THE ROW TOO, which is what makes the row boundary an
+    honest promise rather than an aspiration. A row used to be a single
+    ``embed_documents`` call over all of its chunks, so the flag was not read
+    again until that call returned: measured read-only against the live cache,
+    1348 rows exceed 300 s that way and the largest is 257 chunks — about 86
+    minutes — against a 5-minute ``TimeoutStopSec``. A stop landing inside one
+    of those was SIGKILLed with the claim held, and ``_blame_crashed_row`` then
+    attributed it to a good row. The encode is sliced at
+    ``_MAX_CHUNKS_PER_ENCODE`` now, so the longest a stop can go unanswered is
+    ~80 seconds regardless of how long the row is.
+
+    A ROW INTERRUPTED PARTWAY IS NOT MARKED AND DOES NOT COMMIT. The row stays
+    the unit that commits even though it is no longer the unit that encodes:
+    chunks written under a partially-embedded row's ``owner_id`` would make
+    ``select_unembedded``'s LEFT JOIN read it as done, and the rest of it would
+    never be asked for again. It stays at NULL and the next run re-embeds it
+    whole — one row of repeated work, against a row silently missing from the
+    index.
 
     A ROW THAT MOVED WHILE THE WORKER HELD IT IS NOT MARKED. Ingest sets
     ``embedding_state`` back to NULL and drops a row's vectors whenever its
@@ -2811,10 +2847,37 @@ def _embed_batch(
                 # crash to attribute and claiming it would be a lie about what
                 # this process was doing.
                 store.claim_embed_row(kind, row_id)
-                fresh = embedder.embed_documents([chunks[i] for i in missing])
+                # SLICED, SO THE STOP FLAG IS REACHABLE INSIDE THE ROW. This
+                # used to be one ``embed_documents`` call over every chunk of
+                # the row, and the flag was not read again until it returned —
+                # which made "the stop check is per row" a promise the longest
+                # rows could not keep. See ``_MAX_CHUNKS_PER_ENCODE``.
+                interrupted_mid_row = False
+                for at in range(0, len(missing), _MAX_CHUNKS_PER_ENCODE):
+                    if stop is not None and stop():
+                        interrupted_mid_row = True
+                        break
+                    part = missing[at : at + _MAX_CHUNKS_PER_ENCODE]
+                    fresh = embedder.embed_documents([chunks[i] for i in part])
+                    for i, vec in zip(part, fresh, strict=False):
+                        known[hashes[i]] = vec
                 store.release_embed_claim()
-                for i, vec in zip(missing, fresh, strict=False):
-                    known[hashes[i]] = vec
+                if interrupted_mid_row:
+                    # THE ROW IS PUT DOWN, NOT PUT AWAY. It is not appended to
+                    # ``ok_ids`` and nothing of it reaches ``all_vecs``, so
+                    # ``commit_embed_batch`` never sees a partial row: chunks
+                    # written under this ``owner_id`` would make
+                    # ``select_unembedded``'s LEFT JOIN read it as embedded and
+                    # the missing chunks would be unreachable forever. It stays
+                    # at NULL and the next run re-embeds it from scratch.
+                    #
+                    # The slices that DID encode stay in ``known``, which is
+                    # not a partial commit: that dict is keyed by content hash,
+                    # so it only ever writes a chunk on behalf of a row that
+                    # completes. If another row in this batch holds the same
+                    # text, the work is still saved.
+                    outcome.interrupted = True
+                    break
             vecs = [known[h] for h in hashes]
         except sqlite3.Error as e:
             # THE STORE FAILED, NOT THE ROW — round 3's M3. Two of the three

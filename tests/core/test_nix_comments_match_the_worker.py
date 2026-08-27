@@ -124,16 +124,18 @@ def test_the_module_does_not_call_a_row_short_enough_for_the_stop_window(sources
     So this pins two things: the comfort may not come back, and the gap must
     stay named.
     """
-    row_is_one_uninterruptible_call = (
-        "fresh = embedder.embed_documents([chunks[i] for i in missing])"
+    encode_is_interruptible = (
+        "for at in range(0, len(missing), _MAX_CHUNKS_PER_ENCODE):"
         in sources["cli"]
     )
-    assert row_is_one_uninterruptible_call, (
-        "aggregator/cli.py no longer encodes a whole row in one "
-        "embed_documents() call. If the encode became interruptible — a stop "
-        "the encoder itself can reach — then nix/aggregator.nix's "
-        "TimeoutStopSec comment describes a gap that has been closed, and both "
-        "it and this test need rewriting together."
+    assert encode_is_interruptible, (
+        "aggregator/cli.py no longer slices a row's encode, so the stop flag "
+        "is only read once the whole row returns from the model. That is the "
+        "86-minute window this comment used to document as an open gap: a "
+        "stop landing inside it escalates to SIGKILL, the claim survives, and "
+        "_blame_crashed_row condemns a good row. If the slicing was removed "
+        "deliberately, nix/aggregator.nix's TimeoutStopSec rationale has to go "
+        "back to naming the gap in the same commit."
     )
     nix = sources["nix"].lower()
     for comforting in _COMFORTING_ABOUT_ROW_LENGTH:
@@ -148,17 +150,20 @@ def test_the_module_does_not_call_a_row_short_enough_for_the_stop_window(sources
             f"SIGKILL, the claim survives, and _blame_crashed_row condemns a "
             f"good row."
         )
-    # Anchored on the evidence and the admission rather than on the prose
-    # around them, so rewording the paragraph does not fail the test but
-    # deleting either half does.
-    for required in ("257 chunks", "CURRENTLY UNFIXED"):
+    # Anchored on the evidence and on where the fix actually lives, rather
+    # than on the prose around them: rewording the paragraph does not fail
+    # this, deleting either half does.
+    for required in ("257 chunks", "_MAX_CHUNKS_PER_ENCODE"):
         assert required in sources["nix"], (
             f"nix/aggregator.nix no longer carries {required!r} beside "
-            f"TimeoutStopSec. Both halves have to stay: the measured worst "
+            f"TimeoutStopSec. Both halves have to stay. The measured worst "
             f"case is what makes 'a row is short' checkable rather than a "
-            f"matter of taste, and the admission is what stops the next "
-            f"reader concluding a stop mid-row is handled. If the corpus was "
-            f"re-measured, update this number here and there together; if the "
-            f"worker learned to interrupt an encode, delete the gap paragraph "
-            f"and this assertion in the same commit."
+            f"matter of taste — and it is still true, because 5min still does "
+            f"not cover an 86-minute row. What changed is that it stopped "
+            f"mattering, and the pointer to _MAX_CHUNKS_PER_ENCODE is the only "
+            f"thing that tells the next reader WHY: the safety is in the "
+            f"worker's sliced encode, not in this number. Lose that pointer "
+            f"and someone reasonably concludes the window is what protects "
+            f"them, then edits it. If the corpus was re-measured, update the "
+            f"number here and there together."
         )

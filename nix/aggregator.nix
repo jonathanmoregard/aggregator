@@ -871,30 +871,36 @@ in {
           # commit, the in-flight claim on the current row is released, and
           # the process exits cleanly.
           #
-          # A LONG ROW OUTLIVES THIS WINDOW, and nothing finite would change
-          # that. A row's encode is a single `embed_documents` call over all of
-          # that row's chunks, and nothing inside the call looks at the stop
-          # flag — the flag is only read once it returns. Measured read-only
-          # against the live cache at the chunker's `chunk-4000-400` geometry
-          # and the measured ~20 s per chunk: 1348 rows (1298 observations + 50
-          # records) each exceed 300 s in one call, and the largest single row
-          # is 257 chunks, about 86 minutes. So 5min is roughly three orders of
-          # magnitude under that tail. It is sized to bound a wedged worker
-          # (see FINITE below), never to let a long row finish.
+          # A LONG ROW STILL OUTLIVES THIS WINDOW, and that is now fine — but
+          # only because of something the worker does, not something this
+          # number does. Measured read-only against the live cache at the
+          # chunker's `chunk-4000-400` geometry and the measured ~20 s per
+          # chunk: 1348 rows (1298 observations + 50 records) each exceed 300 s
+          # of encoding, and the largest single row is 257 chunks, about 86
+          # minutes. So 5min is roughly three orders of magnitude under that
+          # tail. It is sized to bound a wedged worker (see FINITE below),
+          # never to let a long row finish.
           #
-          # That leaves a KNOWN, CURRENTLY UNFIXED gap. Stop the unit while one
-          # of those rows is encoding and systemd escalates to SIGKILL: the
-          # on-disk claim survives, the next run's `_blame_crashed_row` reads
-          # it as a crash and attributes it to that row, and the row is booked
-          # into the poison ledger. Three such stops make it terminal — a good
-          # row dropped from the vector arm permanently. Reproduced against a
-          # real spawned worker and a real SIGTERM→SIGKILL sequence, and it
-          # reproduces identically on `main`, so the batch-bounding work
-          # neither introduced it nor closed it. Changing this number does not
-          # close it either: nothing finite covers an unbounded call. The fix
-          # has to be inside the worker — a stop the encoder itself can reach,
-          # or a crash attribution that can tell a SIGKILL-at-stop from a row
-          # that genuinely killed the process.
+          # WHAT USED TO MAKE THAT A DATA-LOSS BUG. A row's encode was a single
+          # `embed_documents` call over all of its chunks, and nothing inside
+          # the call looked at the stop flag — it was only read once the call
+          # returned. Stop the unit mid-row and systemd escalated to SIGKILL:
+          # the claim survived, the next run's `_blame_crashed_row` read it as
+          # a crash and attributed it to that row, and three such stops made it
+          # terminal — a good row dropped from the vector arm permanently.
+          # Reproduced against a real spawned worker and a real SIGTERM→SIGKILL
+          # sequence.
+          #
+          # WHY THE FIX IS NOT HERE. Nothing finite covers an unbounded call:
+          # raising this past 86 minutes would stop it bounding a wedged worker
+          # at all, and with TimeoutStartSec=infinity above that makes a manual
+          # stop no longer the last bound on one. Shortening it spreads the same
+          # gap from the long tail to every routine stop. So the call stopped
+          # being unbounded instead: `cli.py` slices each row's encode at
+          # `_MAX_CHUNKS_PER_ENCODE` and reads the stop flag between slices, so
+          # a SIGTERM is answered within ~80 seconds however long the row is,
+          # and the row is put down — unmarked, uncommitted, still in the
+          # backlog — rather than held into a SIGKILL.
           #
           # What the window still PREVENTS. The claim a row leaves on disk is
           # the worker's crash detector: only code that runs can clear it, so a
