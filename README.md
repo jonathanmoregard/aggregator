@@ -120,6 +120,36 @@ re-ingest, no re-scrub, no `embedding_state` reset. `provenance` is deliberately
 re-run; putting it in the digest would re-run Presidio over the whole corpus
 (~11 hours at the measured 827 rows/min) and discard the observation vector arm.
 
+## Conjunction — free text is an AND, inside one turn
+
+Every term in the freeform part of a query is required, and by default all of
+them have to be found in a **single observation**. `obs_fts` holds one row per
+observation, so that has always been the unit; `scope:` v6 gives it a name and
+pins it, and adds the widening as something a caller asks for rather than
+something that happens to them.
+
+**A balanced double-quoted run is ONE term.** `"PR link"` means those two words
+next to each other; `PR link` means both words anywhere in the same turn. That
+distinction was being discarded before the query reached FTS5, and on this
+corpus it is the whole difference between a precise question and a useless one:
+measured read-only against the live cache, `"low usage cap"` went from the one
+right row to 156 rows with the right one at rank 118, and `"terraform state
+lock"` — a phrase the corpus does not contain anywhere — went from a clean
+nothing to 1,845 hits, because *state* and *lock* are ordinary words here and
+only the adjacency was ever selective. An UNBALANCED quote groups nothing: the
+phrase never closed, and guessing where it ends would invent a query nobody
+wrote.
+
+`scope:session` widens the unit so the terms may sit in **different turns of
+the same session**, hours apart — "which session covered both" rather than
+"which moment said it". It is never the default, because the moment is what a
+recall tool is asked for and a session here runs to hundreds of turns.
+
+When a multi-term query comes back empty the response's `notice` says what was
+ANDed, in what unit, and — when it is true — that the terms *do* all occur in
+some session and `scope:session` will show them. The index does **not** stem:
+`report` and `reports` are different terms.
+
 ## Ingest exit codes
 
 `aggregator ingest SOURCE` exits with one of four codes (defined in `aggregator/cli.py`):
