@@ -113,7 +113,7 @@ import os
 import re
 import sqlite3
 import zlib
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -2150,6 +2150,254 @@ def _wrap_snippet(stable_id: str, source: str, subject: str, snippet: str) -> st
     )
 
 
+# --- the payload ceiling (D3) -----------------------------------------------
+#
+# THERE WAS NO GOVERNOR. Grepping this module for size caps found the page-token
+# budget (``_frozen_over_budget``, ``_MAX_FROZEN_ID_CHARS``) and the
+# cross-encoder's 512-token pair budget, and neither bounds the response.
+# ``page_size`` bounds ROWS, and a single row can carry a whole compacted
+# session — which is how ``page_size=8`` returned 282,110 characters, overran
+# the tool output limit, and got spilled to a file the caller then had to jq.
+#
+# TRUNCATION HERE, REFUSAL FOR PAGE TOKENS, AND THE DIFFERENCE IS NOT TASTE.
+# ``_PageTokenError`` refuses an over-long token rather than truncating it,
+# because a truncated frozen set is plausible and wrong: it looks like a
+# working continuation while addressing different rows. A truncated body is
+# still the right body, and the caller can act on a short one — but only while
+# the cut is DECLARED. That is why ``truncated`` and ``content_length`` are
+# emitted on every item rather than only the cut ones, and why neither is
+# optional.
+
+#: The response ceiling, in characters of serialized JSON.
+#:
+#: DERIVED, NOT PICKED. The MCP client's default tool-output cap is 25 000
+#: tokens. This payload is JSON dense with UUIDs, which tokenizes at roughly
+#: 2.5 characters per token in the worst case measured here — so 62 500
+#: characters is break-even and 50 000 keeps ~20% of headroom. It is also
+#: comfortably under the 83,909-character response the field report watched
+#: spill, which is the only empirical upper bound anyone has on this client.
+_MAX_RESPONSE_CHARS = 50_000
+
+#: Said in the body as well as in the fields, because a caller that reads only
+#: ``content`` must still see the cut. The STRUCTURED fields are authoritative:
+#: this marker sits next to untrusted text and a body could forge it.
+_CONTENT_TRUNCATION_MARKER = "\n[truncated — see content_length]"
+
+_WRAP_OPEN_RE = re.compile(r'\A<ExternalContent source="[^"]*">\n')
+_WRAP_CLOSE = "\n</ExternalContent>"
+
+#: How many measure-allocate rounds the ceiling gets before it stops trying.
+#: Two is enough in practice — the first pass learns the real overhead, the
+#: second lands — and the third exists so an unforeseen term costs a bounded
+#: number of ``json.dumps`` calls rather than a loop that cannot exit.
+_CEILING_PASSES = 3
+
+
+def _payload_chars(result: dict[str, Any]) -> int:
+    """The response's size, measured on the artifact rather than estimated.
+
+    Same reasoning as ``_frozen_over_budget``: a budget enforced against a
+    proxy drifts away from the thing it is supposed to bound. Characters and
+    not bytes because that is the unit the failure was reported in, and
+    ``ensure_ascii=False`` because the transport is UTF-8 — counting an
+    ellipsis as six characters would bill for an escape nobody sends.
+    """
+    return len(json.dumps(result, default=str, ensure_ascii=False))
+
+
+def _truncate_content(content: str, budget: int) -> str:
+    """Cut ``content`` to at most ``budget`` characters, marker included.
+
+    WRAPPER-AWARE, BECAUSE SLICING THE STRING WOULD OPEN THE BOUNDARY. A
+    full-mode ``content`` is ``<ExternalContent source="…">…</ExternalContent>``
+    and a plain slice drops the closing tag, so everything the model reads
+    after that point falls outside the delimiters that mark it untrusted. The
+    body inside is cut instead and the wrapper re-closed around it.
+
+    The marker goes AFTER the closing tag — it is the server talking, and
+    server text inside an untrusted-content block is the confusion the block
+    exists to prevent.
+
+    Returns ``""`` when the budget cannot hold the wrapper and the marker
+    together. An ``<ExternalContent>`` block with nothing in it is the "looks
+    like content, holds none" shape M1 removed from summary mode, and the
+    item's ``truncated`` / ``content_length`` fields carry the fact either way.
+    """
+    marker = _CONTENT_TRUNCATION_MARKER
+    opening = _WRAP_OPEN_RE.match(content)
+    if opening and content.endswith(_WRAP_CLOSE):
+        head = opening.group(0)
+        body = content[len(head) : -len(_WRAP_CLOSE)]
+        floor = len(head) + len(_WRAP_CLOSE) + len(marker)
+        if budget <= floor:
+            return ""
+        return f"{head}{body[: budget - floor]}{_WRAP_CLOSE}{marker}"
+    if budget <= len(marker):
+        return ""
+    return content[: budget - len(marker)] + marker
+
+
+def _fair_share(lengths: Sequence[int], budget: int) -> list[int]:
+    """Max-min fair allocation of ``budget`` characters across ``lengths``.
+
+    A FLAT ``budget // n`` IS THE WRONG SPLIT and it is the obvious one. The
+    page that motivated this is one compacted session beside seven ordinary
+    turns: an equal split cuts all eight, so seven rows that would have fitted
+    whole get mangled to buy room for one that cannot fit at any size. Serving
+    the smallest asks first and re-dividing what they leave means a row is cut
+    only when the budget genuinely binds on it.
+    """
+    out = [0] * len(lengths)
+    remaining = max(0, budget)
+    left = len(lengths)
+    for i in sorted(range(len(lengths)), key=lambda j: lengths[j]):
+        take = min(lengths[i], remaining // left) if left else 0
+        out[i] = take
+        remaining -= take
+        left -= 1
+    return out
+
+
+def _truncation_notice(cut: int, total: int, ceiling: int) -> str:
+    return (
+        f"Payload ceiling: {cut} of {total} `content` fields were cut to keep "
+        f"this response under {ceiling} characters. Every item carries "
+        f"`truncated` and `content_length` (the body's TRUE size), on the cut "
+        f"rows and the whole ones alike. To read a cut body in full, re-call "
+        f"scoped to that row alone — session:<id> or a smaller page_size — "
+        f"rather than re-running this query at a larger size."
+    )
+
+
+def _envelope_notice(size: int, ceiling: int, rows: int, fits: int) -> str:
+    return (
+        f"Payload ceiling: this page is {size} characters against a {ceiling}-"
+        f"character ceiling, and its {rows} rows of ids and timestamps ALONE "
+        f"exceed the ceiling — so cutting bodies cannot bring it under, and "
+        f"every body has been dropped to nothing rather than half-shown. This "
+        f"is a page-size problem, not a body-size one: re-call with "
+        f"page_size={fits} or fewer, or narrow the query. Rows were NOT "
+        f"dropped; `total` and the page token are unaffected."
+    )
+
+
+def _apply_payload_ceiling(
+    result: dict[str, Any], max_chars: int | None = None
+) -> dict[str, Any]:
+    """Bound the response, declaring every cut. The one place it happens.
+
+    Runs at the single choke point every route passes through, after
+    ``_dispatch``, so all four result shapes are governed by one rule instead
+    of four that can drift.
+
+    ROWS ARE NEVER DROPPED. ``total``, ``has_more`` and the page token stay
+    exactly what the route computed, so a caller paging through a result set
+    still visits every row; only how much of each body it sees is negotiable.
+    Dropping rows here would silently disagree with the page token and hand
+    back a continuation that skips what it never showed.
+    """
+    if not result.get("ok"):
+        return result
+    items = [it for it in result.get("records") or [] if "content" in it]
+    originals = [it.get("content") or "" for it in items]
+    for item, original in zip(items, originals, strict=True):
+        item["content_length"] = len(original)
+        item["truncated"] = False
+    ceiling = _MAX_RESPONSE_CHARS
+    if max_chars is not None:
+        # ASKING FOR LESS IS A REQUEST; ASKING FOR MORE IS NOT. The server-side
+        # bound is the whole point of putting it on the server, so a caller
+        # cannot raise it — which is also what keeps this argument optional.
+        ceiling = max(0, min(int(max_chars), _MAX_RESPONSE_CHARS))
+    original_size = _payload_chars(result)
+    if original_size <= ceiling or not items:
+        return result
+
+    base_notice = result.get("notice")
+
+    def say(text: str) -> None:
+        """Lead with ``text``, keeping whatever the route already said.
+
+        Same order as every other notice site here: the new fact first,
+        because it describes what just happened to the payload in hand.
+        """
+        result["notice"] = f"{text} {base_notice}" if base_notice else text
+
+    lengths = [len(o) for o in originals]
+    content_total = sum(lengths)
+    # THE BUDGET IS MEASURED, NOT DERIVED, and it takes as many passes as that
+    # needs. Deriving it looked like arithmetic and was not: the overhead has
+    # to include JSON escaping, the ``notice`` key's own punctuation, and the
+    # length of the sentence explaining the trim — three terms that each cost
+    # a handful of characters and, missed, put the "bounded" response 13
+    # characters over its own ceiling. ``_frozen_over_budget`` learned the
+    # same lesson: ask the question of the exact bytes, of the artifact.
+    # ``slack`` carries any measured deficit into the next pass, so this
+    # converges instead of arguing.
+    slack = 0
+    for _ in range(_CEILING_PASSES):
+        # Installed at its LONGEST form (every row cut) before measuring, so
+        # the sentence lands inside the budget rather than on top of it.
+        say(_truncation_notice(len(items), len(items), ceiling))
+        for item, original in zip(items, originals, strict=True):
+            item["content"] = original
+            item["truncated"] = False
+        overhead = _payload_chars(result) - content_total
+        budget = ceiling - overhead - slack
+        if budget <= 0:
+            return _refuse_to_pretend(
+                result, items, say, original_size, ceiling
+            )
+        cut = 0
+        for item, original, keep in zip(
+            items, originals, _fair_share(lengths, budget), strict=True
+        ):
+            if keep >= len(original):
+                continue
+            item["content"] = _truncate_content(original, keep)
+            item["truncated"] = True
+            cut += 1
+        say(_truncation_notice(cut, len(items), ceiling))
+        actual = _payload_chars(result)
+        if actual <= ceiling:
+            return result
+        slack += actual - ceiling
+    # Three passes that each measured a deficit means the model of the payload
+    # is wrong, not tight. Say so rather than return an unbounded page under a
+    # notice claiming a ceiling.
+    return _refuse_to_pretend(result, items, say, original_size, ceiling)
+
+
+def _refuse_to_pretend(
+    result: dict[str, Any],
+    items: list[dict[str, Any]],
+    say: Any,
+    size: int,
+    ceiling: int,
+) -> dict[str, Any]:
+    """The case cutting bodies cannot fix: the row metadata is itself over.
+
+    A 200-row page costs ~73 000 characters of ids and timestamps before any
+    body at all, so there are pages no content budget can rescue. Dropping
+    rows here is not the answer — the page token and ``total`` would then
+    disagree with what came back, which is the "plausible but wrong" failure
+    the page-token path refuses outright — so every body goes to nothing and
+    the response says why, with the remediation that does work.
+    """
+    for item in items:
+        item["content"] = ""
+        item["truncated"] = True
+    say(_envelope_notice(size, ceiling, len(items), 1))
+    stripped = _payload_chars(result)
+    say(
+        _envelope_notice(
+            size, ceiling, len(items),
+            max(1, len(items) * ceiling // max(1, stripped)),
+        )
+    )
+    return result
+
+
 def _record_to_item(r: Record, fields: str) -> dict[str, Any]:
     # M1: summary mode has no body, so don't wrap it — an empty
     # <ExternalContent> is cosmetically misleading. Subject already shows
@@ -2364,6 +2612,7 @@ def aggregator_query(
     drilldown: bool = False,
     rerank: bool = False,
     search_mode: str = "hybrid",
+    max_chars: int | None = None,
     _store: Store | None = None,
     _log_misses: bool = False,
 ) -> dict[str, Any]:
@@ -2460,6 +2709,10 @@ def aggregator_query(
               Ignored by pure-filter queries (no free text) — they run no
               retrieval arm at all, and the response then carries no
               ``search_mode`` key rather than claiming one.
+      max_chars: ask for a SMALLER response than the default ceiling. It can
+              only lower the bound, never raise it: the server caps every
+              response regardless, because ``page_size`` bounds rows and one
+              row can carry an entire compacted session.
 
     Free text is answered by a hybrid retriever — keyword (FTS5) and semantic
     (vector) arms fused with RRF — whenever the vector index has been built on
@@ -2486,6 +2739,25 @@ def aggregator_query(
       * ``sessions`` — one card per matching session, with
         ``matching_observations``. Homogeneous.
       * ``observations`` — raw turns, from ``drilldown=True``. Homogeneous.
+
+      EVERY ITEM CARRIES ``truncated`` AND ``content_length``, always, whether
+      or not anything was cut. The response is held under a server-side
+      character ceiling that is independent of ``page_size`` — ``page_size``
+      bounds ROWS, and one row can hold a whole compacted session — and when a
+      page would overrun it, individual ``content`` fields are shortened
+      rather than rows being dropped. ``content_length`` is then the body's
+      TRUE size, so ``content_length > len(content)`` is exactly the set of
+      bodies you are only seeing part of. To read one of those in full,
+      re-call scoped to that single row (``session:<id>``, or a smaller
+      ``page_size``); re-running the same query bigger gets you the same cut.
+      ``total`` and the page token are never affected by the ceiling.
+
+      In summary mode ``content`` is a bounded snippet of the body that
+      matched, centred on the first query-term hit, matched terms marked
+      ``[[like this]]`` and elisions marked ``…``. It is usually enough to
+      answer with, and it is the reason ``fields='full'`` should be a
+      deliberate second step for specific rows rather than the default next
+      move.
 
       ``rerank_applied`` appears only when ``rerank=True`` was requested, and
       is ``False`` when the ordering you received is NOT reranked — the model
@@ -2651,9 +2923,12 @@ def aggregator_query(
 
     mode = _route_mode(ast)
     try:
-        result = _dispatch(
-            store, ast, mode, fields, page_size, cursor, drilldown, rerank,
-            fingerprint, search_mode,
+        result = _apply_payload_ceiling(
+            _dispatch(
+                store, ast, mode, fields, page_size, cursor, drilldown, rerank,
+                fingerprint, search_mode,
+            ),
+            max_chars,
         )
         # ZERO-RESULT LOGGING, at the one place every route passes through —
         # AND OFF UNLESS THE CALLER IS A WRITER. ``_log_misses`` defaults to
@@ -3504,6 +3779,7 @@ async def _tool_aggregator_query(
     drilldown: bool = False,
     rerank: bool = False,
     search_mode: str = "hybrid",
+    max_chars: int | None = None,
 ) -> dict[str, Any]:
     return aggregator_query(
         dsl=dsl,
@@ -3513,6 +3789,7 @@ async def _tool_aggregator_query(
         drilldown=drilldown,
         rerank=rerank,
         search_mode=search_mode,
+        max_chars=max_chars,
     )
 
 
