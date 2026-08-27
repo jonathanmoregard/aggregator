@@ -600,6 +600,25 @@ def test_the_frozen_set_is_large_enough_and_covers_every_shape():
     assert len(quoted) >= 8, [p.id for p in quoted]
 
 
+def test_every_frozen_pair_names_the_criterion_to_blame_first():
+    """THE ATTRIBUTION COLUMN IS NOT DECORATIVE, and this is what keeps it from
+    rotting into a free-text field nobody maintains.
+
+    Six of the mined pairs move by exactly zero under criterion D — every one
+    is a single conjunct or unquoted, so there is no phrase to restore — and
+    their remedy is criterion C's. A suite that cannot say which is which
+    credits a change with a gain it did not produce, which is the failure the
+    mission's own sequencing rule was written to prevent.
+    """
+    known = {"A", "B", "C", "D", "—"}
+    for pair in (*TOP5, *ABSTENTIONS):
+        parts = pair.criterion.split("+")
+        assert parts and all(p in known for p in parts), pair
+    named = {p for pair in (*TOP5, *ABSTENTIONS)
+             for p in pair.criterion.split("+")}
+    assert {"A", "B", "C", "D"} <= named, named
+
+
 # ---------------------------------------------------------------------------
 # Abstention: nothing answers it, and the page says so.
 # ---------------------------------------------------------------------------
