@@ -18,6 +18,7 @@ adding a third ``fields='snippet'`` mode.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -139,6 +140,19 @@ def test_the_snippet_is_centred_on_the_hit_not_taken_from_the_head(store):
     assert "preamble that says nothing useful preamble" not in inner[:40], inner
 
 
+def test_the_snippet_does_not_open_mid_word(store):
+    """A window sliced at a fixed offset starts "…hether the timer should",
+    which reads as corruption rather than as elision."""
+    result = _obs_rows(store)
+    buried = next(r for r in result["records"] if r["obs_id"] == "o-buried")
+    inner = _inner(buried["content"])
+    assert inner.startswith("…"), inner
+    first_word = inner.lstrip("…").split(" ", 1)[0]
+    assert first_word in _BURIED.split(), (
+        f"snippet opens on a word fragment: {first_word!r}"
+    )
+
+
 def test_the_snippet_is_wrapped_as_untrusted_content(store):
     """Summary mode now returns real body text, so the boundary rule applies.
 
@@ -245,3 +259,38 @@ def test_full_mode_still_returns_the_whole_body(store):
     )
     answer = next(r for r in result["records"] if r["obs_id"] == "o-answer")
     assert _ANSWER in answer["content"], answer["content"]
+
+
+# --- the acceptance test, end to end --------------------------------------
+
+
+def test_the_question_is_answerable_in_one_call_without_spilling(store):
+    """THE WHOLE POINT, asserted as one thing rather than as its parts.
+
+    "When did the user first ask for clickable PR links in status reports?"
+    cost six calls, two output-limit spills and ~40k tokens, and returned
+    nothing usable — while the correct row sat ranked first with
+    ``content: ""``. One call, summary mode, oldest-first orderable, small
+    enough to read inline.
+    """
+    result = mcp.aggregator_query(
+        dsl='source:sessions type:user "clickable links"',
+        fields="summary", drilldown=True, _store=store,
+    )
+    assert result["ok"] is True, result
+
+    # Readable inline: the answer is in the response, not behind a re-call.
+    answer = next(r for r in result["records"] if r["obs_id"] == "o-answer")
+    assert "[[clickable]]" in answer["content"], answer["content"]
+    assert "[[links]]" in answer["content"], answer["content"]
+
+    # Oldest-first orderable: every row still carries its timestamp.
+    assert all(r["ts"] for r in result["records"]), result["records"]
+
+    # No spill, and nothing was cut to achieve that.
+    assert _payload(result) <= mcp._MAX_RESPONSE_CHARS, _payload(result)
+    assert all(r["truncated"] is False for r in result["records"]), result
+
+
+def _payload(result) -> int:
+    return len(json.dumps(result, default=str, ensure_ascii=False))

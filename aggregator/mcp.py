@@ -113,7 +113,7 @@ import os
 import re
 import sqlite3
 import zlib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -2090,6 +2090,28 @@ def _snippet_pattern(terms: tuple[str, ...]) -> re.Pattern[str] | None:
     )
 
 
+#: How far the window may move to land on a word boundary. A window sliced at
+#: a fixed offset opens mid-word ("…hether the timer should be"), which reads
+#: as corruption rather than as elision and costs a beat to parse — on a
+#: surface whose entire job is being read at a glance. Bounded so the snap
+#: gives up rather than eat a meaningful run of text: longer than any ordinary
+#: word, shorter than a clause.
+_SNIPPET_WORD_SNAP = 24
+
+
+def _snap_to_words(window: str, cut_head: bool, cut_tail: bool) -> str:
+    """Trim partial words off whichever end of ``window`` was cut."""
+    if cut_head:
+        space = window.find(" ")
+        if 0 <= space <= _SNIPPET_WORD_SNAP and window[space + 1 :].strip():
+            window = window[space + 1 :]
+    if cut_tail:
+        space = window.rfind(" ")
+        if space >= len(window) - _SNIPPET_WORD_SNAP and window[:space].strip():
+            window = window[:space]
+    return window
+
+
 def _snippet(body: str | None, terms: tuple[str, ...]) -> str:
     """A bounded excerpt of ``body``, centred on its first query-term hit.
 
@@ -2119,6 +2141,9 @@ def _snippet(body: str | None, terms: tuple[str, ...]) -> str:
         start = hit.start() - slack // 2
     start = max(0, min(start, max(0, len(text) - _SNIPPET_CHARS)))
     window = text[start : start + _SNIPPET_CHARS]
+    cut_head = start > 0
+    cut_tail = start + _SNIPPET_CHARS < len(text)
+    window = _snap_to_words(window, cut_head, cut_tail)
     if pattern is not None:
         window = pattern.sub(
             lambda m: (
@@ -2126,8 +2151,8 @@ def _snippet(body: str | None, terms: tuple[str, ...]) -> str:
             ),
             window,
         )
-    prefix = _SNIPPET_ELLIPSIS if start > 0 else ""
-    suffix = _SNIPPET_ELLIPSIS if start + _SNIPPET_CHARS < len(text) else ""
+    prefix = _SNIPPET_ELLIPSIS if cut_head else ""
+    suffix = _SNIPPET_ELLIPSIS if cut_tail else ""
     return f"{prefix}{window}{suffix}"
 
 
@@ -2371,7 +2396,7 @@ def _apply_payload_ceiling(
 def _refuse_to_pretend(
     result: dict[str, Any],
     items: list[dict[str, Any]],
-    say: Any,
+    say: Callable[[str], None],
     size: int,
     ceiling: int,
 ) -> dict[str, Any]:
@@ -3425,6 +3450,7 @@ def _query_union_path(
     window = window[:page_size]
 
     items: list[dict[str, Any]] = []
+    terms = _snippet_terms(query_text)
     for _ts, kind, obj in window:
         if kind == "record":
             items.append(_record_to_item(_scrub_record(obj), fields))
@@ -3436,7 +3462,7 @@ def _query_union_path(
             session_scoped = _count_scope_for(sess_ast, obj)
             match_count = store.count_observations(session_scoped)
             preview = _session_body_preview(
-                store, session_scoped, fields, subject, _snippet_terms(query_text)
+                store, session_scoped, fields, subject, terms
             )
             items.append(
                 _session_to_item(obj, fields, subject, match_count, preview)
