@@ -989,6 +989,65 @@ def test_the_card_page_is_headed_by_hook_sessions_whose_subject_is_a_prompt(
 # ---------------------------------------------------------------------------
 
 
+def test_the_two_display_budgets_are_pinned_at_their_measured_numbers():
+    """EVERY BOUND IN THIS FILE IS WRITTEN AGAINST THESE TWO CONSTANTS, so
+    raising either would loosen the whole suite in silence — which is exactly
+    how a governor stops governing. Both were derived rather than picked, and
+    the derivation belongs beside the number.
+
+    ``_SNIPPET_CHARS`` — at ~3.4 characters per token, measured on this
+    corpus's own JSON payloads, 200 characters is ~60 tokens per row, so a
+    20-row page costs ~1 200 tokens of body: readable inline with the task
+    still in hand.
+
+    ``_MAX_RESPONSE_CHARS`` — the client's 25 000-token output cap times ~2.5
+    characters per token for UUID-dense JSON is a 62 500-character break-even,
+    less 20% headroom.
+    """
+    assert mcp._SNIPPET_CHARS == 200
+    assert mcp._MAX_RESPONSE_CHARS == 50_000
+
+
+def test_a_page_of_oversized_bodies_is_bounded_and_every_cut_is_declared(corpus):
+    """``page_size`` bounds ROWS. Two rows here are 353 000 and 76 000
+    characters, so a page of two is 429 KB before the envelope — which is how
+    ``page_size=8`` produced a 282 110-character spill in the field report.
+
+    Both are cut, both declare it, and both report the length of the body that
+    EXISTS rather than of what came back. Truncation is the opposite call from
+    the one this module makes for page tokens, where it refuses rather than
+    truncates; the declaration is the only thing that keeps it honest.
+    """
+    result = mcp.aggregator_query(
+        dsl="source:sessions type:user terraform", fields="full",
+        drilldown=True, page_size=8, _store=corpus,
+    )
+    assert result["ok"] is True, result
+    assert sorted(_ids(result)) == ["o-drift", "o-skill-llm-apps"]
+    assert _payload(result) <= mcp._MAX_RESPONSE_CHARS, _payload(result)
+
+    lengths = {r["obs_id"]: r["content_length"] for r in result["records"]}
+    assert lengths["o-skill-llm-apps"] >= len(_SKILL_BODY)
+    assert lengths["o-drift"] >= len(_DRIFT_BODY)
+    for row in result["records"]:
+        assert row["truncated"] is True, row["obs_id"]
+        assert len(row["content"]) < row["content_length"]
+        assert row["content"].count("<ExternalContent") == 1
+        assert "</ExternalContent>" in row["content"]
+        # The in-band marker sits OUTSIDE the closed wrapper: it is the tool's
+        # own words about the row, and putting it inside would file the
+        # server's statement as untrusted body text.
+        assert row["content"].index(mcp._CONTENT_TRUNCATION_MARKER) > row[
+            "content"
+        ].index("</ExternalContent>")
+
+    # One giant row must not starve the other: fair-share gives every row what
+    # it asks for until the budget binds, and only then splits the remainder.
+    assert min(len(r["content"]) for r in result["records"]) > 1000, [
+        (r["obs_id"], len(r["content"])) for r in result["records"]
+    ]
+
+
 def test_a_page_carrying_the_giant_body_stays_under_the_ceiling(corpus):
     """``fn-permission-prompts`` in one call: a 388-character answer sitting
     behind a 342 459-character skill body, so ``page_size=2`` was already a
