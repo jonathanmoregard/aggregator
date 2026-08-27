@@ -770,8 +770,32 @@ _DDL: list[str] = [
         INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
     END;
     """,
+    # ``OF body`` IS THE WHOLE POINT, and it is not a micro-optimisation.
+    #
+    # Without the column list this fires on ANY update to ANY column — an
+    # ``embedding_state`` flip, a ``provenance`` stamp — and each firing is a
+    # full FTS5 ``'delete'`` plus re-insert of the entire body. With
+    # ``auto_vacuum=0`` the pages that frees are never handed back, which is the
+    # same mechanism documented at the ingest UPSERT below. Measured on a
+    # throwaway database at 1/5 of live scale: a chunked column-only UPDATE ran
+    # 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth narrow.
+    # Extrapolated to the live 549,952 rows that is 12x wall clock and
+    # 380-640 MB of permanent bloat on a 1.4 GB file.
+    #
+    # IT INDEXES EXACTLY AS MUCH AS BEFORE. SQLite fires ``UPDATE OF body``
+    # whenever ``body`` appears in the SET clause, whether or not the value
+    # actually moved, and the ingest UPSERT always names ``body =
+    # excluded.body``. Pinned by ``tests/core/test_store_fts_trigger_narrowing
+    # .py::test_upsert_keeps_the_fts_index_correct``, which matches a sentinel
+    # token through the real upsert rather than restating this paragraph.
+    #
+    # ``IF NOT EXISTS`` will NOT replace a trigger that is already there, so
+    # every database created before this change needs ``_ensure_narrow_fts_
+    # update_trigger`` to drop the wide one first — and those are the databases
+    # the narrowing is for.
     """
-    CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations
+    CREATE TRIGGER IF NOT EXISTS observations_au
+    AFTER UPDATE OF body ON observations
     BEGIN
         INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
         INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
@@ -1378,6 +1402,7 @@ class Store:
         self._ensure_sessions_origin_column(c)
         self._ensure_src_hash_columns(c)
         self._ensure_embedding_state_columns(c)
+        self._ensure_narrow_fts_update_trigger(c)
         for stmt in _DDL:
             c.executescript(stmt)
         if self._vector_available:
@@ -1880,6 +1905,35 @@ class Store:
         """
         Store._ensure_column(c, "observations", "embedding_state", "TEXT")
         Store._ensure_column(c, "records", "embedding_state", "TEXT")
+
+    @staticmethod
+    def _ensure_narrow_fts_update_trigger(c: sqlite3.Connection) -> None:
+        """Replace a wide ``observations_au`` with the ``OF body`` form.
+
+        DROP AND LET THE DDL PASS RE-CREATE IT, because
+        ``CREATE TRIGGER IF NOT EXISTS`` does not replace an existing trigger —
+        it is a no-op against one — so shipping the narrow text in ``_DDL``
+        alone would fix only databases that do not exist yet. Precedent for
+        dropping a trigger by name is in ``_DROP_ALL``.
+
+        PROBES THE ARTIFACT, NOT ``user_version``, for the same reason every
+        ``_ensure_*`` helper above does: the stored SQL is the thing that
+        decides how the trigger behaves, and a half-applied state (trigger
+        replaced, version stale, or the reverse) must converge rather than skip.
+        No-op when the trigger is already narrow, and when it is absent
+        entirely — a fresh database gets it from ``_DDL``.
+
+        Must run BEFORE the ``_DDL`` pass, which is what puts the new one back.
+        """
+        row = c.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'observations_au'"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return
+        if "UPDATE OF body" in row[0]:
+            return
+        c.execute("DROP TRIGGER observations_au")
 
     def schema_version(self) -> int:
         """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
