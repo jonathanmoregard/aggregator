@@ -20,7 +20,7 @@ import sqlite3
 
 import pytest
 
-from aggregator.core.store import CacheUnavailableError, Store
+from aggregator.core.store import SCHEMA_VERSION, CacheUnavailableError, Store
 
 
 @pytest.fixture
@@ -59,7 +59,7 @@ def test_a_writable_store_still_creates_its_cache(tmp_path):
     """Only the read-only path may refuse — ingest is what CREATES the cache."""
     store = Store(db_path=tmp_path / "cache.db")
     store.migrate()
-    assert store.schema_version() == 5
+    assert store.schema_version() == SCHEMA_VERSION
 
 
 def test_a_present_cache_is_unaffected(tmp_path):
@@ -67,7 +67,7 @@ def test_a_present_cache_is_unaffected(tmp_path):
     Store(db_path=db).migrate()
     reader = Store(db_path=db, read_only=True)
     assert reader.vector_available in (True, False)
-    assert reader.schema_version() == 5
+    assert reader.schema_version() == SCHEMA_VERSION
 
 
 def test_the_mcp_surface_reports_a_missing_cache_as_a_structured_refusal(

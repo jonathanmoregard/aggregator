@@ -114,7 +114,7 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class VectorIndexUnavailableError(RuntimeError):
@@ -726,6 +726,22 @@ _DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS sessions_last_ts ON sessions(last_ts);",
     "CREATE INDEX IF NOT EXISTS sessions_origin ON sessions(origin);",
     # --- v2: observations (Langfuse "observation") --------------------
+    #
+    # ``provenance`` (v6) SAYS WHO COMPOSED THE TEXT, which ``type`` does not:
+    # ``type`` is the channel a line arrived on, and 59% of ``type='user'`` rows
+    # were written by a machine. It holds one of the five members of
+    # ``aggregator.core.provenance.PROVENANCE_VALUES``. NULL means NOT YET
+    # CLASSIFIED and is the backfill's cursor, exactly as
+    # ``embedding_state IS NULL`` is the embed worker's — never ``'unknown'``,
+    # which would collapse "we looked and could not tell" into "nobody looked".
+    #
+    # THE PROSE LIVES OUT HERE RATHER THAN INSIDE THE STATEMENT because
+    # sqlite_schema stores the CREATE TABLE text verbatim and SQLite re-parses
+    # it with a reduced tokenizer on ``ALTER TABLE ... DROP COLUMN``. Measured:
+    # a multi-line ``--`` block in front of the LAST column made that reparse
+    # fail with "incomplete input" on SQLite 3.50.4 (and not on 3.53.3), which
+    # would strand a future migration on the live database for the sake of a
+    # comment. Column notes inside the statement stay to one trailing line.
     """
     CREATE TABLE IF NOT EXISTS observations (
         obs_id           TEXT PRIMARY KEY,
@@ -743,12 +759,18 @@ _DDL: list[str] = [
         src_hash         TEXT,         -- v4; see ``_src_hash``
         -- v5. NULL means "not embedded yet" and is what the background embed
         -- worker selects on; 'ok' / 'skip' / 'error' are terminal.
-        embedding_state  TEXT
+        embedding_state  TEXT,
+        provenance       TEXT          -- v6; see aggregator.core.provenance
     );
     """,
     "CREATE INDEX IF NOT EXISTS obs_root_ts ON observations(root_session_id, ts);",
     "CREATE INDEX IF NOT EXISTS obs_session_ts ON observations(session_id, ts);",
     "CREATE INDEX IF NOT EXISTS obs_type ON observations(type);",
+    # WITHOUT THIS THE BACKFILL IS QUADRATIC. Its chunk is
+    # ``WHERE provenance IS NULL LIMIT n``, and unindexed that scans past every
+    # row already classified — 1,100 chunks over 549,952 rows, each starting
+    # further in than the last. Indexed it is a seek. It also serves ``by:``.
+    "CREATE INDEX IF NOT EXISTS obs_provenance ON observations(provenance);",
     # FTS5 external-content over observations.body. Sync via triggers below.
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
@@ -1402,6 +1424,7 @@ class Store:
         self._ensure_sessions_origin_column(c)
         self._ensure_src_hash_columns(c)
         self._ensure_embedding_state_columns(c)
+        self._ensure_provenance_column(c)
         self._ensure_narrow_fts_update_trigger(c)
         for stmt in _DDL:
             c.executescript(stmt)
@@ -1907,6 +1930,34 @@ class Store:
         Store._ensure_column(c, "records", "embedding_state", "TEXT")
 
     @staticmethod
+    def _ensure_provenance_column(c: sqlite3.Connection) -> None:
+        """v5 → v6 in-place upgrade: add ``observations.provenance``.
+
+        NULL FOR EVERY EXISTING ROW, and that is the contract — the same one
+        ``_ensure_embedding_state_columns`` states one method up. NULL means
+        "not classified yet" and is what the standalone backfill selects on, so
+        a pre-v6 corpus comes out of this migration QUEUED FOR CLASSIFICATION.
+        A non-NULL default would make every row claim an authorship no
+        classifier ever assigned it, and the backfill would find nothing to do.
+
+        Metadata-only: ``ADD COLUMN`` with no default rewrites no page.
+        Measured on a throwaway database at 1/5 of live scale at **0.006 s**
+        and +4 KB — the column is free. What is not free is UPDATING it, which
+        is why the FTS trigger narrowing (see
+        :meth:`_ensure_narrow_fts_update_trigger`) ships in the same change.
+
+        NOTHING BACKFILLS HERE, deliberately. ``migrate()`` runs on every
+        subcommand including read-only queries; a classification pass over
+        549,952 rows behind an ``aggregator query`` would be exactly the
+        hours-long surprise this schema style exists to abolish. The pass is
+        ``aggregator provenance --backfill``, which is resumable and chunked.
+
+        Must run BEFORE the ``_DDL`` pass, which creates an index ON
+        ``provenance`` that cannot exist against a v5-shaped table.
+        """
+        Store._ensure_column(c, "observations", "provenance", "TEXT")
+
+    @staticmethod
     def _ensure_narrow_fts_update_trigger(c: sqlite3.Connection) -> None:
         """Replace a wide ``observations_au`` with the ``OF body`` form.
 
@@ -2170,6 +2221,26 @@ class Store:
                     ),
                 )
             elif isinstance(e, ObservationRow):
+                # ``provenance`` IS DELIBERATELY ABSENT FROM THIS DIGEST, and
+                # the ``SCRUB_FINGERPRINT`` comment above actively invites the
+                # opposite — so this says no in the place someone would say yes.
+                #
+                # A classifier is not a scrubber. Putting its output in here,
+                # or adding a PROVENANCE_FINGERPRINT beside SCRUB_FINGERPRINT,
+                # would make every classifier revision change all 549,952
+                # digests. The next ingest then takes the ``DO UPDATE`` branch
+                # for every row, which re-runs Presidio on each — ~11 hours at
+                # this repo's measured 827 rows/min — and sets
+                # ``embedding_state = NULL`` a few lines below, discarding the
+                # observation vector arm. That costs nothing TODAY only because
+                # that arm is still cold; the moment the embed backlog reaches
+                # observations the same edit silently throws away weeks of CPU.
+                #
+                # The correct wiring is what is here: provenance is written on
+                # INSERT and on the ``DO UPDATE`` branch (which is rewriting the
+                # row anyway), and is otherwise owned by
+                # ``aggregator provenance --backfill``, whose cursor is
+                # ``provenance IS NULL``.
                 digest = _src_hash(
                     SCRUB_FINGERPRINT,
                     e.obs_id,
@@ -2202,9 +2273,9 @@ class Store:
                     INSERT INTO observations(
                         obs_id, session_id, root_session_id, parent_obs_id,
                         type, ts, model, input_tokens, output_tokens,
-                        tool_name, tool_use_id, body, src_hash
+                        tool_name, tool_use_id, body, src_hash, provenance
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(obs_id) DO UPDATE SET
                         session_id      = excluded.session_id,
                         root_session_id = excluded.root_session_id,
@@ -2218,6 +2289,11 @@ class Store:
                         tool_use_id     = excluded.tool_use_id,
                         body            = excluded.body,
                         src_hash        = excluded.src_hash,
+                        -- The body moved, so who wrote it is worth re-stating
+                        -- from the source that just produced it. Reached ONLY
+                        -- when the digest moved, which provenance is not part
+                        -- of — a classifier revision alone never gets here.
+                        provenance      = excluded.provenance,
                         -- BACK INTO THE EMBED BACKLOG. The body just changed,
                         -- so any vector held for this row describes text that
                         -- is no longer here. ``observations_au`` keeps obs_fts
@@ -2242,6 +2318,7 @@ class Store:
                         e.tool_use_id,
                         scrubbed_body,
                         digest,
+                        e.provenance,
                     ),
                 )
                 # ONLY for a row that already existed. A brand-new obs_id has
@@ -5317,6 +5394,12 @@ def _row_to_observation(row: sqlite3.Row) -> ObservationRow:
         tool_name=row["tool_name"],
         tool_use_id=row["tool_use_id"],
         body=row["body"] or "",
+        # v6. Carried so the MCP can put it on the row beside the snippet —
+        # a caller seeing ``provenance: hook`` next to a hit knows why it is
+        # there, which is the whole legibility win. NULL stays NULL: it means
+        # "not classified yet", and coercing it to 'human' on the way out
+        # would turn an unrun backfill into a corpus-wide authorship claim.
+        provenance=row["provenance"],
     )
 
 

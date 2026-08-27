@@ -96,6 +96,14 @@ class ObservationRow:
     collapsed: first text block into ``body``, first tool_use/tool_result
     block into ``tool_name``/``tool_use_id``. Documented SOTA row-per-message
     shape.
+
+    v6: ``provenance`` says WHO COMPOSED THE TEXT, which ``type`` does not —
+    ``type='user'`` is the channel a line arrived on, and 59% of the rows on
+    that channel were written by a machine. See
+    :mod:`aggregator.core.provenance` for the enum and why ``human`` is a
+    residual rather than a claim. Kept LAST with a default so every existing
+    keyword constructor stays valid; ``None`` means "not classified here" and
+    the standalone backfill owns those rows.
     """
 
     obs_id: str              # message uuid
@@ -110,6 +118,7 @@ class ObservationRow:
     tool_name: str | None
     tool_use_id: str | None
     body: str
+    provenance: str | None = None  # v6; see aggregator.core.provenance
 
 
 # Type alias for the tagged-union yield from ``Source.iter_entities``.
