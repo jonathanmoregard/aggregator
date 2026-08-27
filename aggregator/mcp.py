@@ -2113,7 +2113,7 @@ def _provenance_notice(items: Sequence[dict[str, Any]]) -> str | None:
         parts.append(
             f"{unknown} of {len(items)} rows are NOT YET CLASSIFIED "
             f"(`provenance: null`), so nothing is claimed about who wrote them "
-            f"and no `by:` filter can match them. Run "
+            f"and every `by:` filter excludes them. Run "
             f"`aggregator provenance --backfill` to classify the corpus."
         )
     return " ".join(parts) if parts else None
@@ -2134,9 +2134,9 @@ def _note_provenance(
     notice = _provenance_notice(items)
     if not items and ast.provenance and store.has_unclassified_observations():
         notice = (
-            f"`by:{ast.provenance}` matched nothing, and the corpus is not "
-            f"fully classified: rows whose `provenance` is still null match no "
-            f"`by:` filter at all, so this empty page may mean "
+            f"`by:{ast.provenance}` selected nothing, and the corpus is not "
+            f"fully classified: rows whose `provenance` is still null are "
+            f"excluded by every `by:` filter, so this empty page may mean "
             f"'not classified yet' rather than 'never said'. Run "
             f"`aggregator provenance --backfill`, or drop `by:` to see every "
             f"row."

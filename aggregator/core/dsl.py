@@ -227,8 +227,9 @@ def format_help(
         f"{'|'.join(BY_VALUES)}. 'machine' is any of "
         f"{'/'.join(v for v in PROVENANCE_VALUES if v != 'human')}; 'human' is "
         f"a residual (nothing claimed a machine wrote it), never a positive "
-        f"identification. Absent = no filter. Rows not yet classified match "
-        f"NO value of by: — run `aggregator provenance --backfill`."
+        f"identification. Absent = no filter. Rows not yet classified are "
+        f"excluded by EVERY value of by: — run "
+        f"`aggregator provenance --backfill`."
     )
     lines.append(
         "  active:LO..HI  sessions whose activity window overlaps [LO, HI] "
