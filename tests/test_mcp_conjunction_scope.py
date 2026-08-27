@@ -302,6 +302,50 @@ def test_scope_widens_the_keyword_arm_of_the_fused_scope(store, monkeypatch):
     assert scope == frozenset({"o-both", "o-early", "o-late"})
 
 
+# --- the widening is computed once per response, not once per card ----------
+
+
+def test_a_session_card_page_computes_the_widening_once(store, monkeypatch):
+    """``matching_observations`` is computed per CARD and ``page_size`` defaults
+    to 200, so an unmemoised widening recomputes one answer 200 times. Measured
+    on the live cache: 1.76 s per call against 0.06 s unwidened — about six
+    minutes for one page."""
+    ro = Store(db_path=store.db_path, read_only=True)
+    calls: list[str] = []
+    real = Store._compute_session_hit_scope
+    monkeypatch.setattr(
+        Store, "_compute_session_hit_scope",
+        lambda self, text, *a: (calls.append(text), real(self, text, *a))[1],
+    )
+    result = _query(
+        ro, "source:sessions type:user scope:session green pull request",
+        drilldown=False,
+    )
+    assert len(result["records"]) == 2
+    assert all(r["matching_observations"] for r in result["records"])
+    assert len(calls) == 1, calls
+
+
+def test_a_writable_store_never_serves_a_memoised_answer(store):
+    """A cache is a promise the answer has not changed, and a store that can
+    write cannot make it about itself."""
+    before = _query(
+        store, "source:sessions type:user scope:session green pull request"
+    )
+    store.upsert_entities(
+        [
+            _sess("sess-new"),
+            _obs("o-new-1", "sess-new", "the build is green again"),
+            _obs("o-new-2", "sess-new", "raise the pull request", seconds=600),
+        ]
+    )
+    after = _query(
+        store, "source:sessions type:user scope:session green pull request"
+    )
+    assert after["total"] > before["total"]
+    assert "o-new-1" in {r["obs_id"] for r in after["records"]}
+
+
 # --- records are untouched --------------------------------------------------
 
 

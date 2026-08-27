@@ -95,10 +95,10 @@ import logging
 import os
 import re
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -465,6 +465,12 @@ def _json_id_clause(column: str) -> str:
 #:   position, quoted or not. The safety property — "the only thing that
 #:   reaches MATCH is quoted word characters" — is unchanged.
 _FTS5_TOKEN_RE = re.compile(r"\w+")
+
+#: How many distinct ``scope:session`` intersections one read-only store keeps.
+#: A single request asks one or two distinct questions of it — the page and its
+#: per-card counts — so this is a guard against unbounded growth on a store
+#: somebody holds open, not a working set to tune.
+_SESSION_SCOPE_MEMO_MAX = 8
 
 
 def fts5_match_conjuncts(text: str | None) -> list[str]:
@@ -1321,6 +1327,11 @@ class Store:
         self._vector_quarantine: str | None = None
         #: Whether the question above has been answered for this connection.
         self._vector_quarantine_decided = False
+        #: ``scope:session`` answers computed on this store, keyed on
+        #: ``(what, text, obs_type, provenance)``. Written only when
+        #: ``read_only`` — see :meth:`_session_scope_cached` for why, and for
+        #: the 200x it saves on a session-card page.
+        self._session_scope_memo: dict[tuple, Any] = {}
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -5219,7 +5230,20 @@ class Store:
         belief that produced three instances of the unescaped-MATCH defect. A
         helper taking a pre-built ``expr`` would move the statement out from
         under that rule.
+
+        MEMOISED ON A READ-ONLY STORE, AND ONLY THERE — see
+        :meth:`_session_scope_cached`. A session-card page calls this once per
+        CARD with identical arguments, and ``page_size`` defaults to 200.
         """
+        return self._session_scope_cached(
+            ("roots", text, obs_type, provenance),
+            lambda: self._compute_session_hit_scope(text, obs_type, provenance),
+        )
+
+    def _compute_session_hit_scope(
+        self, text: str, obs_type: str | None, provenance: str | None
+    ) -> tuple[set[str], set[str]]:
+        """:meth:`_session_hit_scope` without the memo. Owns the ``MATCH``."""
         conjuncts = fts5_match_conjuncts(text)
         if not conjuncts:
             return set(), set()
@@ -5249,6 +5273,42 @@ class Store:
             if not roots and not exacts:
                 return set(), set()
         return roots or set(), exacts or set()
+
+    def _session_scope_cached(self, key: tuple, compute: Callable[[], Any]) -> Any:
+        """Memoise one ``scope:session`` answer, on a READ-ONLY store only.
+
+        WHY IT EXISTS. A session-card page computes ``matching_observations``
+        per card, so the widening is recomputed once per CARD from identical
+        arguments, and ``page_size`` defaults to 200. Measured on the live
+        550k-row cache: ``green pull request`` under ``scope:session`` costs
+        1.76 s per call against 0.06 s for the unwidened path, so a default-size
+        card page would have spent about six minutes recomputing one answer.
+        The unwidened path pays the same shape of cost and is left alone —
+        changing it is a separate question with its own risk, and the note in
+        ``mcp._lexical_session_ids`` already says what the correct fix there is.
+
+        WHY READ-ONLY ONLY. A cache is a promise that the answer has not
+        changed, and a store that can write cannot make that promise about
+        itself; invalidating from ``upsert_entities`` is machinery no writer
+        needs, since no write path runs a ``scope:`` query. The MCP builds a
+        fresh ``Store(read_only=True)`` per tool call, so the memo's lifetime is
+        one response — exactly the span over which a page and its per-card
+        counts have to agree anyway.
+
+        Bounded, and cleared wholesale when full: one request asks one or two
+        distinct questions of it, so an eviction policy would be more machinery
+        than the thing it manages.
+        """
+        if not self.read_only:
+            return compute()
+        hit = self._session_scope_memo.get(key)
+        if hit is not None:
+            return hit
+        value = compute()
+        if len(self._session_scope_memo) >= _SESSION_SCOPE_MEMO_MAX:
+            self._session_scope_memo.clear()
+        self._session_scope_memo[key] = value
+        return value
 
     def _text_hit_scope(self, ast: QueryAST) -> tuple[set[str], set[str]]:
         """Whichever conjunction scope the AST asked for. ``scope:`` lives here
@@ -5391,10 +5451,16 @@ class Store:
         text = ast.text or ""
         if ast.scope != SCOPE_SESSION:
             return self._fts_obs_ids(text)
-        roots, _exacts = self._session_hit_scope(
-            text, ast.obs_type, ast.provenance
+        # Memoised for the same reason and over the same lifetime as the root
+        # intersection it builds on: this is the expensive half — measured 1.67
+        # of the 1.76 s — and a session-card page asks for it once per card.
+        return self._session_scope_cached(
+            ("obs", text, ast.obs_type, ast.provenance),
+            lambda: self._session_scope_obs_ids(
+                text,
+                self._session_hit_scope(text, ast.obs_type, ast.provenance)[0],
+            ),
         )
-        return self._session_scope_obs_ids(text, roots)
 
     # -- capabilities -----------------------------------------------------
 
