@@ -472,3 +472,37 @@ def test_an_undeclared_read_failure_stays_loud(tmp_path, capsys, monkeypatch):
     monkeypatch.undo()
     assert rc != 0
     assert "simulated stat failure" in capsys.readouterr().err
+
+
+# --- the human surface ------------------------------------------------------
+
+
+def test_the_cli_prints_who_wrote_each_observation(tmp_path, capsys):
+    """``by=`` sits next to ``type=`` because the two are constantly confused
+    and only one of them is about authorship."""
+    root = _projects_root(tmp_path)
+    store = _unclassified_store(tmp_path, root)
+    _run(store, root, "--backfill")
+    capsys.readouterr()
+
+    rc = main(
+        ["query", "source:sessions type:user NixOS", "--drilldown"],
+        _store=store,
+        _sources={"sessions": SessionsSource(projects_root=str(root))},
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "by=hook" in out, out
+
+
+def test_the_cli_calls_an_unclassified_row_unclassified(tmp_path, capsys):
+    """Not a blank. An un-backfilled cache must read as "nobody has looked",
+    never as a missing field."""
+    root = _projects_root(tmp_path)
+    store = _unclassified_store(tmp_path, root)
+    main(
+        ["query", "source:sessions type:user NixOS", "--drilldown"],
+        _store=store,
+        _sources={"sessions": SessionsSource(projects_root=str(root))},
+    )
+    assert "by=unclassified" in capsys.readouterr().out

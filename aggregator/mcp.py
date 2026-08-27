@@ -3166,10 +3166,11 @@ def _dispatch(
         return _mismatch_response(
             mode="records",
             notice=(
-                "Session-ontology keys (session:, top:, agent:, type:, "
+                "Session-ontology keys (session:, top:, agent:, type:, by:, "
                 "active:) do not apply to records-shaped sources like "
-                "github — records carry no session ids. Drop source:github "
-                "to run the query against the sessions table."
+                "github — records carry no session ids, and no authorship: a "
+                "record is a document, not a turn somebody composed. Drop "
+                "source:github to run the query against the sessions table."
             ),
         )
     if mode == "mismatch_records_on_sessions":

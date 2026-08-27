@@ -496,9 +496,15 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
                 f"({rec['stable_id']}, matches={rec.get('matching_observations', 0)})"
             )
         elif mode == "observations":
+            # ``by=`` sits next to ``type`` because the two are constantly
+            # confused and only one of them is about authorship: ``type=user``
+            # says the line came in on the user channel, ``by=hook`` says a
+            # program wrote it. ``unclassified`` rather than a blank, so an
+            # un-backfilled cache reads as "nobody has looked" instead of as a
+            # missing field.
             print(
-                f"# obs {rec['type']} @{rec['ts']}  "
-                f"({rec['obs_id']}, session={rec['session_id']})"
+                f"# obs {rec['type']} by={rec.get('provenance') or 'unclassified'} "
+                f"@{rec['ts']}  ({rec['obs_id']}, session={rec['session_id']})"
             )
         else:
             print(f"# {rec['source']} :: {rec['subject']}  ({rec['stable_id']})")
