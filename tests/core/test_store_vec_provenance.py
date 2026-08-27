@@ -432,7 +432,10 @@ def test_migration_without_sqlite_vec_stamps_nothing_and_still_serves_fts(
 
     assert store.vector_available is False
     assert _meta(store, "vector_provenance") is None
-    assert store._c().execute("PRAGMA user_version").fetchone()[0] == 5
+    assert (
+        store._c().execute("PRAGMA user_version").fetchone()[0]
+        == store_mod.SCHEMA_VERSION
+    )
 
 
 def test_vector_provenance_reports_the_model_the_embedder_would_load():

@@ -140,3 +140,103 @@ def test_format_help_lists_sources():
     assert "sessions" in help_text
     assert "github" in help_text
     assert "2026-01-01" in help_text
+
+
+# --- v6: by: (provenance) --------------------------------------------------
+#
+# ONE MORE KEY, AND FIVE MORE PLACES IT HAS TO BE REGISTERED. Three of them
+# break QUIETLY when missed — the page-token fingerprint, the sessions-vs-
+# records routing predicate, and the two hit-scope projections — so those are
+# pinned at the MCP and store layers rather than here. This file owns the
+# grammar half.
+
+
+def test_parse_by_key_maps_to_provenance():
+    assert parse("by:human").provenance == "human"
+    assert parse("by:hook").provenance == "hook"
+
+
+def test_parse_by_key_accepts_the_machine_shorthand():
+    assert parse("by:machine").provenance == "machine"
+
+
+def test_parse_by_key_is_case_insensitive():
+    assert parse("by:HUMAN").provenance == "human"
+
+
+def test_parse_by_key_refuses_an_unknown_value():
+    """A CLOSED ENUM, so a typo is a parse error and not an empty page.
+
+    ``type:`` is deliberately open — its value set is additive — and a typo
+    there returns nothing. ``by:`` has exactly six accepted values, so the same
+    silence would be a bug reported as "there is nothing in my history".
+    """
+    with pytest.raises(DSLError) as e:
+        parse("by:humann")
+    assert "humann" in str(e.value)
+    assert "human" in str(e.value)
+
+
+def test_by_is_absent_by_default():
+    """No implicit filter, ever. Same contract as ``type:``."""
+    assert parse("source:sessions clickable links").provenance is None
+
+
+def test_format_help_documents_by_and_says_type_is_transport():
+    help_text = format_help(
+        sources=["sessions"],
+        tags_by_source={"sessions": []},
+        date_range=("2026-01-01", "2026-08-27"),
+    )
+    assert "by:" in help_text
+    assert "machine" in help_text
+    # The docs must say what ``type:`` is not, until every row is classified.
+    assert "transport" in help_text.lower()
+
+
+# --- v6: scope: (conjunction unit) -----------------------------------------
+#
+# The grammar half only. The four sites where a missed registration breaks
+# WITHOUT a test failure — the page-token fingerprint, the sessions-vs-records
+# routing predicate, the session-card projection and the fused keyword arm —
+# are pinned in ``tests/test_mcp_conjunction_scope.py``.
+
+
+def test_parse_scope_key():
+    assert parse("scope:session green").scope == "session"
+    assert parse("scope:observation green").scope == "observation"
+
+
+def test_parse_scope_key_is_case_insensitive():
+    assert parse("scope:SESSION green").scope == "session"
+
+
+def test_parse_scope_refuses_an_unknown_value():
+    """Closed enum, same argument as ``by:``: ``scope:sessions`` falling into
+    ``ast.extra`` would leave the default in place and answer a DIFFERENT
+    question in silence, which is worse than an empty page."""
+    with pytest.raises(DSLError) as e:
+        parse("scope:sessions green")
+    assert "sessions" in str(e.value)
+    assert "observation" in str(e.value)
+
+
+def test_scope_is_absent_by_default():
+    """``None`` and not ``'observation'``. Filling in the default would make
+    EVERY ast look like it carries a sessions-ontology key, and records-shaped
+    queries would stop routing to ``records``."""
+    assert parse("source:sessions clickable links").scope is None
+
+
+def test_format_help_documents_scope_and_what_a_quoted_run_means():
+    help_text = format_help(
+        sources=["sessions"],
+        tags_by_source={"sessions": []},
+        date_range=("2026-01-01", "2026-08-27"),
+    )
+    assert "scope:" in help_text
+    assert "observation" in help_text
+    # The default has to be stated, or a caller cannot know what they got.
+    assert "DEFAULT" in help_text
+    # And what quoting does, because that is the other half of "one term".
+    assert "double-quoted" in help_text.lower()

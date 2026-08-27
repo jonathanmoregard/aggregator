@@ -63,6 +63,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from aggregator.core.provenance import HUMAN, LineStructure, classify
 from aggregator.sources.base import (
     IngestResult,
     ObservationRow,
@@ -310,6 +311,13 @@ class _ParsedLine:
     corrupt-line and wrong-shape reports name theirs. Without it a drop report
     could only cite uuids, which do not tell an operator where in the file to
     look.
+
+    ``provenance`` IS DECIDED HERE AND NOWHERE ELSE DOWNSTREAM, because this is
+    the last point at which the raw JSONL dict still exists. ``isSidechain``,
+    ``isMeta``, ``isCompactSummary``, ``promptSource`` and ``origin`` are the
+    only evidence anyone has about who composed a line, and ``_parse_line``
+    discards the dict the moment it returns. The two emit sites just carry the
+    value across. See :mod:`aggregator.core.provenance`.
     """
 
     lineno: int
@@ -329,6 +337,7 @@ class _ParsedLine:
     model: str | None
     input_tokens: int | None
     output_tokens: int | None
+    provenance: str = HUMAN
 
 
 class SessionsSource:
@@ -543,6 +552,19 @@ class SessionsSource:
         ):
             line_type = "tool_result"
 
+        # THE LAST POINT THE RAW DICT EXISTS. Everything downstream sees a
+        # ``_ParsedLine``, so the vendor's structural fields — the only
+        # evidence anybody has about who composed this line — have to be spent
+        # here or thrown away. ``body_text`` is passed unscrubbed on purpose:
+        # the markers are structural strings the scrubber does not touch, and
+        # classifying after the scrub would make authorship depend on whether
+        # Presidio happened to redact something.
+        provenance = classify(
+            line_type,
+            body_text,
+            structure=LineStructure.from_jsonl(obj),
+        )
+
         return _ParsedLine(
             lineno=lineno,
             session_id=sid,
@@ -561,6 +583,7 @@ class SessionsSource:
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            provenance=provenance,
         )
 
     def _iter_parsed(
@@ -937,6 +960,7 @@ class SessionsSource:
                 tool_name=p.tool_name,
                 tool_use_id=p.tool_use_id,
                 body=p.body,
+                provenance=p.provenance,
             )
 
     def _emit_subagent(
@@ -1008,6 +1032,10 @@ class SessionsSource:
                 tool_name=p.tool_name,
                 tool_use_id=p.tool_use_id,
                 body=p.body,
+                # ``isSidechain`` already made this ``agent`` at parse time —
+                # measured 279/279 on subagent files and 0/3383 on top-level
+                # ones — so the path does not have to be consulted twice.
+                provenance=p.provenance,
             )
 
     # -- Protocol methods -------------------------------------------------

@@ -442,7 +442,7 @@ def test_a_failed_card_projection_does_not_erase_a_keyword_arm_that_matched(
     """
     _seed(store, [("o-lex", "governance working notes", True)])
 
-    def boom(_text, _obs_type=None):
+    def boom(_text, _obs_type=None, _provenance=None):
         raise sqlite3.OperationalError("simulated FTS5 failure in the projection")
 
     monkeypatch.setattr(store, "_fts_hit_scope", boom)

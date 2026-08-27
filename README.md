@@ -7,7 +7,7 @@ Personal "everything about me, currently, one prompt" aggregator. Caches Claude 
 v1: nine registered sources (see [Sources](#sources) below), SQLite+FTS5 store with WAL-mode concurrent-writer safety, four surfaces:
 
 - **FastMCP** (`aggregator-mcp`) — three read-only tools: `aggregator_query`, `aggregator_capabilities`, `aggregator_ingest` (a human-approve gate that only prints the CLI command).
-- **CLI** (`aggregator`) — `query`, `ingest SOURCE [--since ISO] [--rebuild]`, `status`.
+- **CLI** (`aggregator`) — `query`, `ingest SOURCE [--since ISO] [--rebuild]`, `status`, `embed`, `provenance`.
 - **Raycast** — scripts in `scripts/raycast/` wrap the CLI for one-shot triage.
 - **Nix module** (`nix/aggregator.nix`) — home-manager module with systemd user timers on `*:0/30`, currently for `sessions` and `github` only. Note that this module is not what runs in production: `nixos-config` ships a standalone duplicate (`modules/nixos/aggregator-github-timer.nix`) because this repo is local-only and cannot be a flake input on a CI runner. Every other source is hand-run today.
 
@@ -66,6 +66,89 @@ The merge is what makes the CSV leg authoritative for completed/abandoned histor
 ## How ingestion is structured
 
 Every registered source is a plain object with `iter_records`/`iter_entities` (or the older `ingest`) that `aggregator ingest SOURCE` calls directly. Alongside that, `aggregator/imports/` defines a ports-and-adapters seam for a unified runner: the `ImportAdapter` protocol (`aggregator/imports/port.py`) asks only for a `name` and a single async `get_data()` that yields `Record`/`SessionRow`/`ObservationRow` items, and `aggregator/imports/runner.py` drives every configured adapter concurrently, isolating one source's failure from the rest and folding per-adapter errors and input-freshness into one report. Existing synchronous sources are wrapped onto that port through `SyncSourceAdapter` (`aggregator/imports/sync_bridge.py`), which runs the sync iterator in a worker thread rather than rewriting it — `aggregator/imports/ticktick.py` is the TickTick example. See `docs/superpowers/specs/2026-08-08-dropbox-ticktick-sources-design.md` for the design rationale.
+
+## Provenance — `type:user` is a transport role, not an authorship claim
+
+`type:` records the channel a JSONL line arrived on, and that is **not** who
+wrote it. Measured against the vendor's own structural fields over a fixed
+3,000-file sample of `~/.claude/projects`, **59% of `type='user'` observations
+were composed by a machine**: hook-injected classifier prompts, headless SDK
+briefs, subagent task briefs, slash-command output, and client notices. Until
+the backfill below has run over a cache, treat every `type:user` result as
+"arrived on the user channel", never as "the user said this".
+
+The `observations.provenance` column (schema v6) records the author as one of
+five closed values — `human` / `agent` / `hook` / `command` / `system` — and
+`NULL` for "not classified yet". `NULL` is the backfill's cursor, exactly as
+`embedding_state IS NULL` is the embed worker's; `'unknown'` is never stored,
+because "we looked and could not tell" and "nobody has looked" are different
+facts.
+
+**`human` is a residual, never a positive claim.** The vendor exposes no
+authorship field to make one from: `promptSource='typed'` and
+`origin.kind='human'` are transport labels with the same bug one layer down —
+the self-compact resume banner is 43 of 43 both, because the harness injects it
+through the interactive input channel and the client honestly records how it
+arrived. `entrypoint` looks like the signal and is not (2.1.222+ reports
+`sdk-cli` for ordinary interactive sessions). So structure and body markers may
+only ever produce a positive *machine* claim; if the vendor drops a field the
+classifier loses recall rather than mislabelling. The rules live in one place,
+`aggregator/core/provenance.py`, and both ingest and the backfill call it.
+
+Query it with `by:` — `by:human`, `by:agent`, `by:hook`, `by:command`,
+`by:system`, or `by:machine` for any of the four non-human ones. **Absent, it
+filters nothing:** every row comes back carrying a `provenance` field, and when
+a page holds machine-authored rows the response's `notice` says how many and
+how to exclude them. Nothing defaults to human-only, in the store or in the
+tool — that would silently narrow the session-card labels, the frozen eval
+baseline and every `matching_observations` count at once. Rows whose
+`provenance` is still `NULL` match **no** `by:` value.
+
+Fill the column with:
+
+```
+aggregator provenance --backfill      # resumable, chunked, pure UPDATE
+aggregator provenance --reclassify    # after CHANGING the classifier
+```
+
+It classifies from the JSONL archive where that exists (the structural fields
+only live there) and from type + body + the owning session's `kind` for
+everything else — the `claude-web` rows whose export is not on disk, live files
+the walk skips, sessions whose archive is gone. It writes one column: no
+re-ingest, no re-scrub, no `embedding_state` reset. `provenance` is deliberately
+**not** part of `_src_hash`, so a classifier revision costs nothing beyond the
+re-run; putting it in the digest would re-run Presidio over the whole corpus
+(~11 hours at the measured 827 rows/min) and discard the observation vector arm.
+
+## Conjunction — free text is an AND, inside one turn
+
+Every term in the freeform part of a query is required, and by default all of
+them have to be found in a **single observation**. `obs_fts` holds one row per
+observation, so that has always been the unit; `scope:` v6 gives it a name and
+pins it, and adds the widening as something a caller asks for rather than
+something that happens to them.
+
+**A balanced double-quoted run is ONE term.** `"PR link"` means those two words
+next to each other; `PR link` means both words anywhere in the same turn. That
+distinction was being discarded before the query reached FTS5, and on this
+corpus it is the whole difference between a precise question and a useless one:
+measured read-only against the live cache, `"low usage cap"` went from the one
+right row to 156 rows with the right one at rank 118, and `"terraform state
+lock"` — a phrase the corpus does not contain anywhere — went from a clean
+nothing to 1,845 hits, because *state* and *lock* are ordinary words here and
+only the adjacency was ever selective. An UNBALANCED quote groups nothing: the
+phrase never closed, and guessing where it ends would invent a query nobody
+wrote.
+
+`scope:session` widens the unit so the terms may sit in **different turns of
+the same session**, hours apart — "which session covered both" rather than
+"which moment said it". It is never the default, because the moment is what a
+recall tool is asked for and a session here runs to hundreds of turns.
+
+When a multi-term query comes back empty the response's `notice` says what was
+ANDed, in what unit, and — when it is true — that the terms *do* all occur in
+some session and `scope:session` will show them. The index does **not** stem:
+`report` and `reports` are different terms.
 
 ## Ingest exit codes
 

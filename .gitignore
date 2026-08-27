@@ -32,6 +32,25 @@ sync.log
 # arftl per-run state (repo-autosync, 2026-08-13)
 tasks/arftl-run.json
 
+# Stage output the verifier redirects per run. They exist only while a gate is
+# in flight — the script deletes them at the end — but the sync-agent cron
+# auto-commits untracked files and does not know that, so a run that overlaps
+# the cron publishes a test log to a public repo. Exit codes are read directly
+# from these, never through a pipe, so they cannot become /dev/null.
+/pytest.out
+/ruff.out
+/nixflake.out
+/hygiene.out
+
+# `nix build` drops this symlink into the repo root, and the verifier's
+# `nix build --rebuild .#checks…aggregator-embed-unit-hygiene` runs on every
+# gate — so it reappears after each one. Untracked, it is exactly what the
+# sync-agent cron auto-commits: a dangling /nix/store pointer published to a
+# public repo and broken on every other machine. Anchored so a source file
+# legitimately named `result` further down the tree stays tracked.
+/result
+/result-*
+
 # Working notes live in userspace, NOT in this repo (2026-08-16).
 #
 # These are agent/operator notes — mission state, durable user directives,

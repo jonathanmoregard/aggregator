@@ -54,6 +54,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from aggregator.core.provenance import classify
 from aggregator.sources.base import (
     IngestResult,
     ObservationRow,
@@ -314,6 +315,9 @@ class ChatGPTSource:
                 tool_name=n.tool_name,
                 tool_use_id=None,
                 body=n.body,
+                # Same ontology and same absence of structural fields as the
+                # claude-web export: type and body are the whole evidence.
+                provenance=classify(n.role, n.body),
             )
 
     # -- protocol surface --------------------------------------------------

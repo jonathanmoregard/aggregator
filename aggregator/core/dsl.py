@@ -22,7 +22,8 @@ import re
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 
-from aggregator.sources.base import QueryAST
+from aggregator.core.provenance import MACHINE, PROVENANCE_VALUES
+from aggregator.sources.base import SCOPE_VALUES, QueryAST
 
 
 class DSLError(ValueError):
@@ -43,10 +44,29 @@ class DSLError(ValueError):
 #   active:A..B — sessions whose activity window overlaps [A, B]
 #                 (first_ts <= B AND last_ts >= A). A or B may be omitted:
 #                 ``active:..2026-07-01`` or ``active:2026-07-01..``.
+#
+# v6 authorship key:
+#   by:P        — filter observations by WHO COMPOSED them
+#                 (human|agent|hook|command|system, plus the shorthand
+#                 ``machine`` for any of the four non-human members).
+#                 ``type:`` is the channel a line arrived on; this is the
+#                 author. Absent means NO FILTER, exactly like ``type:``.
+#
+# v6 conjunction-scope key:
+#   scope:U     — the UNIT every free-text term must be satisfied in
+#                 (observation|session). Absent = ``observation``: one turn has
+#                 to carry all of them. ``scope:session`` lets the terms be
+#                 spread across different turns of one session. It is NOT a row
+#                 filter — it changes what the text matches — so it is applied
+#                 in ``Store._text_hit_scope``, not in ``Store._obs_where``.
 KNOWN_KEYS = {
     "source", "tag", "from", "to",
-    "session", "top", "agent", "type", "active",
+    "session", "top", "agent", "type", "active", "by", "scope",
 }
+
+#: Everything ``by:`` accepts. A CLOSED SET, which is why an unknown value is a
+#: parse error rather than an empty page — see ``_parse_provenance``.
+BY_VALUES: tuple[str, ...] = (*PROVENANCE_VALUES, MACHINE)
 
 _TOKEN_RE = re.compile(r"\S+")
 
@@ -84,6 +104,10 @@ def parse(query: str) -> QueryAST:
             ast.agent_id = val
         elif key == "type":
             ast.obs_type = val
+        elif key == "by":
+            ast.provenance = _parse_provenance(val)
+        elif key == "scope":
+            ast.scope = _parse_scope(val)
         elif key == "active":
             lo, hi = _parse_active_range(val)
             ast.active_from = lo
@@ -93,6 +117,45 @@ def parse(query: str) -> QueryAST:
     if text_bits:
         ast.text = " ".join(text_bits)
     return ast
+
+
+def _parse_provenance(val: str) -> str:
+    """Validate ``by:``. An unknown value is an ERROR, not an empty page.
+
+    ``type:`` is deliberately open — its value set is additive, and the store
+    comment says so — so a typo there returns nothing and that is tolerable.
+    ``by:`` has exactly six accepted values, so the same silence would be
+    indistinguishable from "there is nothing in your history", which is the
+    failure this whole change exists to remove. Naming the accepted set in the
+    error means one round trip instead of a guess.
+    """
+    value = val.strip().lower()
+    if value not in BY_VALUES:
+        raise DSLError(
+            f"bad by: {val!r} is not an authorship class. Use one of "
+            f"{', '.join(BY_VALUES)} — ``machine`` is the shorthand for any of "
+            f"{', '.join(v for v in PROVENANCE_VALUES if v != 'human')}."
+        )
+    return value
+
+
+def _parse_scope(val: str) -> str:
+    """Validate ``scope:``. Closed set, so an unknown value is an ERROR.
+
+    Same argument as ``by:``: two accepted values means a typo would otherwise
+    come back as a silently DIFFERENT question rather than as an empty page —
+    ``scope:sessions`` landing in ``ast.extra`` and quietly leaving the default
+    in place is precisely the kind of silence this mission exists to remove.
+    """
+    value = val.strip().lower()
+    if value not in SCOPE_VALUES:
+        raise DSLError(
+            f"bad scope: {val!r} is not a conjunction scope. Use one of "
+            f"{', '.join(SCOPE_VALUES)} — 'observation' (the default) requires "
+            f"every term in ONE turn, 'session' lets them be spread across "
+            f"different turns of one session."
+        )
+    return value
 
 
 def _parse_date(val: str, label: str) -> datetime:
@@ -182,7 +245,32 @@ def format_help(
         "tool_result|system|other"
     )
     lines.append(
+        "                 NOTE: type: is a TRANSPORT ROLE, not an authorship "
+        "claim. type:user means the line arrived on the user channel; measured, "
+        "59% of those were composed by a machine (hook prompts, headless "
+        "briefs, subagent briefs, slash-command output, client notices). Use "
+        "by: for authorship."
+    )
+    lines.append(
+        f"  by:<P>         WHO COMPOSED the observation: "
+        f"{'|'.join(BY_VALUES)}. 'machine' is any of "
+        f"{'/'.join(v for v in PROVENANCE_VALUES if v != 'human')}; 'human' is "
+        f"a residual (nothing claimed a machine wrote it), never a positive "
+        f"identification. Absent = no filter. Rows not yet classified are "
+        f"excluded by EVERY value of by: — run "
+        f"`aggregator provenance --backfill`."
+    )
+    lines.append(
         "  active:LO..HI  sessions whose activity window overlaps [LO, HI] "
         "(dates ISO8601)"
+    )
+    lines.append(
+        f"  scope:<U>      the UNIT every free-text term must be found in: "
+        f"{'|'.join(SCOPE_VALUES)}. DEFAULT is 'observation' — all terms in "
+        f"ONE turn. A double-quoted run is one term, so \"PR link\" matches "
+        f"those two words next to each other and PR link matches them "
+        f"anywhere in the turn. scope:session widens it: the terms may sit in "
+        f"different turns of the same session, hours apart, which answers "
+        f"'which session covered both' rather than 'which moment said it'."
     )
     return "\n".join(lines)

@@ -96,6 +96,14 @@ class ObservationRow:
     collapsed: first text block into ``body``, first tool_use/tool_result
     block into ``tool_name``/``tool_use_id``. Documented SOTA row-per-message
     shape.
+
+    v6: ``provenance`` says WHO COMPOSED THE TEXT, which ``type`` does not —
+    ``type='user'`` is the channel a line arrived on, and 59% of the rows on
+    that channel were written by a machine. See
+    :mod:`aggregator.core.provenance` for the enum and why ``human`` is a
+    residual rather than a claim. Kept LAST with a default so every existing
+    keyword constructor stays valid; ``None`` means "not classified here" and
+    the standalone backfill owns those rows.
     """
 
     obs_id: str              # message uuid
@@ -110,6 +118,7 @@ class ObservationRow:
     tool_name: str | None
     tool_use_id: str | None
     body: str
+    provenance: str | None = None  # v6; see aggregator.core.provenance
 
 
 # Type alias for the tagged-union yield from ``Source.iter_entities``.
@@ -212,6 +221,22 @@ def fault_stamp(path: Path | str) -> str:
     return f"{st.st_mtime_ns}:{st.st_size}"
 
 
+#: ``scope:`` — the UNIT a multi-term conjunction has to be satisfied in.
+#:
+#: ``observation`` is the default and is not merely the safe choice: the moment
+#: is what a recall tool is asked for, and a session here runs to six hours and
+#: hundreds of turns, so a session-wide conjunction answers "these words both
+#: occur in this transcript somewhere", which is a different and much weaker
+#: claim than the one the caller made. Absent means ``observation``; the value
+#: is stored only when the caller wrote it, so ``scope:`` behaves like every
+#: other key when asked whether the AST carries one.
+SCOPE_OBSERVATION = "observation"
+SCOPE_SESSION = "session"
+#: Closed, like ``by:`` and unlike ``type:``. An unknown value is a parse error
+#: rather than an empty page.
+SCOPE_VALUES: tuple[str, ...] = (SCOPE_OBSERVATION, SCOPE_SESSION)
+
+
 @dataclass
 class QueryAST:
     """Parsed DSL query. Populated by core/dsl.py.
@@ -223,9 +248,25 @@ class QueryAST:
     * ``top_session_id`` — just the top-level, no subagents.
     * ``agent_id`` — just one subagent.
     * ``obs_type`` — filter observations by type (user/assistant/tool_use/...).
+      A TRANSPORT ROLE, not an authorship claim — see ``provenance``.
+    * ``provenance`` — filter observations by WHO COMPOSED them (``by:``).
+      One of ``aggregator.core.provenance.PROVENANCE_VALUES``, or the
+      shorthand ``'machine'`` for any non-human member. ``None`` means NO
+      FILTER, exactly like ``obs_type``: nothing in this codebase applies a
+      default here, because a default would silently narrow
+      ``_first_user_prompt``, the frozen eval baseline and every
+      ``matching_observations`` count at once.
     * ``active_from``/``active_to`` — activity-window overlap:
       ``first_ts <= active_to AND last_ts >= active_from``. Different from
       ``from_date``/``to_date`` which are point-in-time-created.
+    * ``scope`` — the UNIT the free-text conjunction is satisfied in
+      (``scope:``). ``None`` and ``'observation'`` are the SAME QUERY: one
+      observation must carry every term. ``'session'`` widens it so the terms
+      may be spread across different turns of one session root. Unlike every
+      other field here it is NOT a row predicate — it changes which rows the
+      text matches, not which matched rows survive — so it lives in
+      ``Store._text_hit_scope`` / ``Store._scoped_obs_ids`` and NOT in
+      ``Store._obs_where``.
 
     v5 adds ``id_scope``, and it is the one field with NO DSL key. The hybrid
     retriever fuses an FTS5 arm and a vector arm into a ranked id list that no
@@ -251,6 +292,10 @@ class QueryAST:
     obs_type: str | None = None
     active_from: datetime | None = None
     active_to: datetime | None = None
+    # v6 authorship filter (``by:``). See the class docstring.
+    provenance: str | None = None
+    # v6 conjunction scope (``scope:``). See the class docstring.
+    scope: str | None = None
     # v5 hybrid retrieval: internal-only id filter. See the class docstring.
     id_scope: frozenset[str] | None = None
 

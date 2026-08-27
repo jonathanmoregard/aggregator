@@ -95,16 +95,18 @@ import logging
 import os
 import re
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
 
+from aggregator.core.provenance import MACHINE, MACHINE_VALUES
 from aggregator.core.scrub import scrub
 from aggregator.sources.base import (
+    SCOPE_SESSION,
     ObservationRow,
     QueryAST,
     Record,
@@ -114,7 +116,7 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class VectorIndexUnavailableError(RuntimeError):
@@ -464,6 +466,63 @@ def _json_id_clause(column: str) -> str:
 #:   reaches MATCH is quoted word characters" — is unchanged.
 _FTS5_TOKEN_RE = re.compile(r"\w+")
 
+#: How many distinct ``scope:session`` intersections one read-only store keeps.
+#: A single request asks one or two distinct questions of it — the page and its
+#: per-card counts — so this is a guard against unbounded growth on a store
+#: somebody holds open, not a working set to tune.
+_SESSION_SCOPE_MEMO_MAX = 8
+
+
+def fts5_match_conjuncts(text: str | None) -> list[str]:
+    """Split user text into the FTS5 phrases that must ALL match.
+
+    ``power-on`` -> ``['"power"', '"on"']``.
+    ``"PR link" "status report"`` -> ``['"PR link"', '"status report"']``.
+
+    A DOUBLE-QUOTED RUN IS ONE CONJUNCT, and that is the whole difference from
+    a per-word split. The caller who writes ``"low usage cap"`` is naming three
+    words that stand next to each other; three independent conjuncts is a
+    different question with a different answer, and on this corpus a much worse
+    one — measured, ``"low usage cap"`` goes from the single right row to 156
+    rows with the right one at 118, and ``"terraform state lock"`` goes from a
+    clean nothing to 1,845 hits, because "state" and "lock" are ordinary words
+    here and only the adjacency was selective. Quotes are the one piece of
+    query syntax every caller already knows; discarding them silently turns a
+    precise question into an imprecise one without saying so.
+
+    ONLY BALANCED QUOTES GROUP. An odd number of ``"`` means the caller's
+    phrase never closed, and guessing where it ends invents a query nobody
+    wrote — so an unbalanced string falls all the way back to the per-word
+    split, exactly as before. ``'"unbalanced quote'`` is still
+    ``['"unbalanced"', '"quote"']``.
+
+    THE SAFETY PROPERTY IS UNCHANGED: what reaches ``MATCH`` is still nothing
+    but double-quoted ``\\w+`` runs, now with single spaces allowed between
+    runs INSIDE a pair of quotes. Inside an FTS5 string the only
+    meta-character is ``"``, and no ``"`` from the input survives — the quotes
+    in the output are ones this function wrote. So no operator, column filter,
+    ``NEAR``, prefix ``*`` or stray quote can be expressed, whatever FTS5
+    decides those characters mean next.
+
+    Returns ``[]`` for text with no word characters at all.
+    """
+    raw = text or ""
+    segments = raw.split('"')
+    # An even segment count means an odd number of quotes: unbalanced. Treat
+    # the whole string as unquoted rather than pairing the quotes by position.
+    if len(segments) % 2 == 0:
+        segments = [raw.replace('"', " ")]
+    out: list[str] = []
+    for i, segment in enumerate(segments):
+        tokens = _FTS5_TOKEN_RE.findall(segment)
+        if not tokens:
+            continue
+        if i % 2:  # inside a balanced pair of quotes: one adjacency phrase
+            out.append('"' + " ".join(tokens) + '"')
+        else:
+            out.extend(f'"{t}"' for t in tokens)
+    return out
+
 
 def fts5_match_query(text: str | None) -> str:
     """Rewrite arbitrary user text into a safe FTS5 ``MATCH`` expression.
@@ -485,6 +544,13 @@ def fts5_match_query(text: str | None) -> str:
     ones that already worked return the same rows with the same bm25 scores.
     Asserted in ``tests/core/test_store_fts_sanitize.py``.
 
+    A BALANCED QUOTED RUN STAYS ONE PHRASE — see
+    :func:`fts5_match_conjuncts`, which this is the joined form of. That
+    RESTORES the identity property above rather than weakening it: a quoted
+    phrase was already valid FTS5 and already meant adjacency, so shattering it
+    into independent words was the one class of previously-working query this
+    rewrite silently reranked.
+
     Returns ``""`` for text with no word characters at all. Callers MUST read
     that as "no lexical matches" and skip the query: ``MATCH ''`` is a
     different question, not a cheaper form of this one.
@@ -495,7 +561,20 @@ def fts5_match_query(text: str | None) -> str:
     rewrite happens inside the FTS5 binding sites below, downstream of every
     caller that also drives the vector arm.
     """
-    return " ".join(f'"{t}"' for t in _FTS5_TOKEN_RE.findall(text or ""))
+    return " ".join(fts5_match_conjuncts(text))
+
+
+def fts5_query_terms(text: str | None) -> list[str]:
+    """The tokens :func:`fts5_match_query` sends to ``MATCH``, unquoted.
+
+    ONE DEFINITION OF "WHAT COUNTS AS A QUERY TERM", shared with the snippet
+    builder in ``mcp.py``. A snippet centred on a term the index did not
+    actually match is a lie about why the row is on the page, and a second
+    tokenizer in another module is how the two drift apart — the same argument
+    that put the FTS5 whitelist in one function rather than at each of its
+    binding sites.
+    """
+    return _FTS5_TOKEN_RE.findall(text or "")
 
 
 def _table_present(c: sqlite3.Connection, table: str) -> bool:
@@ -713,6 +792,22 @@ _DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS sessions_last_ts ON sessions(last_ts);",
     "CREATE INDEX IF NOT EXISTS sessions_origin ON sessions(origin);",
     # --- v2: observations (Langfuse "observation") --------------------
+    #
+    # ``provenance`` (v6) SAYS WHO COMPOSED THE TEXT, which ``type`` does not:
+    # ``type`` is the channel a line arrived on, and 59% of ``type='user'`` rows
+    # were written by a machine. It holds one of the five members of
+    # ``aggregator.core.provenance.PROVENANCE_VALUES``. NULL means NOT YET
+    # CLASSIFIED and is the backfill's cursor, exactly as
+    # ``embedding_state IS NULL`` is the embed worker's — never ``'unknown'``,
+    # which would collapse "we looked and could not tell" into "nobody looked".
+    #
+    # THE PROSE LIVES OUT HERE RATHER THAN INSIDE THE STATEMENT because
+    # sqlite_schema stores the CREATE TABLE text verbatim and SQLite re-parses
+    # it with a reduced tokenizer on ``ALTER TABLE ... DROP COLUMN``. Measured:
+    # a multi-line ``--`` block in front of the LAST column made that reparse
+    # fail with "incomplete input" on SQLite 3.50.4 (and not on 3.53.3), which
+    # would strand a future migration on the live database for the sake of a
+    # comment. Column notes inside the statement stay to one trailing line.
     """
     CREATE TABLE IF NOT EXISTS observations (
         obs_id           TEXT PRIMARY KEY,
@@ -730,12 +825,18 @@ _DDL: list[str] = [
         src_hash         TEXT,         -- v4; see ``_src_hash``
         -- v5. NULL means "not embedded yet" and is what the background embed
         -- worker selects on; 'ok' / 'skip' / 'error' are terminal.
-        embedding_state  TEXT
+        embedding_state  TEXT,
+        provenance       TEXT          -- v6; see aggregator.core.provenance
     );
     """,
     "CREATE INDEX IF NOT EXISTS obs_root_ts ON observations(root_session_id, ts);",
     "CREATE INDEX IF NOT EXISTS obs_session_ts ON observations(session_id, ts);",
     "CREATE INDEX IF NOT EXISTS obs_type ON observations(type);",
+    # WITHOUT THIS THE BACKFILL IS QUADRATIC. Its chunk is
+    # ``WHERE provenance IS NULL LIMIT n``, and unindexed that scans past every
+    # row already classified — 1,100 chunks over 549,952 rows, each starting
+    # further in than the last. Indexed it is a seek. It also serves ``by:``.
+    "CREATE INDEX IF NOT EXISTS obs_provenance ON observations(provenance);",
     # FTS5 external-content over observations.body. Sync via triggers below.
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
@@ -757,8 +858,32 @@ _DDL: list[str] = [
         INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
     END;
     """,
+    # ``OF body`` IS THE WHOLE POINT, and it is not a micro-optimisation.
+    #
+    # Without the column list this fires on ANY update to ANY column — an
+    # ``embedding_state`` flip, a ``provenance`` stamp — and each firing is a
+    # full FTS5 ``'delete'`` plus re-insert of the entire body. With
+    # ``auto_vacuum=0`` the pages that frees are never handed back, which is the
+    # same mechanism documented at the ingest UPSERT below. Measured on a
+    # throwaway database at 1/5 of live scale: a chunked column-only UPDATE ran
+    # 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth narrow.
+    # Extrapolated to the live 549,952 rows that is 12x wall clock and
+    # 380-640 MB of permanent bloat on a 1.4 GB file.
+    #
+    # IT INDEXES EXACTLY AS MUCH AS BEFORE. SQLite fires ``UPDATE OF body``
+    # whenever ``body`` appears in the SET clause, whether or not the value
+    # actually moved, and the ingest UPSERT always names ``body =
+    # excluded.body``. Pinned by ``tests/core/test_store_fts_trigger_narrowing
+    # .py::test_upsert_keeps_the_fts_index_correct``, which matches a sentinel
+    # token through the real upsert rather than restating this paragraph.
+    #
+    # ``IF NOT EXISTS`` will NOT replace a trigger that is already there, so
+    # every database created before this change needs ``_ensure_narrow_fts_
+    # update_trigger`` to drop the wide one first — and those are the databases
+    # the narrowing is for.
     """
-    CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations
+    CREATE TRIGGER IF NOT EXISTS observations_au
+    AFTER UPDATE OF body ON observations
     BEGIN
         INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
         INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
@@ -1202,6 +1327,11 @@ class Store:
         self._vector_quarantine: str | None = None
         #: Whether the question above has been answered for this connection.
         self._vector_quarantine_decided = False
+        #: ``scope:session`` answers computed on this store, keyed on
+        #: ``(what, text, obs_type, provenance)``. Written only when
+        #: ``read_only`` — see :meth:`_session_scope_cached` for why, and for
+        #: the 200x it saves on a session-card page.
+        self._session_scope_memo: dict[tuple, Any] = {}
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -1365,6 +1495,8 @@ class Store:
         self._ensure_sessions_origin_column(c)
         self._ensure_src_hash_columns(c)
         self._ensure_embedding_state_columns(c)
+        self._ensure_provenance_column(c)
+        self._ensure_narrow_fts_update_trigger(c)
         for stmt in _DDL:
             c.executescript(stmt)
         if self._vector_available:
@@ -1868,6 +2000,63 @@ class Store:
         Store._ensure_column(c, "observations", "embedding_state", "TEXT")
         Store._ensure_column(c, "records", "embedding_state", "TEXT")
 
+    @staticmethod
+    def _ensure_provenance_column(c: sqlite3.Connection) -> None:
+        """v5 → v6 in-place upgrade: add ``observations.provenance``.
+
+        NULL FOR EVERY EXISTING ROW, and that is the contract — the same one
+        ``_ensure_embedding_state_columns`` states one method up. NULL means
+        "not classified yet" and is what the standalone backfill selects on, so
+        a pre-v6 corpus comes out of this migration QUEUED FOR CLASSIFICATION.
+        A non-NULL default would make every row claim an authorship no
+        classifier ever assigned it, and the backfill would find nothing to do.
+
+        Metadata-only: ``ADD COLUMN`` with no default rewrites no page.
+        Measured on a throwaway database at 1/5 of live scale at **0.006 s**
+        and +4 KB — the column is free. What is not free is UPDATING it, which
+        is why the FTS trigger narrowing (see
+        :meth:`_ensure_narrow_fts_update_trigger`) ships in the same change.
+
+        NOTHING BACKFILLS HERE, deliberately. ``migrate()`` runs on every
+        subcommand including read-only queries; a classification pass over
+        549,952 rows behind an ``aggregator query`` would be exactly the
+        hours-long surprise this schema style exists to abolish. The pass is
+        ``aggregator provenance --backfill``, which is resumable and chunked.
+
+        Must run BEFORE the ``_DDL`` pass, which creates an index ON
+        ``provenance`` that cannot exist against a v5-shaped table.
+        """
+        Store._ensure_column(c, "observations", "provenance", "TEXT")
+
+    @staticmethod
+    def _ensure_narrow_fts_update_trigger(c: sqlite3.Connection) -> None:
+        """Replace a wide ``observations_au`` with the ``OF body`` form.
+
+        DROP AND LET THE DDL PASS RE-CREATE IT, because
+        ``CREATE TRIGGER IF NOT EXISTS`` does not replace an existing trigger —
+        it is a no-op against one — so shipping the narrow text in ``_DDL``
+        alone would fix only databases that do not exist yet. Precedent for
+        dropping a trigger by name is in ``_DROP_ALL``.
+
+        PROBES THE ARTIFACT, NOT ``user_version``, for the same reason every
+        ``_ensure_*`` helper above does: the stored SQL is the thing that
+        decides how the trigger behaves, and a half-applied state (trigger
+        replaced, version stale, or the reverse) must converge rather than skip.
+        No-op when the trigger is already narrow, and when it is absent
+        entirely — a fresh database gets it from ``_DDL``.
+
+        Must run BEFORE the ``_DDL`` pass, which is what puts the new one back.
+        """
+        row = c.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'observations_au'"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return
+        if "UPDATE OF body" in row[0]:
+            return
+        c.execute("DROP TRIGGER observations_au")
+
     def schema_version(self) -> int:
         """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
         c = self._c()
@@ -2103,6 +2292,26 @@ class Store:
                     ),
                 )
             elif isinstance(e, ObservationRow):
+                # ``provenance`` IS DELIBERATELY ABSENT FROM THIS DIGEST, and
+                # the ``SCRUB_FINGERPRINT`` comment above actively invites the
+                # opposite — so this says no in the place someone would say yes.
+                #
+                # A classifier is not a scrubber. Putting its output in here,
+                # or adding a PROVENANCE_FINGERPRINT beside SCRUB_FINGERPRINT,
+                # would make every classifier revision change all 549,952
+                # digests. The next ingest then takes the ``DO UPDATE`` branch
+                # for every row, which re-runs Presidio on each — ~11 hours at
+                # this repo's measured 827 rows/min — and sets
+                # ``embedding_state = NULL`` a few lines below, discarding the
+                # observation vector arm. That costs nothing TODAY only because
+                # that arm is still cold; the moment the embed backlog reaches
+                # observations the same edit silently throws away weeks of CPU.
+                #
+                # The correct wiring is what is here: provenance is written on
+                # INSERT and on the ``DO UPDATE`` branch (which is rewriting the
+                # row anyway), and is otherwise owned by
+                # ``aggregator provenance --backfill``, whose cursor is
+                # ``provenance IS NULL``.
                 digest = _src_hash(
                     SCRUB_FINGERPRINT,
                     e.obs_id,
@@ -2135,9 +2344,9 @@ class Store:
                     INSERT INTO observations(
                         obs_id, session_id, root_session_id, parent_obs_id,
                         type, ts, model, input_tokens, output_tokens,
-                        tool_name, tool_use_id, body, src_hash
+                        tool_name, tool_use_id, body, src_hash, provenance
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(obs_id) DO UPDATE SET
                         session_id      = excluded.session_id,
                         root_session_id = excluded.root_session_id,
@@ -2151,6 +2360,11 @@ class Store:
                         tool_use_id     = excluded.tool_use_id,
                         body            = excluded.body,
                         src_hash        = excluded.src_hash,
+                        -- The body moved, so who wrote it is worth re-stating
+                        -- from the source that just produced it. Reached ONLY
+                        -- when the digest moved, which provenance is not part
+                        -- of — a classifier revision alone never gets here.
+                        provenance      = excluded.provenance,
                         -- BACK INTO THE EMBED BACKLOG. The body just changed,
                         -- so any vector held for this row describes text that
                         -- is no longer here. ``observations_au`` keeps obs_fts
@@ -2175,6 +2389,7 @@ class Store:
                         e.tool_use_id,
                         scrubbed_body,
                         digest,
+                        e.provenance,
                     ),
                 )
                 # ONLY for a row that already existed. A brand-new obs_id has
@@ -4581,6 +4796,70 @@ class Store:
             params.append(ast.to_date.isoformat())
         return " AND ".join(clauses), params
 
+    @staticmethod
+    def _provenance_clause(provenance: str, column: str = "provenance") -> tuple[str, list]:
+        """``(SQL fragment, params)`` for one ``by:`` value.
+
+        ``machine`` EXPANDS TO THE FOUR NON-HUMAN MEMBERS rather than to
+        ``!= 'human'``, and that difference is the whole point: ``!=`` in
+        SQLite is false against NULL, which would be right by accident today
+        and wrong the moment anyone writes ``NOT (provenance = 'human')``. An
+        explicit ``IN`` says what is meant — a positive machine claim — and
+        keeps unclassified rows out of BOTH sides, where they belong: NULL
+        means nobody has looked, which is not a fact about authorship.
+        """
+        if provenance == MACHINE:
+            marks = ",".join("?" * len(MACHINE_VALUES))
+            return f"{column} IN ({marks})", list(MACHINE_VALUES)
+        return f"{column} = ?", [provenance]
+
+    def _apply_provenance(
+        self, ast: QueryAST, clauses: list[str], params: list
+    ) -> None:
+        """Append the ``by:`` predicate, or nothing at all.
+
+        NOTHING AT ALL IS THE DEFAULT AND STAYS THE DEFAULT. A human-only
+        default here would narrow ``_first_user_prompt`` (which labels every
+        session card), ``count_observations`` (which is
+        ``matching_observations``), ``_session_body_preview`` and the frozen
+        eval baseline — four callers that never asked for a filter, in one
+        edit, invisibly.
+        """
+        if not ast.provenance:
+            return
+        clause, extra = self._provenance_clause(ast.provenance)
+        clauses.append(clause)
+        params.extend(extra)
+
+    def has_unclassified_observations(self) -> bool:
+        """Is any observation still ``provenance IS NULL``?
+
+        ONE INDEXED PROBE, not a count: ``LIMIT 1`` against ``obs_provenance``.
+        It exists so an empty ``by:`` page can say WHY it is empty. Before the
+        backfill has run, every row is NULL and every ``by:`` filter matches
+        nothing — an answer indistinguishable from "you never said that",
+        which is precisely the failure this mission exists to remove.
+        """
+        row = self._c().execute(
+            "SELECT 1 FROM observations WHERE provenance IS NULL LIMIT 1"
+        ).fetchone()
+        return row is not None
+
+    def count_unclassified_observations(self) -> int:
+        """How many observations are still ``provenance IS NULL``.
+
+        The backfill's remaining-work number, printed at the end of a run.
+        A COUNT rather than the ``LIMIT 1`` probe above because "how much is
+        left" is the question an operator asks after an interrupted pass, and
+        "some" does not answer it. It is an index-only scan of
+        ``obs_provenance`` and is paid once per run, not per query.
+        """
+        return int(
+            self._c().execute(
+                "SELECT count(*) FROM observations WHERE provenance IS NULL"
+            ).fetchone()[0]
+        )
+
     def _obs_where(self, ast: QueryAST) -> tuple[str, list]:
         """Build WHERE for an ``observations`` query.
 
@@ -4625,6 +4904,7 @@ class Store:
         if ast.obs_type:
             clauses.append("type = ?")
             params.append(ast.obs_type)
+        self._apply_provenance(ast, clauses, params)
         if ast.from_date:
             clauses.append("ts >= ?")
             params.append(ast.from_date.isoformat())
@@ -4777,7 +5057,7 @@ class Store:
         c = self._c()
         if ast.text:
             try:
-                obs_ids = self._fts_obs_ids(ast.text)
+                obs_ids = self._scoped_obs_ids(ast)
             except sqlite3.OperationalError as e:
                 log.warning("FTS5 syntax error in query_observations %r: %s", ast.text, e)
                 return []
@@ -4808,7 +5088,7 @@ class Store:
         c = self._c()
         if ast.text:
             try:
-                obs_ids = self._fts_obs_ids(ast.text)
+                obs_ids = self._scoped_obs_ids(ast)
             except sqlite3.OperationalError:
                 return 0
             if not obs_ids:
@@ -4877,9 +5157,12 @@ class Store:
         return f"({root_part} OR {exact_part})", params
 
     def _fts_hit_scope(
-        self, text: str, obs_type: str | None = None
+        self,
+        text: str,
+        obs_type: str | None = None,
+        provenance: str | None = None,
     ) -> tuple[set[str], set[str]]:
-        """FTS text (+ optional obs type) → ``(root_ids, exact_ids)``.
+        """FTS text (+ optional obs type and authorship) → ``(root_ids, exact_ids)``.
 
         ``root_ids``  — distinct ``root_session_id`` of matching obs; used
         to surface top-level session cards (a hit anywhere under the root
@@ -4890,6 +5173,12 @@ class Store:
         Live-model smoke MEDIUM (2026-08-02): the previous root-only
         mapping ignored ``type:`` and surfaced sibling subagents with
         zero own matches.
+
+        ``provenance`` (v6) rides here for the identical reason ``obs_type``
+        does. A card is supposed to surface only on a hit that PASSES the
+        query's filters; a ``by:`` filter left out of this projection would
+        surface cards whose only matching observation the caller just excluded
+        — the same silent over-surfacing, one filter later.
         """
         match_expr = fts5_match_query(text)
         if not match_expr:
@@ -4904,13 +5193,140 @@ class Store:
         if obs_type:
             sql += " AND o.type = ?"
             params.append(obs_type)
+        if provenance:
+            clause, extra = self._provenance_clause(provenance, "o.provenance")
+            sql += f" AND {clause}"
+            params.extend(extra)
         rows = self._fts_rows(sql, params, text)
         roots = {r["root"] for r in rows if r["root"]}
         exacts = {r["sid"] for r in rows if r["sid"]}
         return roots, exacts
 
+    def _session_hit_scope(
+        self,
+        text: str,
+        obs_type: str | None = None,
+        provenance: str | None = None,
+    ) -> tuple[set[str], set[str]]:
+        """``scope:session``: every conjunct satisfied SOMEWHERE under one root.
+
+        The conjuncts are evaluated separately and their session sets are
+        INTERSECTED, which is the whole difference from the default — under
+        ``scope:observation`` a single row has to carry all of them, here one
+        turn may carry "PR link" and a turn three hours later may carry "status
+        report". That is a real question a caller asks ("the session where we
+        discussed both"), and it is the one this ontology could not express at
+        all until now; it is never the default because the answer it gives back
+        is a session, not the moment, and the moment is what recall is for.
+
+        Early-exit on an empty intersection: a conjunct nothing satisfies makes
+        every later query pointless, and with N conjuncts each costing an FTS5
+        scan that saving is the reason a long query stays affordable.
+
+        THE PER-CONJUNCT STATEMENT IS INLINE RATHER THAN IN A HELPER, and that
+        is not a style choice. ``tests/test_fts5_match_site_enumeration.py``
+        requires the function that OWNS an FTS5 ``MATCH`` to be the function
+        that rewrites the text, precisely because "a caller sanitizes it" is the
+        belief that produced three instances of the unescaped-MATCH defect. A
+        helper taking a pre-built ``expr`` would move the statement out from
+        under that rule.
+
+        MEMOISED ON A READ-ONLY STORE, AND ONLY THERE — see
+        :meth:`_session_scope_cached`. A session-card page calls this once per
+        CARD with identical arguments, and ``page_size`` defaults to 200.
+        """
+        return self._session_scope_cached(
+            ("roots", text, obs_type, provenance),
+            lambda: self._compute_session_hit_scope(text, obs_type, provenance),
+        )
+
+    def _compute_session_hit_scope(
+        self, text: str, obs_type: str | None, provenance: str | None
+    ) -> tuple[set[str], set[str]]:
+        """:meth:`_session_hit_scope` without the memo. Owns the ``MATCH``."""
+        conjuncts = fts5_match_conjuncts(text)
+        if not conjuncts:
+            return set(), set()
+        base = """
+            SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
+            FROM obs_fts f
+            JOIN observations o ON o.rowid = f.rowid
+            WHERE obs_fts MATCH ?
+        """
+        filters = ""
+        extra_params: list = []
+        if obs_type:
+            filters += " AND o.type = ?"
+            extra_params.append(obs_type)
+        if provenance:
+            clause, extra = self._provenance_clause(provenance, "o.provenance")
+            filters += f" AND {clause}"
+            extra_params.extend(extra)
+        roots: set[str] | None = None
+        exacts: set[str] | None = None
+        for expr in conjuncts:
+            rows = self._fts_rows(base + filters, [expr, *extra_params], text)
+            got_roots = {r["root"] for r in rows if r["root"]}
+            got_exacts = {r["sid"] for r in rows if r["sid"]}
+            roots = got_roots if roots is None else roots & got_roots
+            exacts = got_exacts if exacts is None else exacts & got_exacts
+            if not roots and not exacts:
+                return set(), set()
+        return roots or set(), exacts or set()
+
+    def _session_scope_cached(self, key: tuple, compute: Callable[[], Any]) -> Any:
+        """Memoise one ``scope:session`` answer, on a READ-ONLY store only.
+
+        WHY IT EXISTS. A session-card page computes ``matching_observations``
+        per card, so the widening is recomputed once per CARD from identical
+        arguments, and ``page_size`` defaults to 200. Measured on the live
+        550k-row cache: ``green pull request`` under ``scope:session`` costs
+        1.76 s per call against 0.06 s for the unwidened path, so a default-size
+        card page would have spent about six minutes recomputing one answer.
+        The unwidened path pays the same shape of cost and is left alone —
+        changing it is a separate question with its own risk, and the note in
+        ``mcp._lexical_session_ids`` already says what the correct fix there is.
+
+        WHY READ-ONLY ONLY. A cache is a promise that the answer has not
+        changed, and a store that can write cannot make that promise about
+        itself; invalidating from ``upsert_entities`` is machinery no writer
+        needs, since no write path runs a ``scope:`` query. The MCP builds a
+        fresh ``Store(read_only=True)`` per tool call, so the memo's lifetime is
+        one response — exactly the span over which a page and its per-card
+        counts have to agree anyway.
+
+        Bounded, and cleared wholesale when full: one request asks one or two
+        distinct questions of it, so an eviction policy would be more machinery
+        than the thing it manages.
+        """
+        if not self.read_only:
+            return compute()
+        hit = self._session_scope_memo.get(key)
+        if hit is not None:
+            return hit
+        value = compute()
+        if len(self._session_scope_memo) >= _SESSION_SCOPE_MEMO_MAX:
+            self._session_scope_memo.clear()
+        self._session_scope_memo[key] = value
+        return value
+
+    def _text_hit_scope(self, ast: QueryAST) -> tuple[set[str], set[str]]:
+        """Whichever conjunction scope the AST asked for. ``scope:`` lives here
+        and not in :meth:`_obs_where` because it is not a row predicate: it
+        changes which ROWS THE TEXT MATCHES, not which of the matched rows
+        survive a filter. Anyone adding a key to the registration list in the
+        design note should read that difference off this method."""
+        if ast.scope == SCOPE_SESSION:
+            return self._session_hit_scope(
+                ast.text or "", ast.obs_type, ast.provenance
+            )
+        return self._fts_hit_scope(ast.text or "", ast.obs_type, ast.provenance)
+
     def _obs_id_hit_scope(
-        self, obs_ids: Iterable[str], obs_type: str | None = None
+        self,
+        obs_ids: Iterable[str],
+        obs_type: str | None = None,
+        provenance: str | None = None,
     ) -> tuple[set[str], set[str]]:
         """``(root_ids, exact_ids)`` for a set of obs ids — the v5 twin of
         :meth:`_fts_hit_scope`, and it must stay behaviourally identical to it.
@@ -4921,6 +5337,16 @@ class Store:
         while a subagent card surfaces only on a hit in its own stream.
         Diverging here would make hybrid and FTS5 answer the same question
         with differently-shaped hit lists.
+
+        ``scope:`` IS DELIBERATELY NOT A PARAMETER HERE, and that is the one
+        place in the v6 registration list where the answer is "nothing to
+        register". This method projects an id set that some arm already
+        produced; the conjunction it was produced by is upstream, and a fused
+        hybrid id set has no conjunct structure left to intersect. Widening
+        happens in :meth:`_text_hit_scope`, which :meth:`_hit_scope` then
+        INTERSECTS with this projection — so a ``scope:session`` query through
+        the hybrid path is widened exactly once, on the lexical side, rather
+        than twice or not at all.
 
         Parameters are chunked because a fused scope can carry thousands of
         ids and SQLite caps host parameters per statement.
@@ -4938,6 +5364,10 @@ class Store:
             if obs_type:
                 sql += " AND type = ?"
                 params.append(obs_type)
+            if provenance:
+                clause, extra = self._provenance_clause(provenance)
+                sql += f" AND {clause}"
+                params.extend(extra)
             for row in c.execute(sql, params):
                 if row["root"]:
                     roots.add(row["root"])
@@ -4953,10 +5383,12 @@ class Store:
         filter never widens the result, whichever order the arms arrive in.
         """
         if ast.id_scope is None:
-            return self._fts_hit_scope(ast.text or "", ast.obs_type)
-        roots, exacts = self._obs_id_hit_scope(ast.id_scope, ast.obs_type)
+            return self._text_hit_scope(ast)
+        roots, exacts = self._obs_id_hit_scope(
+            ast.id_scope, ast.obs_type, ast.provenance
+        )
         if ast.text:
-            fts_roots, fts_exacts = self._fts_hit_scope(ast.text, ast.obs_type)
+            fts_roots, fts_exacts = self._text_hit_scope(ast)
             roots &= fts_roots
             exacts &= fts_exacts
         return roots, exacts
@@ -4977,6 +5409,58 @@ class Store:
             text,
         )
         return [r["obs_id"] for r in rows]
+
+    def _session_scope_obs_ids(self, text: str, roots: set[str]) -> list[str]:
+        """Observations under ``roots`` matching ANY conjunct.
+
+        THE ROW SET IS WIDER THAN THE DEFAULT AND THAT IS THE POINT. Once a
+        session has qualified by carrying every conjunct somewhere, the turns
+        worth showing are the ones that carry any of them — the turn saying
+        "PR link" and the turn saying "status report" are both part of the
+        answer, and demanding both of each row again would collapse straight
+        back to ``scope:observation``.
+
+        One statement per conjunct rather than an ``OR``-joined expression, so
+        the invariant that only quoted ``\\w+`` runs reach ``MATCH`` survives
+        a widening that had no reason to spend it.
+        """
+        if not roots:
+            return []
+        scope_json = json.dumps(sorted(roots))
+        ids: set[str] = set()
+        for expr in fts5_match_conjuncts(text):
+            rows = self._fts_rows(
+                "SELECT o.obs_id AS obs_id FROM obs_fts f "  # noqa: S608 - placeholders only
+                "JOIN observations o ON o.rowid = f.rowid "
+                "WHERE obs_fts MATCH ? AND "
+                + _json_id_clause("o.root_session_id"),
+                (expr, scope_json),
+                text,
+            )
+            ids.update(r["obs_id"] for r in rows)
+        return sorted(ids)
+
+    def _scoped_obs_ids(self, ast: QueryAST) -> list[str]:
+        """The observation ids the AST's free text matches, in its scope.
+
+        The ONE seam between ``scope:`` and the observations page. Both
+        :meth:`query_observations` and :meth:`count_observations` go through
+        it, because a page and a total computed under different scopes is the
+        "plausible but wrong" answer this module refuses everywhere else.
+        """
+        text = ast.text or ""
+        if ast.scope != SCOPE_SESSION:
+            return self._fts_obs_ids(text)
+        # Memoised for the same reason and over the same lifetime as the root
+        # intersection it builds on: this is the expensive half — measured 1.67
+        # of the 1.76 s — and a session-card page asks for it once per card.
+        return self._session_scope_cached(
+            ("obs", text, ast.obs_type, ast.provenance),
+            lambda: self._session_scope_obs_ids(
+                text,
+                self._session_hit_scope(text, ast.obs_type, ast.provenance)[0],
+            ),
+        )
 
     # -- capabilities -----------------------------------------------------
 
@@ -5250,6 +5734,12 @@ def _row_to_observation(row: sqlite3.Row) -> ObservationRow:
         tool_name=row["tool_name"],
         tool_use_id=row["tool_use_id"],
         body=row["body"] or "",
+        # v6. Carried so the MCP can put it on the row beside the snippet —
+        # a caller seeing ``provenance: hook`` next to a hit knows why it is
+        # there, which is the whole legibility win. NULL stays NULL: it means
+        # "not classified yet", and coercing it to 'human' on the way out
+        # would turn an unrun backfill into a corpus-wide authorship claim.
+        provenance=row["provenance"],
     )
 
 

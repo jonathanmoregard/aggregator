@@ -122,7 +122,18 @@ _NOT_SQL = {
 }
 
 #: The whitelist every FTS5 site's text must be rewritten through.
-_SANITIZER = "fts5_match_query"
+#:
+#: TWO NAMES FOR ONE WHITELIST, and the second is now the primary. v6 split the
+#: rewrite so a caller's balanced double-quoted run stays ONE adjacency phrase
+#: instead of being taken apart into independent words: ``fts5_match_conjuncts``
+#: produces the list, and ``fts5_match_query`` is nothing but that list joined
+#: with spaces. Both emit the identical alphabet — double-quoted ``\w+`` runs,
+#: with single spaces allowed inside one pair of quotes — so a site that calls
+#: either is equally safe, and a site that calls neither is equally not.
+#: Listing only the joined form would have forced every ``scope:session``
+#: statement to re-join and re-split the expression purely to satisfy this
+#: file, which is the shape of change that gets a guard deleted.
+_SANITIZERS = frozenset({"fts5_match_query", "fts5_match_conjuncts"})
 
 
 class _MatchLiteral:
@@ -339,10 +350,10 @@ def test_every_fts5_match_site_is_reached_through_the_whitelist(lit):
     """
     owner = lit.func
     called = _CALLS[lit.path].get(owner, set())
-    assert _SANITIZER in called, (
-        f"{lit!r} binds text to FTS5 MATCH without calling {_SANITIZER}(). "
-        "Raw user text reaching MATCH is a syntax error for any query "
-        "containing '-', '.', '#', '+', ':' or a quote."
+    assert called & _SANITIZERS, (
+        f"{lit!r} binds text to FTS5 MATCH without calling any of "
+        f"{sorted(_SANITIZERS)}. Raw user text reaching MATCH is a syntax "
+        "error for any query containing '-', '.', '#', '+', ':' or a quote."
     )
 
 
@@ -530,14 +541,14 @@ def test_a_smuggled_site_is_held_to_the_whitelist_rule_like_any_other():
 
     The point of classifying a lowercase site as an FTS5 site is that
     ``test_every_fts5_match_site_is_reached_through_the_whitelist`` then demands
-    its owning function call ``fts5_match_query``. This checks the demand
-    actually fails for a function that does not.
+    its owning function call one of the whitelist entry points. This checks the
+    demand actually fails for a function that does not.
     """
     found, calls = _collect(
         "scripts/smuggled.py", _SMUGGLED["lowercase operator"]
     )
     lit = found[0]
-    assert _SANITIZER not in calls.get(lit.func, set()), (
+    assert not calls.get(lit.func, set()) & _SANITIZERS, (
         "the planted site does not sanitize, so the whitelist rule must be the "
         "thing that catches it"
     )

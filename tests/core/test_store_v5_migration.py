@@ -61,6 +61,10 @@ def _make_v4_store(tmp_path, *, seed_v4_state: bool = True) -> Store:
     # so the indexes go first or the DROP COLUMN errors out.
     c.execute("DROP INDEX IF EXISTS obs_embedding_state")
     c.execute("DROP INDEX IF EXISTS rec_embedding_state")
+    # v6's column comes off too, or the fixture is not the v4 shape it claims
+    # to be — and the migration under test would then never run the ALTER.
+    c.execute("DROP INDEX IF EXISTS obs_provenance")
+    _drop_column_if_present(c, "observations", "provenance")
     _drop_column_if_present(c, "observations", "embedding_state")
     _drop_column_if_present(c, "records", "embedding_state")
     c.execute("DROP TABLE IF EXISTS vec_observations")
@@ -89,7 +93,7 @@ def test_v5_migration_is_idempotent(tmp_path):
     s = _make_v4_store(tmp_path)
     s.migrate()
     s.migrate()  # second call must not fail
-    assert s.schema_version() == SCHEMA_VERSION == 5
+    assert s.schema_version() == SCHEMA_VERSION
 
 
 def test_v5_migration_adds_columns(tmp_path):
@@ -141,7 +145,7 @@ def test_v5_bumps_pragma_user_version(tmp_path):
     s = _make_v4_store(tmp_path)
     assert s.schema_version() == 4
     s.migrate()
-    assert s.schema_version() == 5
+    assert s.schema_version() == SCHEMA_VERSION
 
 
 def test_v5_migration_preserves_v4_watermark_and_faults(tmp_path):

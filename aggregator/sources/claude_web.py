@@ -52,6 +52,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from aggregator.core.provenance import classify
 from aggregator.sources.base import (
     IngestResult,
     ObservationRow,
@@ -344,6 +345,13 @@ class ClaudeWebSource:
                     tool_name=None,
                     tool_use_id=None,
                     body=body,
+                    # NO STRUCTURAL FIELDS EXIST HERE — a vendor web-chat
+                    # export carries no ``promptSource``, no ``origin``, no
+                    # ``isSidechain``. Type and body are the whole evidence,
+                    # and that is enough: measured 0 of 3,621 live claude-web
+                    # user rows carry any machine marker, so the residual rule
+                    # lands them on ``human``, which is correct.
+                    provenance=classify(obs_type, body),
                 )
             )
         entities.extend(tool_rows)
@@ -393,6 +401,7 @@ class ClaudeWebSource:
             tool_name=tool_name,
             tool_use_id=tool_use_id,
             body=body,
+            provenance=classify(btype, body),
         )
 
     # -- Protocol methods --------------------------------------------------
