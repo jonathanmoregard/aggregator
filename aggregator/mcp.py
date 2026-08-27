@@ -3276,7 +3276,7 @@ def _query_sessions_path(
             "Each session card's", "that session's whole matching preview"
         ) + (
             " `subject` is the session's first user prompt, which is usually "
-            "NOT where the match is — that is what `content` and "
+            "NOT where the hit is — that is what `content` and "
             "`matching_observations` are for. drilldown=True returns the "
             "matching turns themselves."
         )
