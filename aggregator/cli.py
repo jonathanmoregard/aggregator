@@ -2831,18 +2831,33 @@ def _embed_batch(
             # A lock discriminates between nothing, exactly like a cold model
             # or an OOM, so it gets the same answer round 2 gave those: abort,
             # blame nobody, leave the backlog untouched.
+            #
+            # AND DISOWN THE ROW ON THE WAY OUT — 2026-08-27, observed in
+            # production four times in three hours. "Blame nobody" was true of
+            # this run and false of the next one: the claim written before the
+            # encode was still on disk, so the following run's
+            # `_blame_crashed_row` read it as a kill and booked a row that had
+            # embedded perfectly well into the poison ledger. The intent was
+            # defeated one function call away.
+            #
+            # This is reachable now because the claim lives beside the
+            # database rather than inside it (`Store.embed_claim_path`), so
+            # releasing it does not need the lock that just failed.
+            # `release_embed_claim` never raises, by construction, so this
+            # cannot become one more way to leave a claim behind.
+            store.release_embed_claim()
             store_fault = e
             break
         except Exception as e:
-            try:
-                store.release_embed_claim()
-            except sqlite3.Error as release_error:
-                # The release is itself a write, so it can fail for the same
-                # reason. The row's own failure goes unattributed and it stays
-                # at NULL: it is re-read next run, which costs one embed and
-                # cannot condemn anything.
-                store_fault = release_error
-                break
+            # NO GUARD AROUND THE RELEASE ANY MORE, and its absence is the
+            # point. This used to catch `sqlite3.Error` here because the
+            # release was a database write and could fail for the very reason
+            # the row had — so the run aborted to avoid leaving a claim it
+            # could not clear. The claim is a file beside the database now
+            # (`Store.embed_claim_path`) and `release_embed_claim` swallows
+            # its own errors, so there is no failure left to route: the row is
+            # disowned before anything else is decided about it.
+            store.release_embed_claim()
             if not _embedder_is_healthy(embedder):
                 unhealthy = EmbedderUnhealthyError(
                     f"aggregator embed stopped after {kind} row {row_id!r} failed "

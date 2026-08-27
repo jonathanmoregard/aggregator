@@ -3203,38 +3203,115 @@ class Store:
     # is the only part a kill cannot undo. A run that finds a claim knows the
     # previous process did not survive that row.
 
+    @property
+    def embed_claim_path(self) -> Path:
+        """Where the in-flight claim lives. NEXT TO THE DATABASE, NOT IN IT.
+
+        THE CLAIM IS A CRASH DETECTOR, AND IT USED TO BE STORED INSIDE THE
+        RESOURCE WHOSE UNAVAILABILITY IS THE COMMONEST NON-CRASH FAILURE. It
+        was a ``meta`` row, so disowning a row meant writing to sqlite — and
+        the 30-minute ingest timer takes that write lock. Observed in
+        production on 2026-08-27, four times in three hours: the worker
+        embedded a row, ``release_embed_claim`` raised
+        ``database is locked``, the run exited 1, and the NEXT run read the
+        surviving claim as a kill and booked a healthy row into the poison
+        ledger. Three of those make a row terminal — silently absent from the
+        vector arm forever.
+
+        A retry loop around the DELETE narrows that window and cannot close
+        it: the failure mode IS that the database stays unavailable longer
+        than the process is willing to wait. Any design where "I exited
+        cleanly" has to be written to a contended resource fails exactly when
+        it is needed.
+
+        A FILE SEPARATES THE TWO CASES THE DATABASE COULD NOT. Removing it
+        needs no lock, so a clean exit can always disown its row, however
+        thoroughly sqlite is wedged; a SIGKILL still runs no code, so a real
+        crash still leaves it. Same evidence for the case it was built for,
+        none of the evidence it was fabricating.
+
+        Beside ``<db>.embed.lock``, which the worker already holds for its
+        lifetime — same directory, same owner, same cleanup story, and the
+        adjacency is a hint to anyone who finds one of them by hand.
+        """
+        return Path(str(self.db_path) + ".embed.claim")
+
     def claim_embed_row(self, kind: str, row_id: str) -> None:
-        """Record — durably — which row is about to be embedded."""
-        self._ensure_writable()
-        c = self._c()
-        c.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            (
-                EMBED_CLAIM_KEY,
-                json.dumps({"kind": kind, "row_id": row_id}, sort_keys=True),
-            ),
-        )
-        # COMMIT IS THE ENTIRE POINT. An uncommitted claim dies with the
-        # process that wrote it, which is precisely the process this is meant
-        # to outlive.
-        c.commit()
+        """Record — durably — which row is about to be embedded.
+
+        DURABLY IS THE ENTIRE POINT: this has to outlive a process that gets
+        no chance to unwind, so the bytes are on the platter before the
+        encode starts. Written to a temporary name and renamed, so a kill
+        during the write cannot leave a half-written claim naming a partial
+        row id — ``rename`` is atomic within a directory, and a claim that
+        names the wrong row is worse than no claim at all.
+        """
+        payload = json.dumps({"kind": kind, "row_id": row_id}, sort_keys=True)
+        path = self.embed_claim_path
+        tmp = path.with_suffix(path.suffix + ".new")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
 
     def release_embed_claim(self) -> None:
-        """The claimed row resolved. Clear the claim."""
-        self._ensure_writable()
-        c = self._c()
-        c.execute("DELETE FROM meta WHERE key = ?", (EMBED_CLAIM_KEY,))
-        c.commit()
+        """The claimed row resolved. Clear the claim.
+
+        NEVER RAISES, and that is load-bearing rather than defensive. This is
+        called on the success path of every row and again from the handlers
+        that abort a run; if it could throw it would become one more way to
+        exit while leaving a claim behind, which is the bug it exists to end.
+        Nothing is lost by swallowing: a claim that could not be removed is
+        re-examined next run, and the worst case is the false blame that this
+        whole mechanism is being reshaped to avoid.
+        """
+        try:
+            self.embed_claim_path.unlink(missing_ok=True)
+        except OSError as e:  # pragma: no cover - unreadable claim directory
+            log.warning(
+                "could not remove the embed claim at %s (%s: %s); the next "
+                "run may read it as a crash.",
+                self.embed_claim_path,
+                type(e).__name__,
+                e,
+            )
 
     def pending_embed_claim(self) -> tuple[str, str] | None:
         """``(kind, row_id)`` a previous process died on, or ``None``."""
-        row = self._c().execute(
-            "SELECT value FROM meta WHERE key = ?", (EMBED_CLAIM_KEY,)
-        ).fetchone()
-        if row is None:
+        # A LEGACY CLAIM IN ``meta`` CONVICTS NOBODY, and is cleared on sight.
+        # It was written by a build that could not tell a kill from a
+        # lock-on-release, so its presence is consistent with both and carries
+        # no information about which happened. Reading it as a crash is what
+        # condemned four good rows on 2026-08-27. It is deleted rather than
+        # ignored so it cannot be re-examined by every future run — and the
+        # delete is best-effort, because the same lock that created this mess
+        # may still be held.
+        try:
+            legacy = self._c().execute(
+                "SELECT value FROM meta WHERE key = ?", (EMBED_CLAIM_KEY,)
+            ).fetchone()
+            if legacy is not None:
+                log.warning(
+                    "discarding an in-database embed claim left by an older "
+                    "build (%s). It cannot be distinguished from a lock on "
+                    "the release path, so no row is blamed for it.",
+                    legacy[0],
+                )
+                c = self._c()
+                c.execute("DELETE FROM meta WHERE key = ?", (EMBED_CLAIM_KEY,))
+                c.commit()
+        except sqlite3.Error:
+            pass
+
+        try:
+            raw = self.embed_claim_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
             return None
         try:
-            claim = json.loads(row[0])
+            claim = json.loads(raw)
             return str(claim["kind"]), str(claim["row_id"])
         except (ValueError, KeyError, TypeError):
             # An unreadable claim names nobody, so it can blame nobody. Say
