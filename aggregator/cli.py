@@ -57,6 +57,7 @@ from typing import Any
 
 from aggregator.core.chunk import chunk_body
 from aggregator.core.embed import MODEL_DOWNLOAD_ENV, Embedder, downloads_allowed
+from aggregator.core.provenance import classify
 from aggregator.core.store import (
     EMBED_BACKLOG_ORDER,
     EmptyRebuildRefusedError,
@@ -1975,6 +1976,273 @@ def _flip_completed_pointer(
         print(f"embed: index complete for {model}")
 
 
+#: Rows per committed chunk of the provenance backfill.
+#:
+#: SIZED AGAINST WHAT A KILL COSTS, not against throughput. Each chunk is one
+#: ``executemany`` of single-column UPDATEs plus one COMMIT, and under the
+#: narrowed ``observations_au`` trigger the whole 549,952-row table takes a
+#: measured ~37 s — so the chunk size barely moves the wall clock and entirely
+#: decides the blast radius of a SIGTERM. 2,000 is well under a second of work.
+_PROVENANCE_CHUNK = 2000
+
+
+def _cmd_provenance(
+    args: argparse.Namespace, store: Store, sources: dict[str, Any]
+) -> int:
+    """Classify who composed each observation. Resumable, chunked, pure UPDATE.
+
+    WHY THIS IS A SUBCOMMAND AND NOT PART OF ``migrate()``. ``migrate()`` runs
+    on EVERY subcommand, read-only queries included (``store.py``'s dispatch in
+    ``main``). A classification pass over half a million rows behind an
+    ``aggregator query`` is precisely the hours-long unattended surprise the
+    incremental-ingest rules exist to abolish. It is also not something a read
+    should ever pay for.
+
+    TWO ROUTES, IN THIS ORDER, AND THE ORDER IS THE ACCURACY.
+
+    1. **JSONL-derived.** A read-only walk of the sessions archive, producing
+       ``uuid -> provenance`` from the raw lines. Measured 59% machine share of
+       ``type='user'``, because the vendor's structural fields (``isSidechain``,
+       ``isMeta``, ``promptSource``, ``origin``) only exist there.
+    2. **DB-only.** Type, body and the owning session's ``kind`` — everything
+       route 1 could not reach: the 3,621 ``claude-web`` rows whose export is
+       not on disk, live files the walk skips, and any session whose archive has
+       been deleted. Measured 100% precision, 58% recall against route 1, which
+       is why it runs SECOND and only over what is left.
+
+    Both call the same ``classify``, so ingest and backfill cannot disagree.
+
+    IT IS A PURE UPDATE OF ONE COLUMN. No re-ingest, no re-scrub, no ``body``
+    write, no ``src_hash`` write, no ``embedding_state`` reset. That is not an
+    optimisation: a re-ingest of this corpus is ~11 hours of Presidio at the
+    measured 827 rows/min, and resetting ``embedding_state`` would discard the
+    observation vector arm — weeks of CPU — the moment that arm is warm.
+
+    RESUMABILITY IS ``provenance IS NULL`` AND NOTHING ELSE. The watermark lives
+    in the rows it describes, so there is no sidecar to fall out of step with
+    them and a kill at any moment costs at most one chunk. A file whose rows are
+    all classified is skipped without being opened.
+
+    CPU: single-threaded by construction. It parses JSON and runs SQLite; it
+    loads no model and holds no thread pool, so there is no pool to pin and it
+    cannot take more than one core. It is also hand-run — no timer starts it.
+    """
+    src = sources.get("sessions")
+    errors: list[str] = []
+    if args.reclassify:
+        # THE DOCUMENTED PATH AFTER A CLASSIFIER REVISION, and it is cheap
+        # exactly because provenance is not in ``_src_hash``: resetting the
+        # column tells nothing else in the corpus that anything changed.
+        c = store._c()
+        c.execute("UPDATE observations SET provenance = NULL")
+        c.commit()
+        print("provenance: reset every row to unclassified")
+
+    classified = 0
+    with graceful_shutdown() as stop:
+        from_archive, stopped = _provenance_from_archive(
+            store, src, args.chunk_size, stop, errors
+        )
+        classified += from_archive
+        if not stopped:
+            from_db, stopped = _provenance_from_db(
+                store, args.chunk_size, stop, errors
+            )
+            classified += from_db
+
+    remaining = store.count_unclassified_observations()
+    print(
+        f"provenance: classified={classified} still_unclassified={remaining}"
+        f"{' (INTERRUPTED — stopped at a chunk boundary; the next run resumes)' if stopped else ''}"
+    )
+    if errors:
+        for line in errors[:ERROR_PRINT_LIMIT]:
+            print(f"ERROR: {line}", file=sys.stderr)
+        if len(errors) > ERROR_PRINT_LIMIT:
+            print(
+                f"ERROR: ... and {len(errors) - ERROR_PRINT_LIMIT} more",
+                file=sys.stderr,
+            )
+        # NON-ZERO, because a pass that skipped part of the corpus and a pass
+        # that classified all of it must not look the same from a shell.
+        return EXIT_COMPLETED_WITH_ERRORS
+    return 0
+
+
+def _owed_archive_paths(store: Store) -> set[str]:
+    """JSONL paths that still own at least one unclassified observation.
+
+    THE WORK LIST, AND IT IS WHY THIS IS HISTORY-AWARE WITHOUT A LEDGER. One
+    indexed query answers "which files still owe rows"; every other file in the
+    archive is skipped without being opened, so a re-run over a classified
+    corpus reads nothing. The result is ~11k paths — a work list, not the
+    corpus — and it is recomputed from the database on every run, so a kill
+    cannot leave it stale.
+    """
+    return {
+        row[0]
+        for row in store._c().execute(
+            "SELECT DISTINCT s.jsonl_path FROM sessions s "
+            "JOIN observations o ON o.session_id = s.session_id "
+            "WHERE o.provenance IS NULL"
+        )
+        if row[0]
+    }
+
+
+def _provenance_from_archive(
+    store: Store,
+    src: Any,
+    chunk_size: int,
+    stop: Callable[[], bool],
+    errors: list[str],
+) -> tuple[int, bool]:
+    """Route 1: classify from the raw JSONL, one file at a time.
+
+    Streams. The per-file generator is the sessions source's own parser, so the
+    lines this reads are byte-for-byte the lines ingest reads — a second parser
+    here would be a second thing to keep in step, and a divergence between them
+    would be invisible because both sides would look classified.
+
+    A file that cannot be read is recorded and skipped: one unreadable archive
+    must not cost the other 11,763 their classification, and the run still exits
+    non-zero so the gap is not mistaken for completeness.
+
+    THE STOP IS CHECKED AT EVERY CHUNK, NOT AT EVERY FILE. Files in this archive
+    are not uniform — the largest hold tens of thousands of lines — so a stop
+    honoured only between files is a stop a SIGTERM can wait a long time for.
+    The chunk boundary is already the durable point; it is therefore also the
+    right place to stop.
+    """
+    if src is None or not hasattr(src, "_iter_parsed"):
+        return 0, False
+    owed = _owed_archive_paths(store)
+    if not owed:
+        return 0, False
+    pending: list[tuple[str, str]] = []
+    written = 0
+    for path in src._iter_jsonl_files(errors):
+        if stop():
+            return written + _flush_provenance(store, pending), True
+        if str(path) not in owed:
+            continue
+        try:
+            for parsed in src._iter_parsed(path, errors):
+                pending.append((parsed.provenance, parsed.uuid))
+                if len(pending) >= chunk_size:
+                    written += _flush_provenance(store, pending)
+                    if stop():
+                        return written, True
+        except OSError as e:
+            # Caught here as well as inside the parser because the walk itself
+            # can fail on a file the stat succeeded for — a permission change
+            # or a vanished symlink between the two calls.
+            errors.append(f"{path}: provenance scan failed: {e}")
+    written += _flush_provenance(store, pending)
+    _drop_declared_faults(src, errors)
+    return written, False
+
+
+def _drop_declared_faults(src: Any, errors: list[str]) -> None:
+    """Take the parser's PERMANENT faults back out of this run's errors.
+
+    A line the JSON parser rejects will never parse, no run will ever classify
+    it, and there is no row in the database for it either — ingest could not
+    store it. Counting it as a backfill failure would make
+    ``aggregator provenance --backfill`` exit non-zero for ever over damage
+    that has nothing to do with provenance: a permanently-red alarm, which is
+    the alarm an operator learns to dismiss unread. Exactly the distinction
+    ``PermanentFault`` exists to draw, so this reuses the source's own
+    declaration rather than re-deciding it here.
+
+    Everything the source did NOT declare — a failed ``stat``, a file it could
+    not open, a vendor format change — stays loud, on every run, until a human
+    looks at it.
+    """
+    if not hasattr(src, "drain_faults"):
+        return
+    declared = {fault.line for fault in src.drain_faults()}
+    if declared:
+        errors[:] = [e for e in errors if e not in declared]
+
+
+def _provenance_from_db(
+    store: Store,
+    chunk_size: int,
+    stop: Callable[[], bool],
+    errors: list[str],
+) -> tuple[int, bool]:
+    """Route 2: classify what is left from type, body and the session's kind.
+
+    The chunk is ``WHERE provenance IS NULL LIMIT n`` — the same shape
+    ``select_unembedded`` uses, and resumable for the same reason: the query IS
+    the ledger, so running it twice equals running it once.
+
+    A CHUNK THAT SELECTS ROWS AND WRITES NONE STOPS THE RUN. Without that the
+    next iteration asks the identical question and gets the identical rows, for
+    ever — a poison row silently retried in a loop, which the ingest rules
+    forbid twice over. It cannot happen while ``classify`` is total, so if it
+    ever does, the classifier is broken and saying so beats spinning.
+    """
+    written = 0
+    while True:
+        if stop():
+            return written, True
+        rows = list(
+            store._c().execute(
+                "SELECT o.obs_id AS obs_id, o.type AS type, o.body AS body, "
+                "       s.kind AS kind "
+                "FROM observations o "
+                "LEFT JOIN sessions s ON s.session_id = o.session_id "
+                "WHERE o.provenance IS NULL LIMIT ?",
+                (chunk_size,),
+            )
+        )
+        if not rows:
+            return written, False
+        pending = []
+        for row in rows:
+            value = classify(row["type"], row["body"], session_kind=row["kind"])
+            if value:
+                pending.append((value, row["obs_id"]))
+        if not pending:
+            errors.append(
+                f"provenance backfill stalled: {len(rows)} unclassified row(s) "
+                f"came back and the classifier placed none of them, so the next "
+                f"chunk would select the same rows again. Refusing to loop. "
+                f"First id: {rows[0]['obs_id']!r}."
+            )
+            return written, False
+        written += _flush_provenance(store, pending)
+
+
+def _flush_provenance(store: Store, pending: list[tuple[str, str]]) -> int:
+    """Write one chunk and COMMIT it. Empties ``pending`` in place.
+
+    ``AND provenance IS NULL`` makes the write idempotent and monotone: a row
+    that already carries a value — because ingest classified it, or because an
+    earlier chunk did — is never rewritten, so a re-run costs no writes at all
+    and two overlapping runs cannot fight.
+    """
+    if not pending:
+        return 0
+    c = store._c()
+    before = c.total_changes
+    c.executemany(
+        "UPDATE observations SET provenance = ? "
+        "WHERE obs_id = ? AND provenance IS NULL",
+        pending,
+    )
+    # COUNTED FROM THE DATABASE, not from ``len(pending)``. The archive walk
+    # sees lines that never became rows — non-dominant resume-prefix copies,
+    # lines dropped for want of a timestamp — and billing those as classified
+    # would report a corpus finished while rows are still NULL.
+    written = c.total_changes - before
+    c.commit()
+    pending.clear()
+    return written
+
+
 def _cmd_seed_models() -> int:
     """Fetch/verify the model weights. NO DATABASE, NO ROWS, NO LOCK.
 
@@ -3336,6 +3604,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="assume 'y' for the --reindex confirmation (scripted use)",
     )
 
+    p_prov = sub.add_parser(
+        "provenance",
+        help="classify who composed each observation (fills the v6 column)",
+    )
+    prov_mode = p_prov.add_mutually_exclusive_group(required=True)
+    prov_mode.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            "classify every observation whose provenance is still null, then "
+            "exit, in bounded committed chunks. RESUMABLE: `provenance IS NULL` "
+            "is the watermark and it lives in the rows it describes, so a kill "
+            "costs at most one chunk and a re-run over a classified corpus "
+            "reads nothing. It is a pure UPDATE of one column — no re-ingest, "
+            "no re-scrub, no embedding_state reset. Single-threaded: it loads "
+            "no model and holds no thread pool, so it cannot take more than "
+            "one core"
+        ),
+    )
+    prov_mode.add_argument(
+        "--reclassify",
+        action="store_true",
+        help=(
+            "reset every observation to unclassified and run the backfill "
+            "again. This is what to run after CHANGING the classifier. It is "
+            "cheap and safe precisely because provenance is not part of "
+            "`_src_hash`: nothing else in the corpus notices, no body is "
+            "re-scrubbed and no vector is discarded"
+        ),
+    )
+    p_prov.add_argument(
+        "--chunk-size",
+        type=_positive_int,
+        default=_PROVENANCE_CHUNK,
+        dest="chunk_size",
+        help=(
+            f"rows per committed chunk (default: {_PROVENANCE_CHUNK}, must be "
+            f">= 1). This bounds what a SIGTERM costs, not the throughput: the "
+            f"whole table is a measured ~37 s under the narrowed FTS trigger"
+        ),
+    )
+
     tks = sub.add_parser(
         "github-token-status",
         help=(
@@ -3431,6 +3741,8 @@ def main(
         return _cmd_ingest(args, store, sources())
     if args.cmd == "embed":
         return _cmd_embed(args, _store=store)
+    if args.cmd == "provenance":
+        return _cmd_provenance(args, store, sources())
     if args.cmd == "github-token-status":
         return _cmd_github_token_status(args, store, sources())
     return 2

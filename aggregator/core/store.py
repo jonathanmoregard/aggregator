@@ -4775,6 +4775,21 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def count_unclassified_observations(self) -> int:
+        """How many observations are still ``provenance IS NULL``.
+
+        The backfill's remaining-work number, printed at the end of a run.
+        A COUNT rather than the ``LIMIT 1`` probe above because "how much is
+        left" is the question an operator asks after an interrupted pass, and
+        "some" does not answer it. It is an index-only scan of
+        ``obs_provenance`` and is paid once per run, not per query.
+        """
+        return int(
+            self._c().execute(
+                "SELECT count(*) FROM observations WHERE provenance IS NULL"
+            ).fetchone()[0]
+        )
+
     def _obs_where(self, ast: QueryAST) -> tuple[str, list]:
         """Build WHERE for an ``observations`` query.
 
