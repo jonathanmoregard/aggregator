@@ -2287,10 +2287,11 @@ def _truncation_notice(cut: int, total: int, ceiling: int) -> str:
     return (
         f"Payload ceiling: {cut} of {total} `content` fields were cut to keep "
         f"this response under {ceiling} characters. Every item carries "
-        f"`truncated` and `content_length` (the body's TRUE size), on the cut "
-        f"rows and the whole ones alike. To read a cut body in full, re-call "
-        f"scoped to that row alone — session:<id> or a smaller page_size — "
-        f"rather than re-running this query at a larger size."
+        f"`truncated` and `content_length` — what `content` would have been "
+        f"without the ceiling — on the cut rows and the whole ones alike. To "
+        f"read a cut body in full, re-call scoped to that row alone "
+        f"(session:<id>, or a smaller page_size) rather than re-running this "
+        f"query at a larger size."
     )
 
 
@@ -2767,21 +2768,26 @@ def aggregator_query(
 
       EVERY ITEM CARRIES ``truncated`` AND ``content_length``, always, whether
       or not anything was cut. The response is held under a server-side
-      character ceiling that is independent of ``page_size`` — ``page_size``
-      bounds ROWS, and one row can hold a whole compacted session — and when a
-      page would overrun it, individual ``content`` fields are shortened
-      rather than rows being dropped. ``content_length`` is then the body's
-      TRUE size, so ``content_length > len(content)`` is exactly the set of
-      bodies you are only seeing part of. To read one of those in full,
-      re-call scoped to that single row (``session:<id>``, or a smaller
-      ``page_size``); re-running the same query bigger gets you the same cut.
-      ``total`` and the page token are never affected by the ceiling.
+      character ceiling independent of ``page_size`` — ``page_size`` bounds
+      ROWS, and one row can hold a whole compacted session — and a page that
+      would overrun it gets individual ``content`` fields shortened rather
+      than rows dropped. ``total`` and the page token are never affected.
 
-      In summary mode ``content`` is a bounded snippet of the body that
-      matched, centred on the first query-term hit, matched terms marked
-      ``[[like this]]`` and elisions marked ``…``. It is usually enough to
-      answer with, and it is the reason ``fields='full'`` should be a
-      deliberate second step for specific rows rather than the default next
+      ``truncated: True`` means THE CEILING cut this row, and
+      ``content_length`` is then what ``content`` would have been without it.
+      To read a cut row in full, re-call scoped to that row alone
+      (``session:<id>``, or a smaller ``page_size``); re-running the same
+      query bigger gets you the same cut.
+
+      TWO DIFFERENT SHORTENINGS, AND ONLY ONE OF THEM IS ``truncated``. In
+      summary mode ``content`` is a bounded snippet of the body that matched —
+      centred on the first query-term hit, matched terms marked
+      ``[[like this]]``, elisions marked ``…`` — and that excerpting is the
+      MODE, not the ceiling, so a snippet with ellipses in it still reports
+      ``truncated: False``. Read the ``…`` for "this body goes on" and
+      ``truncated`` for "the payload ceiling bit". The snippet is usually
+      enough to answer with, which is why ``fields='full'`` belongs as a
+      deliberate second step for specific rows rather than as the default next
       move.
 
       ``rerank_applied`` appears only when ``rerank=True`` was requested, and

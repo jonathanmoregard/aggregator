@@ -153,6 +153,22 @@ def test_the_snippet_does_not_open_mid_word(store):
     )
 
 
+def test_an_elided_snippet_is_not_reported_as_ceiling_truncated(store):
+    """Two different shortenings, and conflating them would mislead twice.
+
+    Excerpting is what summary MODE does; ``truncated`` is what the payload
+    CEILING did. A caller that reads a snippet's ellipses as a ceiling cut
+    would go paginating for a page that was never over budget; one that reads
+    ``truncated: False`` as "this is the whole body" would quote half a turn.
+    The ``…`` says the body goes on; ``truncated`` says the ceiling bit.
+    """
+    result = _obs_rows(store)
+    buried = next(r for r in result["records"] if r["obs_id"] == "o-buried")
+    assert _inner(buried["content"]).startswith("…"), buried["content"]
+    assert buried["truncated"] is False, buried
+    assert buried["content_length"] == len(buried["content"])
+
+
 def test_the_snippet_is_wrapped_as_untrusted_content(store):
     """Summary mode now returns real body text, so the boundary rule applies.
 
