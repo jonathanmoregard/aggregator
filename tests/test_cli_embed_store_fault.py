@@ -93,14 +93,29 @@ class _LockedOnClaim(Store):
         raise sqlite3.OperationalError("database is locked")
 
 
-class _LockedOnRelease(Store):
-    """The other store call inside the same try block."""
+class _LockedOnBatchCommit(Store):
+    """The contended write that is still a database write.
 
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.embed_failed_once = False
+    SUCCESSOR TO ``_LockedOnRelease``, and the reason for the swap is a real
+    contract change rather than a test tidy-up. This class used to override
+    ``release_embed_claim``, because that was the second of two store calls
+    inside the same ``try`` block and could therefore lose to the ingest
+    timer's lock like any other write.
 
-    def release_embed_claim(self):
+    It cannot any more. The in-flight claim moved out of the database and next
+    to it (``Store.embed_claim_path``) precisely because a clean exit must be
+    able to disown its row while sqlite is unavailable — an override that makes
+    the release raise ``sqlite3.OperationalError`` now models a world that no
+    longer exists, and a test built on it asserts nothing about this code.
+
+    So the injection point moves to the write that IS still contended and still
+    inside a guard: the one-transaction ``commit_embed_batch`` at the end of the
+    batch. That is also the call the deployed worker actually died on — the
+    production line reads "the cache could not be written while embedding
+    records (OperationalError: database is locked)".
+    """
+
+    def commit_embed_batch(self, *a, **kw):
         raise sqlite3.OperationalError("database is locked")
 
 
@@ -153,17 +168,26 @@ def test_the_error_names_the_store_not_the_row(cache, monkeypatch, capsys):
     )
 
 
-def test_a_lock_on_the_release_is_treated_the_same_way(
+def test_a_lock_on_the_batch_commit_is_treated_the_same_way(
     cache, monkeypatch, capsys
 ):
-    """Both store calls sit inside the handler that blames the row."""
+    """Every store call in the path gets the same answer, not just the first.
+
+    Was ``test_a_lock_on_the_release_is_treated_the_same_way`` — see
+    ``_LockedOnBatchCommit`` for why the injection point moved. The behaviour
+    under test is unchanged: a lock anywhere in the store path aborts the run
+    without blaming a row for it.
+    """
     _stub_embedder(monkeypatch)
 
-    rc = _cmd_embed(_ns(), _store=_LockedOnRelease(db_path=cache))
+    rc = _cmd_embed(_ns(), _store=_LockedOnBatchCommit(db_path=cache))
     capsys.readouterr()
 
     assert rc == 1
     assert _held(cache) == {}
+    assert set(_states(cache).values()) == {None}, (
+        "a row left the backlog for a lock on the batch commit"
+    )
 
 
 def test_a_genuinely_bad_row_is_still_blamed(cache, monkeypatch, capsys):
