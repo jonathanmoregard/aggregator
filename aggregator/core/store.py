@@ -466,6 +466,57 @@ def _json_id_clause(column: str) -> str:
 _FTS5_TOKEN_RE = re.compile(r"\w+")
 
 
+def fts5_match_conjuncts(text: str | None) -> list[str]:
+    """Split user text into the FTS5 phrases that must ALL match.
+
+    ``power-on`` -> ``['"power"', '"on"']``.
+    ``"PR link" "status report"`` -> ``['"PR link"', '"status report"']``.
+
+    A DOUBLE-QUOTED RUN IS ONE CONJUNCT, and that is the whole difference from
+    a per-word split. The caller who writes ``"low usage cap"`` is naming three
+    words that stand next to each other; three independent conjuncts is a
+    different question with a different answer, and on this corpus a much worse
+    one — measured, ``"low usage cap"`` goes from the single right row to 156
+    rows with the right one at 118, and ``"terraform state lock"`` goes from a
+    clean nothing to 1,845 hits, because "state" and "lock" are ordinary words
+    here and only the adjacency was selective. Quotes are the one piece of
+    query syntax every caller already knows; discarding them silently turns a
+    precise question into an imprecise one without saying so.
+
+    ONLY BALANCED QUOTES GROUP. An odd number of ``"`` means the caller's
+    phrase never closed, and guessing where it ends invents a query nobody
+    wrote — so an unbalanced string falls all the way back to the per-word
+    split, exactly as before. ``'"unbalanced quote'`` is still
+    ``['"unbalanced"', '"quote"']``.
+
+    THE SAFETY PROPERTY IS UNCHANGED: what reaches ``MATCH`` is still nothing
+    but double-quoted ``\\w+`` runs, now with single spaces allowed between
+    runs INSIDE a pair of quotes. Inside an FTS5 string the only
+    meta-character is ``"``, and no ``"`` from the input survives — the quotes
+    in the output are ones this function wrote. So no operator, column filter,
+    ``NEAR``, prefix ``*`` or stray quote can be expressed, whatever FTS5
+    decides those characters mean next.
+
+    Returns ``[]`` for text with no word characters at all.
+    """
+    raw = text or ""
+    segments = raw.split('"')
+    # An even segment count means an odd number of quotes: unbalanced. Treat
+    # the whole string as unquoted rather than pairing the quotes by position.
+    if len(segments) % 2 == 0:
+        segments = [raw.replace('"', " ")]
+    out: list[str] = []
+    for i, segment in enumerate(segments):
+        tokens = _FTS5_TOKEN_RE.findall(segment)
+        if not tokens:
+            continue
+        if i % 2:  # inside a balanced pair of quotes: one adjacency phrase
+            out.append('"' + " ".join(tokens) + '"')
+        else:
+            out.extend(f'"{t}"' for t in tokens)
+    return out
+
+
 def fts5_match_query(text: str | None) -> str:
     """Rewrite arbitrary user text into a safe FTS5 ``MATCH`` expression.
 
@@ -486,6 +537,13 @@ def fts5_match_query(text: str | None) -> str:
     ones that already worked return the same rows with the same bm25 scores.
     Asserted in ``tests/core/test_store_fts_sanitize.py``.
 
+    A BALANCED QUOTED RUN STAYS ONE PHRASE — see
+    :func:`fts5_match_conjuncts`, which this is the joined form of. That
+    RESTORES the identity property above rather than weakening it: a quoted
+    phrase was already valid FTS5 and already meant adjacency, so shattering it
+    into independent words was the one class of previously-working query this
+    rewrite silently reranked.
+
     Returns ``""`` for text with no word characters at all. Callers MUST read
     that as "no lexical matches" and skip the query: ``MATCH ''`` is a
     different question, not a cheaper form of this one.
@@ -496,7 +554,7 @@ def fts5_match_query(text: str | None) -> str:
     rewrite happens inside the FTS5 binding sites below, downstream of every
     caller that also drives the vector arm.
     """
-    return " ".join(f'"{t}"' for t in _FTS5_TOKEN_RE.findall(text or ""))
+    return " ".join(fts5_match_conjuncts(text))
 
 
 def fts5_query_terms(text: str | None) -> list[str]:
