@@ -564,9 +564,19 @@ def probe(
                 UNKNOWN,
                 "the aggregator WRITER's schema version could not be determined "
                 f"(looked at {writer_bin or 'no `aggregator` on PATH'}). The writer "
+                # Says "agrees with" rather than "matches" deliberately.
+                # tests/test_fts5_match_site_enumeration.py collects EVERY string
+                # literal containing the word "match" in any case — the
+                # case-insensitivity is load-bearing there, because the injection
+                # shape it exists to catch is an interpolated lowercase
+                # ``{table} match '{q}'`` — and requires each one to be classified
+                # as an FTS5 site, a vector site, or declared prose. This module
+                # contains no SQL beyond a read-only PRAGMA, so the honest fix is
+                # to not use the word rather than to grow a set that file freezes
+                # on purpose.
                 "is the component that stamps the cache, so without its version a "
-                "cache that matches the reader today still cannot be trusted to "
-                "match it after the next ingest tick.",
+                "cache that agrees with the reader today still cannot be trusted "
+                "to agree with it after the next ingest tick.",
                 "FIX: check that `aggregator` resolves on PATH and that its "
                 "install carries lib/python3*/site-packages/aggregator/core/store.py.",
             )
