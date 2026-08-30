@@ -149,6 +149,64 @@ class VectorReindexNotConsentedError(RuntimeError):
     """
 
 
+class SchemaAheadError(RuntimeError):
+    """This build found a cache written by a NEWER build, and stopped.
+
+    THE INCIDENT. Two builds of the same program ran as different roles against
+    one shared cache. The MCP reader ran out of the live checkout at
+    ``SCHEMA_VERSION`` 6; the ``aggregator`` CLI and the ingest timer behind it
+    were a Nix build pinned at 5. ``migrate()`` stamped
+    ``PRAGMA user_version = SCHEMA_VERSION`` unconditionally, so every thirty
+    minutes the v5 writer re-stamped the cache down to 5 and exited 0. The unit
+    reported ``ExecMainStatus=0``, every source read fresh, and every recall was
+    refused for weeks. Nothing noticed, because A SUCCESSFUL DOWNGRADE LOOKS
+    EXACTLY LIKE A SUCCESSFUL MIGRATION — same code path, same exit code, same
+    log line.
+
+    WHY REFUSING IS THE ONLY SAFE MOVE, and not merely the tidy one. A cache
+    stamped above this build's ``SCHEMA_VERSION`` was written by code this
+    process has never seen. It does not know which columns the newer schema
+    added, which of them are ``NOT NULL``, which triggers now fire on write,
+    what the vec tables are shaped like, or whether the FTS shadows still mean
+    what they used to. Every alternative to stopping is worse:
+
+    * stamp anyway (the bug) — silently breaks every newer reader;
+    * skip the stamp and keep writing — writes rows against a schema this
+      build cannot describe, turning "the cache is unreadable by one component"
+      into "the cache is wrong for all of them";
+    * rebuild the cache at this version — that is a downgrade wearing a
+      different hat, and it destroys weeks of computed vectors to do it.
+
+    So nothing is written at all, and the caller is told which two versions
+    disagreed. THE FIX IS ALWAYS FORWARD: bring the lagging side — the build
+    raising this — up to the cache. The cache is the leading side and stays
+    exactly where it is.
+
+    ITS OWN TYPE, and not a bare ``RuntimeError``, because the CLI has to
+    catch precisely this and nothing else. An unhandled exception out of
+    ``migrate()`` reaches ``aggregator-ingest.service`` as a traceback on every
+    thirty-minute tick, and that unit's ``OnFailure=`` notifier has no
+    debounce — forty-eight critical toasts a day about a condition only a
+    deploy can change. See ``cli._report_schema_ahead`` for the alarm that
+    replaces it, and the "deliberately no fourth code" paragraph in
+    ``README.md`` for why alarm fatigue is treated here as a form of silence.
+
+    CARRIES THE TWO NUMBERS AS ATTRIBUTES, not only inside the message. The
+    message is written for a human reading a journal and is long on purpose;
+    the desktop toast that the CLI raises from it has to stay short enough to
+    be read at a glance, and re-deriving ``found`` by parsing the prose would
+    be a parser of our own sentences — the kind of coupling that breaks the
+    moment somebody improves the wording.
+    """
+
+    def __init__(self, message: str, *, found: int, expected: int) -> None:
+        super().__init__(message)
+        #: The cache's ``PRAGMA user_version`` — the LEADING side.
+        self.found = found
+        #: This build's ``SCHEMA_VERSION`` — the side that has to come up.
+        self.expected = expected
+
+
 class CacheUnavailableError(sqlite3.OperationalError):
     """The cache file could not be opened at all — usually it is not there yet.
 
@@ -1444,6 +1502,58 @@ class Store:
 
     # -- schema -----------------------------------------------------------
 
+    def _refuse_if_schema_ahead(self, c: sqlite3.Connection) -> None:
+        """Stop dead if this cache was written by a build newer than this one.
+
+        ONE ``PRAGMA`` READ, AND IT IS FREE ON THE PATHS THAT MATTER.
+        ``user_version`` lives in the header of page 1, which SQLite has
+        already read to open the file at all, so the two overwhelmingly common
+        cases — a cache at exactly this version, and a fresh database at 0 —
+        pay for one integer comparison and take no new branch. That mattered
+        enough to check: ``migrate()`` runs on EVERY subcommand, so anything
+        expensive here would be a tax on the whole CLI.
+
+        ``> SCHEMA_VERSION``, NOT ``!= SCHEMA_VERSION``. Below is the ordinary
+        upgrade and is the entire reason this method exists; refusing in both
+        directions would turn one incident into two, and would brick every
+        machine mid-rollout. Above is the dangerous direction and the only one
+        guarded here, because this build cannot know what the newer schema
+        contains — see :class:`SchemaAheadError` for why every alternative to
+        stopping is worse than stopping.
+
+        THE MESSAGE IS PART OF THE FIX. An operator meeting a schema error
+        fears a half-migrated cache, and reaching for a wholesale reset to
+        repair damage that has not happened is how weeks of computed vectors
+        get deleted for nothing. So it says plainly that nothing was written,
+        names both numbers, and names the one remedy that is not a downgrade
+        in disguise: deploy a build that understands the cache. Nothing here
+        offers to lower the cache to suit this process, because that is not an
+        available answer — skew is resolved by bringing the lagging side up.
+        """
+        found = int(c.execute("PRAGMA user_version").fetchone()[0])
+        if found <= SCHEMA_VERSION:
+            return
+        raise SchemaAheadError(
+            f"refusing to migrate {self.db_path}: it is stamped at schema "
+            f"version {found}, and this build only understands schema version "
+            f"{SCHEMA_VERSION}. NOTHING WAS WRITTEN — the cache on disk is "
+            f"exactly as it was, `PRAGMA user_version` included, and it is not "
+            f"damaged. A cache newer than the process opening it means an OLD "
+            f"BUILD is running against a CURRENT cache: this process cannot "
+            f"know which columns schema {found} added, which of them are NOT "
+            f"NULL, or which triggers now fire, so writing into it would take "
+            f"a cache that one component merely cannot read and make it wrong "
+            f"for all of them. Upgrade this build to one that understands "
+            f"schema {found} — for a Nix deployment that means bumping the "
+            f"pinned aggregator revision and re-running the switch, since the "
+            f"installed store path is immutable and editing a source checkout "
+            f"changes nothing about what runs on the timer. Until then this "
+            f"writer stays stopped, on purpose: the cache is the side that is "
+            f"current, and it keeps its version.",
+            found=found,
+            expected=SCHEMA_VERSION,
+        )
+
     def migrate(
         self, *, allow_vector_reindex: bool = False, embedder: object | None = None
     ) -> None:
@@ -1469,9 +1579,12 @@ class Store:
         cannot leak out of the call that passes it. See
         ``VECTOR_REINDEX_COMMAND``.
 
-        Bumps ``PRAGMA user_version`` to SCHEMA_VERSION. A downgraded schema
-        won't be silently touched — callers detect via ``user_version`` and
-        run ``rebuild_all()`` to drop + recreate.
+        Bumps ``PRAGMA user_version`` to SCHEMA_VERSION — FORWARD ONLY. A cache
+        already stamped above this build raises :class:`SchemaAheadError`
+        before anything is written; see :meth:`_refuse_if_schema_ahead` for the
+        argument, and note that the unconditional stamp this replaced is what
+        made the 2026-08 skew incident invisible. A cache stamped BELOW is the
+        ordinary upgrade and is migrated in place as it always was.
 
         v2 → v3 upgrades in place: ``ALTER TABLE sessions ADD COLUMN origin``
         with the ``'claude-code'`` default backfilling every existing row.
@@ -1492,6 +1605,10 @@ class Store:
         """
         self._ensure_writable()
         c = self._c()
+        # FIRST, BEFORE A SINGLE DDL STATEMENT. Raising further down would
+        # satisfy a test that only catches the exception while reproducing the
+        # incident exactly: the damage is the write, not the return.
+        self._refuse_if_schema_ahead(c)
         self._ensure_sessions_origin_column(c)
         self._ensure_src_hash_columns(c)
         self._ensure_embedding_state_columns(c)
@@ -2090,6 +2207,16 @@ class Store:
         """
         self._ensure_writable()
         c = self._c()
+        # BEFORE THE FIRST ``DROP``, and before the consent prompt too. This
+        # method drops every table and then calls ``migrate()``, so guarding
+        # only ``migrate()`` would turn it into "destroy the cache, then refuse
+        # to recreate it" — strictly worse than the incident that guard exists
+        # for, which cost recall rather than the data. A newer cache is also
+        # not a thing consent can authorise here: the ``allow_vector_reindex``
+        # question is "may I delete vectors I could recompute", while this one
+        # is "may I replace a schema I cannot read with an older one", and the
+        # answer to the second is no at any price.
+        self._refuse_if_schema_ahead(c)
         if not allow_vector_reindex:
             vectors, rows = self.vector_reindex_preview()
             if vectors:

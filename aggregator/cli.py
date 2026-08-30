@@ -49,6 +49,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -61,6 +62,7 @@ from aggregator.core.provenance import classify
 from aggregator.core.store import (
     EMBED_BACKLOG_ORDER,
     EmptyRebuildRefusedError,
+    SchemaAheadError,
     Store,
 )
 
@@ -1477,9 +1479,183 @@ def _resolve_notify(
     """
     if injected is not None:
         return injected
-    if getattr(args, "notify", False) or NOTIFY_COMMAND_ENV_VAR in os.environ:
+    if _desktop_channel_wanted(args):
         return _desktop_notification
     return _silent_notification
+
+
+def _desktop_channel_wanted(args: argparse.Namespace) -> bool:
+    """Has the operator asked for desktop notifications on this invocation?
+
+    ONE PREDICATE, TWO CALLERS, AND THAT IS THE WHOLE REASON IT IS A FUNCTION.
+    ``_resolve_notify`` asks it to decide whether the run-report notifier is
+    installed, and ``_report_schema_ahead`` asks it to decide whether the
+    schema alarm has any channel at all to speak on. A second spelling of the
+    same question is how the two drift into disagreeing, and the disagreement
+    would be invisible: the alarm would go quiet on exactly the machines where
+    notifications are configured, or scream on the ones where they are not.
+    """
+    return getattr(args, "notify", False) or NOTIFY_COMMAND_ENV_VAR in os.environ
+
+
+#: The schema alarm's OWN debounce receipt, and it shares with nothing.
+#:
+#: ``nix/aggregator.nix`` documents the reproduction: run the embed and
+#: embed-seed failure notifiers against one state dir, in either order, and
+#: each silences the other for a day. Two faults a human must act on separately
+#: need two receipts, so this one is named for its own condition.
+SCHEMA_AHEAD_STAMP_NAME = "schema-ahead-notified"
+
+#: How long a DELIVERED schema alarm buys silence on the desktop channel.
+#:
+#: Matched to ``mkFailureNotify``'s window because it is the same shape of
+#: fault: persistent until a human deploys something, and unchanged by any
+#: number of retries in between. The ingest timer ticks every thirty minutes,
+#: so an undebounced alarm here would be forty-eight critical toasts a day.
+SCHEMA_AHEAD_DEBOUNCE_SECONDS = 24 * 60 * 60
+
+
+def _schema_ahead_stamp_path() -> Path:
+    """Where the receipt lives. Same rule as ``default_marker_path``.
+
+    Including the empty-value trap it documents: ``XDG_STATE_HOME=`` — the
+    shape a unit file's ``Environment=XDG_STATE_HOME=`` produces — resolves to
+    a relative path, which would scatter a receipt into whatever directory
+    each run happened to start in and debounce nothing.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "aggregator" / SCHEMA_AHEAD_STAMP_NAME
+
+
+def _schema_ahead_already_notified(stamp: Path) -> bool:
+    """Has a human been told about this within the window?
+
+    FAILS TOWARDS NOISE, in both of its two failure modes. An unreadable or
+    absent stamp is read as "not told" — a duplicate toast costs an operator
+    one dismissal, while a suppressed one costs them the only channel the
+    fault has. And a stamp dated in the FUTURE, which is what a clock jump or
+    a restored backup produces, is also read as "not told": treating it as
+    fresh would buy silence until that future arrived, which for a bad clock
+    can be years. Re-arming rewrites the mtime to now, so one toast repairs it.
+    """
+    try:
+        age = time.time() - stamp.stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age < SCHEMA_AHEAD_DEBOUNCE_SECONDS
+
+
+def _report_schema_ahead(exc: SchemaAheadError, *, desktop_channel: bool) -> int:
+    """Turn a refused migration into an alarm a human actually receives.
+
+    ``Store.migrate()`` refusing to stamp a newer cache downward is the fix;
+    this is what keeps the fix from becoming its own incident. Left uncaught,
+    that refusal reaches ``aggregator-ingest.service`` as a traceback and a
+    non-zero exit on every thirty-minute tick, and that unit's ``OnFailure=``
+    notifier has no debounce — forty-eight ``notify-send -u critical`` toasts a
+    day about a condition that only a deploy can change. This repo already
+    treats that as a form of silence rather than an excess of loudness: see the
+    "deliberately no fourth code" paragraph in ``README.md``, which refuses a
+    distinct non-zero exit for known poison on exactly this reasoning.
+
+    THREE CHANNELS, EACH DOING WHAT ONLY IT CAN.
+
+    * stderr, EVERY RUN, undebounced. It costs nothing, nothing suppresses it,
+      and it is where the full diagnosis is still findable three days later.
+    * ONE critical desktop toast per 24 h, through the notifier the unit
+      already installs in ``$AGGREGATOR_NOTIFY_COMMAND``. The proven path, not
+      a second mechanism built beside it — the same program, the same
+      ``-u critical -a aggregator`` argv, the same receipt-after-exit-0 rule as
+      ``mkFailureNotify`` in ``nix/aggregator.nix``.
+    * the exit code, which is the ``OnFailure=`` channel's trigger and is
+      therefore spent only when the other two could not deliver.
+
+    WHY EXIT 0 AFTER A DELIVERED TOAST. The toast IS the receipt. Holding one,
+    failing the unit as well buys a duplicate notification now and the
+    forty-eight-a-day pattern thereafter, for no added information. The run
+    genuinely did no work, and that is reported by the things a stale unit file
+    cannot suppress — the stderr diagnosis, the toast, and a cache whose
+    ``last_updated`` stops advancing.
+
+    WHY NON-ZERO WHEN IT COULD NOT. Fail-closed on the reporting path: silence
+    must mean "a human was told", never "nobody could be told". A missing,
+    unresolvable or failing notifier leaves ``OnFailure=`` as the last channel
+    in the building, and it only fires on a non-zero exit. The same answer
+    covers the interactive case with no notifier configured, where returning 0
+    after refusing to do the work would lie to every calling script.
+    """
+    print(f"ERROR: {exc}", file=sys.stderr)
+    if not desktop_channel:
+        print(
+            f"No desktop notifier is configured (${NOTIFY_COMMAND_ENV_VAR} is "
+            f"unset), so this refusal has reached stderr and nowhere else. "
+            f"Exiting non-zero so a supervising unit's OnFailure= can be the "
+            f"channel instead.",
+            file=sys.stderr,
+        )
+        return 1
+
+    stamp = _schema_ahead_stamp_path()
+    if _schema_ahead_already_notified(stamp):
+        print(
+            f"desktop notification suppressed — already notified within "
+            f"{SCHEMA_AHEAD_DEBOUNCE_SECONDS // 3600}h ({stamp}). The "
+            f"diagnosis above is printed on every run regardless.",
+            file=sys.stderr,
+        )
+        return 0
+
+    summary = "aggregator STOPPED: cache is newer than this build"
+    body = (
+        f"The cache is stamped schema {exc.found}; this build understands "
+        f"{exc.expected}. Nothing was written and the cache is intact. Ingest "
+        f"stays stopped until a build that understands schema {exc.found} is "
+        f"deployed. Full diagnosis: journalctl --user -u aggregator-ingest"
+    )
+    try:
+        # ``--`` for the same reason as ``_desktop_notification``: summary and
+        # body are POSITIONAL, and a body that began with a dash would be
+        # parsed as an option and the notification lost rather than delivered.
+        subprocess.run(
+            [
+                *_notify_argv(),
+                "-u",
+                "critical",
+                "-a",
+                "aggregator",
+                "--",
+                summary,
+                body,
+            ],
+            check=True,
+            timeout=NOTIFY_TIMEOUT_SECONDS,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        # NO RECEIPT IS ARMED HERE, and that is the whole point of catching
+        # rather than letting it propagate: a swallowed notification is
+        # indistinguishable from a delivered one except by this exit status,
+        # and spending the day's one toast on a message nobody received would
+        # convert a broken notifier into total silence.
+        print(
+            f"could not deliver the critical notification ({type(e).__name__}: "
+            f"{e}); exiting non-zero so OnFailure= still fires",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError as e:
+        # FAILS OPEN, like both halves of ``mkFailureNotify``. An unwritable
+        # state directory costs a repeated toast; treating it as fatal would
+        # cost the delivery that has already succeeded.
+        print(
+            f"notification delivered, but the debounce receipt could not be "
+            f"written to {stamp} ({e}); it will repeat next run",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def _configure_ingest_logging() -> None:
@@ -1812,7 +1988,14 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     # measured in weeks, and the cheap refusal above has already caught the
     # common case.
     embedder = Embedder()
-    store.migrate(allow_vector_reindex=args.reindex, embedder=embedder)
+    # ``embed`` MIGRATES ITSELF (see ``main``), so it needs its own copy of the
+    # guard rather than inheriting one. It runs on its own thirty-minute timer
+    # with its own OnFailure= notifier, so an unhandled refusal here would be a
+    # second alarm-fatigue channel for the identical condition.
+    try:
+        store.migrate(allow_vector_reindex=args.reindex, embedder=embedder)
+    except SchemaAheadError as e:
+        return _report_schema_ahead(e, desktop_channel=_desktop_channel_wanted(args))
 
     # THE SECOND ASKING, now that the index has been reconciled against the
     # embedder that will write it. The first call answered for the process; a
@@ -3689,7 +3872,17 @@ def main(
     # that names two fixes, immediately before the run that applies one of
     # them. Every other subcommand still gets its schema up front.
     if args.cmd != "embed":
-        store.migrate()
+        # THE ONE EXCEPTION THAT MUST NOT REACH systemd AS A TRACEBACK. Every
+        # other fault here is either transient or specific to one subcommand;
+        # a cache newer than this build is neither, and an unhandled raise on
+        # a thirty-minute timer whose OnFailure= notifier has no debounce is
+        # forty-eight critical toasts a day. See ``_report_schema_ahead``.
+        try:
+            store.migrate()
+        except SchemaAheadError as e:
+            return _report_schema_ahead(
+                e, desktop_channel=_desktop_channel_wanted(args)
+            )
 
     def sources() -> dict[str, Any]:
         """Build the source registry ON THE COMMAND THAT NEEDS IT.
