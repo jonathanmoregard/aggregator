@@ -424,12 +424,15 @@ def _stale_cache_response(cache_version: int) -> dict[str, Any]:
             "THIS READER'S OWN entry point out of the same tree — so it is at "
             f"schema version {SCHEMA_VERSION} by construction and tells you "
             "nothing about the writer that maintains this cache. Running it "
-            "would migrate the cache, and would not hold: nothing on the "
-            "writer side checks whether a cache is newer than itself, so the "
-            "scheduled writer's next run stamps `user_version` straight back "
-            "down to its own version. Find the executable that actually runs "
-            "on the timer — `systemctl --user cat aggregator-ingest.service` "
-            "and read its `ExecStart` — and ask that one for its version."
+            "would migrate the cache, and it would not hold. A scheduled "
+            "writer OLDER than the guard now in `Store.migrate()` re-stamps "
+            "`user_version` straight back down to its own version on its next "
+            "run — which is precisely what happened here — while one carrying "
+            "that guard refuses to write at all and raises a critical alarm "
+            "instead. Either way the cache ends up on the writer's terms and "
+            "not this reader's, so find the executable that actually runs on "
+            "the timer — `systemctl --user cat aggregator-ingest.service` and "
+            "read its `ExecStart` — and ask that one for its version."
         )
     elif "/nix/store/" in writer:
         writer_note = (
@@ -478,6 +481,66 @@ def _stale_cache_response(cache_version: int) -> dict[str, Any]:
             f"will fix this; a newer writer has to be deployed. {writer_note} "
             f"MCP recall is read-only and will not create schemas, run "
             f"migrations, or touch SQLite WAL files."
+        ),
+    }
+
+
+def _ahead_cache_response(cache_version: int) -> dict[str, Any]:
+    """A cache NEWER than this reader — the mirror image, and the quieter one.
+
+    THERE WAS NO GUARD HERE AT ALL. ``_ensure_cache_ready`` compared with
+    ``<``, so a cache below this reader was refused and a cache above it was
+    served. Measured on this tree before the fix: nothing anywhere — not in
+    ``mcp.py``, not in ``Store``, not at any call site — asked whether a cache
+    might be ahead.
+
+    AND IT IS THE FAILURE THAT HIDES BEST. A cache behind the reader refuses
+    every call, which is at least an event somebody trips over. A cache ahead
+    of the reader ANSWERS: rows selected out of tables whose shape this build
+    has no description of, columns it does not know to read, and a vector index
+    whose provenance it cannot evaluate. Recall that is wrong but looks like
+    recall is worse than recall that is dead, because nothing about it prompts
+    anyone to look.
+
+    THE TWO REFUSALS MUST NOT SHARE A MESSAGE, and this is the whole reason
+    this function exists beside ``_stale_cache_response`` rather than being a
+    parameter to it. Their causes are opposite and so are their remedies: in
+    the stale case the WRITER lags and a newer writer is deployed; here the
+    READER lags, and the writer — whatever it is — is already ahead. A message
+    that conflated them would send the operator to upgrade the one component
+    that is demonstrably current.
+
+    AND IT MUST NOT NAME THE WRITER AS A REMEDY. Running an older writer
+    against a newer cache is the single most destructive thing available from
+    this position: pre-fix it re-stamped ``user_version`` downward, and the
+    advice that is right for the stale branch is here an instruction to break
+    the cache. So no writer command appears in this text at all — not as a
+    diagnostic, not as a fix.
+    """
+    return {
+        "ok": False,
+        "reason": (
+            f"cache schema version {cache_version} is NEWER than the version "
+            f"{SCHEMA_VERSION} this reader understands"
+        ),
+        "remediation": (
+            f"This reader understands schema version {SCHEMA_VERSION}; the "
+            f"cache is stamped {cache_version}, so it was written by a build "
+            f"newer than this one. THE CACHE IS THE CURRENT SIDE and this "
+            f"reader is the lagging one, which makes this the opposite of a "
+            f"stale cache and gives it the opposite fix. Do nothing to the "
+            f"cache: this build cannot describe what schema {cache_version} "
+            f"contains, so anything it wrote there would turn a cache that one "
+            f"component cannot read into a cache that is wrong for all of "
+            f"them, and no command run against the data can make an old reader "
+            f"understand a new schema. Bring THIS reader up instead. It was "
+            f"imported from `{_READER_TREE}`. If that is a source checkout, "
+            f"update it and then RESTART this MCP server — a server process is "
+            f"held for the life of the client that spawned it, so new code on "
+            f"disk changes nothing until the process is replaced. If it is an "
+            f"installed build, deploy one at schema {cache_version} or higher "
+            f"and restart. MCP recall is read-only and will not create "
+            f"schemas, run migrations, or touch SQLite WAL files."
         ),
     }
 
@@ -536,8 +599,17 @@ def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
     # still use it (a missing or unreadable cache) and a false one here: under
     # build skew the writable path IS the fault, and running it returns 0 while
     # changing nothing. See ``_stale_cache_response``.
-    if version < SCHEMA_VERSION:
-        return _stale_cache_response(version)
+    # ``!=``, NOT ``<``. The old comparison refused a cache behind this reader
+    # and served one ahead of it — and serving it is the worse half, because a
+    # cache this build cannot describe still returns rows that look exactly
+    # like correct ones. Two branches rather than one message, because the two
+    # directions have opposite causes and opposite remedies; see
+    # ``_ahead_cache_response``. Equality falls straight through, which is
+    # every real call.
+    if version != SCHEMA_VERSION:
+        if version < SCHEMA_VERSION:
+            return _stale_cache_response(version)
+        return _ahead_cache_response(version)
     return None
 
 
