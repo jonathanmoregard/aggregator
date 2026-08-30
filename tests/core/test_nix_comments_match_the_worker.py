@@ -24,12 +24,22 @@ the true version ("a ``TimeoutStopSec`` is far shorter than that") in
 third test below pins the comfort, not the number: ``5min`` is a deliberate
 bound on a wedged worker and nothing here argues about its value.
 
+A fourth claim went wrong the same way and cost an outage rather than a
+misreading. ``interval``'s description explained concurrent-write safety as
+"WAL journal mode plus a 30s busy_timeout … one short write transaction per
+batch rather than one long one per run" — true of the embed worker, false of
+ingest, which writes a whole source in one transaction (measured holding the
+write lock for 139 s). ``aggregator-embed.service`` then failed on every tick
+for at least five hours on 2026-08-30. The last two tests pin the replacement:
+the falsified claim may not return, and the lock the module now credits has to
+be one the store actually takes.
+
 Deliberately narrow. It does not try to validate prose in general; it pins
-the three specific sentences that went wrong, in the direction they went
-wrong. Neither ``cli.py`` nor ``store.py`` is modified by this test — they
-are read.
+the specific sentences that went wrong, in the direction they went wrong.
+Neither ``cli.py`` nor ``store.py`` is modified by this test — they are read.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -43,6 +53,17 @@ def sources(repo_root):
         "cli": (root / "aggregator" / "cli.py").read_text(),
         "store": (root / "aggregator" / "core" / "store.py").read_text(),
     }
+
+
+def _unwrapped(text):
+    """One long line, so a pinned sentence survives being re-wrapped.
+
+    The claims below are prose inside a Nix string, and Nix prose gets
+    reflowed by anyone who edits the paragraph around it. Matching against the
+    literal source would make these tests fail on a reflow and pass on a
+    rewrite, which is exactly backwards.
+    """
+    return re.sub(r"\s+", " ", text)
 
 
 def test_the_module_does_not_deny_a_sigterm_handler_that_exists(sources):
@@ -167,3 +188,74 @@ def test_the_module_does_not_call_a_row_short_enough_for_the_stop_window(sources
             f"them, then edits it. If the corpus was re-measured, update the "
             f"number here and there together."
         )
+
+
+def test_the_module_does_not_credit_the_busy_timeout_for_concurrent_safety(sources):
+    """The claim that failed in production, pinned so it cannot come back.
+
+    ``interval``'s description used to end: "What makes overlap safe is on the
+    store side - WAL journal mode plus a 30s busy_timeout - and on the worker
+    side, one short write transaction per batch rather than one long one per
+    run." The first half is a backstop and the second half was never true of
+    ingest: ``cli._ingest_entities`` hands a whole source to ONE
+    ``upsert_entities`` call, and ``_do_write_entities`` chunks the hash probe
+    without chunking the commit.
+
+    Measured on the live cache 2026-08-31 by sampling ``BEGIN IMMEDIATE`` at
+    1Hz through one ordinary ingest run: contiguous write-lock holds of 49s,
+    29s and 139s. Against 139s a 30s timeout is not unlucky, it is arithmetic
+    - and ``aggregator-embed.service`` duly died on every tick for at least
+    five hours on 2026-08-30.
+
+    So the sentence is banned in the affirmative. Quoting it as history, which
+    the replacement text does, reads differently and must stay allowed - that
+    is why the ban is on the CLAIM ("what makes overlap safe is ... busy") and
+    not on the words "busy_timeout".
+    """
+    nix = _unwrapped(sources["nix"]).lower()
+    assert "what makes overlap safe is on the store side" not in nix, (
+        "nix/aggregator.nix has re-credited WAL + busy_timeout with making "
+        "ingest/embed overlap safe. It does not: a busy_timeout is a deadline, "
+        "and the thing it is waiting on is another aggregator process doing "
+        "unbounded legitimate work (139 s measured, on a corpus that only "
+        "grows). What makes overlap safe is Store._CacheWriteLock. If the lock "
+        "was removed, this test and the module have to change together - and "
+        "the removal needs a story for the 2026-08-30 outage."
+    )
+    assert "one short write transaction per batch rather than one long one per run" not in nix, (
+        "nix/aggregator.nix again describes the writers as using one short "
+        "transaction per batch. That is true of the embed worker and false of "
+        "ingest, which is the asymmetry the whole outage lived in."
+    )
+
+
+def test_the_lock_the_module_credits_is_the_lock_the_store_takes(sources):
+    """A conditional, like the rest of this file: claim it, then own it.
+
+    The module now points a reader at ``Store._CacheWriteLock`` as the reason
+    two units may share a cache. That pointer is only worth having while the
+    lock is real AND is actually taken on the write path - a lock defined but
+    never acquired would leave the module confidently describing a mechanism
+    that does nothing, which is the failure mode this file exists for.
+    """
+    if "_CacheWriteLock" not in sources["nix"]:
+        pytest.skip("the module no longer credits the lock; nothing to check")
+
+    assert "class _CacheWriteLock:" in sources["store"], (
+        "nix/aggregator.nix credits Store._CacheWriteLock for concurrent-write "
+        "safety, but aggregator/core/store.py no longer defines it."
+    )
+    ensure_writable = sources["store"].split("def _ensure_writable(self)")[1]
+    body = ensure_writable.split("\n    def ")[0]
+    assert "take_cache_write_lock()" in body, (
+        "Store._ensure_writable no longer takes the cross-process write lock. "
+        "It is the choke point every write method passes through, so an "
+        "acquire anywhere else leaves some write path racing SQLite directly - "
+        "which is the 2026-08-30 failure. If the acquire moved, move this "
+        "assertion with it rather than deleting it."
+    )
+    assert "flock" in sources["store"], (
+        "the write lock no longer uses flock, so it is no longer released by "
+        "the kernel when a process is SIGKILLed mid-transaction. That property "
+        "is what keeps a killed embed worker from wedging ingest."
+    )
