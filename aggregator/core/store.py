@@ -89,12 +89,14 @@ bare ``no such table: vec_observations``.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -117,6 +119,29 @@ from aggregator.sources.base import (
 log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 6
+
+#: How long SQLite's own busy handler waits for the write lock before raising
+#: ``database is locked``, in milliseconds.
+#:
+#: NAMED, NOT INLINED, because a test has to be able to shorten it. The
+#: property worth testing is "a writer that loses the race waits instead of
+#: dying", and at 30s the only test that could observe it would have to hold a
+#: transaction for longer than that — half a minute of wall clock per
+#: assertion. See ``tests/core/test_store_cross_process_write_lock.py``, which
+#: turns it down to milliseconds and holds for two seconds.
+#:
+#: THIS NUMBER IS NOT WHAT MAKES CONCURRENT WRITES SAFE, and history here is
+#: worth keeping: it was 5s, then bumped to 30s to buy margin, and the bump
+#: bought a little and settled nothing. Measured on the live cache
+#: 2026-08-31, a single ordinary ``aggregator ingest --all`` held the write
+#: lock in contiguous blocks of 49s, 29s and 139s — so 30s was not short of
+#: the mark by a margin a bigger number would close, it was short of it by
+#: 4.6x on one transaction, on a corpus that only grows. What makes the
+#: overlap safe is ``_CacheWriteLock`` below, which serialises the writers
+#: before SQLite is ever asked. This timeout is now only a backstop against a
+#: writer that predates the lock (a mid-deploy mix of builds) or one outside
+#: this codebase entirely (a human at the ``sqlite3`` prompt).
+_BUSY_TIMEOUT_MS = 30_000
 
 
 class VectorIndexUnavailableError(RuntimeError):
@@ -1361,18 +1386,194 @@ def _default_db_path() -> Path:
     return p
 
 
+class _CacheWriteLock:
+    """The cache's single writer slot, WAITED FOR rather than raced for.
+
+    SQLite already has a single-writer rule; what it does not have is a way to
+    queue for it. ``busy_timeout`` is a retry schedule with a deadline, and a
+    deadline is the wrong instrument when the thing being waited on is another
+    aggregator process doing legitimate, unbounded work. This is the queue:
+    one ``flock`` per cache file, taken before SQLite is asked for anything,
+    released when the transaction that took it ends.
+
+    WHY AN OS LOCK AND NOT A BIGGER TIMEOUT. The two are not the same fix with
+    different constants. A busy handler that never gives up still cannot make
+    SQLite's lock acquisition fair — the loser re-tries on a backoff schedule
+    and a writer committing back-to-back can keep winning — and it still holds
+    the losing connection's read snapshot open while it spins. ``flock``
+    blocks in the kernel, wakes on release, and costs nothing while waiting.
+    The failure mode it replaces is not "waited and was unlucky", it is
+    "waited 30s against a 139s transaction and was guaranteed to lose".
+
+    WHY IT WRAPS THE TRANSACTION AND NOT THE RUN. Holding this for the life of
+    a process would serialise the two units down to one: a 30-minute embed
+    tick would block ingest for 30 minutes, which is the same starvation with
+    the blame moved. Scoped to the transaction, the asymmetry falls out
+    correctly on its own — ingest holds it for the minutes its one big
+    ``upsert_entities`` transaction takes and embed waits (which costs embed
+    nothing: it has ``TimeoutStartSec=infinity`` and a watermark it resumes
+    from), while embed holds it only for the sub-second commit at the end of a
+    batch and ingest waits for that.
+
+    HELD PER PROCESS, NOT PER STORE. ``flock`` is associated with the open
+    file description, so two descriptors in ONE process are two independent
+    locks and the second would block on the first forever. Hence the registry
+    below: one descriptor per cache path per process, and a holder count so
+    the nested writers this codebase actually has — ``rebuild_and_upsert_
+    entities`` calling ``upsert_entities(_commit=False)``, ``write_checkpoint``
+    composing a data write and a watermark advance into one transaction — take
+    the baton once and hand it back once.
+
+    A PROCESS THAT DIES HOLDING IT RELEASES IT. That is the kernel's doing,
+    not ours: descriptors close on exit, however the exit happened, so a
+    SIGKILL mid-transaction cannot wedge the other unit. This is the same
+    property the worker's ``<cache>.embed.lock`` relies on, for the same
+    reason, and it is why the baton is a file lock rather than a row in the
+    database it is protecting.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fd: int | None = None
+        #: How many Stores in THIS process are inside a write transaction.
+        self._holders = 0
+
+    def acquire(self) -> None:
+        if self._holders == 0:
+            if self._fd is None:
+                try:
+                    self._fd = os.open(
+                        str(self.path), os.O_CREAT | os.O_RDWR, 0o600
+                    )
+                except OSError as e:
+                    # Named, because the bare errno arrives as a puzzle at a
+                    # call site that was trying to write a row. A cache
+                    # directory this process cannot create a file in is a
+                    # cache it could not have written to either, so this is
+                    # the same refusal arriving one step earlier.
+                    raise RuntimeError(
+                        f"cannot take the cache write lock at {self.path}: {e}. "
+                        f"Writing to the cache needs a lock file beside it, so "
+                        f"the directory has to be writable by this user."
+                    ) from e
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        self._holders += 1
+
+    def release(self) -> None:
+        if self._holders == 0:
+            return
+        self._holders -= 1
+        if self._holders == 0 and self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+
+
+#: One ``_CacheWriteLock`` per cache path per process. See the class docstring
+#: for why a second descriptor on the same file would deadlock against the
+#: first rather than queue behind it.
+_WRITE_LOCKS: dict[str, _CacheWriteLock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _write_lock_for(db_path: Path) -> _CacheWriteLock:
+    """The baton for one cache file, keyed by its RESOLVED path.
+
+    Resolved on both halves — the registry key and the lock file's own name —
+    because two processes are only excluded from each other if they agree on
+    which file to lock. ``~/.local/share/aggregator/cache.db`` reached through
+    a symlinked home and reached directly are the same database, and a lock
+    named after the spelling rather than the file would protect neither.
+    """
+    resolved = Path(db_path).resolve()
+    key = str(resolved)
+    with _WRITE_LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = _CacheWriteLock(Path(key + ".write.lock"))
+            _WRITE_LOCKS[key] = lock
+        return lock
+
+
+class _WriteLockedConnection(sqlite3.Connection):
+    """A connection that hands the write baton back the moment it can.
+
+    THE RELEASE LIVES HERE BECAUSE THE TRANSACTION ENDS HERE. ``Store`` has 27
+    places that finish a transaction and every one of them calls ``commit()``
+    or ``rollback()`` on the connection — most directly as ``c.commit()``,
+    which a ``Store.commit()`` override would never see. Overriding the
+    connection catches all of them at once, so no future write method can
+    forget to give the baton back, and no call site had to change to get it
+    right. (``.cursor()`` appears nowhere in this module, so there is no
+    second path to a transaction that would slip past this.)
+
+    ``executescript`` commits without coming through here, which leaves the
+    baton held slightly longer than SQLite's own lock — deliberately the safe
+    direction. Holding a moment too long makes another process wait; letting
+    go a moment too early is the bug this file exists to fix.
+    """
+
+    #: The baton for this connection's cache, or ``None`` on a read-only
+    #: connection — which never writes, so it never queues for anything. That
+    #: is what keeps WAL's real bargain intact: ``aggregator_search_memory``
+    #: reads at full speed straight through a long ingest.
+    cache_write_lock: _CacheWriteLock | None = None
+    _holds_write_lock: bool = False
+
+    def take_cache_write_lock(self) -> None:
+        """Queue for the writer slot. Idempotent for the life of a transaction."""
+        if self.cache_write_lock is None or self._holds_write_lock:
+            return
+        self.cache_write_lock.acquire()
+        self._holds_write_lock = True
+
+    def _drop_cache_write_lock(self) -> None:
+        if not self._holds_write_lock:
+            return
+        # Cleared BEFORE the release, so a release that somehow raises cannot
+        # leave the flag claiming we still hold a baton we have let go of.
+        self._holds_write_lock = False
+        self.cache_write_lock.release()
+
+    def commit(self) -> None:
+        try:
+            super().commit()
+        finally:
+            self._drop_cache_write_lock()
+
+    def rollback(self) -> None:
+        try:
+            super().rollback()
+        finally:
+            self._drop_cache_write_lock()
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self._drop_cache_write_lock()
+
+
 class Store:
     """Thin wrapper around a per-process SQLite connection.
 
     Not thread-safe within a process — v1 assumes a single ingest thread
-    per process. Cross-process concurrency IS supported: two systemd user
-    timers (sessions + github) fire on ``*:0/30`` and both open a Store
-    against the same ``cache.db``. ``_c()`` enables WAL journal mode + a
-    30s busy_timeout (Codex Phase 2 bump from 5s) so the second writer
-    waits for the first to release its lock instead of failing with
-    ``database is locked``. The github timer also jitters by 3 min
-    (``RandomizedDelaySec`` in nix/aggregator.nix) to reduce collision
-    probability at the tick boundary.
+    per process. Cross-process concurrency IS supported, and is the normal
+    case rather than the exception: ``aggregator-ingest.service`` fires on
+    ``*:0/30`` and ``aggregator-embed.service`` on ``*:15/30``, both against
+    the same ``cache.db``, and the embed worker's runs regularly outlast its
+    own 30-minute period, so the two overlap constantly.
+
+    WHAT MAKES THAT SAFE IS ``_CacheWriteLock``, not the timeout. ``_c()``
+    enables WAL so readers never block, and every writer queues for the OS
+    lock in ``_ensure_writable`` before SQLite is asked for anything. The
+    ``busy_timeout`` above it is a backstop for writers that are not part of
+    this scheme, not the mechanism.
+
+    This replaced a scheme of a 30s ``busy_timeout`` plus an offset timer
+    schedule, which failed in production on every tick for at least five
+    hours on 2026-08-30: the offset cannot separate a 47-minute embed run
+    from a 17-minute ingest run inside a 30-minute period, and the timeout
+    cannot outlast a single 139-second ingest transaction. Both numbers were
+    measured, and both get worse as the corpus grows.
     """
 
     def __init__(self, db_path: str | Path | None = None, read_only: bool = False):
@@ -1430,7 +1631,9 @@ class Store:
                 # ``_ensure_writable``; dropping the flag grants no write rights.
                 uri = f"file:{self.db_path}?mode=ro"
                 try:
-                    self._conn = sqlite3.connect(uri, uri=True)
+                    self._conn = sqlite3.connect(
+                        uri, uri=True, factory=_WriteLockedConnection
+                    )
                 except sqlite3.OperationalError as e:
                     # Named, because the bare message is
                     # "unable to open database file" — the same type a
@@ -1442,7 +1645,9 @@ class Store:
                         f"machine that is expected rather than a fault."
                     ) from e
             else:
-                self._conn = sqlite3.connect(self.db_path)
+                self._conn = sqlite3.connect(
+                    self.db_path, factory=_WriteLockedConnection
+                )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON;")
             # BEST-EFFORT, on read-only connections too — the vector arm is a
@@ -1451,18 +1656,14 @@ class Store:
             self._vector_available = _try_load_sqlite_vec(self._conn)
             if self.read_only:
                 return self._conn
+            # THE BATON THIS CONNECTION WILL QUEUE FOR, attached here and only
+            # for writable stores. A read-only connection leaves it ``None``
+            # and never waits for anything — see ``_WriteLockedConnection``.
+            self._conn.cache_write_lock = _write_lock_for(self.db_path)
             # Codex Phase 2 MEDIUM #2: concurrent-writer safety. See prior
             # revision docstring; WAL + busy_timeout + synchronous=NORMAL.
             self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
-            # Codex Phase 2 MEDIUM: bumped from 5s -> 30s. Steady-state
-            # ingests are seconds; 30s absorbs incidental collisions
-            # between the sessions and github timers without failing loud
-            # ``database is locked`` errors. The pathological case (full
-            # sessions rebuild holds a savepoint for minutes) is not fixed
-            # by any busy_timeout — sequence manually or set
-            # ``services.aggregator.sources.github.enable = false`` while
-            # rebuilding.
-            self._conn.execute("PRAGMA busy_timeout = 30000")
+            self._conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             self._conn.execute("PRAGMA synchronous = NORMAL")
             # BOUND THE ``-wal`` SIDECAR. A checkpoint does not truncate the
             # WAL unless this is set — it merely starts overwriting from the
@@ -1497,8 +1698,23 @@ class Store:
         self._c().rollback()
 
     def _ensure_writable(self) -> None:
+        """The gate every write in this file passes through — now also the queue.
+
+        THE BATON IS TAKEN HERE BECAUSE THIS IS ALREADY THE CHOKE POINT. All
+        19 write methods call it first, and a method that skipped it would
+        also be skipping the read-only guard, i.e. would already be a bug of a
+        kind this file is built to make obvious. Putting the acquire here
+        means no write path can reach SQLite without having queued, and no new
+        write method has to remember to.
+
+        BLOCKING, AND THAT IS THE POINT. The caller waits for however long the
+        other writer legitimately needs — 139 seconds is a measured real value
+        — instead of failing after a deadline that has nothing to do with the
+        work in front of it.
+        """
         if self.read_only:
             raise RuntimeError("read-only Store cannot write")
+        self._c().take_cache_write_lock()
 
     # -- schema -----------------------------------------------------------
 

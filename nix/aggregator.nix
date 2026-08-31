@@ -606,17 +606,34 @@ in {
         example = "hourly";
         description = ''
           systemd OnCalendar spec for the embed timer. Default `*:15/30`
-          is every 30 minutes at :15 and :45 — deliberately offset from
-          the ingest timers' `*:0/30`, so the common case is that an
-          embed run and an ingest run are not opening the same SQLite
-          database at the same moment.
+          is every 30 minutes at :15 and :45 — nominally offset from the
+          ingest timers' `*:0/30`.
 
-          The offset is an optimisation, not the correctness story: an
-          ingest run can last hours (TimeoutStartSec=4h on the deployed
-          unit), so overlap is inevitable eventually. What makes overlap
-          safe is on the store side — WAL journal mode plus a 30s
-          busy_timeout — and on the worker side, one short write
-          transaction per batch rather than one long one per run.
+          THE OFFSET BUYS NOTHING AND IS NOT LOAD-BEARING. Measured on
+          this machine 2026-08-30, embed runs took 15, 17, 47, 29, 29,
+          30, 30 and 23 minutes while ingest runs took 3 to 17 minutes,
+          both on 30-minute periods — so embed was already running
+          back-to-back (21:03 -> 21:32 -> 22:02 -> 22:32 -> 23:03, with
+          no gap at all) and every single embed tick overlapped an ingest
+          run. Two jobs whose durations sum past their shared period
+          cannot be separated by choosing a phase; there is no offset
+          that works, and the corpus only grows.
+
+          WHAT MAKES OVERLAP SAFE is `Store._CacheWriteLock`: both units
+          take an OS `flock` on `<cache>.write.lock` before touching
+          SQLite, for the length of a transaction, so the loser waits
+          instead of failing. This replaced a claim that used to live
+          here — "WAL plus a 30s busy_timeout, and one short write
+          transaction per batch" — whose second half was true of the
+          embed worker and false of ingest: `cli._ingest_entities` writes
+          a whole source in ONE `upsert_entities` transaction, measured
+          holding the write lock for 139 seconds in a single block. A 30s
+          timeout against that loses every time, and it did, on every
+          tick for at least five hours on 2026-08-30.
+
+          Keeping the offset anyway: it costs nothing, and starting the
+          two at the same instant would make one of them wait on the
+          other for no reason.
         '';
       };
 

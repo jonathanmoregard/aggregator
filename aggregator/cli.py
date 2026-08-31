@@ -2764,9 +2764,22 @@ def _embed_store_unavailable(
 
     It has to say the row was NOT blamed, because the whole failure mode is a
     good row being condemned for a transient lock and quietly leaving the
-    index. It also has to name the likely cause: on this machine the ingest
-    timer fires every 30 minutes and the embed timer every 30 minutes offset by
-    15, and a long ingest run overlaps regardless.
+    index.
+
+    IT MUST NO LONGER BLAME THE INGEST TIMER, and that correction is the point
+    of this revision. It used to read "the usual cause is another writer
+    holding the database — the ingest timer runs every 30 minutes and a long
+    run overlaps the embed tick", which was true when it was written and is
+    now the one thing this cannot be: aggregator's writers queue for
+    ``Store._CacheWriteLock`` before touching SQLite, so an overlap makes embed
+    WAIT, not fail. Pointing a human at the ingest timer would now send them to
+    read a schedule that is working as designed.
+
+    What is left when a lock still surfaces here is a writer outside that
+    scheme, and the two real ones are worth naming because they need opposite
+    responses: a half-deployed upgrade, where one unit is running a build that
+    predates the lock and therefore does not queue, and a human holding a
+    transaction at an interactive ``sqlite3`` prompt.
     """
     return EmbedStoreUnavailableError(
         f"aggregator embed stopped: the cache could not be written while "
@@ -2774,11 +2787,13 @@ def _embed_store_unavailable(
         f"({type(error).__name__}: {error}). That is the STORE failing, not "
         f"bad data and not the embedder, so NO row was blamed for it, nothing "
         f"was added to the poison ledger, and every row still unembedded "
-        f"stays in the backlog exactly where it was. The usual cause is "
-        f"another writer holding the database — the ingest timer runs every "
-        f"30 minutes and a long run overlaps the embed tick. The next run "
-        f"resumes from the watermark; if it keeps happening, check for a "
-        f"`--rebuild` holding a savepoint for hours."
+        f"stays in the backlog exactly where it was. The next run resumes from "
+        f"the watermark. This should be RARE: aggregator's own writers queue "
+        f"for an OS lock on <cache>.write.lock and wait for each other, so a "
+        f"normal ingest/embed overlap can no longer cause this. Look instead "
+        f"for a writer outside that scheme — a half-finished deploy leaving one "
+        f"unit on a build older than the lock, or an interactive `sqlite3` "
+        f"session holding a transaction open."
     )
 
 
