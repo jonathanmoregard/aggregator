@@ -177,3 +177,18 @@ uv sync --extra dev
 uv run pytest -q
 uv run ruff check .
 ```
+
+`nix develop` exports `XDG_DATA_HOME=<repo root>/.devshell-data`, so anything
+you run in the shell gets its own cache, eval DB and TickTick backup archive.
+Without that override a bare `uv run aggregator …` would open the live
+`~/.local/share/aggregator/cache.db` that the ingest timer owns — and because
+`migrate()` runs on every subcommand and stamps `PRAGMA user_version`
+unconditionally, a branch checkout could silently re-version production state.
+The isolated directory is per-worktree and gitignored; delete it to start from
+an empty cache.
+
+To deliberately work against the real cache, say so on the command line:
+
+```
+XDG_DATA_HOME="$HOME/.local/share" uv run aggregator status
+```

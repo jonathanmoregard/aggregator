@@ -163,6 +163,77 @@
               pkgs.gitleaks
               pkgs.gh
             ];
+
+            # Isolate the dev shell from the PRODUCTION cache.
+            #
+            # `Store` resolves its database as
+            # `$XDG_DATA_HOME/aggregator/cache.db` (aggregator/core/store.py
+            # :1297-1300), falling back to `~/.local/share` when the variable
+            # is unset — and `migrate()` runs on EVERY subcommand, stamping
+            # `PRAGMA user_version = SCHEMA_VERSION` unconditionally
+            # (store.py, ~:1532). So before this hook existed, a bare
+            # `uv run aggregator …` typed inside `nix develop` read and wrote
+            # the live cache the systemd ingest timer owns, and re-stamped its
+            # schema version at whatever the checkout happened to be. A
+            # developer poking at a branch could therefore migrate production
+            # state forward — or, running an older branch, tell the cache it
+            # was older than it is. That is the write-side half of the
+            # reader/writer schema-skew class defect (2026-08-30): the shared
+            # mutable file is the coupling, and the fix is to stop sharing it.
+            #
+            # Isolation is the RESTING STATE, not an opt-in. There is
+            # deliberately no enable flag: a guard that only works when someone
+            # remembers to set a variable is not a guard. Touching the real
+            # cache from a shell now requires saying so out loud, e.g.
+            # `XDG_DATA_HOME="$HOME/.local/share" uv run aggregator status`.
+            #
+            # Why the whole XDG_DATA_HOME rather than an aggregator-specific
+            # variable: there isn't one. Three separate call sites read
+            # XDG_DATA_HOME directly — the cache (store.py:1299), the retrieval
+            # eval DB (aggregator/evals/db.py:91) and the TickTick backup
+            # archive (aggregator/sources/ticktick.py:69). Overriding the base
+            # covers all three at once and matches what tests/conftest.py:8-9
+            # already does per-test.
+            #
+            # Why repo-local: it follows the worktree. Every `~/worktrees/
+            # aggregator-*` checkout gets its own cache, so two branches under
+            # test cannot corrupt each other, and deleting a worktree reclaims
+            # the space. `.gitignore` anchors `/.devshell-data/` so the
+            # (potentially multi-GB) database is neither committed by the
+            # auto-commit cron nor copied into the Nix store when `nix develop`
+            # snapshots a dirty git tree.
+            #
+            # `git rev-parse --show-toplevel` rather than `$PWD` because
+            # `nix develop` can be run from a subdirectory; the `||` fallback
+            # keeps the hook working if the flake is ever evaluated outside a
+            # git checkout. The value must never end up empty —
+            # ticktick.py:65-68 records that an empty XDG_DATA_HOME silently
+            # takes the spec default, i.e. production again — so the fallback
+            # is a literal path, not an unset variable.
+            # `uv` is the one other tool here that keys off XDG_DATA_HOME, and
+            # moving its stores would be a worse bug than the one being fixed.
+            # Measured: with only XDG_DATA_HOME set, `uv python dir` and
+            # `uv tool dir` inside the shell relocate to
+            # `<repo>/.devshell-data/uv/{python,tools}` — so every worktree
+            # would re-download its own CPython (and, finding no managed
+            # interpreter, uv falls back to the Nix `python` on PATH, whose
+            # numpy manylinux wheel then dies on a missing `libstdc++.so.6`).
+            # Interpreters are not project state; they are a shared cache. Pin
+            # both back to the real user data dir, captured BEFORE the
+            # override. Only aggregator's own state moves.
+            shellHook = ''
+              _agg_root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+              if [ -z "$_agg_root" ]; then
+                _agg_root="$PWD"
+              fi
+              _agg_xdg_real="''${XDG_DATA_HOME:-$HOME/.local/share}"
+              export UV_PYTHON_INSTALL_DIR="$_agg_xdg_real/uv/python"
+              export UV_TOOL_DIR="$_agg_xdg_real/uv/tools"
+              export XDG_DATA_HOME="$_agg_root/.devshell-data"
+              mkdir -p "$XDG_DATA_HOME/aggregator"
+              unset _agg_root _agg_xdg_real
+              echo "aggregator devShell: XDG_DATA_HOME=$XDG_DATA_HOME (production cache at ~/.local/share/aggregator is NOT in scope)" >&2
+            '';
           };
           packages.default = aggregatorPkg;
 
