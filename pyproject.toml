@@ -18,7 +18,7 @@ dependencies = [
   # list rather than an extras group: with extras, a missing install turns
   # ~590 Dropbox files into a silent gap in search results, and a silent gap
   # is the one failure mode this index cannot tolerate.
-  "pypdf>=5.0",
+  "pypdf>=6.16.1",
   "python-docx>=1.1",
   # v5 RAG / hybrid retrieval. `sqlite-vec` is the vector index; it ships as a
   # loadable SQLite extension, and the store loads it BEST-EFFORT — see
