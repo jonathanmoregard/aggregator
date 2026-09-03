@@ -329,9 +329,21 @@ class ChatGPTSource:
     ) -> Iterator[SessionEntity]:
         """Main ingest entrypoint. Yields each SessionRow before its
         ObservationRows. ``since`` filters conversations by update_time
-        (last_ts) — mirrors the sessions source's advisory semantics."""
+        (last_ts) — mirrors the sessions source's advisory semantics.
+
+        A CONVERSATION ID IN TWO EXPORT FILES EMITS ONCE, from the newest
+        file: discovery hands files over newest-first and ``claimed`` makes
+        the first sighting the only one — same union-across-files mechanism
+        and same fix as claude-web and substack (the SessionRows differ on
+        ``jsonl_path``, so duplicates would flip-flop the stored row every
+        tick). Claimed before the ``since`` filter, so the newest file owns
+        the id for the whole run even when the window already excludes its
+        copy. A conversation without a usable id skips the claim and falls
+        through to ``_emit_conversation``'s existing error handling.
+        """
         sink = errors if errors is not None else []
         since_utc = _normalise_utc(since) if since else None
+        claimed: set[str] = set()
         for source_label, raw in self._iter_conversation_payloads(sink):
             try:
                 conversations = json.loads(raw)
@@ -350,6 +362,12 @@ class ChatGPTSource:
             ):
                 continue
             for conv in conversations:
+                if isinstance(conv, dict):
+                    raw_id = conv.get("conversation_id") or conv.get("id")
+                    if isinstance(raw_id, str) and raw_id:
+                        if raw_id in claimed:
+                            continue
+                        claimed.add(raw_id)
                 yield from self._emit_conversation(conv, source_label, since_utc, sink)
 
     def ingest(self, since: datetime | None) -> IngestResult:
