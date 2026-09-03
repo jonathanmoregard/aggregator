@@ -18,7 +18,9 @@ Classification is by CONTENT, not filename:
 from __future__ import annotations
 
 import json
+import os
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -224,6 +226,48 @@ def test_export_file_label_and_read_bytes_for_bare_file(drops, downloads):
 def test_unknown_kind_raises():
     with pytest.raises(ValueError):
         discover_export_files("nope-not-a-kind")
+
+
+# -- newest-first ordering (duplicate-export dedupe contract) ----------------
+
+
+def _set_mtime(path: Path, dt: datetime) -> None:
+    os.utime(path, (dt.timestamp(), dt.timestamp()))
+
+
+def test_discovery_orders_export_files_newest_first(drops, downloads):
+    """The NEWEST export file (file mtime) comes first, regardless of which
+    scan dir holds it or how its name sorts. This ordering is the contract
+    the sources' per-run duplicate-record claim rests on: first claim wins,
+    so newest file wins."""
+    older = _write_zip(
+        drops / "aaa-first-by-name.zip",
+        {"conversations.json": json.dumps(CHATGPT_CONVS)},
+    )
+    newer = _write_zip(
+        downloads / "zzz-last-by-name.zip",
+        {"conversations.json": json.dumps(CHATGPT_CONVS)},
+    )
+    _set_mtime(older, datetime(2026, 7, 1, tzinfo=UTC))
+    _set_mtime(newer, datetime(2026, 8, 1, tzinfo=UTC))
+    found = discover_export_files("chatgpt")
+    assert [f.path for f in found] == [newer, older]
+
+
+def test_discovery_mtime_tie_breaks_on_path_sort(drops, downloads):
+    """Equal mtimes → deterministic path sort, not scan-dir order."""
+    in_drops = _write_zip(
+        drops / "export.zip", {"conversations.json": json.dumps(CHATGPT_CONVS)}
+    )
+    in_downloads = _write_zip(
+        downloads / "export.zip",
+        {"conversations.json": json.dumps(CHATGPT_CONVS)},
+    )
+    same = datetime(2026, 8, 1, tzinfo=UTC)
+    _set_mtime(in_drops, same)
+    _set_mtime(in_downloads, same)
+    found = discover_export_files("chatgpt")
+    assert [f.path for f in found] == sorted([in_drops, in_downloads], key=str)
 
 
 # -- substack (Chunk 5) -----------------------------------------------------
