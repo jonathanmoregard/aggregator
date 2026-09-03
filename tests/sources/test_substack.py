@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+from aggregator.core.store import Store
 from aggregator.sources.base import IngestResult, Record
 from aggregator.sources.substack import SubstackSource
 
@@ -357,6 +358,101 @@ def test_extra_carries_zip_path_member_and_post_id(drops, downloads):
 
 
 # -- multiple zips ---------------------------------------------------------
+
+
+def _set_mtime(path: Path, dt: datetime) -> None:
+    os.utime(path, (dt.timestamp(), dt.timestamp()))
+
+
+def test_duplicate_posts_across_zips_yield_one_record_from_newest_zip(
+    drops, downloads
+):
+    """Two overlapping exports (an old zip left behind + a fresh one) must
+    yield exactly ONE record per stable_id, from the NEWEST zip (file mtime).
+    Measured live 2026-09-03: without this, each ingest tick wrote each post
+    once per zip (updated=522 for 261 posts) and the row flip-flopped on
+    extra.zip_path, resetting embedding_state every 30 minutes."""
+    posts = {"4242.dup-post.html": "<h1>Dup</h1><p>" + "x" * 300 + "</p>"}
+    older = _build_substack_zip(
+        downloads / "aaa-old-export.zip", posts, include_sidecars=False
+    )
+    newer = _build_substack_zip(
+        downloads / "zzz-new-export.zip", posts, include_sidecars=False
+    )
+    _set_mtime(older, datetime(2026, 7, 1, tzinfo=UTC))
+    _set_mtime(newer, datetime(2026, 8, 1, tzinfo=UTC))
+    recs = _records()
+    assert [r.stable_id for r in recs] == ["substack:4242"]
+    assert recs[0].extra["zip_path"] == str(newer)
+
+
+def test_duplicate_posts_mtime_tie_is_deterministic_by_path(drops, downloads):
+    """Equal file mtimes → the path-sorted-first zip wins, every run, so the
+    stored row never flip-flops between the two copies."""
+    posts = {"7.tie.html": "<h1>T</h1><p>" + "x" * 300 + "</p>"}
+    first = _build_substack_zip(
+        downloads / "aaa-export.zip", posts, include_sidecars=False
+    )
+    second = _build_substack_zip(
+        downloads / "bbb-export.zip", posts, include_sidecars=False
+    )
+    same = datetime(2026, 8, 1, tzinfo=UTC)
+    _set_mtime(first, same)
+    _set_mtime(second, same)
+    recs = _records()
+    assert len(recs) == 1
+    assert recs[0].extra["zip_path"] == str(first)
+
+
+def test_newest_zip_claims_a_post_even_when_since_excludes_its_copy(
+    drops, downloads
+):
+    """The newest zip owns an id for the WHOLE run, including when the since
+    window already excludes its (unchanged) copy. Without the claim, an older
+    zip whose member happens to carry a fresher stamp would slip through the
+    window and overwrite the row the newest export already settled."""
+    since = datetime(2026, 6, 1, tzinfo=UTC)
+    older = _build_substack_zip(
+        downloads / "aaa-old-export.zip",
+        {"55.post.html": "<h1>Old</h1><p>" + "x" * 300 + "</p>"},
+        include_sidecars=False,
+        member_mtimes={"posts/55.post.html": (2026, 7, 15, 0, 0, 0)},
+    )
+    newer = _build_substack_zip(
+        downloads / "zzz-new-export.zip",
+        {"55.post.html": "<h1>New</h1><p>" + "x" * 300 + "</p>"},
+        include_sidecars=False,
+        member_mtimes={"posts/55.post.html": (2026, 5, 1, 0, 0, 0)},
+    )
+    _set_mtime(older, datetime(2026, 7, 15, tzinfo=UTC))
+    _set_mtime(newer, datetime(2026, 8, 1, tzinfo=UTC))
+    assert _records(since=since) == []
+
+
+def test_second_run_over_unchanged_duplicate_zips_writes_zero_rows(
+    drops, downloads, tmp_data_home
+):
+    """Store-level proof of the churn fix: with two overlapping zips on disk,
+    a second run over unchanged inputs re-writes NOTHING (upsert returns
+    every row as unchanged), so embedding_state is never reset by a tick
+    that learned nothing new."""
+    posts = {"9001.stable.html": "<h1>S</h1><p>" + "x" * 300 + "</p>"}
+    older = _build_substack_zip(
+        downloads / "aaa-old-export.zip", posts, include_sidecars=False
+    )
+    newer = _build_substack_zip(
+        downloads / "zzz-new-export.zip", posts, include_sidecars=False
+    )
+    _set_mtime(older, datetime(2026, 7, 1, tzinfo=UTC))
+    _set_mtime(newer, datetime(2026, 8, 1, tzinfo=UTC))
+
+    store = Store()
+    store.migrate()
+    store.upsert(list(SubstackSource().iter_records(None)))
+    second = list(SubstackSource().iter_records(None))
+    unchanged = store.upsert(second)
+    assert len(second) == 1
+    assert unchanged == len(second)
 
 
 def test_two_substack_zips_both_ingested(drops, downloads):
