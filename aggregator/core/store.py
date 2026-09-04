@@ -966,8 +966,9 @@ _OBS_FTS_TRIGGERS: tuple[str, ...] = (
     # full FTS5 ``'delete'`` plus re-insert of the entire body. With
     # ``auto_vacuum=0`` the pages that frees are never handed back, which is the
     # same mechanism documented at the ingest UPSERT below. Measured on a
-    # throwaway database at 1/5 of live scale: a chunked column-only UPDATE ran
-    # 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth narrow.
+    # throwaway database at 1/5 of live scale: a chunked column-only rewrite
+    # took 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth
+    # narrow.
     # Extrapolated to the live 549,952 rows that is 12x wall clock and
     # 380-640 MB of permanent bloat on a 1.4 GB file.
     #
@@ -2640,12 +2641,16 @@ class Store:
                     "observations_au",
                 ):
                     c.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                # Porter migration: FTS5 tokenizer cannot be ALTERed; this is
+                # the deliberate drop+recreate+rebuild inside the SAVEPOINT.
+                # arftl-allow: sql-drop
                 c.execute("DROP TABLE obs_fts")
                 c.execute(_OBS_FTS_DDL)
                 c.execute("INSERT INTO obs_fts(obs_fts) VALUES('rebuild')")
                 for stmt in _OBS_FTS_TRIGGERS:
                     c.execute(stmt)
             if rec_stale:
+                # arftl-allow: sql-drop — same porter migration, records side.
                 c.execute("DROP TABLE records_fts")
                 c.execute(_RECORDS_FTS_DDL)
                 c.execute(

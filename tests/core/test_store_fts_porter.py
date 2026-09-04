@@ -120,9 +120,13 @@ def _downgrade_fts_to_unicode61(db) -> None:
     c = s._c()
     for trig in ("observations_ai", "observations_ad", "observations_au"):
         c.execute(f"DROP TRIGGER IF EXISTS {trig}")
+    # Fixture downgrades a throwaway DB to the v6 tokenizer so the migration
+    # under test has something to migrate.
+    # arftl-allow: sql-drop
     c.execute("DROP TABLE obs_fts")
     c.executescript(_OLD_OBS_FTS)
     c.execute("INSERT INTO obs_fts(obs_fts) VALUES('rebuild')")
+    # arftl-allow: sql-drop — same v6 downgrade, records side.
     c.execute("DROP TABLE records_fts")
     c.executescript(_OLD_RECORDS_FTS)
     for row in c.execute(
