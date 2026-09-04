@@ -1577,9 +1577,12 @@ def _note_confidence(
        checked against your words at all" — the sentence it used to fire. One
        side's FTS5 can fall over while the other side runs, matches, and puts
        corroborated rows on the very page being returned. So the STRENGTH of
-       the sentence is chosen from the flag together with ``lexical_support``:
-       corroboration on this page downgrades it from "nothing here" to "part of
-       this response", which is the claim that survives being checked.
+       the sentence is chosen from the flag together with ``lexical_support``
+       AND ``lexical_matched``: corroboration on this page downgrades it from
+       "nothing here" to "part of this response", and so does a ladder that
+       matched rows a filter then removed — on an empty page ``lexical_support``
+       is vacuously false, which is precisely where the absolute wording used to
+       fire beside a diagnosis reporting the arm's own match count.
     3. **The reranker ran and found nothing that stands out.** The report's
        preferred abstention signal, and the weakest one HERE, because the
        cross-encoder is off by default at ~13.7 s per pair on this hardware.
@@ -1601,15 +1604,27 @@ def _note_confidence(
         else "lexical"
     )
     reasons: list[str] = []
-    if lexical_unavailable and lexical_support:
+    if lexical_unavailable and (lexical_support or lexical_matched):
         # Union mode: one ontology's arm fell over and another's answered. The
         # absolute sentence below would be false about the rows on this page.
+        #
+        # ``lexical_matched`` COUNTS AS CORROBORATION EVEN WITH NO ROWS TO
+        # SHOW. On an empty page ``lexical_support`` is vacuously false — there
+        # is nothing to corroborate — so the absolute wording fired and told
+        # the caller nothing had been checked against their words, on a page
+        # whose diagnosis one sentence later said the keyword arm matched N
+        # rows and a filter removed them. An arm that matched ran.
+        corroborated = (
+            "Other rows on this page were keyword-matched normally"
+            if lexical_support
+            else "the keyword arm did run, and matched, on the source(s) it "
+            "reached"
+        )
         reasons.append(
             "the keyword arm was UNAVAILABLE for PART of this query — it "
             "failed on one of the two sources searched, so those rows come "
             "from the semantic arm alone and have not been checked against "
-            "your words. Other rows on this page were keyword-matched "
-            "normally, and a re-run may answer differently"
+            f"your words. {corroborated}, and a re-run may answer differently"
         )
     elif lexical_unavailable:
         reasons.append(
@@ -1633,18 +1648,28 @@ def _note_confidence(
         # The two sentences land on one page, so they have to be chosen from
         # one condition — a hedge that fired on facts the diagnosis ignores
         # would recreate the contradiction from the other side.
+        #
+        # AND THE FILTER CASE OUTRANKS THE DROPPED ARM, which is the other way
+        # round from how it was written. ``lexical_unavailable`` is ``any`` over
+        # the union's arms, so one ontology's FTS5 falling over made the page
+        # say "the semantic arm, the only one that ran" — printed directly
+        # beside "the keyword arm matched N row(s)" from the composer, about the
+        # arm that had just run and matched. Whatever failed elsewhere, an arm
+        # that matched rows is not the arm that did not run; the sentence above
+        # has already disclosed the failure, and this one says why the page is
+        # empty, which is the filter.
         filter_excluded = bool(lexical_matched) and search_mode != "vector"
-        if lexical_unavailable:
-            reasons.append(
-                "nothing matched this query on the semantic arm, the only one "
-                "that ran, so this is an abstention rather than a short answer"
-            )
-        elif filter_excluded:
+        if filter_excluded:
             reasons.append(
                 f"the keyword arm matched {lexical_matched} row(s) and this "
                 f"query's filters then excluded every one of them, so this is "
                 f"an abstention by FILTER rather than by the corpus — the "
                 f"words are in the index and different words will not help"
+            )
+        elif lexical_unavailable:
+            reasons.append(
+                "nothing matched this query on the semantic arm, the only one "
+                "that ran, so this is an abstention rather than a short answer"
             )
         else:
             reasons.append(
@@ -2528,12 +2553,24 @@ class _PageFacts:
     ``tier_attributed`` is the three-valued discipline this file uses
     everywhere: ``False`` means the route did not answer the question (one arm,
     so there is nothing to attribute), NOT that the answer was "exact".
+
+    ``arm_probes`` IS THE SAME QUESTION FOR AN EMPTY PAGE, which ``visible_tier``
+    cannot answer because there are no visible rows to attribute anything to.
+    The filter diagnosis still talks about rows — the ones the ladder matched
+    and a filter removed — and those rows have tiers too: the records arm can
+    have matched STRICTLY while the observations arm relaxed, and the
+    request-wide marker keeps the deeper of the two. Handing the composer the
+    per-arm probes lets it say "some of those rows" where it used to say "those
+    rows", which is the difference between a hedge and a false label.
     """
 
     #: Deepest tier behind the rows actually on this page.
     visible_tier: str | None = None
     #: Whether ``visible_tier`` is an answer rather than an absence.
     tier_attributed: bool = False
+    #: One probe per lexical arm this route ran. Empty on single-arm routes,
+    #: where the request-wide marker already IS the attribution.
+    arm_probes: tuple[LexicalProbe, ...] = ()
 
 
 #: The single-arm routes' facts: nothing to attribute, marker stands as is.
@@ -2730,8 +2767,49 @@ def _note_relaxation(
     return result
 
 
+def _relaxed_suffix(tier: str | None, facts: _PageFacts) -> str:
+    """How to describe the TIERS behind rows a filter removed. Per arm.
+
+    THE REQUEST-WIDE MARKER IS THE WRONG SOURCE HERE and that is the same
+    mistake :class:`_PageFacts` was created to fix, one page state later. The
+    marker keeps the DEEPEST tier any arm reached, which is a safe
+    over-disclosure between sub-evaluations of ONE arm and a plain falsehood
+    across two ontologies: a union query whose records arm matched strictly and
+    whose observations arm relaxed had every one of its filtered-out rows
+    labelled "matched under the RELAXED `or` tier".
+
+    So the arms are consulted individually, and only the ones that MATCHED get
+    a vote — an arm that found nothing has no rows in the count the sentence is
+    about. All exact: no suffix at all, because absence is the exact-match
+    claim. All relaxed: the original sentence, unchanged. Mixed: "some", which
+    is the only one of the three that is true of a page holding both.
+
+    Falls back to the request-wide ``tier`` for single-arm routes, where the
+    marker and the arm are the same thing.
+    """
+    matched_arms = [p for p in facts.arm_probes if p.matched]
+    tiers = {p.tier for p in matched_arms} if matched_arms else {tier}
+    deepest = _deepest_tier(tiers)
+    if deepest is None:
+        return ""
+    if None in tiers:
+        return (
+            f" SOME of those rows matched under the RELAXED `{deepest}` tier "
+            f"rather than as an exact conjunction, and the rest matched "
+            f"exactly — so the relaxed ones are leads either way."
+        )
+    return (
+        f" Those rows matched under the RELAXED `{deepest}` tier rather than as "
+        f"an exact conjunction, so they are leads either way."
+    )
+
+
 def _filter_excluded_notice(
-    ast: QueryAST, conjuncts: list[str], matched: int, tier: str | None
+    ast: QueryAST,
+    conjuncts: list[str],
+    matched: int,
+    tier: str | None,
+    facts: _PageFacts = _NO_PAGE_FACTS,
 ) -> str:
     """The page is empty because a FILTER emptied it, not because the words are.
 
@@ -2747,15 +2825,19 @@ def _filter_excluded_notice(
     the filter as the remedy. ``matched`` is the ladder's own pre-filter row
     count (see :class:`aggregator.core.store.LexicalProbe`) — a number it
     already had, not a re-run of the query.
+
+    THE WAY OUT IS A PROMISE ONLY WHEN ONE FILTER IS IN PLAY. "Drop or widen
+    one and the matching rows come back" is checkable in a single re-run, and
+    with two or more filters active it is checkably false whenever each of them
+    excludes the matched rows independently — which is the common case, since
+    they were all typed to narrow the same query. The caller drops ``tag:``,
+    gets a second empty page, and has been taught not to believe the notice. So
+    the multi-filter wording names them all and says what it can actually
+    stand behind.
     """
     shown = ", ".join(conjuncts)
     filters = _active_filters(ast)
-    relaxed = (
-        f" Those rows matched under the RELAXED `{tier}` tier rather than as an "
-        f"exact conjunction, so they are leads either way."
-        if tier
-        else ""
-    )
+    relaxed = _relaxed_suffix(tier, facts)
     if not filters:
         return (
             f"Nothing came back, and THE WORDS ARE NOT THE PROBLEM: the "
@@ -2767,13 +2849,21 @@ def _filter_excluded_notice(
     # the only one that can also exclude an entire ontology by definition, so
     # it is where a caller should look before rewriting anything.
     first = next((f for f in filters if f.startswith("tag:")), filters[0])
+    way_out = (
+        f"drop or widen `{first}` and the matching rows come back"
+        if len(filters) == 1
+        else (
+            f"widen them, starting with `{first}` — but relaxing only one may "
+            f"not be enough, because each of these can exclude the matched "
+            f"rows on its own"
+        )
+    )
     return (
         f"Nothing came back, and THE WORDS ARE NOT THE PROBLEM: the keyword "
         f"arm matched {matched} row(s) on {shown}, and this query's other "
         f"filters ({', '.join(filters)}) then excluded every one of them. The "
         f"terms ARE in the index, so the fix is a FILTER and not different "
-        f"words — drop or widen one (start with `{first}`) and the matching "
-        f"rows come back.{relaxed}"
+        f"words — {way_out}.{relaxed}"
     )
 
 
@@ -2783,6 +2873,7 @@ def _empty_page_notice(
     mode: str,
     query_text: str | None,
     search_mode: str = "hybrid",
+    facts: _PageFacts = _NO_PAGE_FACTS,
 ) -> str | None:
     """Why an empty page is empty. One diagnosis, chosen from what actually ran.
 
@@ -2798,7 +2889,11 @@ def _empty_page_notice(
        records route too — where no empty-page notice used to fire at all.
     3. **``scope:session`` already widened, still empty.** There is no wider
        unit to suggest and suggesting one would be a lie the caller can check
-       in one call.
+       in one call — but "they do not co-occur in any one session" is a
+       measurement too, so this branch reads ``lexical_matches`` before making
+       it. The intersection qualified sessions and a filter took their rows
+       (branch 2 owns that page), it ran and qualified none (the wording
+       below), or it never ran at all and the branch says nothing.
     4. **The ladder ran and every tier came back empty.** The one case where
        "the corpus does not hold these terms" is a measurement rather than an
        inference — ``lexical_matches == 0`` says the ladder looked.
@@ -2820,7 +2915,7 @@ def _empty_page_notice(
     matched = store.lexical_matches
     if search_mode != "vector" and matched:
         return _filter_excluded_notice(
-            ast, conjuncts, matched, store.lexical_relaxation
+            ast, conjuncts, matched, store.lexical_relaxation, facts
         )
     if len(conjuncts) < 2:
         # One term matched nothing: the corpus does not hold it, and there is
@@ -2832,6 +2927,20 @@ def _empty_page_notice(
         return None
     shown = ", ".join(conjuncts)
     if ast.scope == SCOPE_SESSION:
+        # "They do not co-occur in any one session" IS A MEASUREMENT, and only
+        # ``matched == 0`` licenses it: the intersection ran and qualified no
+        # session. ``matched > 0`` is the opposite fact and belongs to the
+        # filter branch above, which owns it for every ontology. ``None`` is
+        # neither — nobody ran the intersection at all (``search_mode='vector'``
+        # drops the keyword arm) — and reporting the unmeasured case in the
+        # words of the measured one is how this notice came to deny a
+        # co-occurrence the store had never been asked about.
+        if matched:
+            return _filter_excluded_notice(
+                ast, conjuncts, matched, store.lexical_relaxation, facts
+            )
+        if matched is None:
+            return None
         return (
             f"Nothing matched. All {len(conjuncts)} terms ({shown}) had to "
             f"appear in the SAME SESSION — you asked for `scope:session`, "
@@ -2914,11 +3023,12 @@ def _note_empty_page(
     mode: str,
     query_text: str | None,
     search_mode: str = "hybrid",
+    facts: _PageFacts = _NO_PAGE_FACTS,
 ) -> dict[str, Any]:
     """Attach :func:`_empty_page_notice` to an empty page. No-op otherwise."""
     if not result.get("ok") or result.get("total") or result.get("records"):
         return result
-    notice = _empty_page_notice(store, ast, mode, query_text, search_mode)
+    notice = _empty_page_notice(store, ast, mode, query_text, search_mode, facts)
     if not notice:
         return result
     prior = result.get("notice")
@@ -2952,7 +3062,7 @@ def _compose_notices(
     from the answer; the diagnosis explains an emptiness the two above only
     contribute to.
     """
-    _note_empty_page(result, store, ast, mode, query_text, search_mode)
+    _note_empty_page(result, store, ast, mode, query_text, search_mode, facts)
     _note_tag_ontology(result, ast, mode)
     _note_relaxation(result, store, ast, query_text, facts)
     return result
@@ -4627,6 +4737,12 @@ def _query_union_path(
             if kind in kinds_on_page
         ),
         tier_attributed=True,
+        # BOTH probes, unconditionally, and that is not the same list as the
+        # one above. ``visible_tier`` describes rows the caller can see;
+        # ``arm_probes`` describes rows a filter removed, which is the only
+        # thing an EMPTY union page has left to attribute — and there
+        # ``kinds_on_page`` is empty by construction.
+        arm_probes=(rec_probe, sess_probe),
     )
     if has_more:
         _attach_next_page_token(
