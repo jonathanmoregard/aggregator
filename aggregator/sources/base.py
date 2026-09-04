@@ -41,6 +41,13 @@ class Record:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     extra: dict[str, Any] = field(default_factory=dict)  # source-specific metadata
+    # LLM-generated topic tags (``aggregator tag``). READ-ONLY on this shape:
+    # sources never populate it, the store fills it from ``records.llm_tags``
+    # on the way out, and the write path ignores it — the tagger's own write
+    # (``Store.write_llm_tags``) is the only thing that moves the column.
+    # Kept separate from ``tags`` so source-written tags stay pristine and a
+    # caller can always tell which kind of tag matched.
+    llm_tags: list[str] = field(default_factory=list)
 
 
 # --- v2 Langfuse-derived entities (Schema B) ------------------------------

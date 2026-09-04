@@ -1003,6 +1003,34 @@ _RECORDS_FTS_DDL = f"""
     );
 """
 
+#: The text the ``records_fts`` ``tags`` column indexes for one row: the
+#: space-joined UNION of the source-written ``tags`` array and the LLM-written
+#: ``llm_tags`` array, read from the ``records`` row itself. One SQL
+#: expression shared by every site that (re)builds a ``records_fts`` row —
+#: the porter rebuild, the row-write path and ``write_llm_tags`` — because a
+#: second spelling is how the index and the columns would come to disagree
+#: about whether a record is reachable by its tags. ``COALESCE`` on
+#: ``llm_tags``: NULL means "never tagged" and must read as no tags, not as a
+#: ``json_each`` error.
+_RECORDS_FTS_TAGS_SQL = (
+    "TRIM(COALESCE((SELECT group_concat(je.value, ' ') "
+    "FROM json_each(records.tags) AS je), '') || ' ' || "
+    "COALESCE((SELECT group_concat(je.value, ' ') "
+    "FROM json_each(COALESCE(records.llm_tags, '[]')) AS je), ''))"
+)
+
+#: Rebuild one record's ``records_fts`` row from the stored row. Callers
+#: DELETE the old FTS row first (records_fts is not external-content, so
+#: delete+insert is the update idiom — see ``_write_one_record``). Reading
+#: from ``records`` rather than from caller-held values is what keeps the
+#: index equal to the columns by construction: whatever the row holds — a
+#: fresh ingest's body, a tag write's llm_tags — is what gets indexed.
+_RECORDS_FTS_REFRESH_SQL = (
+    "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
+    "SELECT stable_id, source, subject, body, " + _RECORDS_FTS_TAGS_SQL + " "
+    "FROM records WHERE stable_id = ?"
+)
+
 _DDL: list[str] = [
     # --- v2: sessions (Langfuse "trace") ------------------------------
     """
@@ -1086,12 +1114,14 @@ _DDL: list[str] = [
         source     TEXT NOT NULL,
         subject    TEXT NOT NULL,
         body       TEXT NOT NULL,
-        tags       TEXT NOT NULL,       -- JSON array
+        tags       TEXT NOT NULL,       -- JSON array; SOURCE-written, pristine
         created_at TEXT,
         updated_at TEXT,
         extra      TEXT NOT NULL DEFAULT '{}',
         src_hash   TEXT,             -- v4; see ``_src_hash``
-        embedding_state TEXT         -- v5; NULL = not embedded yet
+        embedding_state TEXT,        -- v5; NULL = not embedded yet
+        llm_tags   TEXT,             -- JSON array; see ``_ensure_llm_tags_columns``
+        llm_tags_src_hash TEXT       -- src_hash the llm_tags were computed from
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_records_source ON records(source);",
@@ -1931,6 +1961,7 @@ class Store:
         self._ensure_src_hash_columns(c)
         self._ensure_embedding_state_columns(c)
         self._ensure_provenance_column(c)
+        self._ensure_llm_tags_columns(c)
         self._ensure_narrow_fts_update_trigger(c)
         self._ensure_porter_fts_tokenizer(c)
         for stmt in _DDL:
@@ -2465,6 +2496,34 @@ class Store:
         Store._ensure_column(c, "observations", "provenance", "TEXT")
 
     @staticmethod
+    def _ensure_llm_tags_columns(c: sqlite3.Connection) -> None:
+        """Additive (no version bump): ``records.llm_tags`` + its watermark.
+
+        ``llm_tags`` holds a JSON array of LLM-generated topic tags;
+        ``llm_tags_src_hash`` records the ``records.src_hash`` value those
+        tags were computed FROM. NULL for every existing row, and — the same
+        contract as ``embedding_state`` and ``provenance`` above — that NULL
+        is the whole watermark: ``aggregator tag`` selects rows whose
+        ``llm_tags_src_hash`` is NULL or disagrees with the current
+        ``src_hash``, so a pre-existing corpus comes out of this migration
+        QUEUED FOR TAGGING and a record whose content changes re-queues
+        itself. No sidecar ledger, nothing to fall out of step.
+
+        SOURCE TAGS STAY PRISTINE. The LLM never writes into ``records.tags``
+        — the union of the two is computed at query/index time
+        (:data:`_RECORDS_FTS_TAGS_SQL`, ``_build_where``) so a bad tagging
+        run can always be re-done without having corrupted source data.
+
+        Additive columns ship WITHOUT a schema-version bump, per the rule at
+        the top of ``_DDL``: old readers ignore columns they do not know.
+        Metadata-only ALTERs, like every ``_ensure_*`` above. Must run BEFORE
+        ``_ensure_porter_fts_tokenizer``, whose records repopulate reads the
+        ``llm_tags`` column through :data:`_RECORDS_FTS_TAGS_SQL`.
+        """
+        Store._ensure_column(c, "records", "llm_tags", "TEXT")
+        Store._ensure_column(c, "records", "llm_tags_src_hash", "TEXT")
+
+    @staticmethod
     def _ensure_narrow_fts_update_trigger(c: sqlite3.Connection) -> None:
         """Replace a wide ``observations_au`` with the ``OF body`` form.
 
@@ -2593,9 +2652,8 @@ class Store:
                     "INSERT INTO records_fts"
                     "(stable_id, source, subject, body, tags) "
                     "SELECT stable_id, source, subject, body, "
-                    "COALESCE((SELECT group_concat(je.value, ' ') "
-                    "FROM json_each(records.tags) AS je), '') "
-                    "FROM records"
+                    + _RECORDS_FTS_TAGS_SQL
+                    + " FROM records"
                 )
         except BaseException:
             c.execute("ROLLBACK TO SAVEPOINT porter_fts")
@@ -5009,17 +5067,14 @@ class Store:
         if existed and vec_usable:
             _drop_row_vectors(c, "vec_records", "stable_id", r.stable_id)
         c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
-        c.execute(
-            "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                r.stable_id,
-                r.source,
-                scrubbed_subject,
-                scrubbed_body,
-                " ".join(r.tags),
-            ),
-        )
+        # INSERT..SELECT FROM the row just written, not VALUES from the
+        # incoming Record. The difference is ``llm_tags``: the tagger's
+        # columns survive an upsert (they are not in the SET list above), so
+        # the FTS row has to carry them too or every ingest tick would strip
+        # the LLM tags from the lexical index while the columns still claimed
+        # the record tagged. The SELECT reads the scrubbed subject/body the
+        # statement above stored, so the indexed text is identical either way.
+        c.execute(_RECORDS_FTS_REFRESH_SQL, (r.stable_id,))
 
     # -- reads: legacy Record-shaped path (GitHub) ------------------------
 
@@ -5039,7 +5094,13 @@ class Store:
             iso = ast.to_date.isoformat()
             params.extend([iso, iso])
         for tag in ast.tags:
-            clauses.append("tags LIKE ?")
+            # UNION of the source-written and LLM-written tag arrays: a
+            # ``tag:`` filter must reach a record however it earned the tag.
+            # NULL ``llm_tags`` makes the right side NULL, and
+            # ``FALSE OR NULL`` is not true, so never-tagged rows behave
+            # exactly as before.
+            clauses.append("(tags LIKE ? OR llm_tags LIKE ?)")
+            params.append(f'%"{tag}"%')
             params.append(f'%"{tag}"%')
         self._apply_id_scope(ast, "stable_id", clauses, params)
         return " AND ".join(clauses), params
@@ -5255,6 +5316,152 @@ class Store:
                 "SELECT COUNT(*) AS n FROM records WHERE source = ?", (source,)
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    # -- LLM topic tags on records (``aggregator tag``) -------------------
+    #
+    # The watermark predicate, spelled once. A record NEEDS tagging when it
+    # was never tagged (``llm_tags_src_hash IS NULL``) or when its content
+    # moved on since the tags were computed (the hashes disagree). The second
+    # clause requires ``src_hash IS NOT NULL``: a pre-v4 row with no hash at
+    # all cannot "disagree" with anything, so once tagged (the write stores
+    # ``''`` for the missing hash) it stays tagged until ingest stamps a real
+    # hash — at which point ``'' != hash`` re-queues it, correctly, because
+    # the tags describe text the hash does not.
+    _LLM_TAGS_NEEDED = (
+        "(llm_tags_src_hash IS NULL "
+        "OR (src_hash IS NOT NULL AND llm_tags_src_hash != src_hash))"
+    )
+
+    def ids_needing_llm_tags(self, sources: Sequence[str]) -> list[str]:
+        """Stable ids of records the tag backfill still owes, newest first.
+
+        IDS, NOT ROWS, and that is the streaming story: the CLI snapshots
+        this list once per run (a few thousand short strings) and then pulls
+        each batch's full rows via :meth:`records_for_tagging`, so bodies are
+        only ever held one batch at a time. Snapshotting also gives the run a
+        poison-loop guarantee for free — a record whose tagging fails is
+        simply not revisited until the NEXT run, rather than re-selected by
+        the very predicate its failure left unchanged.
+
+        Newest first because tags exist to make recent material findable; on
+        an interrupted first backfill that is the half worth having.
+        """
+        placeholders = ",".join("?" * len(sources))
+        return [
+            row["stable_id"]
+            for row in self._c().execute(
+                f"SELECT stable_id FROM records "  # noqa: S608 - placeholders only
+                f"WHERE source IN ({placeholders}) AND {self._LLM_TAGS_NEEDED} "
+                f"ORDER BY updated_at DESC, stable_id",
+                list(sources),
+            )
+        ]
+
+    def records_for_tagging(self, ids: Sequence[str]) -> list[sqlite3.Row]:
+        """The fields one prompt batch needs, for the given stable ids.
+
+        ``src_hash`` is read HERE, before the LLM call, and the caller hands
+        it back to :meth:`write_llm_tags` unchanged — never re-read at write
+        time. If ingest rewrites the row while the model is thinking, the
+        stored watermark then disagrees with the new ``src_hash`` and the
+        record re-queues on the next run, which is the truthful outcome: the
+        tags were computed from text the row no longer holds.
+        """
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        return self._c().execute(
+            f"SELECT stable_id, source, subject, body, src_hash "  # noqa: S608 - placeholders only
+            f"FROM records WHERE stable_id IN ({placeholders})",
+            list(ids),
+        ).fetchall()
+
+    def write_llm_tags(
+        self, items: Sequence[tuple[str, Sequence[str], str | None]]
+    ) -> int:
+        """Write one committed batch of ``(stable_id, tags, src_hash)``.
+
+        ONE COMMIT PER CALL — this is the tag backfill's checkpoint, so a
+        kill at any moment costs at most one batch and the watermark (which
+        lives in the same rows, same transaction) can never get ahead of the
+        tags it describes.
+
+        ``src_hash`` is the value read at SELECT time (see
+        :meth:`records_for_tagging`); ``None`` — a pre-v4 row — is stored as
+        ``''`` so the row does not re-queue forever, per the predicate note
+        above. Touches NOTHING else: not ``tags`` (source-written, pristine),
+        not ``src_hash``, not ``embedding_state`` — a tag write must never
+        cost the corpus a re-scrub or the vector arm its work. The record's
+        ``records_fts`` row is rebuilt (delete + insert, the table's update
+        idiom) so the lexical index carries the union immediately.
+
+        Returns how many rows were actually updated; an id that vanished
+        between select and write (source rebuild) counts zero and its FTS
+        refresh is skipped rather than resurrecting a deleted row's index
+        entry.
+        """
+        if not items:
+            return 0
+        self._ensure_writable()
+        c = self._c()
+        written = 0
+        for stable_id, tags, src_hash in items:
+            cur = c.execute(
+                "UPDATE records SET llm_tags = ?, llm_tags_src_hash = ? "
+                "WHERE stable_id = ?",
+                (json.dumps(list(tags)), src_hash or "", stable_id),
+            )
+            if cur.rowcount == 0:
+                continue
+            written += 1
+            c.execute(
+                "DELETE FROM records_fts WHERE stable_id = ?", (stable_id,)
+            )
+            c.execute(_RECORDS_FTS_REFRESH_SQL, (stable_id,))
+        c.commit()
+        return written
+
+    def llm_tag_progress_by_source(self) -> list[dict]:
+        """How far the tag backfill has got, PER SOURCE — the truth surface.
+
+        Same argument as :meth:`embed_progress_by_source`: a partially-tagged
+        corpus must never look fully tagged, and one global percentage cannot
+        say which sources a ``tag:`` filter can be trusted for. One row per
+        source actually present in ``records`` (the population the tagger
+        walks), each with ``total``, ``tagged``, ``pending`` and a ``state``
+        from the same vocabulary the vector surfaces use: ``not_started`` /
+        ``in_progress`` / ``complete``. No ``degraded`` here — a failed
+        record keeps its NULL watermark and stays honestly in ``pending``;
+        the failure itself is reported loudly by the run that hit it.
+
+        Cheap by construction (one grouped count over a ~4.4k-row table), so
+        unlike the embed tally it CAN ride along on ``capabilities()``.
+        """
+        rows = self._c().execute(
+            f"SELECT source, COUNT(*) AS total, "  # noqa: S608 - fixed predicate
+            f"SUM(CASE WHEN {self._LLM_TAGS_NEEDED} THEN 0 ELSE 1 END) "
+            f"AS tagged FROM records GROUP BY source ORDER BY source"
+        ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            total = int(row["total"])
+            tagged = int(row["tagged"] or 0)
+            if tagged == 0:
+                state = "not_started"
+            elif tagged < total:
+                state = "in_progress"
+            else:
+                state = "complete"
+            out.append(
+                {
+                    "source": row["source"],
+                    "total": total,
+                    "tagged": tagged,
+                    "pending": total - tagged,
+                    "state": state,
+                }
+            )
+        return out
 
     def count_sessions_by_origin(self, origins: Sequence[str] | None = None) -> int:
         """Rows in ``sessions``, optionally restricted to ``origins``.
@@ -6224,6 +6431,10 @@ class Store:
             "schema_version": SCHEMA_VERSION,
             "counts": counts,
             "vector_index": self.vector_index_state(),
+            # Cheap (one grouped count over records) unlike the embed tally,
+            # so it rides the connect path: an agent deciding whether a
+            # ``tag:`` filter can be trusted needs this BEFORE it searches.
+            "llm_tag_coverage": self.llm_tag_progress_by_source(),
         }
 
     def vector_index_state(self) -> dict:
@@ -6316,6 +6527,13 @@ class Store:
 
 
 def _row_to_record(row: sqlite3.Row) -> Record:
+    # ``llm_tags`` guarded by presence: the column is ensured by migrate(),
+    # but a few pure-SQL tests build rows without it, and a missing key must
+    # read as "never tagged" rather than raise on the way out of a query.
+    # ``.keys()`` is LOAD-BEARING (noqa SIM118): bare ``in`` on sqlite3.Row
+    # iterates VALUES, so it would test whether some column holds the string
+    # "llm_tags" — a different question that is almost always False.
+    llm_tags_raw = row["llm_tags"] if "llm_tags" in row.keys() else None  # noqa: SIM118
     return Record(
         stable_id=row["stable_id"],
         source=row["source"],
@@ -6325,6 +6543,7 @@ def _row_to_record(row: sqlite3.Row) -> Record:
         created_at=_parse_iso(row["created_at"]),
         updated_at=_parse_iso(row["updated_at"]),
         extra=json.loads(row["extra"] or "{}"),
+        llm_tags=json.loads(llm_tags_raw) if llm_tags_raw else [],
     )
 
 
