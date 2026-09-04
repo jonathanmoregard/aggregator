@@ -5101,12 +5101,28 @@ class Store:
         for tag in ast.tags:
             # UNION of the source-written and LLM-written tag arrays: a
             # ``tag:`` filter must reach a record however it earned the tag.
-            # NULL ``llm_tags`` makes the right side NULL, and
-            # ``FALSE OR NULL`` is not true, so never-tagged rows behave
-            # exactly as before.
-            clauses.append("(tags LIKE ? OR llm_tags LIKE ?)")
-            params.append(f'%"{tag}"%')
-            params.append(f'%"{tag}"%')
+            #
+            # EXACT membership via json_each, not the old ``LIKE '%"tag"%'``
+            # substring probe, which had two real defects: LIKE wildcards in
+            # the tag value leaked through (``tag:a_b`` matched a record
+            # tagged ``axb``), and source tags are stored ensure_ascii
+            # ``json.dumps``-escaped, so a non-ASCII tag (``blåbär`` →
+            # ``blåbär`` on disk) could never match the raw JSON
+            # text. json_each decodes the escapes and ``=`` has no wildcard
+            # vocabulary, so both go away without any ESCAPE bookkeeping.
+            # COLLATE NOCASE keeps LIKE's ASCII case folding — callers copy
+            # tag values from capabilities, but a hand-typed ``tag:bug`` must
+            # still find the github label ``Bug`` like it always did.
+            # ``COALESCE(llm_tags, '[]')``: NULL means never tagged and must
+            # read as no tags — the same guard ``_RECORDS_FTS_TAGS_SQL`` uses.
+            clauses.append(
+                "(EXISTS (SELECT 1 FROM json_each(records.tags) "
+                "WHERE json_each.value = ? COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM json_each(COALESCE(records.llm_tags, '[]')) "
+                "WHERE json_each.value = ? COLLATE NOCASE))"
+            )
+            params.append(tag)
+            params.append(tag)
         self._apply_id_scope(ast, "stable_id", clauses, params)
         return " AND ".join(clauses), params
 

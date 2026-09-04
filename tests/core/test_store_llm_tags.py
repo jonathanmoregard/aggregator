@@ -128,6 +128,45 @@ def test_llm_tags_visible_on_the_returned_record(tmp_path):
     assert rec.llm_tags == ["llm-topic"]
 
 
+def test_tag_filter_is_exact_not_a_like_wildcard(tmp_path):
+    """``%`` and ``_`` in a tag value must match literally, not as LIKE
+    wildcards: ``tag:a_b`` used to match a record tagged ``axb`` because the
+    filter bound the raw value into a LIKE pattern."""
+    s = _store(tmp_path)
+    s.upsert(
+        [
+            _rec("github:lit", "S", "b", tags=["a_b"]),
+            _rec("github:wild", "S2", "b2", tags=["axb"]),
+            _rec("github:pct", "S3", "b3", tags=["50%"]),
+            _rec("github:pfx", "S4", "b4", tags=["50-percent"]),
+        ]
+    )
+    assert [r.stable_id for r in s.query(parse("tag:a_b"))] == ["github:lit"]
+    assert [r.stable_id for r in s.query(parse("tag:50%"))] == ["github:pct"]
+    # And on the llm side of the union too.
+    s.upsert([_rec("github:llm-w", "S5", "b5", tags=[])])
+    s.write_llm_tags([("github:llm-w", ["cxd"], "h1")])
+    assert s.query(parse("tag:c_d")) == []
+
+
+def test_non_ascii_source_tag_is_reachable(tmp_path):
+    """Source tags are stored ``json.dumps``-escaped (``\\uXXXX``), so a LIKE
+    against the raw JSON text could never see ``tag:blåbär``. json_each
+    decodes the escapes back to text before comparing."""
+    s = _store(tmp_path)
+    s.upsert([_rec("github:sv", "S", "b", tags=["blåbär"])])
+    assert [r.stable_id for r in s.query(parse("tag:blåbär"))] == ["github:sv"]
+    assert s.count(parse("tag:blåbär")) == 1
+
+
+def test_tag_filter_keeps_ascii_case_insensitivity(tmp_path):
+    """LIKE folded ASCII case; callers may have leaned on it (a github label
+    ``Bug`` found by ``tag:bug``), so the exact-match rewrite pins it."""
+    s = _store(tmp_path)
+    s.upsert([_rec("github:case", "S", "b", tags=["Bug"])])
+    assert [r.stable_id for r in s.query(parse("tag:bug"))] == ["github:case"]
+
+
 # --- records_fts carries the union ------------------------------------------
 
 
