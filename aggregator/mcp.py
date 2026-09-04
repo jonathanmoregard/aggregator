@@ -3247,6 +3247,60 @@ def _wants_sessions(ast: QueryAST) -> bool:
     return _route_mode(ast) == "sessions"
 
 
+def _note_tag_ontology(
+    result: dict[str, Any], ast: QueryAST, mode: str
+) -> None:
+    """Disclose the sessions arm a ``tag:`` filter excludes by definition.
+
+    The store already knows sessions carry no tags — ``tag:`` under the
+    sessions/observations WHERE renders ``1=0`` — which turned
+    ``source:sessions tag:main`` from "every session, unfiltered" into a
+    clean empty page. Correct rows, and the page said NOTHING about why:
+    the silence this project bans. Filtering semantics are unchanged here;
+    this attaches the missing sentence. Route by route:
+
+    * ``"sessions"`` (the ``observations`` drilldown rides the same route):
+      the whole result set is sessions-shaped, so under ``tag:`` it is empty
+      BY DEFINITION — not "nothing on that topic". Say so and name both ways
+      out.
+    * ``"union"`` WITH free text: the records half answers and its hits
+      stand, but the sessions half was excluded before the text ever reached
+      it — the page looks complete while sessions holding the terms are
+      absent. Disclose the half that did not run.
+    * ``"union"`` WITHOUT free text (``tag:x``, ``tag:x from:…``): no
+      notice. A tag-only query asks a records-ontology question, its
+      records-only answer is complete on the query's own terms, and stamping
+      every plain ``tag:`` page with an ontology lecture would bury the
+      notices that carry page-specific facts.
+    * ``"records"`` and the mismatch modes: no-op — records ARE the
+      tag-bearing shape, and the mismatch responses already disclose.
+    """
+    if not ast.tags or not result.get("ok"):
+        return
+    if mode == "sessions":
+        notice = (
+            "tag: matches records only — sessions and observations carry no "
+            "tags — so under a tag: filter every sessions/observations "
+            "result is empty BY DEFINITION, not empty of the topic. Drop "
+            "the sessions-route key (source:sessions/subagents, session:, "
+            "top:, agent:, type:, by:, scope:, active:) to see the tagged "
+            "records, or drop tag: and keep the topic as free text to "
+            "search sessions."
+        )
+    elif mode == "union" and ast.text:
+        notice = (
+            "The sessions half of this cross-source union was excluded BY "
+            "DEFINITION: tag: matches records only — sessions and "
+            "observations carry no tags — so the free text never reached "
+            "the sessions table. The record hits here are unaffected. Drop "
+            "tag: (keep the free text) to reach sessions too."
+        )
+    else:
+        return
+    prior = result.get("notice")
+    result["notice"] = f"{notice} {prior}" if prior else notice
+
+
 def aggregator_query(
     dsl: str,
     fields: str = "summary",
@@ -3625,6 +3679,10 @@ def aggregator_query(
             ),
             max_chars,
         )
+        # TAG-ONTOLOGY DISCLOSURE, at the one place every route passes
+        # through. Attached BEFORE the relaxation stamp so a rescued page's
+        # relaxation sentence still leads, as its docstring promises.
+        _note_tag_ontology(result, ast, mode)
         # RELAXATION DISCLOSURE, at the one place every route passes through
         # — the same argument as the miss log below. The store recorded which
         # tier answered; a relaxed page must say so or it masquerades as an
