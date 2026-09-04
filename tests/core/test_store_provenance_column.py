@@ -69,8 +69,15 @@ def _columns(c: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
 
 
-def test_schema_version_is_six():
-    assert SCHEMA_VERSION == 6
+def test_schema_version_is_seven():
+    """v6 added ``provenance``; v7 (porter stemming, ``ededbf2``) is current.
+
+    Pinned to the literal so a migration bump is a conscious edit here rather
+    than silent drift — same precedent as ``test_store.py``'s
+    ``test_schema_version_is_7``. The provenance column this file guards
+    shipped in v6 and survives unchanged through v7.
+    """
+    assert SCHEMA_VERSION == 7
 
 
 def test_a_fresh_database_has_the_column_and_its_index(tmp_path):
