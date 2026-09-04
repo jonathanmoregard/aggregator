@@ -167,6 +167,20 @@ def test_tag_filter_keeps_ascii_case_insensitivity(tmp_path):
     assert [r.stable_id for r in s.query(parse("tag:bug"))] == ["github:case"]
 
 
+def test_capabilities_tag_inventory_includes_llm_only_tags(tmp_path):
+    """``tags_by_source`` advertises what ``tag:`` can filter on, and ``tag:``
+    filters the UNION — so a value only ``llm_tags`` carries must appear in
+    the inventory, or the one place callers discover tags hides half of them."""
+    s = _store(tmp_path)
+    s.upsert([_rec("github:u1", "S", "b", tags=["src-only"])])
+    s.upsert([_rec("github:u2", "S2", "b2", tags=[])])
+    s.write_llm_tags([("github:u2", ["llm-only", "src-only"], "h1")])
+    tags = s.capabilities()["tags_by_source"]["github"]
+    assert "llm-only" in tags
+    # Popularity counts the union per record: both records carry src-only.
+    assert tags.index("src-only") < tags.index("llm-only")
+
+
 # --- records_fts carries the union ------------------------------------------
 
 

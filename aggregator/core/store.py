@@ -6382,9 +6382,16 @@ class Store:
             freshness[s] = row["m"] if row else None
             tag_counter: dict[str, int] = {}
             for row in c.execute(
-                "SELECT tags FROM records WHERE source = ?", (s,)
+                "SELECT tags, llm_tags FROM records WHERE source = ?", (s,)
             ):
-                for t in json.loads(row["tags"]):
+                # UNION of source and LLM tags, mirroring what ``tag:``
+                # actually filters on — an llm-only tag value must show up in
+                # the advertised inventory or callers can never discover it.
+                # Per-record set, so a tag both arrays carry counts once.
+                for t in {
+                    *json.loads(row["tags"]),
+                    *json.loads(row["llm_tags"] or "[]"),
+                }:
                     tag_counter[t] = tag_counter.get(t, 0) + 1
             tags_by_source[s] = [
                 t for t, _ in sorted(
