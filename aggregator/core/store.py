@@ -97,7 +97,9 @@ import os
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -672,6 +674,39 @@ LEXICAL_RELAX_PREFIX = "prefix"
 
 #: Tier depth, for the sticky-deepest marker: ``None`` (exact) < or < prefix.
 _LEXICAL_RELAX_DEPTH = {None: 0, LEXICAL_RELAX_OR: 1, LEXICAL_RELAX_PREFIX: 2}
+
+
+@dataclass
+class LexicalProbe:
+    """What the relaxation ladder did inside one scope. Two facts, not one.
+
+    ``tier`` alone could not answer the question the empty-page notice asks,
+    and that is the whole reason this type exists. ``tier is None`` conflates
+    "the STRICT tier answered" with "no tier matched anything at all" —
+    indistinguishable states in the marker, opposite states in a diagnosis.
+    When a ``tag:``/``source:``/``from:`` filter then removes every matching
+    row, the page is empty for a reason that has nothing to do with the words,
+    and the notice built on ``tier`` alone told the caller the corpus contains
+    none of their terms. It does; the filter took them.
+
+    ``matched`` is the missing half: how many rows the tier that answered
+    returned, AS THE LADDER SAW THEM — that is, before the outer SELECT
+    applied ``tag:``, ``source:``, ``from:``/``to:`` or the id-scope keys. It
+    is a count the ladder already had in hand (``len(rows)``), so this costs
+    no extra query.
+
+    THREE-VALUED ON PURPOSE, the same discipline as ``lexical_ids`` in
+    ``mcp.py``: ``None`` means the ladder never ran (a pure-filter query, or
+    ``search_mode='vector'``), ``0`` means it ran and matched nothing, and
+    ``> 0`` means the words are in the corpus. A notice that collapsed the
+    first two would state a fact about the corpus out of a query that never
+    asked it.
+    """
+
+    #: Deepest relaxation tier that returned rows in this scope.
+    tier: str | None = None
+    #: Pre-filter rows the answering tier returned; ``None`` = ladder unused.
+    matched: int | None = None
 
 
 def fts5_relaxation_tiers(
@@ -1720,10 +1755,13 @@ class Store:
         #: ``read_only`` — see :meth:`_session_scope_cached` for why, and for
         #: the 200x it saves on a session-card page.
         self._session_scope_memo: dict[tuple, Any] = {}
-        #: Which relaxation tier the lexical arm answered from — ``None``
-        #: for exact, else ``LEXICAL_RELAX_OR`` / ``LEXICAL_RELAX_PREFIX``.
-        #: See :meth:`lexical_relaxation` for the contract.
-        self._lexical_relaxation: str | None = None
+        #: The lexical-ladder observation stack. Element 0 is the REQUEST's
+        #: probe — what :meth:`lexical_relaxation` and :meth:`lexical_matches`
+        #: report — and :meth:`lexical_probe` pushes narrower ones on top so a
+        #: caller driving two ontologies from one query can ask what EACH arm
+        #: did. Every recorder writes to every probe on the stack, so the
+        #: request-wide answer is unaffected by who is watching.
+        self._lexical_probes: list[LexicalProbe] = [LexicalProbe()]
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -5198,20 +5236,80 @@ class Store:
         resets on entry; within one request every evaluation runs the same
         ladder over the same text and corpus, so the recorded tier is
         deterministic for the response it describes.
+
+        NOT A DIAGNOSIS ON ITS OWN. ``None`` here is two different worlds —
+        the strict tier answered, or nothing matched anywhere — and telling
+        them apart is :meth:`lexical_matches`. See :class:`LexicalProbe`.
         """
-        return self._lexical_relaxation
+        return self._lexical_probes[0].tier
+
+    @property
+    def lexical_matches(self) -> int | None:
+        """How many rows the lexical ladder matched BEFORE the query's filters.
+
+        ``None`` = the ladder never ran on this request. ``0`` = it ran and
+        no tier matched. ``> 0`` = the terms are in the corpus, whatever the
+        page ended up showing. See :class:`LexicalProbe` for why the empty-page
+        notice cannot be honest without this.
+        """
+        return self._lexical_probes[0].matched
+
+    @contextmanager
+    def lexical_probe(
+        self, probe: LexicalProbe | None = None
+    ) -> Iterator[LexicalProbe]:
+        """Watch what the ladder does inside this block, per arm.
+
+        The union route runs the ladder once per ontology and the request-wide
+        marker keeps the DEEPEST of the two — correct as an over-disclosure,
+        wrong as an attribution, which is the bug this exists to fix: a page
+        showing exact RECORD hits was stamped "NOT exact matches" because the
+        observations arm, whose rows are not on the page, had relaxed.
+
+        Pass an existing ``probe`` to keep accumulating into it across
+        non-adjacent blocks — a route evaluates its arm in two places (the
+        fused-scope build, then the store query underneath it) and both belong
+        to the same arm.
+
+        Re-entrant and exception-safe: the probe is removed by identity, so a
+        nested block cannot pop somebody else's.
+        """
+        probe = probe if probe is not None else LexicalProbe()
+        self._lexical_probes.append(probe)
+        try:
+            yield probe
+        finally:
+            # By identity, and only once: the same probe may legitimately be
+            # re-entered later, and ``list.remove`` drops the first match.
+            for i in range(len(self._lexical_probes) - 1, 0, -1):
+                if self._lexical_probes[i] is probe:
+                    del self._lexical_probes[i]
+                    break
 
     def reset_lexical_relaxation(self) -> None:
-        """Start a fresh request: forget which tier answered the last one."""
-        self._lexical_relaxation = None
+        """Start a fresh request: forget what the last one's ladder did.
+
+        Drops any per-arm probes along with the request probe. Called at the
+        request boundary, where no arm can still be open.
+        """
+        self._lexical_probes = [LexicalProbe()]
 
     def _note_lexical_relaxation(self, tier: str | None) -> None:
-        """Record ``tier`` if it is deeper than what this request has seen."""
-        if (
-            _LEXICAL_RELAX_DEPTH[tier]
-            > _LEXICAL_RELAX_DEPTH[self._lexical_relaxation]
-        ):
-            self._lexical_relaxation = tier
+        """Record ``tier`` if it is deeper than what this probe has seen."""
+        for probe in self._lexical_probes:
+            if _LEXICAL_RELAX_DEPTH[tier] > _LEXICAL_RELAX_DEPTH[probe.tier]:
+                probe.tier = tier
+
+    def _note_lexical_matched(self, matched: int) -> None:
+        """Record that the ladder RAN, and how many rows it saw pre-filter.
+
+        ``max`` for the same reason the tier is sticky-deepest: one request can
+        evaluate the arm several times (the page and its count, a session
+        projection), and "did the words match anything at all" must survive a
+        later evaluation that happened to see fewer rows.
+        """
+        for probe in self._lexical_probes:
+            probe.matched = max(probe.matched or 0, matched)
 
     def _fts_rows(self, sql: str, params: Sequence, text: str) -> list[sqlite3.Row]:
         """Run one MATCH-bearing SELECT, and be LOUD if it still fails.
@@ -5257,7 +5355,9 @@ class Store:
             )
             if rows:
                 self._note_lexical_relaxation(tier)
+                self._note_lexical_matched(len(rows))
                 return {row["stable_id"] for row in rows}
+        self._note_lexical_matched(0)
         return set()
 
     def query(
@@ -6068,9 +6168,11 @@ class Store:
             rows = self._fts_rows(sql, [match_expr, *extra_params], text)
             if rows:
                 self._note_lexical_relaxation(tier)
+                self._note_lexical_matched(len(rows))
                 roots = {r["root"] for r in rows if r["root"]}
                 exacts = {r["sid"] for r in rows if r["sid"]}
                 return roots, exacts
+        self._note_lexical_matched(0)
         return set(), set()
 
     def _session_hit_scope(
@@ -6286,7 +6388,9 @@ class Store:
             )
             if rows:
                 self._note_lexical_relaxation(tier)
+                self._note_lexical_matched(len(rows))
                 return [r["obs_id"] for r in rows]
+        self._note_lexical_matched(0)
         return []
 
     def _session_scope_obs_ids(self, text: str, roots: set[str]) -> list[str]:

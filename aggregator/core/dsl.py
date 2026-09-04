@@ -225,7 +225,13 @@ def format_help(
         "  tag: matches source-written tags AND llm topic tags (the",
         "  `aggregator tag` backfill) as one set. It reaches the",
         "  records-shaped sources only — sessions and observations carry",
-        "  no tags, so tag: never selects them. Coverage is PARTIAL until",
+        # Case folding is a recall fact, so it belongs where the key is
+        # documented: tag values are copied out of capabilities most of the
+        # time, but a hand-typed ``tag:bug`` must still find github's ``Bug``
+        # label, and a caller who does not know that will not try it.
+        "  no tags, so tag: never selects them. Matching is",
+        "  CASE-INSENSITIVE (ASCII), so tag:bug finds a label written Bug.",
+        "  Coverage is PARTIAL until",
         "  that backfill finishes — check llm_tag_coverage in",
         "  aggregator_capabilities before trusting tag: alone; free text",
         "  reaches untagged records regardless.",

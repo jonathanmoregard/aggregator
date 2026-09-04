@@ -139,8 +139,10 @@ from aggregator.core.provenance import MACHINE_VALUES
 from aggregator.core.scrub import scrub
 from aggregator.core.store import (
     CHAT_ORIGINS,
+    LEXICAL_RELAX_OR,
     LEXICAL_RELAX_PREFIX,
     SCHEMA_VERSION,
+    LexicalProbe,
     Store,
     VectorIndexUnavailableError,
     fts5_match_conjuncts,
@@ -2422,15 +2424,33 @@ def _note_provenance(
     return result
 
 
-# --- the conjunction, said out loud when it eats the answer (D) -------------
+# --- ONE COMPOSITION POINT FOR THE EMPTY-PAGE DIAGNOSIS ---------------------
 #
-# THE THREE OUTCOMES, RANKED BY THE MISSION. Returning the right turn is best;
-# returning nothing WITH an explanation is acceptable; returning a pile of
-# irrelevant rows in silence is the worst, and it is what a multi-term query
-# used to do. This is the second outcome made real: when free text is ANDed
-# down to nothing, the caller is told WHAT was ANDed, in WHAT unit, and what to
-# type instead — including, when it is true, that the terms DO all occur in the
-# same session and ``scope:session`` would show it.
+# THREE NOTICES USED TO STAMP THE SAME PAGE INDEPENDENTLY, AND THEY BEGAN TO
+# CONTRADICT EACH OTHER. The relaxation marker, the tag-ontology disclosure and
+# the conjunction notice each read one fact off the store, each was right about
+# its own fact, and together they produced pages that said, in order: the
+# sessions half was excluded by definition, nothing matched on either arm, and
+# the corpus contains none of your terms — for a query whose terms were sitting
+# in a record the ``tag:`` filter had just removed. Three true sentences, one
+# false page.
+#
+# The fix is not a fourth guard on each notice. It is that ONE function decides
+# what an empty page is told, from the facts that actually determine it:
+#
+#   * WHICH TIERS RAN AND MATCHED — ``Store.lexical_matches`` separates "the
+#     strict tier answered" from "no tier matched anything", the two worlds
+#     ``lexical_relaxation is None`` used to conflate;
+#   * WHICH FILTERS ARE ACTIVE — the AST's own row filters, named back to the
+#     caller, because when they are what emptied the page the remedy is a
+#     filter and never different words;
+#   * WHICH ARMS WERE EXCLUDED — the route mode, so an ontology excluded BY
+#     DEFINITION is disclosed once rather than argued about twice.
+#
+# The composed order is unchanged from when each notice stamped itself:
+# relaxation leads, then the tag ontology, then the empty-page diagnosis, then
+# whatever the route already said. Each helper still PREPENDS, so this composes
+# them in reverse.
 #
 # It costs one extra pass and only on an already-empty page, so nothing that
 # found something pays for it.
@@ -2445,6 +2465,53 @@ def _note_provenance(
 #: skip that reads as "no session has them" is worse than the cost it avoids —
 #: for that very query, fourteen sessions DO.
 _SCOPE_PROBE_MAX_CONJUNCTS = 24
+
+#: The routes whose free-text unit is an OBSERVATION. The conjunction prose
+#: ("all N terms had to appear in one observation") is only true for these; a
+#: record is a document, and the whole document is the unit there, so the
+#: records route gets the ontology-neutral branches of the diagnosis and none
+#: of the turn-shaped ones.
+_OBSERVATION_ROUTES = ("sessions", "union")
+
+#: Tier depth for picking the deepest of several arms. Mirrors the store's own
+#: ordering; kept here as a tuple because this module only ever needs the sort.
+_TIER_ORDER: tuple[str | None, ...] = (None, LEXICAL_RELAX_OR, LEXICAL_RELAX_PREFIX)
+
+
+def _deepest_tier(tiers: Iterable[str | None]) -> str | None:
+    """The deepest relaxation tier among ``tiers``. Exact (``None``) is least."""
+    return max(tiers, key=_TIER_ORDER.index, default=None)
+
+
+@dataclass(frozen=True)
+class _PageFacts:
+    """What a route knows about its own page that the composer cannot re-derive.
+
+    Only the union route fills this in, and only for one question: WHICH ARM'S
+    ROWS ARE ON THE PAGE. The request-wide relaxation marker keeps the deepest
+    tier any arm reached, which is the right over-disclosure for a marker and
+    the wrong attribution for a page — a union page showing exact RECORD hits
+    was stamped "these are NOT exact matches" because the observations arm, none
+    of whose rows are on the page, had relaxed on the way past.
+
+    ``tier_attributed`` is the three-valued discipline this file uses
+    everywhere: ``False`` means the route did not answer the question (one arm,
+    so there is nothing to attribute), NOT that the answer was "exact".
+    """
+
+    #: Deepest tier behind the rows actually on this page.
+    visible_tier: str | None = None
+    #: Whether ``visible_tier`` is an answer rather than an absence.
+    tier_attributed: bool = False
+
+
+#: The single-arm routes' facts: nothing to attribute, marker stands as is.
+_NO_PAGE_FACTS = _PageFacts()
+
+#: Where a route parks its facts on the way back through ``_dispatch``. Popped
+#: before the payload ceiling measures the response, so it never reaches a
+#: caller and never counts against the character budget.
+_PAGE_FACTS_KEY = "_page_facts"
 
 
 def _relaxation_notice(tier: str) -> str:
@@ -2477,13 +2544,95 @@ def _relaxation_notice(tier: str) -> str:
     )
 
 
+def _active_filters(ast: QueryAST) -> list[str]:
+    """The query's ROW filters, spelled the way the caller typed them.
+
+    ROW filters only, and the distinction is what makes the sentence built on
+    this list true. These keys remove rows the lexical arm has ALREADY matched,
+    so when the page is empty and the arm matched, one of them is the reason.
+    ``scope:`` is deliberately absent — it changes what the text matches rather
+    than which matched rows survive — and so is the free text itself, which is
+    the arm rather than a filter on it.
+
+    Named, not counted: "your filters excluded them" sends a caller looking,
+    while "``tag:main``, ``from:2026-07-01``" tells them where to look first.
+    """
+    filters: list[str] = []
+    if ast.tags:
+        filters.append(f"tag:{','.join(ast.tags)}")
+    if ast.source:
+        filters.append(f"source:{ast.source}")
+    if ast.from_date:
+        filters.append(f"from:{ast.from_date.date().isoformat()}")
+    if ast.to_date:
+        filters.append(f"to:{ast.to_date.date().isoformat()}")
+    if ast.active_from or ast.active_to:
+        filters.append("active:")
+    if ast.session_id:
+        filters.append(f"session:{ast.session_id}")
+    if ast.top_session_id:
+        filters.append(f"top:{ast.top_session_id}")
+    if ast.agent_id:
+        filters.append(f"agent:{ast.agent_id}")
+    if ast.obs_type:
+        filters.append(f"type:{ast.obs_type}")
+    if ast.provenance:
+        filters.append(f"by:{ast.provenance}")
+    filters.extend(f"{k}:{v}" for k, v in sorted(ast.extra.items()))
+    return filters
+
+
+def _sessions_route_keys(ast: QueryAST) -> list[str]:
+    """The sessions-ontology keys THIS query used, for a way-out sentence.
+
+    The tag-ontology notice tells the caller to drop the sessions-route key to
+    reach the tagged records, and it used to name a fixed list beginning
+    ``source:sessions/subagents`` — which is not what routed the query when the
+    caller typed ``source:chatgpt`` or ``source:claude-web`` (both session-
+    shaped via :data:`_SESSIONS_SOURCES`). Being told to drop a key you did not
+    type is a way out that leads nowhere, so the list is built from the AST.
+    """
+    keys: list[str] = []
+    if ast.source in _SESSIONS_SOURCES:
+        keys.append(f"source:{ast.source}")
+    if ast.session_id:
+        keys.append("session:")
+    if ast.top_session_id:
+        keys.append("top:")
+    if ast.agent_id:
+        keys.append("agent:")
+    if ast.obs_type:
+        keys.append("type:")
+    if ast.provenance:
+        keys.append("by:")
+    if ast.scope:
+        keys.append("scope:")
+    if ast.active_from or ast.active_to:
+        keys.append("active:")
+    return keys
+
+
+def _scope_session_hint_ok(ast: QueryAST) -> bool:
+    """Whether "re-run with ``scope:session``" is a real way out for this query.
+
+    IT IS NOT, WHENEVER ``tag:`` IS SET. Sessions and observations carry no
+    tags, so a ``tag:`` query widened to ``scope:session`` is empty BY
+    DEFINITION — the hint sends the caller to a guaranteed-empty re-run and
+    contradicts the tag-ontology notice sitting on the same page. Checked
+    BEFORE the probe runs, so the dead-end case also stops paying for one FTS5
+    scan per conjunct.
+    """
+    return not ast.tags
+
+
 def _note_relaxation(
     result: dict[str, Any],
     store: Store,
     ast: QueryAST,
     query_text: str | None,
+    facts: _PageFacts = _NO_PAGE_FACTS,
 ) -> dict[str, Any]:
-    """Stamp a response whose lexical rows came from a relaxed tier.
+    """Stamp a response whose VISIBLE rows came from a relaxed tier.
 
     Reads the marker the store recorded during retrieval (see
     ``Store.lexical_relaxation``) — the single place every binding site
@@ -2492,23 +2641,44 @@ def _note_relaxation(
     NEITHER the field NOR the sentence: absence is the exact-match claim,
     so it must never be diluted into a default.
 
+    ATTRIBUTED TO THE ARM WHOSE ROWS ARE ON THE PAGE, when the route can say.
+    The request-wide marker keeps the deepest tier ANY evaluation reached,
+    which over-discloses on purpose — but in union mode the two ontologies are
+    two separate arms, and a page holding exact record hits was stamped "these
+    are NOT exact matches" on the strength of the observations arm relaxing
+    somewhere the caller cannot see. Over-disclosure is cautious between
+    sub-evaluations of one arm and simply false across two. See
+    :class:`_PageFacts`.
+
+    AN EMPTY PAGE KEEPS THE REQUEST-WIDE MARKER, because there are no visible
+    rows to attribute it to and the fact is still worth having: the ladder
+    relaxed and even that found nothing the query's filters would keep.
+
     THE ``scope:session`` HINT SURVIVES THE RESCUE. Before relaxation, the
-    AND-dead page was empty and ``_conjunction_notice`` told the caller when
+    AND-dead page was empty and the empty-page notice told the caller when
     the terms DID co-occur inside one session. Relaxation fills that page
     with ANY-term rows, which answers a looser question — so when the strict
     probe finds sessions holding ALL the terms, the notice still names them:
     that is the exact-conjunction answer the caller originally asked for,
     one `scope:session` away. Probe bound and strictness are shared with the
-    conjunction notice (the probe is the diagnostic, so it never relaxes).
+    empty-page notice (the probe is the diagnostic, so it never relaxes), and
+    so is the ``tag:`` dead-end guard — see :func:`_scope_session_hint_ok`.
     """
-    tier = store.lexical_relaxation
-    if not tier or not result.get("ok"):
+    if not result.get("ok"):
+        return result
+    tier = (
+        facts.visible_tier
+        if facts.tier_attributed and result.get("records")
+        else store.lexical_relaxation
+    )
+    if not tier:
         return result
     result["lexical_relaxation"] = tier
     notice = _relaxation_notice(tier)
     conjuncts = fts5_match_conjuncts(query_text)
     if (
         ast.scope != SCOPE_SESSION
+        and _scope_session_hint_ok(ast)
         and 2 <= len(conjuncts) <= _SCOPE_PROBE_MAX_CONJUNCTS
     ):
         try:
@@ -2529,17 +2699,105 @@ def _note_relaxation(
     return result
 
 
-def _conjunction_notice(
+def _filter_excluded_notice(
+    ast: QueryAST, conjuncts: list[str], matched: int, tier: str | None
+) -> str:
+    """The page is empty because a FILTER emptied it, not because the words are.
+
+    THE LIE THIS REPLACES was the sharpest one on the surface: with
+    ``lexical_relaxation is None`` meaning both "the strict tier answered" and
+    "no tier matched anything", a query like ``tag:main fix bug`` — whose terms
+    sit in an untagged record — was told that every tier came back empty, that
+    the rows it can see contain none of these terms, and to try different
+    words. All three false, and the third actively harmful: rewriting the query
+    cannot undo a filter.
+
+    So it says what happened instead, names the filters in play, and points at
+    the filter as the remedy. ``matched`` is the ladder's own pre-filter row
+    count (see :class:`aggregator.core.store.LexicalProbe`) — a number it
+    already had, not a re-run of the query.
+    """
+    shown = ", ".join(conjuncts)
+    filters = _active_filters(ast)
+    relaxed = (
+        f" Those rows matched under the RELAXED `{tier}` tier rather than as an "
+        f"exact conjunction, so they are leads either way."
+        if tier
+        else ""
+    )
+    if not filters:
+        return (
+            f"Nothing came back, and THE WORDS ARE NOT THE PROBLEM: the "
+            f"keyword arm matched {matched} row(s) on {shown}, and the rest of "
+            f"this query removed every one of them before the page was built. "
+            f"The terms ARE in the index.{relaxed}"
+        )
+    # ``tag:`` first when present: it is the narrowest of the row filters and
+    # the only one that can also exclude an entire ontology by definition, so
+    # it is where a caller should look before rewriting anything.
+    first = next((f for f in filters if f.startswith("tag:")), filters[0])
+    return (
+        f"Nothing came back, and THE WORDS ARE NOT THE PROBLEM: the keyword "
+        f"arm matched {matched} row(s) on {shown}, and this query's other "
+        f"filters ({', '.join(filters)}) then excluded every one of them. The "
+        f"terms ARE in the index, so the fix is a FILTER and not different "
+        f"words — drop or widen one (start with `{first}`) and the matching "
+        f"rows come back.{relaxed}"
+    )
+
+
+def _empty_page_notice(
     store: Store,
     ast: QueryAST,
+    mode: str,
     query_text: str | None,
     search_mode: str = "hybrid",
 ) -> str | None:
-    """Why an empty page is empty, when the reason is the conjunction."""
+    """Why an empty page is empty. One diagnosis, chosen from what actually ran.
+
+    The branches, in the order they are ruled out — each one owning the pages
+    the next one must not speak for:
+
+    1. **``tag:`` on a sessions route.** The tag-ontology notice already says
+       this page is empty BY DEFINITION. Adding "the corpus contains none of
+       these terms" beside it makes the page argue with itself about which of
+       two incompatible reasons applies, so this branch says nothing at all.
+    2. **The words matched and a filter took them.** See
+       :func:`_filter_excluded_notice`. Ontology-neutral, so it serves the
+       records route too — where no empty-page notice used to fire at all.
+    3. **``scope:session`` already widened, still empty.** There is no wider
+       unit to suggest and suggesting one would be a lie the caller can check
+       in one call.
+    4. **The ladder ran and every tier came back empty.** The one case where
+       "the corpus does not hold these terms" is a measurement rather than an
+       inference — ``lexical_matches == 0`` says the ladder looked.
+    5. **``search_mode='vector'``.** No lexical arm ran, so the pre-relaxation
+       conjunction diagnosis is still the honest one, probe and all.
+
+    A LADDER THAT NEVER RAN GETS NO SENTENCE. ``lexical_matches is None`` means
+    nobody looked — the keyword arm dropped out mid-query, or the route never
+    reached it — and "no term matches at all" is a claim about the corpus that
+    a failure of the index does not license. ``_note_confidence`` already says
+    the arm was unavailable; this stays quiet rather than converting a broken
+    index into a fact about the words.
+    """
     conjuncts = fts5_match_conjuncts(query_text)
+    if not conjuncts:
+        return None
+    if ast.tags and mode == "sessions":
+        return None
+    matched = store.lexical_matches
+    if search_mode != "vector" and matched:
+        return _filter_excluded_notice(
+            ast, conjuncts, matched, store.lexical_relaxation
+        )
     if len(conjuncts) < 2:
         # One term matched nothing: the corpus does not hold it, and there is
         # no conjunction to blame. ``_note_confidence`` already speaks to that.
+        return None
+    if mode not in _OBSERVATION_ROUTES:
+        # A record is a document and the document IS the unit, so none of the
+        # turn-shaped prose below is true here.
         return None
     shown = ", ".join(conjuncts)
     if ast.scope == SCOPE_SESSION:
@@ -2552,18 +2810,14 @@ def _conjunction_notice(
         )
     if search_mode != "vector":
         # The default-scope lexical arm RELAXED on the way here (see
-        # ``fts5_relaxation_tiers``), and that splits the empty page into two
-        # stories, neither of which is the old "the conjunction ate it":
-        if store.lexical_relaxation is not None:
-            # Rows DID match under a relaxed tier — the page is empty because
-            # the query's OTHER filters excluded every one of them. The
-            # relaxation notice attached at the tool boundary already says
-            # relaxation fired; blaming the conjunction here would be false.
+        # ``fts5_relaxation_tiers``), and ``matched`` is what tells the two
+        # remaining stories apart. ``0`` means the ladder ran and no tier
+        # matched, so even OR-of-all-terms and a prefix on the final term
+        # found nothing — which also proves the ``scope:session`` probe cannot
+        # help (a session containing all the terms would need each term to
+        # match somewhere), so it is not run.
+        if matched != 0:
             return None
-        # Even OR-of-all-terms and a prefix on the final term matched nothing,
-        # so no individual term matches at all — which also proves the
-        # ``scope:session`` probe cannot help (a session containing all the
-        # terms would need each term to match somewhere), so it is not run.
         return (
             f"Nothing matched. All {len(conjuncts)} terms ({shown}) were "
             f"first required together in one observation, then automatically "
@@ -2583,7 +2837,7 @@ def _conjunction_notice(
     # eleven-word gist is the case that proves it — reported as "no session has
     # these" under the first, tighter probe bound, while fourteen sessions do.
     together: int | None = None
-    if len(conjuncts) <= _SCOPE_PROBE_MAX_CONJUNCTS:
+    if _scope_session_hint_ok(ast) and len(conjuncts) <= _SCOPE_PROBE_MAX_CONJUNCTS:
         try:
             roots, _exacts = store._session_hit_scope(
                 query_text or "", ast.obs_type, ast.provenance
@@ -2622,23 +2876,54 @@ def _conjunction_notice(
     )
 
 
-def _note_conjunction(
+def _note_empty_page(
     result: dict[str, Any],
     store: Store,
     ast: QueryAST,
+    mode: str,
     query_text: str | None,
     search_mode: str = "hybrid",
 ) -> dict[str, Any]:
-    """Attach :func:`_conjunction_notice` to an empty page. No-op otherwise."""
-    if result.get("total") or result.get("records"):
+    """Attach :func:`_empty_page_notice` to an empty page. No-op otherwise."""
+    if not result.get("ok") or result.get("total") or result.get("records"):
         return result
-    notice = _conjunction_notice(store, ast, query_text, search_mode)
+    notice = _empty_page_notice(store, ast, mode, query_text, search_mode)
     if not notice:
         return result
     prior = result.get("notice")
     # Leads: on an empty page every other notice is about rows that are not
     # there, and this is the one sentence that says why.
     result["notice"] = f"{notice} {prior}" if prior else notice
+    return result
+
+
+def _compose_notices(
+    result: dict[str, Any],
+    store: Store,
+    ast: QueryAST,
+    mode: str,
+    query_text: str | None,
+    search_mode: str,
+    facts: _PageFacts,
+) -> dict[str, Any]:
+    """Say why this page looks the way it does — once, coherently.
+
+    Every route passes through here, which is the point: the three notices
+    below used to stamp themselves from three places on three different facts,
+    and a page could carry all three saying incompatible things. Composed in
+    reverse of how they read, because each one prepends:
+
+        relaxation · tag ontology · empty-page diagnosis · the route's own
+
+    The order is the one each notice argued for when it stamped itself, kept
+    deliberately: the relaxation sentence changes how every row below it must
+    be read, so it leads; the ontology disclosure explains which arm is missing
+    from the answer; the diagnosis explains an emptiness the two above only
+    contribute to.
+    """
+    _note_empty_page(result, store, ast, mode, query_text, search_mode)
+    _note_tag_ontology(result, ast, mode)
+    _note_relaxation(result, store, ast, query_text, facts)
     return result
 
 
@@ -3281,25 +3566,41 @@ def _note_tag_ontology(
       notices that carry page-specific facts.
     * ``"records"`` and the mismatch modes: no-op — records ARE the
       tag-bearing shape, and the mismatch responses already disclose.
+
+    TWO SENTENCES HERE ARE BUILT FROM THE PAGE RATHER THAN WRITTEN FLAT, and
+    both were wrong flat. The way out named a fixed key list starting
+    ``source:sessions/subagents``, which is not what routed a caller who typed
+    ``source:chatgpt`` (session-shaped via :data:`_SESSIONS_SOURCES`) — a way
+    out through a key they never used. And the union sentence promised "the
+    record hits here are unaffected" on pages that had no record hits at all,
+    which reads as "your answer is intact" over an empty page.
     """
     if not ast.tags or not result.get("ok"):
         return
     if mode == "sessions":
+        keys = _sessions_route_keys(ast)
+        drop = ", ".join(keys) if keys else "the sessions-route key"
         notice = (
             "tag: matches records only — sessions and observations carry no "
             "tags — so under a tag: filter every sessions/observations "
-            "result is empty BY DEFINITION, not empty of the topic. Drop "
-            "the sessions-route key (source:sessions/subagents, session:, "
-            "top:, agent:, type:, by:, scope:, active:) to see the tagged "
+            "result is empty BY DEFINITION, not empty of the topic. Drop the "
+            f"sessions-route key this query used ({drop}) to see the tagged "
             "records, or drop tag: and keep the topic as free text to "
             "search sessions."
         )
     elif mode == "union" and ast.text:
+        standing = (
+            " The record hits here are unaffected."
+            if result.get("records")
+            else " There are no record hits here either, so this page is the "
+            "records half's own empty answer plus a sessions half that never "
+            "ran — not a complete search that found nothing."
+        )
         notice = (
             "The sessions half of this cross-source union was excluded BY "
             "DEFINITION: tag: matches records only — sessions and "
             "observations carry no tags — so the free text never reached "
-            "the sessions table. The record hits here are unaffected. Drop "
+            f"the sessions table.{standing} Drop "
             "tag: (keep the free text) to reach sessions too."
         )
     else:
@@ -3386,7 +3687,12 @@ def aggregator_query(
            match never carries the field. When even relaxation finds nothing,
            the ``notice`` says every tier was tried; when the terms DO
            co-occur inside one session, it says ``scope:session`` would find
-           them exactly. The index stems (porter): ``report`` and
+           them exactly. AND WHEN THE TERMS MATCHED BUT A FILTER
+           (``tag:``, ``source:``, ``from:``…) EXCLUDED EVERY MATCHING ROW,
+           the notice says THAT instead, names the filters and tells you to
+           widen one — rewriting the query cannot undo a filter, and an empty
+           page that blames the corpus for a filter's work sends you to
+           rewrite it anyway. The index stems (porter): ``report`` and
            ``reports`` count as the same term.
       fields: ``"summary"`` (default) or ``"full"``.
       page_size: cap per page. Defaults to 200 for summary, 40 for full.
@@ -3679,22 +3985,23 @@ def aggregator_query(
 
     mode = _route_mode(ast)
     try:
-        result = _apply_payload_ceiling(
-            _dispatch(
-                store, ast, mode, fields, page_size, cursor, drilldown, rerank,
-                fingerprint, search_mode,
-            ),
-            max_chars,
+        routed = _dispatch(
+            store, ast, mode, fields, page_size, cursor, drilldown, rerank,
+            fingerprint, search_mode,
         )
-        # TAG-ONTOLOGY DISCLOSURE, at the one place every route passes
-        # through. Attached BEFORE the relaxation stamp so a rescued page's
-        # relaxation sentence still leads, as its docstring promises.
-        _note_tag_ontology(result, ast, mode)
-        # RELAXATION DISCLOSURE, at the one place every route passes through
-        # — the same argument as the miss log below. The store recorded which
-        # tier answered; a relaxed page must say so or it masquerades as an
-        # exact match.
-        _note_relaxation(result, store, ast, ast.text)
+        # POPPED BEFORE THE CEILING MEASURES THE PAYLOAD. The route's own facts
+        # are for the composer, not for the caller — and ``_apply_payload_ceiling``
+        # sizes the response by serialising it, so leaving a dataclass in the
+        # dict would both inflate the measurement and break it.
+        facts = routed.pop(_PAGE_FACTS_KEY, _NO_PAGE_FACTS)
+        result = _apply_payload_ceiling(routed, max_chars)
+        # THE WHOLE EMPTY-PAGE DIAGNOSIS, composed once, at the one place every
+        # route passes through — relaxation, tag ontology and the reason the
+        # page is empty, decided together rather than stamped independently.
+        # See ``_compose_notices`` for why that had to become one function.
+        _compose_notices(
+            result, store, ast, mode, ast.text, search_mode, facts
+        )
         # ZERO-RESULT LOGGING, at the one place every route passes through —
         # AND OFF UNLESS THE CALLER IS A WRITER. ``_log_misses`` defaults to
         # False, so the MCP tool adapter, which passes it nothing, cannot
@@ -3947,7 +4254,9 @@ def _query_sessions_path(
         # sentence leads. It is emitted in full mode too: it is a fact about
         # WHICH ROWS came back, not about how much of each one is shown.
         _note_provenance(result, store, ast)
-        _note_conjunction(result, store, ast, query_text, search_mode)
+        # The empty-page diagnosis is NOT attached here any more: it is
+        # composed with the relaxation and tag-ontology notices at the single
+        # point every route returns through. See ``_compose_notices``.
         if has_more:
             _attach_next_page_token(
                 result, offset + page_size, hybrid, fingerprint, frozen_out
@@ -4020,7 +4329,8 @@ def _query_sessions_path(
             "`matching_observations` are for. drilldown=True returns the "
             "matching turns themselves."
         )
-    _note_conjunction(result, store, ast, query_text, search_mode)
+    # The empty-page diagnosis is composed at the tool boundary, not here —
+    # see ``_compose_notices``.
     if has_more:
         _attach_next_page_token(
             result, offset + page_size, hybrid, fingerprint, frozen_out
@@ -4108,24 +4418,36 @@ def _query_union_path(
     )
     if needs_embedding:
         embedding = _query_embedding(ast.text or "")
-    rec_ast, rec_hybrid, rec_hits, rec_lexical_ids = _apply_hybrid(
-        store,
-        "records",
-        ast,
-        cursor.pin_for("records"),
-        embedding,
-        frozen_in.get("records"),
-        search_mode,
-    )
-    sess_ast, sess_hybrid, sess_hits, sess_lexical_ids = _apply_hybrid(
-        store,
-        "observations",
-        ast,
-        cursor.pin_for("observations"),
-        embedding,
-        frozen_in.get("observations"),
-        search_mode,
-    )
+    # ONE PROBE PER ARM, because the relaxation marker has to be attributable
+    # to the rows on the page. Both arms run the same ladder over the same
+    # text, and the request-wide marker keeps the deeper of the two — so a page
+    # of EXACT record hits was stamped "NOT exact matches" whenever the
+    # observations ladder relaxed on the way past, contradicting, on the same
+    # page, a tag-ontology notice saying the record hits stand. Each arm is
+    # watched separately; ``window`` below decides which watcher's answer the
+    # page is allowed to report. Re-entered around the store queries because
+    # the FTS5-only route runs its ladder there rather than in ``_apply_hybrid``.
+    rec_probe, sess_probe = LexicalProbe(), LexicalProbe()
+    with store.lexical_probe(rec_probe):
+        rec_ast, rec_hybrid, rec_hits, rec_lexical_ids = _apply_hybrid(
+            store,
+            "records",
+            ast,
+            cursor.pin_for("records"),
+            embedding,
+            frozen_in.get("records"),
+            search_mode,
+        )
+    with store.lexical_probe(sess_probe):
+        sess_ast, sess_hybrid, sess_hits, sess_lexical_ids = _apply_hybrid(
+            store,
+            "observations",
+            ast,
+            cursor.pin_for("observations"),
+            embedding,
+            frozen_in.get("observations"),
+            search_mode,
+        )
     query_text = ast.text
     hybrid = rec_hybrid or sess_hybrid
     # Each ontology's hits are frozen SEPARATELY. They backfill at different
@@ -4137,8 +4459,9 @@ def _query_union_path(
     if sess_hybrid:
         frozen_out["observations"] = sess_hits
     try:
-        rec_rows = store.query(rec_ast, limit=None, offset=0)
-        rec_total = store.count(rec_ast)
+        with store.lexical_probe(rec_probe):
+            rec_rows = store.query(rec_ast, limit=None, offset=0)
+            rec_total = store.count(rec_ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: records-side query failed for ast=%r", ast)
         return {
@@ -4150,8 +4473,9 @@ def _query_union_path(
             ),
         }
     try:
-        sess_rows = store.query_sessions(sess_ast, limit=None, offset=0)
-        sess_total = store.count_sessions(sess_ast)
+        with store.lexical_probe(sess_probe):
+            sess_rows = store.query_sessions(sess_ast, limit=None, offset=0)
+            sess_total = store.count_sessions(sess_ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: sessions-side query failed for ast=%r", ast)
         return {
@@ -4219,14 +4543,15 @@ def _query_union_path(
     # is a ``stable_id`` the keyword arm returns directly, a session card is a
     # session id the arm's observation hits have to be projected onto. The
     # merged item list no longer says which is which.
-    sess_lexical_cards = _lexical_session_ids(
-        store,
-        query_text,
-        sess_ast.obs_type,
-        sess_lexical_ids,
-        sess_ast.provenance,
-        sess_ast.scope,
-    )
+    with store.lexical_probe(sess_probe):
+        sess_lexical_cards = _lexical_session_ids(
+            store,
+            query_text,
+            sess_ast.obs_type,
+            sess_lexical_ids,
+            sess_ast.provenance,
+            sess_ast.scope,
+        )
     page_lexical_support = any(
         _lexical_on_page(
             [obj.stable_id if kind == "record" else obj.session_id],
@@ -4252,10 +4577,21 @@ def _query_union_path(
             "with `stable_id` and no `kind`) carry `subject` only and no body "
             "at fields='summary'. Add source:<name> to target one ontology."
         )
-    # The sessions half of the union is conjunction-scoped exactly like the
-    # dedicated path, and the spec's own headline false negative was typed
-    # WITHOUT a source hint — so it lands here, not there.
-    _note_conjunction(result, store, sess_ast, query_text, search_mode)
+    # WHICH ARM'S ROWS ARE ACTUALLY ON THIS PAGE — the fact the relaxation
+    # marker needs and only this route can supply. Computed over ``window``
+    # (the merged tuples still say which half each row came from) rather than
+    # over ``items``, which no longer does. An arm that contributed no visible
+    # row does not get to describe the page: that is exactly how an exact
+    # records page came to be flagged as relaxed.
+    kinds_on_page = {kind for _ts, kind, _obj in window}
+    result[_PAGE_FACTS_KEY] = _PageFacts(
+        visible_tier=_deepest_tier(
+            probe.tier
+            for kind, probe in (("record", rec_probe), ("session", sess_probe))
+            if kind in kinds_on_page
+        ),
+        tier_attributed=True,
+    )
     if has_more:
         _attach_next_page_token(
             result, offset + page_size, hybrid, fingerprint, frozen_out or None
@@ -4440,7 +4776,8 @@ _LLM_TAG_NOTE = (
     "records not tagged yet are reachable only through source-written tags. "
     "Their text is STILL fully reachable by free-text search. tag: reaches "
     "the records-shaped sources in these rows ONLY — sessions and "
-    "observations carry no tags, so tag: never selects them. Treat "
+    "observations carry no tags, so tag: never selects them. Tag matching is "
+    "CASE-INSENSITIVE (ASCII), so tag:bug finds a label written Bug. Treat "
     "'not_started' / 'in_progress' as 'do not trust tag: alone for this "
     "source', never as 'nothing is tagged with that topic'."
 )
