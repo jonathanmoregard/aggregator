@@ -506,3 +506,71 @@ def test_parse_failures_do_not_count_toward_the_breaker(
     rc = main(["tag", "--batch-size", "1"], _store=s)
     assert rc == EXIT_COMPLETED_WITH_ERRORS
     assert len(fake.calls) == 4  # every batch was still attempted
+
+
+# --- parser-level refusals own their TAG semantics --------------------------
+
+
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_batch_size_refusal_names_the_tag_failure(tmp_path, capsys, value):
+    """``tag --batch-size`` explains ITS OWN silent failures, not embed's.
+
+    The batch walk is ``range(0, len(ids), batch_size)``: 0 crashes it with
+    a bare ValueError, a negative value walks no batches and exits 0 with the
+    corpus still owed. The refusal has to say that — an error message about
+    ``LIMIT 0`` and ``--catchup`` (embed's ``_positive_int``) describes a
+    command this one is not.
+    """
+    with pytest.raises(SystemExit) as exc:
+        main(["tag", "--batch-size", value], _store=_store(tmp_path, []))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "records per claude invocation" in err
+    assert "catchup" not in err  # embed's prose must not leak in
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_timeout_refusal_names_the_tag_failure(tmp_path, capsys, value):
+    """``tag --timeout`` at 0 or below expires every subprocess immediately;
+    the refusal says so in subprocess-seconds terms."""
+    with pytest.raises(SystemExit) as exc:
+        main(["tag", "--timeout", value], _store=_store(tmp_path, []))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "seconds each claude subprocess" in err
+
+
+def test_non_integer_batch_size_still_refused(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["tag", "--batch-size", "many"], _store=_store(tmp_path, []))
+    assert exc.value.code == 2
+    assert "not an integer" in capsys.readouterr().err
+
+
+# --- _TAG_SOURCES mirrors the real source registry --------------------------
+
+
+def test_tag_sources_pins_the_records_shaped_registry():
+    """``_TAG_SOURCES`` is a hand-kept mirror of the records-shaped half of
+    ``cli._default_sources()`` — the registry the ingest dispatch and the MCP
+    router both derive shape from (``iter_entities`` means session-shaped,
+    ``iter_records`` means records-shaped; a source with both counts as
+    session-shaped, matching the router-registry guard in
+    ``tests/test_mcp_routing.py``). Same whole-registry pattern: read the
+    registry, don't re-enumerate it here.
+    """
+    records_shaped = {
+        name
+        for name, src in cli._default_sources().items()
+        if not hasattr(src, "iter_entities") and hasattr(src, "iter_records")
+    }
+    assert set(cli._TAG_SOURCES) == records_shaped, (
+        "cli._TAG_SOURCES disagrees with the records-shaped sources in "
+        "cli._default_sources(). That registry is the authority: a "
+        "records-shaped source added there (one exposing iter_records, not "
+        "iter_entities) must ALSO be added to cli._TAG_SOURCES or its "
+        "records never receive LLM topic tags; a name only in "
+        "cli._TAG_SOURCES sends `aggregator tag` walking a source that is "
+        "not registered. Extend cli._TAG_SOURCES to match the registry — "
+        "never this test."
+    )

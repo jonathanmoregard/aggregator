@@ -2742,6 +2742,56 @@ def _parse_tag_output(
     return accepted, failures
 
 
+def _tag_batch_size(raw: str) -> int:
+    """``argparse`` type for ``tag --batch-size``: records per LLM call.
+
+    Refused at the parser rather than at runtime because both bad values
+    fail in TAG-specific ways that ``embed``'s ``_positive_int`` prose does
+    not describe (and that one stays as it is): the batch walk is
+    ``range(0, len(ids), batch_size)``, so 0 crashes it with a bare
+    ``ValueError`` (range step of zero) and a negative value makes the walk
+    EMPTY — the run prints ``tagged=0`` and exits 0 with the whole corpus
+    still owed, a silent no-op under the timer unit.
+    """
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from e
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be at least 1, got {value}. --batch-size is records per "
+            f"claude invocation AND per committed checkpoint: 0 crashes the "
+            f"batch walk (a range step of zero), and a negative value walks "
+            f"no batches at all — the run reports tagged=0 and exits 0 with "
+            f"every record still owed."
+        )
+    return value
+
+
+def _tag_timeout(raw: str) -> int:
+    """``argparse`` type for ``tag --timeout``: seconds per subprocess.
+
+    Same parser-level refusal as ``_tag_batch_size``, for the tag-specific
+    failure: the value goes straight to ``subprocess.run(timeout=...)``, and
+    at 0 or below every ``claude`` invocation expires immediately — each
+    batch then burns its full retry backoff before failing, and after
+    ``_TAG_BREAKER_BATCHES`` of those the circuit breaker aborts a run that
+    could never have tagged anything.
+    """
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from e
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be at least 1, got {value}. --timeout is seconds each "
+            f"claude subprocess may run: at 0 or below every invocation "
+            f"expires immediately, so each batch burns its retries and "
+            f"backoff, then the circuit breaker aborts the run untagged."
+        )
+    return value
+
+
 def _cmd_tag(args: argparse.Namespace, store: Store) -> int:
     """Tag every record the watermark still owes. Resumable, chunked, loud.
 
@@ -4288,7 +4338,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tag.add_argument(
         "--batch-size",
-        type=_positive_int,
+        type=_tag_batch_size,
         default=_TAG_BATCH,
         dest="batch_size",
         help=(
@@ -4307,7 +4357,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tag.add_argument(
         "--timeout",
-        type=_positive_int,
+        type=_tag_timeout,
         default=_TAG_TIMEOUT_SECONDS,
         help=(
             f"seconds per claude invocation before it is treated as a "
