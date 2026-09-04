@@ -48,6 +48,12 @@ _CORPUS_BLAME = (
     "Try different words",
 )
 
+#: The confidence note's own corpus claim. TRUE on a page nothing matched, and
+#: FALSE beside the filter diagnosis — which is the contradiction pinned below:
+#: the two sentences are composed onto one page from two functions, so they can
+#: only agree if the second is told what the first measured.
+_EITHER_ARM = "nothing matched this query on either arm"
+
 
 def _rec(sid: str, subject: str, body: str, tags=(), source="github") -> Record:
     return Record(
@@ -161,6 +167,27 @@ def test_the_records_route_gets_it_too(filtered):
     assert "one observation" not in notice, notice
 
 
+def test_the_confidence_note_agrees_with_the_filter_diagnosis(filtered):
+    """ONE PAGE, TWO SENTENCES, AND THEY MUST NOT ARGUE. The diagnosis says the
+    keyword arm matched a row and a filter took it; the low-confidence note,
+    reading only ``total``, said "nothing matched this query on either arm" —
+    directly beside it. Both are composed onto the same empty page, so the
+    hedge has to be told what the ladder measured."""
+    result = aggregator_query(dsl="tag:main fix bug", _store=filtered)
+    assert result["ok"] is True and result["total"] == 0
+    notice = result["notice"]
+    reason = result["low_confidence_reason"]
+    # The diagnosis is on the page…
+    assert "matched 1 row(s)" in notice, notice
+    # …so the hedge beside it may not deny it, in either surface.
+    assert _EITHER_ARM not in reason, reason
+    assert _EITHER_ARM not in notice, notice
+    # Still an abstention, still hedged — the page has no rows either way.
+    assert result["low_confidence"] is True
+    assert "matched 1 row(s)" in reason, reason
+    assert "FILTER" in reason, reason
+
+
 # --- the honest zero survives the fix ----------------------------------------
 
 
@@ -178,6 +205,11 @@ def test_a_genuinely_empty_corpus_still_says_every_tier_was_tried(tmp_path):
     notice = result["notice"]
     assert "every tier came back empty" in notice, notice
     assert "contain none of these terms" in notice, notice
+    # AND SO DOES THE HEDGE'S HALF OF IT. The ladder ran and matched nothing,
+    # so "neither arm" is a measurement here, not the mis-stated filter case:
+    # teaching the note about the filters must not cost it this sentence.
+    assert _EITHER_ARM in result["low_confidence_reason"], result
+    assert _EITHER_ARM in notice, notice
 
 
 # --- 2. the relaxation marker names the arm whose rows are on the page -------

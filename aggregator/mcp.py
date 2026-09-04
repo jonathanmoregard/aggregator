@@ -1424,6 +1424,7 @@ def _note_confidence(
     lexical_contributed: bool,
     lexical_unavailable: bool,
     lexical_unknown: bool = False,
+    lexical_matched: int | None = None,
 ) -> dict[str, Any]:
     """Say which arms answered and whether the answer is trusted.
 
@@ -1508,6 +1509,20 @@ def _note_confidence(
     1. **Nothing came back.** The query abstained. Reported as low confidence
        rather than as a bare empty page, because an agent cannot otherwise tell
        "we looked and there is nothing" from "the index is not built yet".
+
+       WHY THE EMPTY PAGE IS EMPTY IS NOT DERIVABLE FROM ``total``, and reading
+       only ``total`` is how this sentence came to contradict the notice printed
+       beside it. ``_empty_page_notice`` now diagnoses a filter-emptied page —
+       "the keyword arm matched N row(s), and this query's other filters then
+       excluded every one of them" — while this function, knowing nothing but
+       ``total == 0``, added "nothing matched this query on either arm" to the
+       very same page. One of the two is false, and it is this one: the ladder
+       had already counted the rows. ``lexical_matched`` is that count
+       (``Store.lexical_matches``, threaded from each route), and it is
+       three-valued exactly as the store reports it — ``None`` the ladder never
+       ran, ``0`` it ran and matched nothing, ``> 0`` the words are in the
+       corpus and something downstream removed their rows. Only ``> 0`` changes
+       the sentence; the other two keep the wording they had.
     2. **The keyword arm corroborated none of THESE ROWS.** The vector arm
        returns its ``k`` nearest neighbours whether or not any of them is
        relevant — a recipe corpus answers a question about German stock-option
@@ -1613,13 +1628,29 @@ def _note_confidence(
             "re-run may answer differently"
         )
     if not result.get("total"):
-        reasons.append(
-            "nothing matched this query on the semantic arm, the only one that "
-            "ran, so this is an abstention rather than a short answer"
-            if lexical_unavailable
-            else "nothing matched this query on either arm, so this is an "
-            "abstention rather than a short answer"
-        )
+        # THE SAME GATE THE DIAGNOSIS USES, mirrored on purpose: see branch 2
+        # of ``_empty_page_notice`` (``search_mode != "vector" and matched``).
+        # The two sentences land on one page, so they have to be chosen from
+        # one condition — a hedge that fired on facts the diagnosis ignores
+        # would recreate the contradiction from the other side.
+        filter_excluded = bool(lexical_matched) and search_mode != "vector"
+        if lexical_unavailable:
+            reasons.append(
+                "nothing matched this query on the semantic arm, the only one "
+                "that ran, so this is an abstention rather than a short answer"
+            )
+        elif filter_excluded:
+            reasons.append(
+                f"the keyword arm matched {lexical_matched} row(s) and this "
+                f"query's filters then excluded every one of them, so this is "
+                f"an abstention by FILTER rather than by the corpus — the "
+                f"words are in the index and different words will not help"
+            )
+        else:
+            reasons.append(
+                "nothing matched this query on either arm, so this is an "
+                "abstention rather than a short answer"
+            )
     else:
         if (
             not lexical_unavailable
@@ -4190,6 +4221,9 @@ def _query_records_path(
         vector_contributed=hybrid and bool(total),
         lexical_contributed=_lexical_contributed(lexical_ids) and bool(total),
         lexical_unavailable=_lexical_arm_failed(lexical_ids),
+        # The ladder's own pre-filter count, so an empty page's hedge says the
+        # same thing the empty-page diagnosis does — see _note_confidence.
+        lexical_matched=store.lexical_matches,
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -4271,6 +4305,7 @@ def _query_sessions_path(
             vector_contributed=hybrid and bool(total),
             lexical_contributed=_lexical_contributed(lexical_ids) and bool(total),
             lexical_unavailable=_lexical_arm_failed(lexical_ids),
+            lexical_matched=store.lexical_matches,
         )
         return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -4354,6 +4389,7 @@ def _query_sessions_path(
         # separately rather than collapsed into one flag here.
         lexical_unavailable=_lexical_arm_failed(lexical_ids, lexical_cards),
         lexical_unknown=_lexical_page_unknown(lexical_cards),
+        lexical_matched=store.lexical_matches,
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
@@ -4608,6 +4644,9 @@ def _query_union_path(
             rec_lexical_ids, sess_lexical_ids, sess_lexical_cards
         ),
         lexical_unknown=_lexical_page_unknown(sess_lexical_cards),
+        # The request-wide probe, which keeps the MAX across both arms — the
+        # same value the diagnosis reads at the tool boundary.
+        lexical_matched=store.lexical_matches,
     )
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
