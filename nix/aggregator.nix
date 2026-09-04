@@ -294,15 +294,17 @@ let
   #
   # HOW `claude` IS FOUND, and why that satisfies the 2026-08-16 deployment
   # constraint: the CLI subprocesses the bare name `claude` from PATH,
-  # exactly as the github ingest finds `gh`. The systemd *user* manager's
-  # PATH on this machine is the NixOS profile chain
-  # (/etc/profiles/per-user/<user>/bin, /run/current-system/sw/bin, ...),
-  # so the binary a unit resolves is the Nix-store claude-code from the
-  # deployed profile — a pinned artifact — and NOT ~/.local/bin's
-  # self-updating native install, which is only on interactive-shell PATHs.
-  # No /home/ path is ever written into the unit or this script; the
-  # preflight below makes "claude is not installed in the profile" a loud
-  # one-line failure instead of a retry storm.
+  # exactly as the github ingest finds `gh` — and PATH is an environment
+  # fact no comment can pin, so the preflight below ENFORCES it at unit
+  # start instead of asserting it. On this machine the user manager's PATH
+  # is the NixOS profile chain (/etc/profiles/per-user/<user>/bin,
+  # /run/current-system/sw/bin, ...), whose `claude` is a symlink into the
+  # Nix store — a pinned artifact. What the guard exists to refuse is the
+  # OTHER install: ~/.local/bin's self-updating native build, which is a
+  # working-tree-shaped dependency by another name (unpinned, mutates
+  # underneath the unit). No /home/ path is ever written into the unit or
+  # this script; the guard resolves whatever PATH offers and requires the
+  # real binary to live in the store.
   tagRunner = pkgs.writeShellScript "aggregator-tag" ''
     set -uo pipefail
 
@@ -311,6 +313,17 @@ let
       echo "aggregator-tag: install claude-code into the system or home-manager profile; the tag backfill cannot run without it." >&2
       exit 1
     fi
+
+    resolved=$(command -v claude)
+    real=$(readlink -f "$resolved")
+    case "$real" in
+      /nix/store/*) ;;
+      *)
+        echo "aggregator-tag: 'claude' resolved to $resolved -> $real, which is not a Nix store artifact." >&2
+        echo "aggregator-tag: a service must run a deployed, pinned binary — not a self-updating install. Put claude-code in the system or home-manager profile and make sure the unit's PATH prefers it." >&2
+        exit 1
+        ;;
+    esac
 
     # `exec` so the CLI's exit status IS the unit's: `aggregator tag` exits
     # non-zero whenever any record failed, and that status must reach
