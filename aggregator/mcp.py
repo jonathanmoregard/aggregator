@@ -2461,7 +2461,10 @@ def _relaxation_notice(tier: str) -> str:
             "LEXICAL RELAXATION APPLIED (`lexical_relaxation: \"prefix\"`): "
             "no row matched all of the query's terms, and none matched any "
             "whole term either, so the keyword arm fell back to rows where "
-            "the FINAL term matches as a prefix (`term*`). These are NOT "
+            "the FINAL term matches as a prefix (`term*`). The prefix is "
+            "matched UNSTEMMED against a stemmed index, so an inflected "
+            "final term (`running*`) can miss rows its stem (`run`) would "
+            "have found. These are NOT "
             "exact matches — treat them as leads, and re-ask with a quoted "
             "phrase for the precise question."
         )
