@@ -223,7 +223,9 @@ def format_help(
         # the backfill finishes, or an empty tag: page reads as "nothing on
         # that topic" — the silence this project bans.
         "  tag: matches source-written tags AND llm topic tags (the",
-        "  `aggregator tag` backfill) as one set. Coverage is PARTIAL until",
+        "  `aggregator tag` backfill) as one set. It reaches the",
+        "  records-shaped sources only — sessions and observations carry",
+        "  no tags, so tag: never selects them. Coverage is PARTIAL until",
         "  that backfill finishes — check llm_tag_coverage in",
         "  aggregator_capabilities before trusting tag: alone; free text",
         "  reaches untagged records regardless.",

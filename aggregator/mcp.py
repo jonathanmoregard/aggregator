@@ -4438,7 +4438,9 @@ _LLM_TAG_NOTE = (
     "tag: filters select from the UNION of source-written tags and LLM "
     "tags, so for any source not 'complete' a tag: filter under-selects — "
     "records not tagged yet are reachable only through source-written tags. "
-    "Their text is STILL fully reachable by free-text search. Treat "
+    "Their text is STILL fully reachable by free-text search. tag: reaches "
+    "the records-shaped sources in these rows ONLY — sessions and "
+    "observations carry no tags, so tag: never selects them. Treat "
     "'not_started' / 'in_progress' as 'do not trust tag: alone for this "
     "source', never as 'nothing is tagged with that topic'."
 )
