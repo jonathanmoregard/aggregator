@@ -3080,7 +3080,14 @@ def _session_to_item(
         "agent_id": s.agent_id,
         "agent_type": s.agent_type,
         "subject": subject,
-        "tags": [t for t in [s.cwd, s.git_branch] if t],
+        # Named "context", NOT "tags". These are the session's cwd and git
+        # branch — orientation data, not topic labels — and under the old
+        # "tags" name they baited `tag:` queries that can never select a
+        # session (sessions carry no tags; see _note_tag_ontology). Renamed
+        # rather than annotated because nothing outside this repo's tests
+        # read the key (grepped aggregator/, scripts/, nix/, docs/ and the
+        # Raycast surface, 2026-09-04); MCP callers read it fresh each call.
+        "context": [t for t in [s.cwd, s.git_branch] if t],
         "first_ts": s.first_ts.isoformat() if s.first_ts else None,
         "last_ts": s.last_ts.isoformat() if s.last_ts else None,
         "matching_observations": match_count,
