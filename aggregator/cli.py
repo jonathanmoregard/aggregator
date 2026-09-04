@@ -2507,6 +2507,15 @@ _TAG_SHAPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
 #: the corpus, and must not be retried forever.
 _TAG_BACKOFF_SECONDS = (5.0, 15.0)
 
+#: Cross-batch circuit breaker: abort the run after this many CONSECUTIVE
+#: batches whose ``claude`` invocation failed (after their in-batch retries).
+#: Per-batch isolation is right for data problems, but a dead CLI — revoked
+#: auth, binary gone mid-run — fails every batch identically, and grinding
+#: through a large backlog at retries-plus-backoff per batch turns "the CLI
+#: is broken" into days of retry noise. Three straight invocation deaths is
+#: the CLI's problem, not the records'; per-record PARSE failures never count.
+_TAG_BREAKER_BATCHES = 3
+
 #: Wall-clock ceiling per invocation. A hung CLI (auth prompt, dead network)
 #: must not wedge the timer unit; measured haiku batches answer in well under
 #: a minute, so five minutes is generous without being infinite.
@@ -2722,7 +2731,17 @@ def _cmd_tag(args: argparse.Namespace, store: Store) -> int:
     the checkpoint: a kill costs at most one batch and the next run's
     snapshot starts exactly where this one stopped.
     """
-    sources = tuple(s for s in args.sources.split(",") if s)
+    sources = tuple(s.strip() for s in args.sources.split(",") if s.strip())
+    if not sources:
+        # Vacuous-filter guard: an empty tuple would sail past the
+        # unknown-source check below and render ``source IN ()`` — a SQLite
+        # syntax error — inside ``ids_needing_llm_tags``.
+        print(
+            f"tag: --sources is empty — name at least one records-shaped "
+            f"source ({', '.join(_TAG_SOURCES)}) or omit the flag for all",
+            file=sys.stderr,
+        )
+        return 2
     unknown = [s for s in sources if s not in _TAG_SOURCES]
     if unknown:
         print(
@@ -2741,6 +2760,8 @@ def _cmd_tag(args: argparse.Namespace, store: Store) -> int:
     errors: list[str] = []
     tagged = 0
     interrupted = False
+    dead_batches = 0  # consecutive invocation failures — the breaker's count
+    breaker_tripped = False
     with graceful_shutdown() as stop:
         for i in range(0, len(ids), args.batch_size):
             if stop():
@@ -2757,7 +2778,15 @@ def _cmd_tag(args: argparse.Namespace, store: Store) -> int:
                     f"{attempts} attempt(s); batch skipped"
                     for row in rows
                 )
+                dead_batches += 1
+                if dead_batches >= _TAG_BREAKER_BATCHES:
+                    breaker_tripped = True
+                    break
                 continue
+            # The invocation worked — only INVOCATION deaths feed the
+            # breaker, so a stretch of records the model mis-answers
+            # (parse failures below) cannot abort the run.
+            dead_batches = 0
             accepted, failures = _parse_tag_output(stdout, rows)
             errors.extend(failures)
             tagged += store.write_llm_tags(accepted)
@@ -2766,7 +2795,18 @@ def _cmd_tag(args: argparse.Namespace, store: Store) -> int:
     print(
         f"tag: tagged={tagged} failed={len(errors)} remaining={remaining}"
         f"{' (INTERRUPTED — stopped at a batch boundary; the next run resumes)' if interrupted else ''}"
+        f"{' (ABORTED — circuit breaker)' if breaker_tripped else ''}"
     )
+    if breaker_tripped:
+        print(
+            f"tag: aborting — {dead_batches} consecutive batches' claude "
+            f"invocations failed after their retries. The CLI itself looks "
+            f"dead (auth, network, or the binary); fix that and re-run — "
+            f"{remaining} record(s) remain owed and the next run resumes.",
+            file=sys.stderr,
+        )
+        _print_errors(errors, ERROR_PRINT_LIMIT)
+        return 1
     if errors:
         shown = _print_errors(errors, ERROR_PRINT_LIMIT)
         if len(errors) > len(shown):

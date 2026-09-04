@@ -413,3 +413,78 @@ def test_unknown_source_is_a_usage_error(tmp_path, monkeypatch, capsys):
     assert rc == 2
     assert fake.calls == []
     assert "sessions" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["", ",", " , "])
+def test_empty_sources_is_a_usage_error_not_a_traceback(
+    tmp_path, monkeypatch, capsys, value
+):
+    """``--sources ''`` (or ',') used to slip past the unknown-source check —
+    an empty tuple has no unknown members — and then rendered ``source IN ()``
+    in SQLite: a syntax-error traceback instead of a usage message."""
+    s = _store(tmp_path, [_rec("github:e", "s", "b")])
+    fake = FakeClaude()
+    _install(monkeypatch, fake)
+    rc = main(["tag", "--sources", value], _store=s)
+    assert rc == 2
+    assert fake.calls == []
+    err = capsys.readouterr().err
+    assert "--sources" in err
+
+
+# --- the cross-batch circuit breaker ----------------------------------------
+
+
+def test_consecutive_dead_batches_trip_the_breaker(
+    tmp_path, monkeypatch, capsys, no_sleep
+):
+    """A dead CLI (revoked auth, uninstalled binary mid-run) fails EVERY
+    batch identically. Per-batch isolation would grind through the whole
+    backlog at ~minutes per batch for days; three consecutive invocation
+    failures instead abort the run loudly."""
+    s = _store(
+        tmp_path,
+        [_rec(f"github:cb{i}", f"s{i}", f"b{i}") for i in range(5)],
+    )
+    fake = FakeClaude(script=[1])  # every invocation exits 1, forever
+    _install(monkeypatch, fake)
+    rc = main(["tag", "--batch-size", "1"], _store=s)
+    assert rc == 1  # aborted, not "completed with errors"
+    attempts_per_batch = 1 + len(cli._TAG_BACKOFF_SECONDS)
+    # Batches 4 and 5 were never attempted.
+    assert len(fake.calls) == cli._TAG_BREAKER_BATCHES * attempts_per_batch
+    out, err = capsys.readouterr()
+    assert "consecutive" in err
+    assert "tagged=0" in out  # counts still reported
+
+
+def test_a_successful_batch_resets_the_breaker(tmp_path, monkeypatch, no_sleep):
+    s = _store(
+        tmp_path,
+        [_rec(f"github:rs{i}", f"s{i}", f"b{i}") for i in range(5)],
+    )
+    dead_batch = [1] * (1 + len(cli._TAG_BACKOFF_SECONDS))
+    # fail, success, fail, fail, success — never 3 consecutive.
+    fake = FakeClaude(
+        script=[*dead_batch, "auto", *dead_batch, *dead_batch, "auto"]
+    )
+    _install(monkeypatch, fake)
+    rc = main(["tag", "--batch-size", "1"], _store=s)
+    assert rc == EXIT_COMPLETED_WITH_ERRORS  # ran to completion
+    assert len(fake.calls) == 3 * len(dead_batch) + 2
+
+
+def test_parse_failures_do_not_count_toward_the_breaker(
+    tmp_path, monkeypatch, no_sleep
+):
+    """A record the model mis-answers is a DATA problem — isolation is right
+    for it. Only invocation failures (the CLI itself dying) feed the breaker."""
+    s = _store(
+        tmp_path,
+        [_rec(f"github:pf{i}", f"s{i}", f"b{i}") for i in range(4)],
+    )
+    fake = FakeClaude(script=["this is not json"])
+    _install(monkeypatch, fake)
+    rc = main(["tag", "--batch-size", "1"], _store=s)
+    assert rc == EXIT_COMPLETED_WITH_ERRORS
+    assert len(fake.calls) == 4  # every batch was still attempted
