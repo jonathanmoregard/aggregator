@@ -4367,12 +4367,12 @@ _COVERAGE_NOTE = (
 #: nothing under the tag asked about.
 _LLM_TAG_NOTE = (
     "Per-source progress of the LLM topic-tag backfill (`aggregator tag`). "
-    "tag: filters match the UNION of source-written tags and LLM tags, so "
-    "for any source not 'complete' a tag: filter under-selects — records "
-    "not tagged yet match only through source-written tags. Their text is "
-    "STILL fully reachable by free-text search. Treat 'not_started' / "
-    "'in_progress' as 'do not trust tag: alone for this source', never as "
-    "'nothing is tagged with that topic'."
+    "tag: filters select from the UNION of source-written tags and LLM "
+    "tags, so for any source not 'complete' a tag: filter under-selects — "
+    "records not tagged yet are reachable only through source-written tags. "
+    "Their text is STILL fully reachable by free-text search. Treat "
+    "'not_started' / 'in_progress' as 'do not trust tag: alone for this "
+    "source', never as 'nothing is tagged with that topic'."
 )
 
 
