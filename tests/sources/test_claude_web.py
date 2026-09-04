@@ -21,6 +21,7 @@ fixture is built in-test via :mod:`zipfile` — no committed binaries.
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -321,3 +322,40 @@ def test_record_shape_documents_fields():
     shape = src.record_shape()
     for key in ("session_id", "origin", "first_ts", "last_ts", "obs_type"):
         assert key in shape, f"missing key {key!r} in record_shape"
+
+
+# -- duplicate exports (newest file wins) -----------------------------------
+
+
+def test_duplicate_conversation_across_export_files_newest_file_wins(tmp_path):
+    """The same conversation uuid in TWO export files must emit ONE
+    SessionRow, from the NEWEST file (file mtime). Without the per-run claim,
+    both copies emit and the stored row flip-flops on jsonl_path every ingest
+    tick — the substack churn's sibling, one export file away from live."""
+    drops = tmp_path / "drops"
+    drops.mkdir()
+    dup = "dddd1111-2222-4333-8444-555566667777"
+    conv_old = {
+        "uuid": dup,
+        "created_at": "2026-07-01T10:00:00.000Z",
+        "updated_at": "2026-07-01T10:06:00.000Z",
+        "chat_messages": [],
+    }
+    conv_new = dict(conv_old, updated_at="2026-07-02T09:00:00.000Z")
+    # The OLDER file sorts first by name, so name-order emission would keep
+    # the stale copy — the mtime has to be what decides.
+    older = drops / "conversations-a.json"
+    newer = drops / "conversations-b.json"
+    older.write_text(json.dumps([conv_old]))
+    newer.write_text(json.dumps([conv_new]))
+    old_ts = datetime(2026, 7, 1, tzinfo=UTC).timestamp()
+    new_ts = datetime(2026, 8, 1, tzinfo=UTC).timestamp()
+    os.utime(older, (old_ts, old_ts))
+    os.utime(newer, (new_ts, new_ts))
+
+    src = ClaudeWebSource(drops_dir=str(drops))
+    sessions, _obs, errs = _split_entities(src)
+    assert errs == []
+    assert [s.session_id for s in sessions] == [f"claude-web:{dup}"]
+    assert sessions[0].jsonl_path == str(newer)
+    assert sessions[0].last_ts == datetime(2026, 7, 2, 9, 0, tzinfo=UTC)

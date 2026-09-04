@@ -131,8 +131,20 @@ def discover_export_files(
 
     ``dirs`` overrides the default drops+Downloads pair (sources pass their
     constructor-resolved drops dir plus the live Downloads dir). Duplicate
-    dirs are scanned once. Missing dirs are skipped. Order: per-dir sorted
-    filenames, zip members sorted within each zip — deterministic emission.
+    dirs are scanned once. Missing dirs are skipped.
+
+    ORDER IS A CONTRACT: newest export FILE first (file mtime; ties and
+    members within one file break on path then member sort). The sources
+    dedupe duplicate records across overlapping exports with a per-run
+    first-claim-wins set, so this ordering is what makes the NEWEST export
+    the winner. Measured live 2026-09-03 before it existed: a stale substack
+    zip left beside the fresh one made every ingest tick write each post
+    once per zip (updated=522 for 261 posts), flip-flopping the row on
+    ``extra.zip_path`` and resetting ``embedding_state`` every 30 minutes.
+
+    The FILE's mtime, not any member's, for the same reason as
+    :func:`newest_export_mtime`: the question is which archive the human
+    acquired most recently, not when the vendor stamped its contents.
     """
     if kind not in EXPORT_KINDS:
         raise ValueError(f"unknown export kind {kind!r}; expected {EXPORT_KINDS}")
@@ -155,6 +167,21 @@ def discover_export_files(
                 _classify_bare(path, kind, found, sink)
             elif path.suffix.lower() == ".zip":
                 _classify_zip(path, kind, found, sink)
+    # One stat per FILE, memoised so two members of one zip cannot disagree
+    # about their file's mtime if it moves mid-sort. A file whose stat fails
+    # sorts oldest — its read will fail into the errors sink anyway, and an
+    # unreadable file must never outrank a live one.
+    mtimes: dict[Path, float] = {}
+
+    def _file_mtime(f: ExportFile) -> float:
+        if f.path not in mtimes:
+            try:
+                mtimes[f.path] = f.path.stat().st_mtime
+            except OSError:
+                mtimes[f.path] = 0.0
+        return mtimes[f.path]
+
+    found.sort(key=lambda f: (-_file_mtime(f), str(f.path), f.member or ""))
     return found
 
 

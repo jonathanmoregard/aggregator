@@ -25,6 +25,7 @@ built in-test (no committed binaries).
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -310,3 +311,37 @@ def test_record_shape_documents_fields():
     shape = src.record_shape()
     for key in ("session_id", "root_session_id", "kind", "origin", "first_ts", "last_ts", "obs_type"):
         assert key in shape, f"missing key {key!r} in record_shape"
+
+
+# -- duplicate exports (newest file wins) -----------------------------------
+
+
+def test_duplicate_conversation_across_export_files_newest_file_wins(tmp_path):
+    """The same conversation_id in TWO export files must emit ONE SessionRow,
+    from the NEWEST file (file mtime). Same union-across-files mechanism as
+    substack and claude-web: without the per-run claim, both copies emit and
+    the stored row flip-flops on jsonl_path every ingest tick."""
+    conv_old = {
+        "conversation_id": "dup-conv",
+        "create_time": 1750000000.0,
+        "update_time": 1750003600.0,
+        "mapping": {},
+    }
+    conv_new = dict(conv_old, update_time=1750010000.0)
+    # The OLDER file sorts first by name, so name-order emission would keep
+    # the stale copy — the mtime has to be what decides.
+    older = tmp_path / "conversations-a.json"
+    newer = tmp_path / "conversations-b.json"
+    older.write_text(json.dumps([conv_old]))
+    newer.write_text(json.dumps([conv_new]))
+    old_ts = datetime(2026, 7, 1, tzinfo=UTC).timestamp()
+    new_ts = datetime(2026, 8, 1, tzinfo=UTC).timestamp()
+    os.utime(older, (old_ts, old_ts))
+    os.utime(newer, (new_ts, new_ts))
+
+    src = ChatGPTSource(drops_dir=str(tmp_path))
+    sessions, _obs, errors = _split_entities(src)
+    assert errors == []
+    assert [s.session_id for s in sessions] == ["chatgpt:dup-conv"]
+    assert sessions[0].jsonl_path == str(newer)
+    assert sessions[0].last_ts == datetime.fromtimestamp(1750010000.0, tz=UTC)

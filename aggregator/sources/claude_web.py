@@ -193,10 +193,28 @@ class ClaudeWebSource:
 
         ``since`` filters conversations by ``updated_at`` (a conversation
         updated past the cutoff is emitted in full).
+
+        A CONVERSATION UUID IN TWO EXPORT FILES EMITS ONCE, from the newest
+        file: discovery hands files over newest-first and ``claimed`` makes
+        the first sighting the only one. Without it, an old export left
+        beside the fresh one emits every shared conversation once per file —
+        the SessionRows differ on ``jsonl_path``, so the stored row would
+        flip-flop on every tick exactly like the measured substack churn
+        (same union mechanism, one stale export away from live). Claimed
+        before the ``since`` filter, so the newest file owns the uuid for
+        the whole run even when the window already excludes its copy. A
+        conversation without a usable uuid skips the claim and falls through
+        to the existing per-conversation error handling.
         """
         sink = errors if errors is not None else []
+        claimed: set[str] = set()
         for src_path, conversations in self._iter_conversation_files(sink):
             for index, conv in enumerate(conversations):
+                cuuid = conv.get("uuid") if isinstance(conv, dict) else None
+                if isinstance(cuuid, str) and cuuid:
+                    if cuuid in claimed:
+                        continue
+                    claimed.add(cuuid)
                 try:
                     entities = self._conversation_entities(conv, src_path, since)
                 except (KeyError, TypeError, ValueError, AttributeError) as e:

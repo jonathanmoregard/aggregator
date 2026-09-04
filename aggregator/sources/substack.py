@@ -269,8 +269,21 @@ class SubstackSource:
         since: datetime | None = None,
         errors: list[str] | None = None,
     ) -> Iterator[Record]:
-        """Yield one Record per ``posts/*.html`` member across all substack
-        zips discovered in drops dir + Downloads.
+        """Yield one Record per stable_id across all substack zips discovered
+        in drops dir + Downloads.
+
+        DUPLICATE EXPORTS YIELD ONE RECORD, from the newest zip. Discovery
+        hands the zips over newest-file-first, and ``claimed`` makes the
+        first sighting of a stable_id the only one — so an old export left
+        beside the fresh one can no longer make each tick rewrite every post
+        once per zip (measured live 2026-09-03: updated=522 for 261 posts,
+        ``extra.zip_path`` flip-flopping, ``embedding_state`` reset every 30
+        minutes). The claim happens BEFORE the ``since`` filter on purpose:
+        the newest zip owns an id for the whole run even when the window
+        already excludes its (unchanged) copy, otherwise an older zip whose
+        member carries a fresher stamp would slip through the window and
+        overwrite the settled row. A set of stable_ids is the entire memory
+        cost — the records themselves still stream.
 
         ``since``: skip members whose zip-recorded mtime is <= since
         (exclusive boundary, matching the sibling records sources). Naive
@@ -281,6 +294,7 @@ class SubstackSource:
         if since is not None:
             since_utc = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
 
+        claimed: set[str] = set()
         for ef in self._iter_export_files(sink):
             zip_path = ef.path
             try:
@@ -300,6 +314,18 @@ class SubstackSource:
                     # glob semantics we announce).
                     if "/" in member[len("posts/"):]:
                         continue
+                    # Same id derivation as ``_html_to_record``; claimed here,
+                    # before the read and before the since filter (see the
+                    # method docstring for why that order matters). Also
+                    # dedupes a within-zip ``<id>.<slug>.<n>.html`` collision
+                    # pair deterministically (first sorted member wins) —
+                    # previously both wrote, last-one-wins.
+                    stem = member.rsplit("/", 1)[-1][: -len(".html")]
+                    post_id, _ = _split_stem(stem)
+                    claim = post_id if post_id else stem
+                    if claim in claimed:
+                        continue
+                    claimed.add(claim)
                     mtime = _member_mtime(info, zip_path)
                     if since_utc is not None and mtime <= since_utc:
                         continue
