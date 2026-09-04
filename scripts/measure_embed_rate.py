@@ -58,8 +58,11 @@ import re
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 
 import numpy as np
+
+from aggregator.core import embed as embed_mod
 
 WORD = "the quick brown fox jumps over the lazy dog and then writes some code "
 
@@ -177,7 +180,211 @@ def body(chars: int) -> str:
     return (WORD * (chars // len(WORD) + 1))[:chars]
 
 
-def main() -> int:
+@contextmanager
+def _pinned(sha: str | None):
+    """Inject a candidate revision into ``embed.py``'s own constant, briefly.
+
+    This is what "validate a pin BEFORE hardcoding it" means mechanically: the
+    gguf load runs with ``QWEN3_EMBEDDING_GGUF_REVISION`` holding the candidate
+    — the exact code path the committed pin will take, including the download
+    gate reopening (``tests/test_embed_gguf_offline.py`` proves that path) —
+    and the constant is restored on the way out, so a bench can never leave a
+    sha behind that nobody verified.
+    """
+    if sha is None:
+        yield
+        return
+    prev = embed_mod.QWEN3_EMBEDDING_GGUF_REVISION
+    embed_mod.QWEN3_EMBEDDING_GGUF_REVISION = sha
+    try:
+        yield
+    finally:
+        embed_mod.QWEN3_EMBEDDING_GGUF_REVISION = prev
+
+
+def resolve_gguf_sha() -> str:
+    """The current commit sha of the default ``-GGUF`` repo, from the hub.
+
+    NETWORK. Only reached behind ``--resolve-and-pin`` plus the one download
+    opt-in. The repo id is read off ``embed.py`` rather than retyped, so the
+    sha is resolved for exactly the repository the loader will fetch — and the
+    answer is validated, because a hub that returned ``main`` would otherwise
+    flow straight into a pin line.
+    """
+    import huggingface_hub
+
+    repo_id = embed_mod._DEFAULT_MODEL_GGUF
+    sha = huggingface_hub.HfApi().model_info(repo_id).sha
+    print(f"resolved {repo_id} -> {sha}", flush=True)
+    return validate_sha(sha)
+
+
+def _load_embedder(backend: str):
+    """Construct the real Embedder. The seam the offline tests replace."""
+    from aggregator.core.embed import Embedder
+
+    t0 = time.perf_counter()
+    embedder = Embedder(backend=backend)
+    print(f"load {backend} {round(time.perf_counter() - t0, 2)}s", flush=True)
+    return embedder
+
+
+def _bench_size_curve(
+    backend: str, embedder, texts: dict[int, str], counts: dict[int, int]
+) -> tuple[dict, np.ndarray]:
+    """Time the doc's size curve on one backend; return aggregate + vectors.
+
+    One ``embed_documents`` call per text, batch 1 — the worker's own shape
+    and the methodology behind every number in the 40 tok/s table. The same
+    call yields the vectors the fidelity check compares, so timing and cos-sim
+    describe the identical forward passes.
+    """
+    vectors = []
+    total_tokens = 0
+    total_wall = 0.0
+    for chars, text in texts.items():
+        t = time.perf_counter()
+        vec = embedder.embed_documents([text])
+        dt = max(time.perf_counter() - t, 1e-9)
+        vectors.append(vec[0])
+        total_tokens += counts[chars]
+        total_wall += dt
+        rec = {
+            "label": f"{backend}-size-curve",
+            "backend": backend,
+            "chars": chars,
+            "tokens_per_chunk": counts[chars],
+            "batch": 1,
+            "wall_s": round(dt, 3),
+            "ms_per_chunk": round(dt * 1000, 1),
+            "tokens_per_s": round(counts[chars] / dt, 1),
+        }
+        print("RUN " + json.dumps(rec), flush=True)
+    agg = {
+        "tokens": total_tokens,
+        "wall_s": round(total_wall, 3),
+        "tokens_per_s": round(total_tokens / max(total_wall, 1e-9), 1),
+    }
+    return agg, np.stack(vectors)
+
+
+def run_bench(args: argparse.Namespace) -> int:
+    """``--backend st|gguf``: the size curve, plus fidelity + pin for gguf."""
+    # Never against the real cache: this builds nothing, but the embedder's
+    # module-level environment reads are shared with code that would.
+    os.environ.setdefault("XDG_DATA_HOME", "/tmp/aggregator-measure-xdg")
+
+    if args.backend == "st" and (args.resolve_and_pin or args.gguf_revision):
+        print(
+            "error: --resolve-and-pin/--gguf-revision only make sense with "
+            "--backend gguf",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        revision = effective_revision(args.gguf_revision, os.environ)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    if args.backend == "gguf" and args.resolve_and_pin and revision is None:
+        if not embed_mod.downloads_allowed():
+            print(
+                f"error: --resolve-and-pin asks the hub for the current sha of "
+                f"{embed_mod._DEFAULT_MODEL_GGUF}, which is a network call — "
+                f"set {embed_mod.MODEL_DOWNLOAD_ENV}=1 (the one model-download "
+                f"opt-in) to run it, or supply a known sha via --gguf-revision.",
+                file=sys.stderr,
+            )
+            return 2
+        revision = resolve_gguf_sha()
+
+    texts = {chars: body(chars) for chars in SIZE_CURVE_CHARS}
+
+    # gguf first: a bad sha or a refused download should fail in seconds,
+    # before a minute of st reference encoding is spent.
+    gguf_embedder = None
+    if args.backend == "gguf":
+        with _pinned(revision):
+            gguf_embedder = _load_embedder("gguf")
+    st_embedder = _load_embedder("st")
+
+    # Token counts from the st tokenizer FOR BOTH BACKENDS: the comparison is
+    # "same text, same token count, different wall clock", which is the only
+    # tok/s ratio that answers the backfill question. llama.cpp's own token
+    # count differs slightly and would skew the ratio by tokenizer, not speed.
+    tok = st_embedder._st_model.tokenizer
+    counts = {chars: len(tok(text)["input_ids"]) for chars, text in texts.items()}
+
+    # Warm-ups, so neither backend's first timed run pays allocator init.
+    st_embedder.embed_documents([body(200)])
+    if gguf_embedder is not None:
+        gguf_embedder.embed_documents([body(200)])
+
+    st_agg, st_vecs = _bench_size_curve("st", st_embedder, texts, counts)
+    summary: dict = {"backends": {"st": st_agg}}
+
+    if gguf_embedder is not None:
+        gguf_agg, gguf_vecs = _bench_size_curve("gguf", gguf_embedder, texts, counts)
+        summary["backends"]["gguf"] = gguf_agg
+        summary["speedup"] = round(
+            gguf_agg["tokens_per_s"] / max(st_agg["tokens_per_s"], 1e-9), 2
+        )
+        cos = cosine_stats(st_vecs, gguf_vecs)
+        summary["cos"] = {
+            "per_text": [
+                {"chars": chars, "cos": round(value, 6)}
+                for chars, value in zip(texts, cos["per_text"], strict=True)
+            ],
+            "mean": round(cos["mean"], 6),
+            "min": round(cos["min"], 6),
+        }
+        summary["revision"] = revision
+
+    print(flush=True)
+    print("=== summary ===", flush=True)
+    print(f"st  (fp32):   {st_agg['tokens_per_s']} tok/s", flush=True)
+    if gguf_embedder is not None:
+        print(f"gguf (q4_k_m): {summary['backends']['gguf']['tokens_per_s']} tok/s")
+        print(f"speedup (gguf/st): {summary['speedup']}x")
+        for entry in summary["cos"]["per_text"]:
+            print(f"cos(st, gguf) chars={entry['chars']}: {entry['cos']}")
+        print(
+            f"cos(st, gguf) mean={summary['cos']['mean']} "
+            f"min={summary['cos']['min']}"
+        )
+        print(
+            "decision rule (docs/embedding-throughput.md): adopt gguf for the "
+            "backfill at >=2.5x with acceptable cos-sim/retrieval delta",
+            flush=True,
+        )
+        if revision is not None:
+            print(
+                "pin line for aggregator/core/embed.py "
+                "(replaces the `= None` line):"
+            )
+            print(pin_line(revision), flush=True)
+        else:
+            print(
+                "no revision supplied or resolved (cache load) — nothing to "
+                "pin; rerun with --resolve-and-pin or --gguf-revision to "
+                "produce the line for embed.py",
+                flush=True,
+            )
+    print("BENCH_SUMMARY " + json.dumps(summary), flush=True)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.backend is not None:
+        return run_bench(args)
+    return legacy_sweep()
+
+
+def legacy_sweep() -> int:
+    """The original full sweep — the instrument behind the 40 tok/s table."""
     # Never against the real cache: this builds nothing, but the embedder's
     # module-level environment reads are shared with code that would.
     os.environ.setdefault("XDG_DATA_HOME", "/tmp/aggregator-measure-xdg")

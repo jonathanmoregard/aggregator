@@ -19,7 +19,9 @@ bench harness is exactly the kind of file where that mistake recurs.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -186,3 +188,215 @@ def test_pin_line_is_a_drop_in_replacement_for_the_line_embed_py_holds(harness):
     expected = unpinned[: -len("None")] + f'"{sha}"'
     assert harness.pin_line(sha) == expected
     assert embed_mod.QWEN3_EMBEDDING_GGUF_REVISION is None
+
+
+# ---------------------------------------------------------------------------
+# Bench orchestration — model layer stubbed at the script's own seams
+# ---------------------------------------------------------------------------
+
+_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+class _FakeEmbedder:
+    """Just enough surface for the bench: a tokenizer and deterministic vectors.
+
+    Both backends return the SAME unit vector per text, so the cos-sim the
+    bench reports has a known value (1.0) without a single real weight.
+    """
+
+    def __init__(self, backend):
+        self.backend = backend
+        self._st_model = types.SimpleNamespace(
+            tokenizer=lambda text: {"input_ids": [0] * max(1, len(text) // 5)}
+        )
+
+    def embed_documents(self, docs):
+        out = np.zeros((len(docs), 8), dtype=np.float32)
+        for i, doc in enumerate(docs):
+            out[i, len(doc) % 8] = 1.0
+        return out
+
+
+@pytest.fixture
+def fake_loaders(monkeypatch, harness):
+    """Replace ``_load_embedder`` and record every construction."""
+    loads = []
+
+    def _fake_load(backend):
+        loads.append(
+            {
+                "backend": backend,
+                "pin_at_load": embed_mod.QWEN3_EMBEDDING_GGUF_REVISION,
+            }
+        )
+        return _FakeEmbedder(backend)
+
+    monkeypatch.setattr(harness, "_load_embedder", _fake_load)
+    return loads
+
+
+def test_a_gguf_run_prints_rates_speedup_cos_and_the_exact_pin_line(
+    harness, fake_loaders, capsys
+):
+    """Criterion 3, end to end: everything a human needs is in the stdout of
+    one successful run — tok/s per backend, the ratio, the fidelity numbers,
+    and the line to paste into embed.py."""
+    rc = harness.main(["--backend", "gguf", "--gguf-revision", _SHA])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    for needle in ("st", "gguf", "tok/s", "speedup", "cos"):
+        assert needle in out, f"summary never mentions {needle!r}"
+    assert harness.pin_line(_SHA) in out, (
+        "the run ended without printing the exact QWEN3_EMBEDDING_GGUF_REVISION "
+        "source line — the one artifact the whole bench exists to produce"
+    )
+    # Machine-readable trailer, one line, for tooling and the docs table.
+    summary_lines = [
+        line for line in out.splitlines() if line.startswith("BENCH_SUMMARY ")
+    ]
+    assert len(summary_lines) == 1
+    summary = json.loads(summary_lines[0][len("BENCH_SUMMARY ") :])
+    assert set(summary["backends"]) == {"st", "gguf"}
+    for backend in ("st", "gguf"):
+        assert summary["backends"][backend]["tokens_per_s"] > 0
+    assert summary["speedup"] > 0
+    assert summary["cos"]["mean"] == pytest.approx(1.0)
+    assert len(summary["cos"]["per_text"]) == len(harness.SIZE_CURVE_CHARS)
+    assert summary["revision"] == _SHA
+
+
+def test_the_candidate_sha_reaches_the_gguf_load_and_the_constant_is_restored(
+    harness, fake_loaders
+):
+    """The override must exercise the SAME path the hardcoded pin will take —
+    ``embed.py``'s own constant, injected for the load — and must leave no
+    trace afterwards: the source constant stays None (criterion 6)."""
+    rc = harness.main(["--backend", "gguf", "--gguf-revision", _SHA])
+    assert rc == 0
+
+    gguf_loads = [rec for rec in fake_loaders if rec["backend"] == "gguf"]
+    assert len(gguf_loads) == 1
+    assert gguf_loads[0]["pin_at_load"] == _SHA, (
+        "the gguf Embedder was constructed without the candidate revision in "
+        "place, so the bench validated nothing about the pin"
+    )
+    st_loads = [rec for rec in fake_loaders if rec["backend"] == "st"]
+    assert len(st_loads) == 1
+    assert st_loads[0]["pin_at_load"] is None, (
+        "the injected pin leaked past the gguf load"
+    )
+    assert embed_mod.QWEN3_EMBEDDING_GGUF_REVISION is None
+
+
+def test_backend_st_benches_st_alone_with_no_pin_talk(harness, fake_loaders, capsys):
+    rc = harness.main(["--backend", "st"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert [rec["backend"] for rec in fake_loaders] == ["st"]
+    assert "tok/s" in out
+    assert "QWEN3_EMBEDDING_GGUF_REVISION" not in out
+
+
+def test_resolve_and_pin_without_the_download_opt_in_is_refused_early(
+    harness, fake_loaders, monkeypatch, capsys
+):
+    """Resolving a sha is a network call; the codebase has exactly ONE opt-in
+    for model-related network and the harness must not sneak past it. The
+    refusal happens before any resolution or load, and names the fix."""
+
+    def _must_not_resolve():
+        raise AssertionError("resolve_gguf_sha was called without the opt-in")
+
+    monkeypatch.setattr(harness, "resolve_gguf_sha", _must_not_resolve)
+    monkeypatch.delenv(embed_mod.MODEL_DOWNLOAD_ENV, raising=False)
+
+    rc = harness.main(["--backend", "gguf", "--resolve-and-pin"])
+    err = capsys.readouterr().err
+
+    assert rc != 0
+    assert embed_mod.MODEL_DOWNLOAD_ENV in err, (
+        "the refusal never names the env var that unlocks the run"
+    )
+    assert fake_loaders == [], "a model was loaded on the way to refusing"
+
+
+def test_resolve_and_pin_benches_at_the_resolved_sha(
+    harness, fake_loaders, monkeypatch, capsys
+):
+    resolved = []
+
+    def _fake_resolve():
+        resolved.append(True)
+        return _SHA
+
+    monkeypatch.setattr(harness, "resolve_gguf_sha", _fake_resolve)
+    monkeypatch.setenv(embed_mod.MODEL_DOWNLOAD_ENV, "1")
+
+    rc = harness.main(["--backend", "gguf", "--resolve-and-pin"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert resolved == [True]
+    gguf_loads = [rec for rec in fake_loaders if rec["backend"] == "gguf"]
+    assert gguf_loads and gguf_loads[0]["pin_at_load"] == _SHA
+    assert harness.pin_line(_SHA) in out
+
+
+def test_an_explicit_revision_wins_and_skips_resolution(
+    harness, fake_loaders, monkeypatch, capsys
+):
+    """``--resolve-and-pin --gguf-revision <sha>`` re-validates a KNOWN sha:
+    no resolution call, no need for the download opt-in just to resolve."""
+
+    def _must_not_resolve():
+        raise AssertionError("resolved despite an explicit --gguf-revision")
+
+    monkeypatch.setattr(harness, "resolve_gguf_sha", _must_not_resolve)
+    monkeypatch.delenv(embed_mod.MODEL_DOWNLOAD_ENV, raising=False)
+
+    rc = harness.main(["--backend", "gguf", "--gguf-revision", _SHA, "--resolve-and-pin"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert harness.pin_line(_SHA) in out
+
+
+def test_gguf_flags_on_the_st_backend_are_refused_not_ignored(harness, capsys):
+    rc = harness.main(["--backend", "st", "--resolve-and-pin"])
+    assert rc != 0
+    assert "gguf" in capsys.readouterr().err
+
+
+def test_resolve_gguf_sha_asks_the_hub_for_the_default_gguf_repo(
+    harness, monkeypatch
+):
+    """The repo id comes from ``embed.py``, not a second copy here — the pin
+    must be resolved for exactly the repository the loader will fetch."""
+    import huggingface_hub
+
+    asked = []
+
+    class _FakeApi:
+        def model_info(self, repo_id):
+            asked.append(repo_id)
+            return types.SimpleNamespace(sha=_SHA)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    assert harness.resolve_gguf_sha() == _SHA
+    assert asked == [embed_mod._DEFAULT_MODEL_GGUF]
+
+
+def test_resolve_gguf_sha_refuses_a_hub_answer_that_is_not_a_sha(
+    harness, monkeypatch
+):
+    import huggingface_hub
+
+    class _FakeApi:
+        def model_info(self, repo_id):
+            return types.SimpleNamespace(sha="main")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    with pytest.raises(ValueError):
+        harness.resolve_gguf_sha()
