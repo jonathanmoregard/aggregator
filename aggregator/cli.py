@@ -512,6 +512,15 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
             print(f"# {rec['source']} :: {rec['subject']}  ({rec['stable_id']})")
         print(rec["content"])
         print()
+    # ITS OWN LINE, not only a clause inside the notice prose: a relaxed page
+    # must be recognisable at a glance in a terminal, because every row above
+    # this line is an ANY-term (or prefix) match and not the exact conjunction
+    # the operator typed. Absent for exact matches, by contract.
+    if "lexical_relaxation" in result:
+        print(
+            f"# lexical_relaxation: {result['lexical_relaxation']} "
+            f"(no rows matched all terms; these are relaxed matches)"
+        )
     if "notice" in result:
         print(f"# notice: {result['notice']}")
     print(f"# total: {result['total']}")

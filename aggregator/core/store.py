@@ -664,6 +664,69 @@ def fts5_query_terms(text: str | None) -> list[str]:
     return _FTS5_TOKEN_RE.findall(text or "")
 
 
+#: The two relaxed tiers, by name. These strings travel all the way to the
+#: tool boundary (``lexical_relaxation`` in the MCP response, a ``#`` line in
+#: CLI output), so they are part of the response vocabulary, not internals.
+LEXICAL_RELAX_OR = "or"
+LEXICAL_RELAX_PREFIX = "prefix"
+
+#: Tier depth, for the sticky-deepest marker: ``None`` (exact) < or < prefix.
+_LEXICAL_RELAX_DEPTH = {None: 0, LEXICAL_RELAX_OR: 1, LEXICAL_RELAX_PREFIX: 2}
+
+
+def fts5_relaxation_tiers(
+    conjuncts: list[str],
+) -> list[tuple[str | None, str]]:
+    """The progressive-relaxation ladder: ``(tier, MATCH expression)`` pairs.
+
+    THE FAILURE THIS REMOVES is the index's documented worst one: free text
+    is an implicit AND inside one row, so a remembered-gist query of several
+    words reliably returned nothing at all. The ladder keeps strict AND as
+    tier 1 — a query that matches exactly returns identical rows to before —
+    and adds two fallbacks a caller only ever sees when every earlier tier
+    was EMPTY: the same conjuncts joined with ``OR``, then ``OR`` with a
+    prefix ``*`` on the final conjunct (the token most likely to be
+    half-remembered or half-typed).
+
+    TAKES SANITIZED CONJUNCTS, NOT RAW TEXT, and that is deliberate twice
+    over. First, the safety property: every character of user origin inside
+    the returned expressions was emitted by :func:`fts5_match_conjuncts` —
+    quoted ``\\w+`` runs — and the ``OR`` and trailing ``*`` are written
+    HERE, by this function, so no operator can be smuggled in through the
+    ladder. (``"a b"*`` is FTS5's phrase-prefix form: adjacency is kept and
+    only the last token of the phrase prefix-matches — a caller's quoted
+    phrase stays a phrase in every tier.) Second, the enumeration rule:
+    ``tests/test_fts5_match_site_enumeration.py`` requires the function that
+    OWNS a ``MATCH`` statement to call the sanitizer itself, so the binding
+    sites call ``fts5_match_conjuncts`` and hand the result here rather than
+    passing raw text through one more layer.
+
+    THE OR TIER IS SKIPPED FOR A SINGLE CONJUNCT — it would be byte-identical
+    to the strict tier, and re-running an FTS scan to learn nothing is how a
+    "cheap" fallback stops being cheap.
+
+    A NOTE ON PREFIX UNDER PORTER: the index holds STEMMED tokens, and FTS5
+    does not stem a prefix query's token (stem-then-prefix is incoherent), so
+    ``configurati*`` misses a corpus that only holds ``configur``. The prefix
+    tier is therefore a genuine last resort for truncated tokens
+    (``alphab*``), not a general recall widener — which matches its position
+    at the bottom of the ladder.
+
+    Callers run the tiers IN ORDER and stop at the first tier with rows:
+    exactly one tier's rows are ever returned, so relaxed and exact results
+    can never interleave, and the tier that answered is recorded via
+    :meth:`Store._note_lexical_relaxation` for the output layer to surface.
+    """
+    if not conjuncts:
+        return []
+    tiers: list[tuple[str | None, str]] = [(None, " ".join(conjuncts))]
+    if len(conjuncts) > 1:
+        tiers.append((LEXICAL_RELAX_OR, " OR ".join(conjuncts)))
+    prefixed = [*conjuncts[:-1], conjuncts[-1] + "*"]
+    tiers.append((LEXICAL_RELAX_PREFIX, " OR ".join(prefixed)))
+    return tiers
+
+
 def _table_present(c: sqlite3.Connection, table: str) -> bool:
     """Whether ``table`` exists. Probed once per write group, not per row."""
     return (
@@ -1626,6 +1689,10 @@ class Store:
         #: ``read_only`` — see :meth:`_session_scope_cached` for why, and for
         #: the 200x it saves on a session-card page.
         self._session_scope_memo: dict[tuple, Any] = {}
+        #: Which relaxation tier the lexical arm answered from — ``None``
+        #: for exact, else ``LEXICAL_RELAX_OR`` / ``LEXICAL_RELAX_PREFIX``.
+        #: See :meth:`lexical_relaxation` for the contract.
+        self._lexical_relaxation: str | None = None
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -5015,6 +5082,43 @@ class Store:
         clauses.append(_json_id_clause(column))
         params.append(json.dumps(sorted(ast.id_scope)))
 
+    @property
+    def lexical_relaxation(self) -> str | None:
+        """Which relaxation tier answered the lexical arm, if any.
+
+        ``None`` means every lexical evaluation on this store since the last
+        :meth:`reset_lexical_relaxation` was answered by the STRICT tier (or
+        found nothing at any tier) — so ``None`` is a hard guarantee that no
+        relaxed row is in the caller's hands. ``"or"`` / ``"prefix"`` name
+        the DEEPEST tier that contributed rows to any evaluation in the
+        request: a request can run the lexical arm more than once (the page
+        and its count, the union's two ontologies), and "did anything on this
+        page come from a relaxed tier" is the question the output layer has
+        to answer — so the marker over-discloses across sub-evaluations
+        rather than ever under-disclosing. The direction is deliberate: a
+        relaxed match reported as exact is the lie this field exists to
+        prevent; an exact match reported alongside a relaxed sibling is
+        merely cautious.
+
+        RESET AT THE REQUEST BOUNDARY, NOT PER CALL. ``aggregator_query``
+        resets on entry; within one request every evaluation runs the same
+        ladder over the same text and corpus, so the recorded tier is
+        deterministic for the response it describes.
+        """
+        return self._lexical_relaxation
+
+    def reset_lexical_relaxation(self) -> None:
+        """Start a fresh request: forget which tier answered the last one."""
+        self._lexical_relaxation = None
+
+    def _note_lexical_relaxation(self, tier: str | None) -> None:
+        """Record ``tier`` if it is deeper than what this request has seen."""
+        if (
+            _LEXICAL_RELAX_DEPTH[tier]
+            > _LEXICAL_RELAX_DEPTH[self._lexical_relaxation]
+        ):
+            self._lexical_relaxation = tier
+
     def _fts_rows(self, sql: str, params: Sequence, text: str) -> list[sqlite3.Row]:
         """Run one MATCH-bearing SELECT, and be LOUD if it still fails.
 
@@ -5041,16 +5145,26 @@ class Store:
             raise
 
     def _fts_ids(self, text: str) -> set[str]:
-        """Records-path FTS5 arm. Empty set when the text has no word chars."""
-        match_expr = fts5_match_query(text)
-        if not match_expr:
-            return set()
-        rows = self._fts_rows(
-            "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
-            (match_expr,),
-            text,
-        )
-        return {row["stable_id"] for row in rows}
+        """Records-path FTS5 arm. Empty set when the text has no word chars.
+
+        RUNS THE RELAXATION LADDER — strict AND first, and only when a tier
+        matches NOTHING the next one: OR, then OR with a prefix on the final
+        conjunct. The tier that answered is recorded on the store for the
+        output layer to surface; see :func:`fts5_relaxation_tiers` and
+        :meth:`lexical_relaxation`. A main user-facing arm, which is why it
+        relaxes — the narrow internal helpers (``probe_fts``, the
+        ``scope:session`` conjunct intersection) deliberately do not.
+        """
+        for tier, match_expr in fts5_relaxation_tiers(fts5_match_conjuncts(text)):
+            rows = self._fts_rows(
+                "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
+                (match_expr,),
+                text,
+            )
+            if rows:
+                self._note_lexical_relaxation(tier)
+                return {row["stable_id"] for row in rows}
+        return set()
 
     def query(
         self,
@@ -5675,28 +5789,36 @@ class Store:
         query's filters; a ``by:`` filter left out of this projection would
         surface cards whose only matching observation the caller just excluded
         — the same silent over-surfacing, one filter later.
+
+        RUNS THE RELAXATION LADDER, because this is the session-card face of
+        the same user-facing search the two arms above serve — a gist query
+        that observations rescue and session cards do not would answer the
+        same question two ways. The filters ride inside each tier, so a tier
+        "matched" only when it matched rows the query can actually see.
         """
-        match_expr = fts5_match_query(text)
-        if not match_expr:
-            return set(), set()
+        conjuncts = fts5_match_conjuncts(text)
         sql = """
             SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
             FROM obs_fts f
             JOIN observations o ON o.rowid = f.rowid
             WHERE obs_fts MATCH ?
         """
-        params: list = [match_expr]
+        extra_params: list = []
         if obs_type:
             sql += " AND o.type = ?"
-            params.append(obs_type)
+            extra_params.append(obs_type)
         if provenance:
             clause, extra = self._provenance_clause(provenance, "o.provenance")
             sql += f" AND {clause}"
-            params.extend(extra)
-        rows = self._fts_rows(sql, params, text)
-        roots = {r["root"] for r in rows if r["root"]}
-        exacts = {r["sid"] for r in rows if r["sid"]}
-        return roots, exacts
+            extra_params.extend(extra)
+        for tier, match_expr in fts5_relaxation_tiers(conjuncts):
+            rows = self._fts_rows(sql, [match_expr, *extra_params], text)
+            if rows:
+                self._note_lexical_relaxation(tier)
+                roots = {r["root"] for r in rows if r["root"]}
+                exacts = {r["sid"] for r in rows if r["sid"]}
+                return roots, exacts
+        return set(), set()
 
     def _session_hit_scope(
         self,
@@ -5890,21 +6012,29 @@ class Store:
         return roots, exacts
 
     def _fts_obs_ids(self, text: str) -> list[str]:
-        """Observations-path FTS5 arm. Empty when the text has no word chars."""
-        match_expr = fts5_match_query(text)
-        if not match_expr:
-            return []
-        rows = self._fts_rows(
-            """
-            SELECT o.obs_id AS obs_id
-            FROM obs_fts f
-            JOIN observations o ON o.rowid = f.rowid
-            WHERE obs_fts MATCH ?
-            """,
-            (match_expr,),
-            text,
-        )
-        return [r["obs_id"] for r in rows]
+        """Observations-path FTS5 arm. Empty when the text has no word chars.
+
+        RUNS THE RELAXATION LADDER — the same contract as ``_fts_ids``: one
+        tier's rows only, deepest-used tier recorded on the store. This is
+        the arm behind ``query_observations``/``count_observations`` AND the
+        hybrid retriever's keyword side (via ``_scoped_obs_ids``), so both
+        the FTS5-only route and the fused route relax identically.
+        """
+        for tier, match_expr in fts5_relaxation_tiers(fts5_match_conjuncts(text)):
+            rows = self._fts_rows(
+                """
+                SELECT o.obs_id AS obs_id
+                FROM obs_fts f
+                JOIN observations o ON o.rowid = f.rowid
+                WHERE obs_fts MATCH ?
+                """,
+                (match_expr,),
+                text,
+            )
+            if rows:
+                self._note_lexical_relaxation(tier)
+                return [r["obs_id"] for r in rows]
+        return []
 
     def _session_scope_obs_ids(self, text: str, roots: set[str]) -> list[str]:
         """Observations under ``roots`` matching ANY conjunct.
