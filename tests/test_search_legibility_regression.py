@@ -799,7 +799,11 @@ def test_the_empty_page_names_the_widening_that_would_have_worked(corpus):
     notice = result["notice"]
     assert "scope:session" in notice, notice
     assert "1 session" in notice, notice
-    assert "does not stem" in notice, notice
+    # v7: the index NOW stems (porter), and the notice must say so rather
+    # than repeat the pre-v7 "does not stem" warning, which would send the
+    # caller off to hand-pluralise terms the tokenizer already folds.
+    assert "stems" in notice, notice
+    assert "does not stem" not in notice, notice
 
 
 # ---------------------------------------------------------------------------
@@ -1172,9 +1176,11 @@ def test_acceptance_2_the_caller_who_does_not_know_the_exact_phrase(corpus):
     irrelevant sessions is the worst of the three outcomes.**
 
     It returns nothing, and the reason is honest: the answer says "link prs",
-    not "PR link", and this index does not stem. The rows that DO satisfy the
-    four loose words are hook prompts quoting a transcript — which is what the
-    silent version handed back.
+    not "PR link", and a quoted run means ADJACENCY — stemming folds ``prs``
+    into ``pr`` but cannot reorder a phrase. The loose (unquoted) four-word
+    query is a different story since v7: porter stemming now carries it to
+    the human answer row, where pre-v7 it drowned in hook prompts quoting a
+    transcript.
     """
     result = mcp.aggregator_query(
         dsl='source:sessions type:user "PR link" "status report"',
@@ -1190,10 +1196,12 @@ def test_acceptance_2_the_caller_who_does_not_know_the_exact_phrase(corpus):
     assert "one phrase" in notice or "single quoted phrase" in notice, notice
     assert "scope:session" in notice, notice
 
-    # The worst outcome, reproduced so the difference is visible: drop the
-    # quotes and the page fills with a machine row that quotes a transcript.
+    # The loose query, for contrast. Pre-v7 this page held ONLY machine rows
+    # quoting a transcript — the silent worst outcome. Under porter stemming
+    # "prs" and "PR" are one term, so the same four loose words now reach the
+    # human answer row as well. The machine rows still ride along; the quoted
+    # form above is still what asks the precise question.
     silent = _query(corpus, "source:sessions type:user PR link status report")
     assert silent["total"] > 0
-    assert all(r["provenance"] in MACHINE_VALUES for r in silent["records"]), [
-        (r["obs_id"], r["provenance"]) for r in silent["records"]
-    ]
+    by_id = {r["obs_id"]: r["provenance"] for r in silent["records"]}
+    assert by_id.get("o-report-answer") == "human", by_id

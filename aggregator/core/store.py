@@ -118,7 +118,11 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+# v7: porter stemming on both FTS5 tables. The version stamp is bookkeeping
+# only — the migration itself is guarded by probing the artifact (the
+# ``tokenize=`` clause in ``sqlite_master``), so a half-applied state
+# converges rather than skips. See ``Store._ensure_porter_fts_tokenizer``.
+SCHEMA_VERSION = 7
 
 #: How long SQLite's own busy handler waits for the write lock before raising
 #: ``database is locked``, in milliseconds.
@@ -848,6 +852,94 @@ class EmptyRebuildRefusedError(RuntimeError):
 # ---------------------------------------------------------------------------
 # DDL — three tables + three FTS shadows, all under one migration.
 # ---------------------------------------------------------------------------
+
+#: ONE tokenizer string for BOTH FTS tables, and the reason it is a constant:
+#: the v7 migration probes the stored ``sqlite_master`` SQL against it, so a
+#: second spelling in a second CREATE would make one table migrate and the
+#: other silently keep the old tokenizer.
+#:
+#: ``porter`` IS THE v7 CHANGE. Without it, ``report`` and ``reports`` are
+#: different terms, and a multi-word gist query — every term ANDed — loses to
+#: morphology before the conjunction even gets its turn. Porter stems the
+#: indexed tokens AND the query tokens with the same rules, so ``running``
+#: finds ``run fast`` and ``run`` finds ``running shoes``. It wraps
+#: ``unicode61 remove_diacritics 2``, which keeps the existing case- and
+#: diacritic-folding exactly as it was.
+_FTS_TOKENIZE = "porter unicode61 remove_diacritics 2"
+
+#: The FTS table CREATEs and the obs sync triggers, as named constants rather
+#: than inline ``_DDL`` strings, because the v7 migration has to recreate
+#: exactly these artifacts (a tokenizer cannot be ALTERed — see
+#: ``Store._ensure_porter_fts_tokenizer``) and a second copy of the text is
+#: how the migrated shape and the fresh shape drift apart.
+
+# FTS5 external-content over observations.body. Sync via the triggers below.
+_OBS_FTS_DDL = f"""
+    CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
+        body,
+        content='observations',
+        content_rowid='rowid',
+        tokenize='{_FTS_TOKENIZE}'
+    );
+"""
+
+_OBS_FTS_TRIGGERS: tuple[str, ...] = (
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations
+    BEGIN
+        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations
+    BEGIN
+        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+    END;
+    """,
+    # ``OF body`` IS THE WHOLE POINT, and it is not a micro-optimisation.
+    #
+    # Without the column list this fires on ANY update to ANY column — an
+    # ``embedding_state`` flip, a ``provenance`` stamp — and each firing is a
+    # full FTS5 ``'delete'`` plus re-insert of the entire body. With
+    # ``auto_vacuum=0`` the pages that frees are never handed back, which is the
+    # same mechanism documented at the ingest UPSERT below. Measured on a
+    # throwaway database at 1/5 of live scale: a chunked column-only UPDATE ran
+    # 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth narrow.
+    # Extrapolated to the live 549,952 rows that is 12x wall clock and
+    # 380-640 MB of permanent bloat on a 1.4 GB file.
+    #
+    # IT INDEXES EXACTLY AS MUCH AS BEFORE. SQLite fires ``UPDATE OF body``
+    # whenever ``body`` appears in the SET clause, whether or not the value
+    # actually moved, and the ingest UPSERT always names ``body =
+    # excluded.body``. Pinned by ``tests/core/test_store_fts_trigger_narrowing
+    # .py::test_upsert_keeps_the_fts_index_correct``, which matches a sentinel
+    # token through the real upsert rather than restating this paragraph.
+    #
+    # ``IF NOT EXISTS`` will NOT replace a trigger that is already there, so
+    # every database created before this change needs ``_ensure_narrow_fts_
+    # update_trigger`` to drop the wide one first — and those are the databases
+    # the narrowing is for.
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_au
+    AFTER UPDATE OF body ON observations
+    BEGIN
+        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+    """,
+)
+
+_RECORDS_FTS_DDL = f"""
+    CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
+        stable_id UNINDEXED,
+        source    UNINDEXED,
+        subject,
+        body,
+        tags,
+        tokenize='{_FTS_TOKENIZE}'
+    );
+"""
+
 _DDL: list[str] = [
     # --- v2: sessions (Langfuse "trace") ------------------------------
     """
@@ -920,58 +1012,10 @@ _DDL: list[str] = [
     # row already classified — 1,100 chunks over 549,952 rows, each starting
     # further in than the last. Indexed it is a seek. It also serves ``by:``.
     "CREATE INDEX IF NOT EXISTS obs_provenance ON observations(provenance);",
-    # FTS5 external-content over observations.body. Sync via triggers below.
-    """
-    CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
-        body,
-        content='observations',
-        content_rowid='rowid',
-        tokenize='unicode61 remove_diacritics 2'
-    );
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations
-    BEGIN
-        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
-    END;
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations
-    BEGIN
-        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
-    END;
-    """,
-    # ``OF body`` IS THE WHOLE POINT, and it is not a micro-optimisation.
-    #
-    # Without the column list this fires on ANY update to ANY column — an
-    # ``embedding_state`` flip, a ``provenance`` stamp — and each firing is a
-    # full FTS5 ``'delete'`` plus re-insert of the entire body. With
-    # ``auto_vacuum=0`` the pages that frees are never handed back, which is the
-    # same mechanism documented at the ingest UPSERT below. Measured on a
-    # throwaway database at 1/5 of live scale: a chunked column-only UPDATE ran
-    # 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth narrow.
-    # Extrapolated to the live 549,952 rows that is 12x wall clock and
-    # 380-640 MB of permanent bloat on a 1.4 GB file.
-    #
-    # IT INDEXES EXACTLY AS MUCH AS BEFORE. SQLite fires ``UPDATE OF body``
-    # whenever ``body`` appears in the SET clause, whether or not the value
-    # actually moved, and the ingest UPSERT always names ``body =
-    # excluded.body``. Pinned by ``tests/core/test_store_fts_trigger_narrowing
-    # .py::test_upsert_keeps_the_fts_index_correct``, which matches a sentinel
-    # token through the real upsert rather than restating this paragraph.
-    #
-    # ``IF NOT EXISTS`` will NOT replace a trigger that is already there, so
-    # every database created before this change needs ``_ensure_narrow_fts_
-    # update_trigger`` to drop the wide one first — and those are the databases
-    # the narrowing is for.
-    """
-    CREATE TRIGGER IF NOT EXISTS observations_au
-    AFTER UPDATE OF body ON observations
-    BEGIN
-        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
-        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
-    END;
-    """,
+    # FTS5 shadow + sync triggers — shared with the v7 rebuild migration,
+    # which is why they are module constants rather than inline strings here.
+    _OBS_FTS_DDL,
+    *_OBS_FTS_TRIGGERS,
     # --- Legacy: records + records_fts for GitHub-shaped sources -------
     """
     CREATE TABLE IF NOT EXISTS records (
@@ -989,16 +1033,7 @@ _DDL: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_records_source ON records(source);",
     "CREATE INDEX IF NOT EXISTS idx_records_updated ON records(updated_at);",
-    """
-    CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-        stable_id UNINDEXED,
-        source    UNINDEXED,
-        subject,
-        body,
-        tags,
-        tokenize='unicode61 remove_diacritics 2'
-    );
-    """,
+    _RECORDS_FTS_DDL,
     """
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
@@ -1830,6 +1865,7 @@ class Store:
         self._ensure_embedding_state_columns(c)
         self._ensure_provenance_column(c)
         self._ensure_narrow_fts_update_trigger(c)
+        self._ensure_porter_fts_tokenizer(c)
         for stmt in _DDL:
             c.executescript(stmt)
         if self._vector_available:
@@ -2389,6 +2425,123 @@ class Store:
         if "UPDATE OF body" in row[0]:
             return
         c.execute("DROP TRIGGER observations_au")
+
+    @staticmethod
+    def _fts_table_sql(c: sqlite3.Connection, table: str) -> str | None:
+        """The stored CREATE text of ``table``, or None when absent."""
+        row = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    @staticmethod
+    def _ensure_porter_fts_tokenizer(c: sqlite3.Connection) -> None:
+        """v6 → v7: rebuild both FTS5 tables with porter stemming.
+
+        A TOKENIZER CANNOT BE ALTERED. It is baked into the FTS5 shadow tables
+        at CREATE time, so the only path from ``unicode61`` to
+        ``porter unicode61`` is drop + recreate + re-tokenize every row:
+        ``obs_fts`` is external-content, so its rebuild is FTS5's own
+        ``INSERT INTO obs_fts(obs_fts) VALUES('rebuild')`` over the
+        observations table it shadows; ``records_fts`` is standalone, so it is
+        repopulated from ``records`` — with ``tags`` space-joined out of the
+        stored JSON array via ``json_each``, exactly the shape the row-write
+        path stores (see the INSERT in ``_write_record_group``).
+
+        PROBES THE ARTIFACT, NOT ``user_version`` — the same rule as every
+        ``_ensure_*`` helper above, and here it is what makes an interrupted
+        migration safe rather than silent: the whole swap for each table runs
+        inside one SAVEPOINT, so a process killed mid-rebuild rolls back to
+        the intact old-tokenizer table and the next ``migrate()`` (one runs on
+        every CLI invocation) starts over. The probe can therefore never see
+        ``porter`` in ``sqlite_master`` next to a partial index — which is the
+        invariant that matters, because a migrated database that silently
+        served an empty or half-built FTS index would look exactly like a
+        corpus with nothing to say.
+
+        THE COST IS PAID HERE, ON PURPOSE, AND ANNOUNCED OUT LOUD. On the live
+        cache this re-tokenizes ~657k observation rows (~772 MB of text) and
+        runs for minutes, on whichever process first executes the new build —
+        possibly the MCP reader or the embed worker while other writers queue
+        on the write lock. The alternative — a chunked background backfill —
+        would mean a window in which queries silently answer from a partial
+        index, the exact empty-looks-like-success failure this project bans by
+        name. A migration that blocks once, says why, and leaves a complete
+        index behind is the honest trade. The recommended controlled first
+        run is one ``aggregator status`` immediately after deploy, so the
+        rebuild happens in a terminal a human is watching rather than under a
+        timer.
+
+        Runs BEFORE the ``_DDL`` pass. On a fresh database neither table
+        exists yet, so this no-ops and the DDL creates them with porter
+        directly. The triggers are recreated inside the same savepoint — not
+        left to the DDL pass — so "the savepoint committed" and "the index is
+        complete AND kept in sync" are the same fact.
+        """
+        obs_sql = Store._fts_table_sql(c, "obs_fts")
+        rec_sql = Store._fts_table_sql(c, "records_fts")
+        obs_stale = obs_sql is not None and "porter" not in obs_sql
+        rec_stale = rec_sql is not None and "porter" not in rec_sql
+        if not obs_stale and not rec_stale:
+            return
+        obs_rows = (
+            c.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            if obs_stale
+            else 0
+        )
+        rec_rows = (
+            c.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+            if rec_stale
+            else 0
+        )
+        log.warning(
+            "Rebuilding the FTS5 index with porter stemming (schema v7): "
+            "re-tokenizing %d observation row(s) and %d record row(s). This "
+            "is a one-time migration — a tokenizer cannot be changed in "
+            "place — and on the full cache it takes MINUTES while holding "
+            "the write lock. Do not interrupt it; an interrupted run rolls "
+            "back and starts over on the next command.",
+            obs_rows,
+            rec_rows,
+        )
+        c.execute("SAVEPOINT porter_fts")
+        try:
+            if obs_stale:
+                for trig in (
+                    "observations_ai",
+                    "observations_ad",
+                    "observations_au",
+                ):
+                    c.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                c.execute("DROP TABLE obs_fts")
+                c.execute(_OBS_FTS_DDL)
+                c.execute("INSERT INTO obs_fts(obs_fts) VALUES('rebuild')")
+                for stmt in _OBS_FTS_TRIGGERS:
+                    c.execute(stmt)
+            if rec_stale:
+                c.execute("DROP TABLE records_fts")
+                c.execute(_RECORDS_FTS_DDL)
+                c.execute(
+                    "INSERT INTO records_fts"
+                    "(stable_id, source, subject, body, tags) "
+                    "SELECT stable_id, source, subject, body, "
+                    "COALESCE((SELECT group_concat(je.value, ' ') "
+                    "FROM json_each(records.tags) AS je), '') "
+                    "FROM records"
+                )
+        except BaseException:
+            c.execute("ROLLBACK TO SAVEPOINT porter_fts")
+            c.execute("RELEASE SAVEPOINT porter_fts")
+            raise
+        c.execute("RELEASE SAVEPOINT porter_fts")
+        c.commit()
+        log.info(
+            "FTS5 porter rebuild complete: %d observation row(s), %d record "
+            "row(s) re-tokenized.",
+            obs_rows,
+            rec_rows,
+        )
 
     def schema_version(self) -> int:
         """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
