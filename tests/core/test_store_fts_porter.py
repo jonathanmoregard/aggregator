@@ -253,6 +253,32 @@ def test_migrate_rebuilds_old_tokenizer_tables_completely(tmp_path):
     s.close()
 
 
+def test_porter_rebuild_commit_keeps_the_write_baton(tmp_path, monkeypatch):
+    """The rebuild's durability commit must not hand the flock baton back.
+
+    ``_WriteLockedConnection.commit`` releases the cache write lock, so the
+    ``c.commit()`` that makes the porter rebuild durable used to leave the
+    REST of ``migrate()`` — the DDL pass, the vec reconcile, the version
+    stamp — running unlocked on the first post-deploy invocation, exactly
+    when the ingest/embed timers are most likely to pile in behind it.
+    """
+    db = _seeded_v6_db(tmp_path)
+    held_after: list[bool] = []
+    original = Store._ensure_porter_fts_tokenizer
+
+    def spy(c):
+        original(c)
+        held_after.append(c._holds_write_lock)
+
+    monkeypatch.setattr(
+        Store, "_ensure_porter_fts_tokenizer", staticmethod(spy)
+    )
+    s = Store(db_path=db)
+    s.migrate()
+    s.close()
+    assert held_after == [True]
+
+
 def test_porter_migration_is_idempotent(tmp_path, caplog):
     db = _seeded_v6_db(tmp_path)
 

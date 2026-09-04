@@ -2665,7 +2665,19 @@ class Store:
             c.execute("RELEASE SAVEPOINT porter_fts")
             raise
         c.execute("RELEASE SAVEPOINT porter_fts")
+        # The commit makes the minutes-long rebuild durable NOW, so a failure
+        # later in migrate() cannot roll it back and pay the cost twice — but
+        # ``_WriteLockedConnection.commit`` also hands the flock baton back,
+        # and the REST of migrate() (DDL pass, vec reconcile, version stamp)
+        # must not run unlocked on the first post-deploy invocation. Re-queue
+        # immediately: ``take_cache_write_lock`` is idempotent, and if another
+        # writer slipped in between commit and re-acquire it saw a consistent,
+        # fully-rebuilt index. Guarded because the parameter type is the plain
+        # ``sqlite3.Connection`` protocol; migrate() always passes the
+        # write-locked subclass.
         c.commit()
+        if isinstance(c, _WriteLockedConnection):
+            c.take_cache_write_lock()
         log.info(
             "FTS5 porter rebuild complete: %d observation row(s), %d record "
             "row(s) re-tokenized.",
