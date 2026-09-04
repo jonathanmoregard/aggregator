@@ -2531,13 +2531,35 @@ CLAUDE_COMMAND_ENV_VAR = "AGGREGATOR_CLAUDE_COMMAND"
 #: Cheap fast alias — tagging is a bulk labeling job, not reasoning work.
 DEFAULT_TAG_MODEL = "haiku"
 
-#: Tools the tagger invocation may NOT use. ``claude -p`` is an agent, and an
-#: agent fed attacker-influenced record bodies must be a pure text transform:
-#: nothing to read, nothing to run, nowhere to exfiltrate. Permission-gated
-#: tools are auto-denied in print mode anyway; this list makes the read-only
-#: ones explicit too, so the guarantee does not rest on permission defaults.
-_TAG_DISALLOWED_TOOLS = (
-    "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,Task,WebFetch,WebSearch"
+#: The tagger invocation's ambient-surface clamp. ``claude -p`` is an agent,
+#: and an agent fed attacker-influenced record bodies must be a pure text
+#: transform: nothing to read, nothing to run, nowhere to exfiltrate, nothing
+#: ambient leaking in. Allowlist-of-nothing beats the denylist this replaced
+#: (a denylist is only as good as its census of tool names):
+#:
+#: * ``--tools ""`` removes EVERY built-in tool from the session — stronger
+#:   than allow/deny permission lists, which gate tools that still exist.
+#: * ``--strict-mcp-config --mcp-config {"mcpServers":{}}`` pins the MCP
+#:   server set to empty, so no configured server (and no tool it exports)
+#:   is reachable.
+#: * ``--setting-sources ""`` loads no user/project/local settings — no
+#:   hooks, no ambient config in the transform.
+#: * ``--no-session-persistence`` writes no transcript. Belt half of the
+#:   feedback-loop fix: transcripts under ``~/.claude/projects`` are exactly
+#:   what the sessions source ingests, so a persisted tag run would re-inject
+#:   every record body it read into the corpus and the embed backlog.
+#:
+#: All four verified against the deployed CLI (2026-09-04 smoke: 3 synthetic
+#: records, injection bait tagged as data, no transcript directory created).
+_TAG_CLAUDE_FLAGS = (
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--setting-sources",
+    "",
+    "--no-session-persistence",
 )
 
 _TAG_PROMPT_HEADER = """\
@@ -2611,8 +2633,7 @@ def _claude_argv(model: str) -> list[str]:
         "-p",
         "--model",
         model,
-        "--disallowedTools",
-        _TAG_DISALLOWED_TOOLS,
+        *_TAG_CLAUDE_FLAGS,
     ]
 
 

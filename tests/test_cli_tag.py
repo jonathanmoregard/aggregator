@@ -179,6 +179,24 @@ def test_prompt_carries_data_not_instructions_framing(tmp_path, monkeypatch):
     assert "haiku" in argv
 
 
+def test_invocation_clamps_the_ambient_surface(tmp_path, monkeypatch):
+    """The tagger is a pure text transform over untrusted bodies, so the
+    invocation must define NO tools (allowlist-of-nothing, not a denylist),
+    no MCP servers, no ambient settings — and must persist no transcript:
+    tag-run transcripts under ~/.claude/projects would be re-ingested by the
+    sessions source, feeding every record body back into the corpus."""
+    s = _store(tmp_path, [_rec("github:clamp", "s", "b")])
+    fake = FakeClaude()
+    _install(monkeypatch, fake)
+    assert main(["tag"], _store=s) == 0
+    argv = fake.calls[0]["argv"]
+    assert argv[argv.index("--tools") + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert json.loads(argv[argv.index("--mcp-config") + 1]) == {"mcpServers": {}}
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--no-session-persistence" in argv
+
+
 def test_batches_are_bounded(tmp_path, monkeypatch):
     s = _store(
         tmp_path,
