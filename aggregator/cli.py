@@ -2742,16 +2742,32 @@ def _parse_tag_output(
     return accepted, failures
 
 
+#: Ceiling on ``tag --batch-size``. BOUNDED AT BOTH ENDS BECAUSE BOTH ENDS
+#: FAIL, and the top end fails worse than the bottom. One batch is one prompt
+#: carrying ``batch_size × _TAG_BODY_CAP`` characters of record body — 100 ×
+#: 4000 is already ~400k characters, ~100k tokens, before the instructions —
+#: so an oversized batch does not tag slowly, it makes an invocation the model
+#: cannot answer. And the failure is not local: a prompt too big to answer
+#: fails EVERY batch identically, each burning its full retry backoff, and
+#: after ``_TAG_BREAKER_BATCHES`` consecutive deaths the circuit breaker
+#: aborts the whole run. So `--batch-size 5000` does not tag 5000 records at a
+#: time; it tags nothing at all and takes the run down with it. 100 is
+#: comfortably above any batch worth running (the default is 15) and
+#: comfortably below the cliff.
+_TAG_BATCH_MAX = 100
+
+
 def _tag_batch_size(raw: str) -> int:
     """``argparse`` type for ``tag --batch-size``: records per LLM call.
 
-    Refused at the parser rather than at runtime because both bad values
-    fail in TAG-specific ways that ``embed``'s ``_positive_int`` prose does
+    Refused at the parser rather than at runtime because every bad value
+    fails in TAG-specific ways that ``embed``'s ``_positive_int`` prose does
     not describe (and that one stays as it is): the batch walk is
     ``range(0, len(ids), batch_size)``, so 0 crashes it with a bare
     ``ValueError`` (range step of zero) and a negative value makes the walk
     EMPTY — the run prints ``tagged=0`` and exits 0 with the whole corpus
-    still owed, a silent no-op under the timer unit.
+    still owed, a silent no-op under the timer unit. Too LARGE is the third
+    failure and the expensive one; see :data:`_TAG_BATCH_MAX`.
     """
     try:
         value = int(raw)
@@ -2764,6 +2780,18 @@ def _tag_batch_size(raw: str) -> int:
             f"batch walk (a range step of zero), and a negative value walks "
             f"no batches at all — the run reports tagged=0 and exits 0 with "
             f"every record still owed."
+        )
+    if value > _TAG_BATCH_MAX:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {_TAG_BATCH_MAX}, got {value}. --batch-size "
+            f"records go into ONE prompt at up to {_TAG_BODY_CAP} body chars "
+            f"each, so {value} of them is ~{value * _TAG_BODY_CAP // 1000}k "
+            f"characters before the instructions — a prompt the model cannot "
+            f"answer. That does not fail one batch: it fails every batch "
+            f"identically, each burning its retries and backoff, until the "
+            f"circuit breaker aborts the run after "
+            f"{_TAG_BREAKER_BATCHES} consecutive deaths — nothing tagged. "
+            f"The default is {_TAG_BATCH}; raise it in tens, not thousands."
         )
     return value
 
@@ -4343,8 +4371,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="batch_size",
         help=(
             f"records per claude invocation AND per committed checkpoint "
-            f"(default: {_TAG_BATCH}). Bounds what a kill costs and what one "
-            f"malformed response takes down"
+            f"(default: {_TAG_BATCH}, max {_TAG_BATCH_MAX}). Bounds what a "
+            f"kill costs and what one malformed response takes down; the "
+            f"ceiling keeps one prompt answerable"
         ),
     )
     p_tag.add_argument(

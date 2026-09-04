@@ -529,6 +529,40 @@ def test_batch_size_refusal_names_the_tag_failure(tmp_path, capsys, value):
     assert "catchup" not in err  # embed's prose must not leak in
 
 
+@pytest.mark.parametrize("value", ["101", "5000"])
+def test_batch_size_is_capped_and_the_refusal_explains_the_blowup(
+    tmp_path, capsys, value
+):
+    """THE TOP END FAILS TOO, AND WORSE THAN THE BOTTOM.
+
+    ``--batch-size`` was bounded below and unbounded above, so
+    ``--batch-size 5000`` looked like "tag faster". One batch is one prompt
+    carrying ``batch_size × _TAG_BODY_CAP`` characters of body, so it is not a
+    slow run — it is an invocation the model cannot answer. And the failure is
+    not per-batch: an unanswerable prompt kills EVERY batch identically, each
+    burning its retries and backoff, until the circuit breaker aborts the run
+    with nothing tagged. The refusal has to name both halves, or the operator
+    reads the breaker abort as a broken CLI.
+    """
+    with pytest.raises(SystemExit) as exc:
+        main(["tag", "--batch-size", value], _store=_store(tmp_path, []))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert f"at most {cli._TAG_BATCH_MAX}" in err, err
+    # The prompt-size cause…
+    assert "one prompt" in err.lower() or "ONE prompt" in err, err
+    # …and the consequence that makes it a run-level failure, not a batch one.
+    assert "circuit breaker" in err, err
+
+
+def test_the_batch_size_ceiling_itself_is_accepted(tmp_path, monkeypatch):
+    """The bound is inclusive: the cap is a usable value, not the first bad
+    one. An off-by-one here would refuse a documented setting."""
+    s = _store(tmp_path, [_rec("github:cap", "subj", "body")])
+    _install(monkeypatch, FakeClaude())
+    assert main(["tag", "--batch-size", str(cli._TAG_BATCH_MAX)], _store=s) == 0
+
+
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_timeout_refusal_names_the_tag_failure(tmp_path, capsys, value):
     """``tag --timeout`` at 0 or below expires every subprocess immediately;
