@@ -75,7 +75,9 @@ GGUF_REVISION_ENV = "AGGREGATOR_GGUF_BENCH_REVISION"
 #: The gguf bench reuses it verbatim so its numbers land in the same table.
 SIZE_CURVE_CHARS = (4000, 2000, 1000, 500, 250)
 
-_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+#: Matched with ``fullmatch``: ``$`` would tolerate a trailing newline, and a
+#: 40-hex sha read out of a file carries exactly that.
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -125,7 +127,7 @@ def validate_sha(sha: str) -> str:
     harness refuses to bench one, exactly as ``embed.py`` would refuse to
     hold one.
     """
-    if not _SHA_RE.match(sha):
+    if not _SHA_RE.fullmatch(sha):
         raise ValueError(
             f"{sha!r} is not a 40-character lowercase hex commit sha; refusing "
             f"to bench it — a tag or branch name is a moving target and could "
@@ -138,12 +140,16 @@ def effective_revision(flag_value: str | None, environ: Mapping[str, str]) -> st
     """The revision override to bench at: flag first, then env, validated.
 
     Validation happens HERE, before any model loads, so a typo'd pin costs
-    milliseconds rather than surfacing after a multi-minute download.
+    milliseconds rather than surfacing after a multi-minute download. The ENV
+    read is stripped — values sourced from files carry a trailing newline —
+    while the flag comes from argv and is taken verbatim.
     """
-    raw = flag_value if flag_value is not None else environ.get(GGUF_REVISION_ENV)
+    if flag_value is not None:
+        return validate_sha(flag_value)
+    raw = environ.get(GGUF_REVISION_ENV)
     if raw is None:
         return None
-    return validate_sha(raw)
+    return validate_sha(raw.strip())
 
 
 def pin_line(sha: str) -> str:

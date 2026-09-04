@@ -108,6 +108,33 @@ def test_effective_revision_rejects_a_malformed_sha_before_any_bench(harness):
             harness.effective_revision(None, {harness.GGUF_REVISION_ENV: bad})
 
 
+def test_validate_sha_refuses_a_sha_with_trailing_newline(harness):
+    """``$`` tolerates a trailing newline; ``fullmatch`` semantics must not.
+
+    ``"sha\\n"`` would flow into a pin line whose quoted value embeds the
+    newline — a source line embed.py could never hold.
+    """
+    sha = "a" * 40
+    for bad in (sha + "\n", sha + " ", "\n" + sha, sha + "\nx"):
+        with pytest.raises(ValueError):
+            harness.validate_sha(bad)
+        with pytest.raises(ValueError):
+            harness.pin_line(bad)
+
+
+def test_the_env_read_is_stripped_but_the_flag_is_not(harness):
+    """Env values sourced from files carry a trailing newline — the friendly
+    contract is to strip the ENV read. The flag comes from argv and stays
+    strict: a newline there is an anomaly worth refusing."""
+    sha = "a" * 40
+    env = {harness.GGUF_REVISION_ENV: sha + "\n"}
+    assert harness.effective_revision(None, env) == sha
+    env = {harness.GGUF_REVISION_ENV: f"  {sha}  \n"}
+    assert harness.effective_revision(None, env) == sha
+    with pytest.raises(ValueError):
+        harness.effective_revision(sha + "\n", {})
+
+
 # ---------------------------------------------------------------------------
 # Cosine similarity — the fidelity half of the decision rule
 # ---------------------------------------------------------------------------
