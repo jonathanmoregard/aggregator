@@ -5307,6 +5307,13 @@ class Store:
         evaluate the arm several times (the page and its count, a session
         projection), and "did the words match anything at all" must survive a
         later evaluation that happened to see fewer rows.
+
+        ONLY EVER CALLED BY A SITE THAT ACTUALLY RAN A STATEMENT. Recording a
+        zero for a ladder that never ran collapses the three-valued contract
+        this method exists to serve: ``None`` means nobody looked, and an arm
+        that returns early on text with no word characters looked at nothing.
+        Each arm below therefore checks its tier list (or its conjuncts) BEFORE
+        the loop and returns without a note when there is nothing to run.
         """
         for probe in self._lexical_probes:
             probe.matched = max(probe.matched or 0, matched)
@@ -5347,7 +5354,11 @@ class Store:
         relaxes — the narrow internal helpers (``probe_fts``, the
         ``scope:session`` conjunct intersection) deliberately do not.
         """
-        for tier, match_expr in fts5_relaxation_tiers(fts5_match_conjuncts(text)):
+        tiers = fts5_relaxation_tiers(fts5_match_conjuncts(text))
+        if not tiers:
+            # No word characters: no tier ran, so there is nothing to record.
+            return set()
+        for tier, match_expr in tiers:
             rows = self._fts_rows(
                 "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
                 (match_expr,),
@@ -6164,7 +6175,11 @@ class Store:
             clause, extra = self._provenance_clause(provenance, "o.provenance")
             sql += f" AND {clause}"
             extra_params.extend(extra)
-        for tier, match_expr in fts5_relaxation_tiers(conjuncts):
+        tiers = fts5_relaxation_tiers(conjuncts)
+        if not tiers:
+            # No word characters: no tier ran, so there is nothing to record.
+            return set(), set()
+        for tier, match_expr in tiers:
             rows = self._fts_rows(sql, [match_expr, *extra_params], text)
             if rows:
                 self._note_lexical_relaxation(tier)
@@ -6216,9 +6231,22 @@ class Store:
     def _compute_session_hit_scope(
         self, text: str, obs_type: str | None, provenance: str | None
     ) -> tuple[set[str], set[str]]:
-        """:meth:`_session_hit_scope` without the memo. Owns the ``MATCH``."""
+        """:meth:`_session_hit_scope` without the memo. Owns the ``MATCH``.
+
+        RECORDS WHAT THE INTERSECTION FOUND, like every other lexical arm, and
+        the omission was the ``scope:session`` half of the empty-page lie. This
+        probe never relaxes — so it noted no tier — but it is still a lexical
+        evaluation, and ``lexical_matches`` staying ``None`` through it left the
+        notice with nothing to tell "the terms are not in any one session" from
+        "a filter removed the sessions that hold them". It then said the first
+        about queries where the second was true. The count is the SESSIONS the
+        intersection qualified, measured BEFORE the outer SELECT applies the
+        query's row filters — which is exactly the pre-filter reading
+        :class:`LexicalProbe` documents.
+        """
         conjuncts = fts5_match_conjuncts(text)
         if not conjuncts:
+            # No word characters: nothing ran, so nothing is recorded.
             return set(), set()
         base = """
             SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
@@ -6244,8 +6272,11 @@ class Store:
             roots = got_roots if roots is None else roots & got_roots
             exacts = got_exacts if exacts is None else exacts & got_exacts
             if not roots and not exacts:
+                self._note_lexical_matched(0)
                 return set(), set()
-        return roots or set(), exacts or set()
+        roots, exacts = roots or set(), exacts or set()
+        self._note_lexical_matched(len(roots))
+        return roots, exacts
 
     def _session_scope_cached(self, key: tuple, compute: Callable[[], Any]) -> Any:
         """Memoise one ``scope:session`` answer, on a READ-ONLY store only.
@@ -6375,7 +6406,11 @@ class Store:
         hybrid retriever's keyword side (via ``_scoped_obs_ids``), so both
         the FTS5-only route and the fused route relax identically.
         """
-        for tier, match_expr in fts5_relaxation_tiers(fts5_match_conjuncts(text)):
+        tiers = fts5_relaxation_tiers(fts5_match_conjuncts(text))
+        if not tiers:
+            # No word characters: no tier ran, so there is nothing to record.
+            return []
+        for tier, match_expr in tiers:
             rows = self._fts_rows(
                 """
                 SELECT o.obs_id AS obs_id
@@ -6406,12 +6441,21 @@ class Store:
         One statement per conjunct rather than an ``OR``-joined expression, so
         the invariant that only quoted ``\\w+`` runs reach ``MATCH`` survives
         a widening that had no reason to spend it.
+
+        THE ROWS IT SEES ARE WHAT ``lexical_matches`` MEANS on this path: this
+        is the row set a ``scope:session`` drilldown page is built from, and the
+        query's row filters (``from:``/``to:``, the id-scope keys) are applied
+        by the SELECT above it, so the count recorded here is the pre-filter one
+        the empty-page diagnosis needs. ``roots`` being empty is not a
+        no-measurement: the intersection that produced it already recorded its
+        own zero, and re-recording here would only repeat it.
         """
-        if not roots:
+        conjuncts = fts5_match_conjuncts(text)
+        if not roots or not conjuncts:
             return []
         scope_json = json.dumps(sorted(roots))
         ids: set[str] = set()
-        for expr in fts5_match_conjuncts(text):
+        for expr in conjuncts:
             rows = self._fts_rows(
                 "SELECT o.obs_id AS obs_id FROM obs_fts f "  # noqa: S608 - placeholders only
                 "JOIN observations o ON o.rowid = f.rowid "
@@ -6421,6 +6465,7 @@ class Store:
                 text,
             )
             ids.update(r["obs_id"] for r in rows)
+        self._note_lexical_matched(len(ids))
         return sorted(ids)
 
     def _scoped_obs_ids(self, ast: QueryAST) -> list[str]:

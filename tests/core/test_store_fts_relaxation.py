@@ -276,3 +276,84 @@ def test_relaxed_query_ast_reaches_query_observations(store):
     assert {r.obs_id for r in rows} == {"o-alpha", "o-beta"}
     assert store.lexical_relaxation == LEXICAL_RELAX_OR
     assert store.count_observations(QueryAST(text="alpha beta")) == 2
+
+
+# --- what the ladder RECORDS, and when it records nothing at all -------------
+#
+# ``lexical_matches`` is three-valued on purpose (see ``LexicalProbe``): None =
+# the ladder never ran, 0 = it ran and matched nothing, > 0 = the words are in
+# the corpus. Every site that can collapse None into 0 is a site where an
+# empty-page notice states a fact about the corpus out of a query that never
+# asked it.
+
+
+def test_a_query_with_no_word_chars_never_records_a_probe(store):
+    """NO TIER RAN, SO NOTHING WAS MEASURED. ``fts5_relaxation_tiers`` returns
+    an empty ladder for text with no word characters, and the arms used to
+    record a zero anyway on the way past — turning "nobody looked" into "we
+    looked and the corpus has none of it"."""
+    store.upsert_entities([_session(), _obs("o1", "alpha")])
+    store.upsert([_rec("r1", "n", "alpha")])
+    for probe in (
+        lambda: store._fts_obs_ids("---"),
+        lambda: store._fts_ids("---"),
+        lambda: store._fts_hit_scope("---"),
+        lambda: store._session_hit_scope("---"),
+    ):
+        store.reset_lexical_relaxation()
+        probe()
+        assert store.lexical_matches is None, probe
+
+
+def test_a_ladder_that_ran_and_missed_records_a_measured_zero(store):
+    """The other half of the same discipline: a real miss IS a measurement."""
+    store.upsert_entities([_session(), _obs("o1", "alpha")])
+    assert store._fts_obs_ids("zzzmissing qqqmissing") == []
+    assert store.lexical_matches == 0
+
+
+def test_scope_session_records_what_the_intersection_found(store):
+    """``scope:session`` used to record NOTHING, so an empty page under it was
+    diagnosed from a probe nobody ran — and the notice said the terms "do not
+    co-occur in any one session" about terms that do."""
+    store.upsert_entities(
+        [
+            _session("s1"),
+            _obs("o-alpha", "alpha alone", "s1"),
+            _obs("o-beta", "beta alone", "s1"),
+        ]
+    )
+    roots, _ = store._session_hit_scope("alpha beta")
+    assert roots == {"s1"}
+    assert store.lexical_matches == 1
+
+
+def test_scope_session_records_a_measured_zero_for_a_real_miss(store):
+    """An intersection that really is empty must still be a MEASURED zero, or
+    the honest "they do not co-occur" wording loses its licence."""
+    store.upsert_entities(
+        [
+            _session("s1"),
+            _obs("o-alpha", "alpha alone", "s1"),
+            _session("s2"),
+            _obs("o-beta", "beta alone", "s2"),
+        ]
+    )
+    roots, _ = store._session_hit_scope("alpha beta")
+    assert roots == set()
+    assert store.lexical_matches == 0
+
+
+def test_scope_session_obs_ids_record_the_rows_they_saw(store):
+    """The widened row set is what a ``scope:session`` drilldown page is built
+    from, so it is the count the empty-page notice means by "row(s)"."""
+    store.upsert_entities(
+        [
+            _session("s1"),
+            _obs("o-alpha", "alpha alone", "s1"),
+            _obs("o-beta", "beta alone", "s1"),
+        ]
+    )
+    ast = QueryAST(text="alpha beta", scope="session")
+    assert store._scoped_obs_ids(ast) == ["o-alpha", "o-beta"]
+    assert store.lexical_matches == 2
