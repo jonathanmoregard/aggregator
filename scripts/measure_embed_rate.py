@@ -100,7 +100,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "40-hex commit sha of Qwen/Qwen3-Embedding-0.6B-GGUF to load at, "
             f"so a pin can be validated before it is hardcoded; env "
-            f"{GGUF_REVISION_ENV} is the fallback"
+            f"{GGUF_REVISION_ENV} is the fallback (the flag wins when both "
+            f"are set). The env form is refused alongside --resolve-and-pin: "
+            f"a stale exported sha would silently suppress the hub resolution"
         ),
     )
     parser.add_argument(
@@ -274,10 +276,26 @@ def run_bench(args: argparse.Namespace) -> int:
     # module-level environment reads are shared with code that would.
     os.environ.setdefault("XDG_DATA_HOME", "/tmp/aggregator-measure-xdg")
 
-    if args.backend == "st" and (args.resolve_and_pin or args.gguf_revision):
+    if args.backend == "st":
+        inputs = _bench_inputs(args, os.environ)
+        if inputs:
+            print(
+                f"error: {', '.join(inputs)} only make sense with "
+                f"--backend gguf",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.resolve_and_pin and os.environ.get(GGUF_REVISION_ENV):
+        # Ambiguous: the env sha would win over the hub resolution, so the
+        # pin line would print a possibly-stale exported sha while the
+        # operator believes it was freshly resolved. Fail loudly instead.
         print(
-            "error: --resolve-and-pin/--gguf-revision only make sense with "
-            "--backend gguf",
+            f"error: --resolve-and-pin with {GGUF_REVISION_ENV} set is "
+            f"ambiguous — the env sha would silently replace the hub "
+            f"resolution and the printed pin line could be stale. Unset "
+            f"{GGUF_REVISION_ENV}, or drop --resolve-and-pin (pass the sha "
+            f"via --gguf-revision to re-validate a known one).",
             file=sys.stderr,
         )
         return 2

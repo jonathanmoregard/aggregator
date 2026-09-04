@@ -369,6 +369,65 @@ def test_gguf_flags_on_the_st_backend_are_refused_not_ignored(harness, capsys):
     assert "gguf" in capsys.readouterr().err
 
 
+def test_the_env_sha_on_the_st_backend_is_refused_like_the_flag(
+    harness, fake_loaders, monkeypatch, capsys
+):
+    """--backend st refuses --gguf-revision; the env form must not slip past.
+
+    An operator who exported AGGREGATOR_GGUF_BENCH_REVISION and benched st
+    would have the sha silently unused — the flag form errors, so the env
+    form must error identically, naming the env var.
+    """
+    monkeypatch.setenv(harness.GGUF_REVISION_ENV, _SHA)
+
+    rc = harness.main(["--backend", "st"])
+    err = capsys.readouterr().err
+
+    assert rc != 0, "an env sha with --backend st was silently ignored"
+    assert harness.GGUF_REVISION_ENV in err, (
+        "the refusal never names the env var that triggered it"
+    )
+    assert fake_loaders == [], "a model was loaded on the way to refusing"
+
+
+def test_resolve_and_pin_with_the_env_sha_set_is_refused_as_ambiguous(
+    harness, fake_loaders, monkeypatch, capsys
+):
+    """A stale env sha must not masquerade as a fresh hub resolution.
+
+    With AGGREGATOR_GGUF_BENCH_REVISION exported, --resolve-and-pin would
+    silently bench (and print a pin line for) the OLD env sha while the
+    operator believes it was just resolved. Ambiguous input — fail loudly.
+    """
+
+    def _must_not_resolve():
+        raise AssertionError("resolved despite the ambiguous env sha")
+
+    monkeypatch.setattr(harness, "resolve_gguf_sha", _must_not_resolve)
+    monkeypatch.setenv(embed_mod.MODEL_DOWNLOAD_ENV, "1")
+    monkeypatch.setenv(harness.GGUF_REVISION_ENV, _SHA)
+
+    rc = harness.main(["--backend", "gguf", "--resolve-and-pin"])
+    err = capsys.readouterr().err
+
+    assert rc != 0, "--resolve-and-pin quietly used the env sha as the pin"
+    assert harness.GGUF_REVISION_ENV in err
+    assert "--resolve-and-pin" in err
+    assert fake_loaders == [], "a model was loaded on the way to refusing"
+
+
+def test_help_documents_the_flag_over_env_precedence(harness, capsys):
+    """Finding C asks for the precedence contract in --help: the flag wins
+    over the env on the non-resolve path, and the env conflicts with
+    --resolve-and-pin."""
+    with pytest.raises(SystemExit):
+        harness.parse_args(["--help"])
+    out = capsys.readouterr().out
+    assert harness.GGUF_REVISION_ENV in out
+    assert "flag wins" in out
+    assert "--resolve-and-pin" in out
+
+
 def test_a_bench_input_without_backend_is_refused_not_swept(
     harness, monkeypatch, capsys
 ):
