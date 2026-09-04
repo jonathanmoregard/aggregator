@@ -217,6 +217,17 @@ def format_help(
         "Aggregator DSL:",
         "  source:X tag:a,b from:YYYY-MM-DD to:YYYY-MM-DD [freeform FTS text]",
         "",
+        # The union is a coverage claim, and coverage claims need their
+        # caveat attached where the key is documented: a caller who reads
+        # only this help must still learn that tag: recall is partial until
+        # the backfill finishes, or an empty tag: page reads as "nothing on
+        # that topic" — the silence this project bans.
+        "  tag: matches source-written tags AND llm topic tags (the",
+        "  `aggregator tag` backfill) as one set. Coverage is PARTIAL until",
+        "  that backfill finishes — check llm_tag_coverage in",
+        "  aggregator_capabilities before trusting tag: alone; free text",
+        "  reaches untagged records regardless.",
+        "",
         "Sources currently cached:",
     ]
     for s in sources:

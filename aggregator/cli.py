@@ -601,6 +601,17 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
             f"embedded, {row['pending']} pending, {row['skipped']} nothing to "
             f"embed, {row['errors']} held ({row['kind']})"
         )
+    # The tag backfill's truth surface, same bargain as the block above: a
+    # partially-tagged corpus must never look fully tagged, and per-source is
+    # the granularity a human actually asks at ("can I trust tag: for my
+    # dropbox notes yet"). Riding on capabilities' llm_tag_coverage — cheap,
+    # unlike the embed tally.
+    print("llm tag coverage by source (`aggregator tag` backfill):")
+    for row in caps.get("llm_tag_coverage", []):
+        print(
+            f"  {row['source']}: {row['state']} — {row['tagged']}/{row['total']} "
+            f"tagged, {row['pending']} pending"
+        )
     print("ingest windows (per-source high-water marks):")
     for name in sorted(SOURCE_CURSORS):
         cursor = SOURCE_CURSORS[name]

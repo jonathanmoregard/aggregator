@@ -3020,6 +3020,11 @@ def _record_to_item(r: Record, fields: str) -> dict[str, Any]:
         "source": r.source,
         "subject": r.subject,
         "tags": list(r.tags),
+        # SEPARATE from ``tags``, deliberately: a caller must always be able
+        # to tell a source-written tag from a machine-generated topic label.
+        # Empty means "not tagged (yet)" — see capabilities'
+        # ``llm_tag_coverage`` for whether that is backlog or done.
+        "llm_tags": list(r.llm_tags),
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
         "content": content,
     }
@@ -4352,6 +4357,25 @@ _COVERAGE_NOTE = (
 )
 
 
+#: Printed beside ``llm_tag_coverage``. Same truthfulness bargain as
+#: :data:`_COVERAGE_NOTE` one surface over: the counts are worth nothing to
+#: an agent that cannot say what they imply, and what a partial tally implies
+#: is that ``tag:`` recall is PARTIAL for that source — an untagged record
+#: matches ``tag:`` only through its source-written tags, while its text
+#: stays fully reachable by free-text search either way. Without this
+#: sentence a half-tagged corpus reads as a fully-tagged one that simply has
+#: nothing under the tag asked about.
+_LLM_TAG_NOTE = (
+    "Per-source progress of the LLM topic-tag backfill (`aggregator tag`). "
+    "tag: filters match the UNION of source-written tags and LLM tags, so "
+    "for any source not 'complete' a tag: filter under-selects — records "
+    "not tagged yet match only through source-written tags. Their text is "
+    "STILL fully reachable by free-text search. Treat 'not_started' / "
+    "'in_progress' as 'do not trust tag: alone for this source', never as "
+    "'nothing is tagged with that topic'."
+)
+
+
 def aggregator_capabilities(
     embedding_coverage: bool = False, _store: Store | None = None
 ) -> dict[str, Any]:
@@ -4426,6 +4450,12 @@ def aggregator_capabilities(
         "tags_by_source": caps["tags_by_source"],
         "counts": caps.get("counts", {}),
         "vector_index": caps.get("vector_index", {}),
+        # Cheap enough for the connect path (one grouped count over ~4.4k
+        # records, unlike the embed tally) and needed BEFORE a search: an
+        # agent must know whether tag: can be trusted per source. The note is
+        # what keeps a partially-tagged corpus from looking fully tagged.
+        "llm_tag_coverage": caps.get("llm_tag_coverage", []),
+        "llm_tag_coverage_note": _LLM_TAG_NOTE,
         "date_range": caps["date_range"],
         "cache_path": caps["cache_path"],
         "schema_version": caps["schema_version"],
