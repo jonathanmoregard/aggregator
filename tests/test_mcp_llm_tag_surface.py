@@ -18,7 +18,7 @@ from aggregator.cli import main
 from aggregator.core.dsl import format_help
 from aggregator.core.store import Store
 from aggregator.mcp import aggregator_capabilities, aggregator_query
-from aggregator.sources.base import Record
+from aggregator.sources.base import ObservationRow, Record, SessionRow
 
 _TS = datetime(2026, 7, 25, tzinfo=UTC)
 
@@ -58,6 +58,93 @@ def test_untagged_record_item_has_empty_llm_tags(tmp_path):
     result = aggregator_query("tag:src-tag", search_mode="lexical", _store=s)
     (item,) = result["records"]
     assert item["llm_tags"] == []
+
+
+def _store_with_session(tmp_path) -> Store:
+    """A store holding ONE tagged record and ONE session with an observation.
+
+    The session half is the leak vector: sessions carry no tags, so a
+    ``tag:`` filter must never surface them — neither in union mode (a bare
+    ``tag:`` query) nor via the sessions path.
+    """
+    s = _store(tmp_path)
+    s.upsert([_rec("github:acme/api:1", "pr 1", "refactor foo.py", tags=["real-tag"])])
+    s.upsert_entities(
+        [
+            SessionRow(
+                session_id="sess-a",
+                root_session_id="sess-a",
+                parent_session_id=None,
+                kind="session",
+                agent_id=None,
+                agent_type=None,
+                spawned_by_tool_use_id=None,
+                cwd=None,
+                git_branch=None,
+                first_ts=_TS,
+                last_ts=_TS,
+                jsonl_path="/tmp/x.jsonl",
+            ),
+            ObservationRow(
+                obs_id="o1",
+                session_id="sess-a",
+                root_session_id="sess-a",
+                parent_obs_id=None,
+                type="user",
+                ts=_TS,
+                model=None,
+                input_tokens=None,
+                output_tokens=None,
+                tool_name=None,
+                tool_use_id=None,
+                body="hello there",
+            ),
+        ]
+    )
+    return s
+
+
+def test_tag_only_query_never_returns_untagged_sessions(tmp_path):
+    """Union-leak regression: a ``tag:`` filter must not match sessions.
+
+    A bare ``tag:`` query routes to union mode, and the sessions arm used to
+    ignore ``ast.tags`` entirely — every session came back unfiltered, so a
+    nonexistent tag returned the whole sessions table and a real tag's page 1
+    was dominated by sessions that never carried it.
+    """
+    s = _store_with_session(tmp_path)
+    result = aggregator_query(dsl="tag:zzz-nope", _store=s)
+    assert result["ok"] is True, result
+    assert result["total"] == 0, {
+        "total": result["total"],
+        "items": result.get("records"),
+    }
+
+
+def test_tag_query_returns_only_the_tagged_record(tmp_path):
+    s = _store_with_session(tmp_path)
+    result = aggregator_query(dsl="tag:real-tag", _store=s)
+    assert result["ok"] is True, result
+    assert result["total"] == 1
+    (item,) = result["records"]
+    assert item["stable_id"] == "github:acme/api:1"
+
+
+def test_sessions_scoped_tag_query_matches_nothing(tmp_path):
+    """``source:sessions tag:x``: sessions have no tags, so nothing matches."""
+    s = _store_with_session(tmp_path)
+    result = aggregator_query(dsl="source:sessions tag:real-tag", _store=s)
+    assert result["ok"] is True, result
+    assert result["total"] == 0
+    assert result["records"] == []
+
+
+def test_records_side_tag_filter_still_works_with_source_hint(tmp_path):
+    s = _store_with_session(tmp_path)
+    result = aggregator_query(dsl="source:github tag:real-tag", _store=s)
+    assert result["ok"] is True and result["mode"] == "records"
+    assert result["total"] == 1
+    assert result["records"][0]["stable_id"] == "github:acme/api:1"
 
 
 def test_capabilities_exposes_llm_tag_coverage_and_note(tmp_path):

@@ -5584,6 +5584,12 @@ class Store:
         """
         clauses = ["1=1"]
         params: list = []
+        if ast.tags:
+            # Sessions carry no tags, so a ``tag:`` filter can match NO
+            # session row — ever. Without this clause a ``tag:``-only query
+            # (which union-routes) got its sessions arm back UNFILTERED:
+            # every session in the store, drowning the actual tagged records.
+            clauses.append("1=0")
         if ast.source == "sessions":
             clauses.append("kind = ? AND origin = 'claude-code'")
             params.append("session")
@@ -5700,6 +5706,11 @@ class Store:
         """
         clauses = ["1=1"]
         params: list = []
+        if ast.tags:
+            # Observations carry no tags either — same invariant as
+            # ``_sessions_where``: an item without tags cannot match a
+            # ``tag:`` filter.
+            clauses.append("1=0")
         if ast.source in ("sessions", "subagents"):
             kind = "session" if ast.source == "sessions" else "subagent"
             clauses.append(
@@ -5784,6 +5795,7 @@ class Store:
             ast.top_session_id
             and not sessions
             and not ast.text
+            and not ast.tags
             and ast.id_scope is None
             and offset == 0
         ):
@@ -5814,6 +5826,7 @@ class Store:
             n == 0
             and ast.top_session_id
             and not ast.text
+            and not ast.tags
             and ast.id_scope is None
             and self._synthesise_orphan_root(ast.top_session_id) is not None
         ):
