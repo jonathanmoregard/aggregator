@@ -204,6 +204,32 @@ def _pinned(sha: str | None):
         embed_mod.QWEN3_EMBEDDING_GGUF_REVISION = prev
 
 
+@contextmanager
+def _scratch_xdg():
+    """Point XDG_DATA_HOME at /tmp scratch for the bench, then restore.
+
+    Never against the real cache: the bench builds nothing, but the
+    embedder's environment reads are shared with code that would. The legacy
+    sweep does this with a process-global ``setdefault`` (pre-existing
+    behavior, left alone); the bench path scopes it so importing the harness
+    and invoking ``main`` from a test leaves ``os.environ`` exactly as it
+    was. An operator's own value (the documented ``mktemp -d`` invocation)
+    still wins.
+    """
+    if os.environ.get("XDG_DATA_HOME"):
+        yield
+        return
+    prev = os.environ.get("XDG_DATA_HOME")  # None, or set-but-empty
+    os.environ["XDG_DATA_HOME"] = "/tmp/aggregator-measure-xdg"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("XDG_DATA_HOME", None)
+        else:
+            os.environ["XDG_DATA_HOME"] = prev
+
+
 def resolve_gguf_sha() -> str:
     """The current commit sha of the default ``-GGUF`` repo, from the hub.
 
@@ -272,10 +298,6 @@ def _bench_size_curve(
 
 def run_bench(args: argparse.Namespace) -> int:
     """``--backend st|gguf``: the size curve, plus fidelity + pin for gguf."""
-    # Never against the real cache: this builds nothing, but the embedder's
-    # module-level environment reads are shared with code that would.
-    os.environ.setdefault("XDG_DATA_HOME", "/tmp/aggregator-measure-xdg")
-
     if args.backend == "st":
         inputs = _bench_inputs(args, os.environ)
         if inputs:
@@ -318,6 +340,12 @@ def run_bench(args: argparse.Namespace) -> int:
             return 2
         revision = resolve_gguf_sha()
 
+    with _scratch_xdg():
+        return _run_bench_loaded(args, revision)
+
+
+def _run_bench_loaded(args: argparse.Namespace, revision: str | None) -> int:
+    """The model-touching half of the bench, under the scratch XDG."""
     texts = {chars: body(chars) for chars in SIZE_CURVE_CHARS}
 
     # gguf first: a bad sha or a refused download should fail in seconds,

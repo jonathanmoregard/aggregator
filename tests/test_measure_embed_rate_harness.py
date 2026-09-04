@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -367,6 +368,55 @@ def test_gguf_flags_on_the_st_backend_are_refused_not_ignored(harness, capsys):
     rc = harness.main(["--backend", "st", "--resolve-and-pin"])
     assert rc != 0
     assert "gguf" in capsys.readouterr().err
+
+
+def test_run_bench_leaves_os_environ_unchanged(harness, monkeypatch, capsys):
+    """The scratch XDG_DATA_HOME must not leak out of the bench.
+
+    run_bench pointed XDG_DATA_HOME at /tmp scratch via a process-global
+    setdefault, so any test (or caller) invoking main() with the var unset
+    inherited the mutation for the rest of the process. The scratch value
+    must be in effect during the model load and gone afterwards.
+    """
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    seen = []
+
+    def _fake_load(backend):
+        seen.append(os.environ.get("XDG_DATA_HOME"))
+        return _FakeEmbedder(backend)
+
+    monkeypatch.setattr(harness, "_load_embedder", _fake_load)
+
+    rc = harness.main(["--backend", "st"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert seen == ["/tmp/aggregator-measure-xdg"], (
+        "the model load ran against the REAL data dir, not the scratch one"
+    )
+    assert "XDG_DATA_HOME" not in os.environ, (
+        "run_bench leaked the scratch XDG_DATA_HOME into os.environ"
+    )
+
+
+def test_run_bench_respects_a_preset_xdg_data_home(harness, monkeypatch, capsys):
+    """An operator's own XDG_DATA_HOME (the documented mktemp -d invocation)
+    keeps winning, exactly as setdefault behaved."""
+    monkeypatch.setenv("XDG_DATA_HOME", "/custom/xdg")
+    seen = []
+
+    def _fake_load(backend):
+        seen.append(os.environ.get("XDG_DATA_HOME"))
+        return _FakeEmbedder(backend)
+
+    monkeypatch.setattr(harness, "_load_embedder", _fake_load)
+
+    rc = harness.main(["--backend", "st"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert seen == ["/custom/xdg"]
+    assert os.environ.get("XDG_DATA_HOME") == "/custom/xdg"
 
 
 def test_the_env_sha_on_the_st_backend_is_refused_like_the_flag(
