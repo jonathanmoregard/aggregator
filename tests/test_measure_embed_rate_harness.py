@@ -553,6 +553,62 @@ def test_bare_invocation_with_no_bench_input_still_sweeps(harness, monkeypatch):
     assert swept == [True]
 
 
+def _real_unpinned_download_error() -> RuntimeError:
+    """embed.py's genuine refusal, produced by the code that raises it.
+
+    Generated rather than retyped so the harness's detection is tested
+    against the message that will actually reach it — if embed.py rewords
+    the refusal, this fails instead of silently testing a stale copy.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(embed_mod.MODEL_DOWNLOAD_ENV, "1")
+        with pytest.raises(RuntimeError) as excinfo:
+            embed_mod.Embedder._gguf_revision(embed_mod._DEFAULT_MODEL_GGUF)
+    return excinfo.value
+
+
+def test_the_unpinned_download_refusal_gets_the_harness_remedy(
+    harness, monkeypatch, capsys
+):
+    """--backend gguf + download opt-in + no revision must not end in a raw
+    traceback whose remedy says to edit the constant. The harness catches
+    embed.py's refusal and exits with its OWN remedy: the bench validates a
+    sha BEFORE the constant is edited, via --resolve-and-pin or
+    --gguf-revision. embed.py itself stays unchanged."""
+    error = _real_unpinned_download_error()
+
+    def _fake_load(backend):
+        if backend == "gguf":
+            raise error
+        return _FakeEmbedder(backend)
+
+    monkeypatch.setattr(harness, "_load_embedder", _fake_load)
+    monkeypatch.setenv(embed_mod.MODEL_DOWNLOAD_ENV, "1")
+    monkeypatch.delenv(harness.GGUF_REVISION_ENV, raising=False)
+
+    rc = harness.main(["--backend", "gguf"])
+    err = capsys.readouterr().err
+
+    assert rc != 0
+    assert "--gguf-revision" in err and "--resolve-and-pin" in err, (
+        "the harness's remedy never names its own flags — the operator is "
+        "left with embed.py's edit-the-constant instruction"
+    )
+
+
+def test_an_unrelated_runtime_error_still_propagates(harness, monkeypatch):
+    """Only the unpinned-download refusal gets translated; anything else out
+    of the loader is a real failure and must keep its traceback."""
+
+    def _fake_load(backend):
+        raise RuntimeError("no embedder backend loaded")
+
+    monkeypatch.setattr(harness, "_load_embedder", _fake_load)
+
+    with pytest.raises(RuntimeError, match="no embedder backend loaded"):
+        harness.main(["--backend", "gguf"])
+
+
 def test_resolve_gguf_sha_asks_the_hub_for_the_default_gguf_repo(
     harness, monkeypatch
 ):

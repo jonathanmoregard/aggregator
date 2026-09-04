@@ -358,8 +358,28 @@ def _run_bench_loaded(args: argparse.Namespace, revision: str | None) -> int:
     # before a minute of st reference encoding is spent.
     gguf_embedder = None
     if args.backend == "gguf":
-        with _pinned(revision):
-            gguf_embedder = _load_embedder("gguf")
+        try:
+            with _pinned(revision):
+                gguf_embedder = _load_embedder("gguf")
+        except RuntimeError as e:
+            msg = str(e)
+            if "unpinned" not in msg or "QWEN3_EMBEDDING_GGUF_REVISION" not in msg:
+                raise
+            # embed.py's unpinned-download refusal. Its remedy — edit the
+            # constant and rebuild — is right for its own callers, but the
+            # BENCH exists to validate a sha before that edit; re-state the
+            # refusal with the harness's remedy instead of a raw traceback.
+            print(
+                f"error: embed.py refused to download "
+                f"{embed_mod._DEFAULT_MODEL_GGUF} unpinned "
+                f"(QWEN3_EMBEDDING_GGUF_REVISION is None and no candidate "
+                f"revision was supplied). The bench validates a sha BEFORE "
+                f"that constant is edited: rerun with --resolve-and-pin to "
+                f"fetch and bench the repo's current sha, or name a known "
+                f"one via --gguf-revision SHA (env {GGUF_REVISION_ENV}).",
+                file=sys.stderr,
+            )
+            return 2
     st_embedder = _load_embedder("st")
 
     # Token counts from the st tokenizer FOR BOTH BACKENDS: the comparison is
