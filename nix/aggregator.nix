@@ -1136,6 +1136,28 @@ in {
           ExecStart = "${tagRunner}";
           StandardOutput = "journal";
           StandardError = "journal";
+          # The sandbox its siblings carry, to the extent the claude CLI
+          # tolerates — every directive below verified on this host
+          # (2026-09-04): `claude -p --model haiku` under exactly this set
+          # via `systemd-run --user` answered and exited 0. The prompt
+          # carries attacker-influenced record bodies, so the unit gets the
+          # same "shrink the ambient surface" treatment as the torch pair.
+          #
+          # DELIBERATELY ABSENT, each load-bearing for `claude -p`:
+          #   ProtectHome — the CLI must READ ~/.claude config+credentials
+          #     and WRITE its own state under $HOME. `ProtectSystem=full`
+          #     still makes /usr, /boot and /etc read-only.
+          #   PrivateNetwork / IPAddressDeny — the CLI exists to reach the
+          #     API; this unit is network-permitted like aggregator-github.
+          # The hygiene check asserts both directions (present + absent).
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          ProtectSystem = "full";
+          ProtectKernelTunables = true;
+          ProtectControlGroups = true;
         };
       };
 

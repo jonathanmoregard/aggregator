@@ -740,6 +740,38 @@
                 fail "aggregator-embed-seed.service sets PrivateNetwork — it exists to fetch 2.4 GB of weights over the internet"
               fi
 
+              # ---- 8c. The tag unit's sandbox ------------------------------
+              # `aggregator tag` shells out to `claude -p` with
+              # attacker-influenced record bodies in the prompt, so the unit
+              # carries the sibling sandbox to the extent the claude CLI
+              # tolerates. Every directive below was verified on the host
+              # (2026-09-04): `claude -p --model haiku` under exactly this
+              # set via `systemd-run --user` answered and exited 0.
+              tag_svc="$units/aggregator-tag.service"
+              for directive in \
+                'NoNewPrivileges=true' \
+                'PrivateTmp=true' \
+                'RestrictRealtime=true' \
+                'RestrictSUIDSGID=true' \
+                'LockPersonality=true' \
+                'ProtectSystem=full' \
+                'ProtectKernelTunables=true' \
+                'ProtectControlGroups=true'; do
+                grep -qxF "$directive" "$tag_svc" \
+                  || fail "aggregator-tag.service is missing '$directive' — it feeds attacker-influenced record bodies to a subprocess and must not run with the user's full ambient authority"
+              done
+
+              # ...and the directives that would BREAK it, step-8b style.
+              if grep -q '^ProtectHome=' "$tag_svc"; then
+                fail "aggregator-tag.service sets ProtectHome — claude -p must read ~/.claude config+credentials and write its own state under \$HOME"
+              fi
+              if grep -q '^PrivateNetwork=' "$tag_svc"; then
+                fail "aggregator-tag.service sets PrivateNetwork — the claude CLI exists to reach its API; this unit is network-permitted like aggregator-github"
+              fi
+              if grep -q '^IPAddressDeny=any$' "$tag_svc"; then
+                fail "aggregator-tag.service sets IPAddressDeny=any — that blocks the API call this unit exists to make"
+              fi
+
               # ---- 9. The score behind step 8, and why it is not asserted -
               # `systemd-analyze security --offline=true --user <unit>` rates
               # the rendered file without loading it, and
