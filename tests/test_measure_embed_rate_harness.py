@@ -369,6 +369,54 @@ def test_gguf_flags_on_the_st_backend_are_refused_not_ignored(harness, capsys):
     assert "gguf" in capsys.readouterr().err
 
 
+def test_a_bench_input_without_backend_is_refused_not_swept(
+    harness, monkeypatch, capsys
+):
+    """A forgotten ``--backend gguf`` must not burn a ~30-minute st sweep.
+
+    The bare invocation stays the legacy sweep ONLY when no bench-mode input
+    is present. If --resolve-and-pin, --gguf-revision, or the env sha arrives
+    without --backend, the run must exit non-zero naming the missing flag —
+    not silently ignore the input and start sweeping.
+    """
+
+    def _must_not_sweep():
+        raise AssertionError("legacy sweep started despite a bench-mode input")
+
+    monkeypatch.setattr(harness, "legacy_sweep", _must_not_sweep)
+    monkeypatch.delenv(harness.GGUF_REVISION_ENV, raising=False)
+
+    for argv, env_sha in (
+        (["--resolve-and-pin"], None),
+        (["--gguf-revision", _SHA], None),
+        ([], _SHA),
+    ):
+        if env_sha is not None:
+            monkeypatch.setenv(harness.GGUF_REVISION_ENV, env_sha)
+        rc = harness.main(argv)
+        err = capsys.readouterr().err
+        if env_sha is not None:
+            monkeypatch.delenv(harness.GGUF_REVISION_ENV)
+
+        assert rc != 0, f"{argv} with env={env_sha!r} fell through to the sweep"
+        assert "--backend" in err, (
+            f"the refusal for {argv} never names the missing flag"
+        )
+        if env_sha is not None:
+            assert harness.GGUF_REVISION_ENV in err, (
+                "the env-triggered refusal never names the env var"
+            )
+
+
+def test_bare_invocation_with_no_bench_input_still_sweeps(harness, monkeypatch):
+    """The doc's 40 tok/s table came from the bare command; keep it working."""
+    swept = []
+    monkeypatch.setattr(harness, "legacy_sweep", lambda: (swept.append(True), 0)[1])
+    monkeypatch.delenv(harness.GGUF_REVISION_ENV, raising=False)
+    assert harness.main([]) == 0
+    assert swept == [True]
+
+
 def test_resolve_gguf_sha_asks_the_hub_for_the_default_gguf_repo(
     harness, monkeypatch
 ):

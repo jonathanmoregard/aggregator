@@ -376,10 +376,36 @@ def run_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bench_inputs(args: argparse.Namespace, environ: Mapping[str, str]) -> list[str]:
+    """The names of every bench-mode input present — flag or env."""
+    return [
+        name
+        for name, present in (
+            ("--resolve-and-pin", args.resolve_and_pin),
+            ("--gguf-revision", args.gguf_revision is not None),
+            (GGUF_REVISION_ENV, bool(environ.get(GGUF_REVISION_ENV))),
+        )
+        if present
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.backend is not None:
         return run_bench(args)
+    # Bare invocation == the legacy sweep, but ONLY when nothing bench-shaped
+    # was supplied. A forgotten `--backend gguf` must fail in milliseconds,
+    # not burn a ~30-minute st sweep with the pin inputs silently ignored.
+    inputs = _bench_inputs(args, os.environ)
+    if inputs:
+        print(
+            f"error: {', '.join(inputs)} set without --backend — the bare "
+            f"invocation is the legacy full sweep and would ignore "
+            f"{'them' if len(inputs) > 1 else 'it'}; add --backend gguf to "
+            f"run the bench",
+            file=sys.stderr,
+        )
+        return 2
     return legacy_sweep()
 
 
