@@ -27,12 +27,15 @@ exists to detect.
 """
 from __future__ import annotations
 
+import importlib
 import itertools
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -92,29 +95,44 @@ def _fake_tree(root: Path, version: int) -> Path:
     return root
 
 
-def _fake_writer(root: Path, version: int | None) -> Path:
-    """A Nix-shaped writer install, wrapper indirection and all.
+def _fake_writer(
+    root: Path,
+    version: int | None,
+    *,
+    name: str = "aggregator",
+    outer_dir: str = "wrapper",
+) -> Path:
+    """A Nix-shaped install, wrapper indirection and all.
 
-    Reproduces the real chain measured on this host: ``bin/aggregator`` is a
-    shell wrapper whose last line execs a second ``bin/aggregator`` inside an
-    env derivation, and only that env carries
-    ``lib/python3.11/site-packages/aggregator/core/store.py``. A probe that
-    only handled the direct case would report UNKNOWN against every real
-    NixOS install, which is the only kind this host has.
+    Reproduces the real chain measured on this host: ``bin/<name>`` is a shell
+    wrapper whose last line execs a second ``bin/<name>`` inside an env
+    derivation, and only that env carries
+    ``lib/python3.11/site-packages/aggregator/core/store.py``. A probe that only
+    handled the direct case would report UNKNOWN against every real NixOS
+    install, which is the only kind this host has.
 
-    ``version=None`` builds the wrapper chain but no packaged source, i.e. a
-    writer whose version cannot be determined.
+    ONE fixture builds both sides, because the reader's chain has the identical
+    shape — ``/etc/profiles/.../bin/aggregator-mcp`` -> a wrapper in an
+    ``aggregator-0.0.1`` derivation -> a console script in an
+    ``aggregator-env`` derivation that owns site-packages. ``name`` picks the
+    program, and ``outer_dir`` puts the outer wrapper in a real ``bin/`` when
+    the test needs it found on a ``PATH``. Mirrors the source, which resolves
+    both through one walker: if the two ever needed different fixtures, they
+    would need different walkers, and that is the drift this design refuses.
+
+    ``version=None`` builds the wrapper chain but no packaged source, i.e. an
+    install whose version cannot be determined.
     """
     env = root / "env"
-    binroot = root / "wrapper"
+    binroot = root / outer_dir
     (env / "bin").mkdir(parents=True, exist_ok=True)
     binroot.mkdir(parents=True, exist_ok=True)
 
-    inner = env / "bin" / "aggregator"
+    inner = env / "bin" / name
     inner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     inner.chmod(0o755)
 
-    outer = binroot / "aggregator"
+    outer = binroot / name
     outer.write_text(
         "#!/bin/sh\n"
         "PYTHONPATH=${PYTHONPATH%':'}\n"
@@ -131,6 +149,52 @@ def _fake_writer(root: Path, version: int | None) -> Path:
             f"SCHEMA_VERSION = {int(version)}\n", encoding="utf-8"
         )
     return outer
+
+
+def _claude_json(home: Path, entry: object | None) -> Path:
+    """A ``~/.claude.json`` shaped like this host's, with one aggregator entry.
+
+    ``entry=None`` means the file exists and configures no aggregator server.
+    Anything else is written verbatim, including shapes that are not objects at
+    all — the probe has to survive a hand-edited config, not only a valid one.
+
+    The two decorations are not decoration. The real file carries FIVE
+    top-level servers, so a probe that took "the only server" or "the first
+    server" would pass a one-entry fixture and fail on the host. And it carries
+    a stale PROJECT-scoped block —
+    ``projects["/home/jonathan/Repos/gdocs-review-mcp"].mcpServers.aggregator``
+    with ``args: ["not", "found"]``, left over from an unrelated repo — which
+    applies only to sessions started in that directory. Both are in every
+    fixture so a probe that ever starts reading either fails here rather than on
+    the machine.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    doc: dict = {
+        "projects": {
+            "/home/jonathan/Repos/gdocs-review-mcp": {
+                "mcpServers": {
+                    "aggregator": {"command": "aggregator-mcp", "args": ["not", "found"]}
+                }
+            }
+        },
+        "mcpServers": {"research-agent": {"command": "true", "args": []}},
+    }
+    if entry is not None:
+        doc["mcpServers"]["aggregator"] = entry
+    path = home / ".claude.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _env(home: Path, *, path: str = "") -> dict[str, str]:
+    """The two environment values the reader resolution reads, and nothing else.
+
+    A plain dict rather than a monkeypatched ``os.environ``: every resolver in
+    the probe takes its environment as an argument, and that is the property
+    that makes a PATH lookup testable without a shell and without leaking one
+    test's PATH into the next.
+    """
+    return {"HOME": str(home), "PATH": path}
 
 
 @pytest.fixture
@@ -226,28 +290,228 @@ def test_the_live_incident_reports_both_states_at_once(world):
     assert v.exit_code() == sp.EXIT_DEAD
 
 
-def test_a_cache_ahead_of_the_reader_is_not_a_fault(world):
-    """Mirrors the gate's ``<``, which is deliberate and not a typo.
+def test_a_cache_ahead_of_the_reader_is_dead_too(world):
+    """The mirror of the incident, and the half the probe used to call healthy.
 
-    ``mcp.py`` refuses only a cache OLDER than it requires. A newer cache is
-    readable, so the probe must not invent a fault the reader does not have —
-    a check stricter than the thing it checks trains its operator to ignore
-    it.
+    THIS TEST USED TO ASSERT THE OPPOSITE, on the strength of ``mcp.py``'s gate
+    being ``version < SCHEMA_VERSION``. That gate is now ``!=`` — see
+    ``_ensure_cache_ready`` and ``_ahead_cache_response``, which exist because
+    serving a cache the reader cannot describe is the WORSE half of the two
+    failures: it answers, with rows out of tables this build has no description
+    of, so nothing about it prompts anyone to look. A probe that reported
+    "healthy, exit 0" while every ``aggregator_search_memory`` call came back
+    ``ok:false`` would be the original incident wearing the other shoe.
+
+    The probe must mirror the gate it reports on. Stricter than the reader
+    trains an operator to ignore it; LOOSER than the reader is the failure this
+    module exists to prevent.
     """
     v = world(cache=7, reader=6, writer=7)
-    assert v.state == sp.FINE, v.explain()
-    assert v.exit_code() == 0
+    assert v.state != sp.FINE, v.explain()
+    assert sp.DEAD in v.states, v.explain()
+    assert v.exit_code() == sp.EXIT_DEAD
+    assert "7" in v.explain() and "6" in v.explain()
 
 
-def test_writer_ahead_of_the_reader_is_not_a_fault(world):
-    """The forward-fix direction, which must never be flagged.
+def test_the_cache_ahead_remedy_moves_the_reader_never_the_cache(world):
+    """Opposite cause, opposite fix — and one fix here is actively destructive.
 
-    Bringing the writer up past the reader is the sanctioned repair for this
-    incident. If the probe called that a fault it would argue against its own
-    remedy while the operator was applying it.
+    In the stale direction the writer lags and a newer writer is deployed. Here
+    the CACHE is the current side: whatever wrote it is already ahead, and the
+    reader is the lagging one. Running an older writer against it re-stamps
+    ``user_version`` DOWNWARD, which turns a cache one component cannot read
+    into a cache that is wrong for all of them. So the remedy must send the
+    operator at the reader binary Claude Code launches, and must not name the
+    cache or a downgrade as an option at all.
+    """
+    v = world(cache=7, reader=6, writer=7)
+    fix = " ".join(f.remedy for f in v.findings if f.state == sp.DEAD)
+    assert "restart" in fix.lower(), fix
+    assert "reader" in fix.lower(), fix
+    assert "downgrad" not in fix.lower(), fix
+
+
+def _remedy_targets(verdict) -> set[int]:
+    """Every version number the SKEW remedies tell an operator to reach.
+
+    Remedies only — never ``detail``. The details legitimately quote numbers
+    that are below the cache, because that is what they measured; it is the
+    instructions that must not send anyone backwards. UNKNOWN findings are
+    excluded too: their remedies carry ``lib/python3*`` and byte counts, which
+    are not versions.
+    """
+    return {
+        int(n)
+        for f in verdict.findings
+        if f.state in (sp.DEAD, sp.WILL_ROT)
+        for n in re.findall(r"\d+", f.remedy)
+    }
+
+
+def test_a_three_way_skew_does_not_advise_undoing_its_own_other_remedy(world):
+    """cache 7, reader 6, writer 5 — and the two remedies used to disagree.
+
+    Each finding was computed against the READER alone, so with three distinct
+    versions the advice forked. The DEAD finding said the cache is the current
+    side, leave it alone, bring the reader to 7. The WILL_ROT finding said bump
+    the writer to "at least 6" — and a schema-6 writer re-stamps that
+    schema-7 cache DOWN on the next tick, destroying the thing the other half
+    of the same message had just called authoritative.
+
+    An operator who follows both instructions must not end up worse off than
+    one who follows either. So every remedy names ONE target: the highest
+    version anything here is at, because that is the only number nothing has to
+    move backwards to reach.
+    """
+    v = world(cache=7, reader=6, writer=5)
+    assert sp.DEAD in v.states and sp.WILL_ROT in v.states, v.explain()
+
+    targets = _remedy_targets(v)
+    assert targets == {7}, v.explain()
+    assert min(targets) >= v.cache_version, "a remedy advised down-stamping the cache"
+
+
+def test_the_mirror_three_way_skew_agrees_with_itself_too(world):
+    """cache 5, reader 6, writer 7. Same defect, pointing the other way.
+
+    Here the DEAD finding used to say "bring the WRITER up to at least 6" about
+    a writer already at 7 — which is either inert or, read literally, an
+    instruction to install a SIXES writer in place of the seven and start
+    down-stamping. Meanwhile the WILL_ROT finding correctly asked for a reader
+    at 7. One number, derived from all three quantities, is what makes those
+    the same instruction.
+    """
+    v = world(cache=5, reader=6, writer=7)
+    assert sp.DEAD in v.states and sp.WILL_ROT in v.states, v.explain()
+
+    targets = _remedy_targets(v)
+    assert targets == {7}, v.explain()
+    assert min(targets) >= v.cache_version, "a remedy advised down-stamping the cache"
+
+
+def test_two_way_skews_keep_naming_the_reader_s_requirement(world):
+    """The target only moves when a third version exists to move it.
+
+    Every two-quantity world — the live incident included — has its highest
+    version at the reader or the cache, so the number in these messages is the
+    one that was always there. Stated so the generalisation is visibly a
+    generalisation and not a rewrite of the texts the incident produced.
+    """
+    assert _remedy_targets(world(cache=5, reader=6, writer=6)) == {6}
+    assert _remedy_targets(world(cache=6, reader=6, writer=5)) == {6}
+    assert _remedy_targets(world(cache=5, reader=6, writer=5)) == {6}
+    assert _remedy_targets(world(cache=7, reader=6, writer=7)) == {7}
+
+
+def test_writer_ahead_of_the_reader_will_rot(world):
+    """The writer stamps what the reader must accept, so ahead rots too.
+
+    ALSO INVERTED FROM WHAT IT ONCE ASSERTED, and for the same reason: while
+    the gate was ``<``, a writer past the reader was the sanctioned forward
+    fix and flagging it would have argued against the probe's own remedy. Under
+    ``!=`` it is a countdown. ``migrate()`` ends by stamping the writer's own
+    constant, so the next ingest tick puts the cache at 7 against a reader that
+    requires exactly 6 — recall works this minute and is refused within one
+    timer period, which is the WILL_ROT shape exactly.
     """
     v = world(cache=6, reader=6, writer=7)
+    assert v.state != sp.FINE, v.explain()
+    assert sp.WILL_ROT in v.states, v.explain()
+    assert v.exit_code() == sp.EXIT_WILL_ROT
+
+
+def test_a_writer_level_with_the_reader_still_down_stamps_a_newer_cache(world):
+    """cache 7, reader 6, writer 6 — and nothing used to name the writer.
+
+    WILL_ROT was computed against the reader alone, so a writer that agrees
+    with the reader was silent by construction. Here that silence is wrong: the
+    DEAD finding correctly says the cache is the current side, bring the READER
+    up to 7 and never down-stamp the cache — and the writer sitting at 6 does
+    exactly that down-stamp on the next ingest tick, and exits 0 doing it. The
+    operator follows the remedy, redeploys the reader, and thirty minutes later
+    the cache is back at 6 with no new alarm to explain why.
+
+    "Behind" is therefore a comparison against the highest version anything
+    here is at, not against the reader: the writer is what STAMPS, so a cache
+    above it is a cache it will pull down.
+    """
+    v = world(cache=7, reader=6, writer=6)
+    assert sp.DEAD in v.states, v.explain()
+    assert sp.WILL_ROT in v.states, v.explain()
+
+    rot = " ".join(f.text() for f in v.findings if f.state == sp.WILL_ROT).lower()
+    assert "writer" in rot, rot
+    assert "cache" in rot, rot
+    assert _remedy_targets(v) == {7}, v.explain()
+
+
+def test_a_writer_that_agrees_with_a_current_cache_stays_silent(world):
+    """The control for the test above: agreement is still agreement.
+
+    Widening "behind" to the maximum must not make a healthy machine speak.
+    Cache, reader and writer all at 6 is the FINE case, and the silence budget
+    is spent the moment a probe finds something to say about it.
+    """
+    v = world(cache=6, reader=6, writer=6)
     assert v.state == sp.FINE, v.explain()
+    assert v.findings == [], v.explain()
+
+
+def test_a_writer_below_the_cache_is_named_even_with_an_unknown_reader(tmp_path):
+    """cache 7, reader UNKNOWN, writer 6 — the skew was measured, so say it.
+
+    Both skew blocks used to be gated on a known reader, so an unresolvable or
+    oversized ``~/.claude.json`` swallowed a comparison that never needed the
+    reader in the first place. The operator was handed one instruction —
+    repair the config — while the schema-6 writer beside it re-stamped a
+    schema-7 cache DOWN to 6 on the next ingest tick and exited 0 doing it.
+    Repairing the config does not slow that down by one second, and nothing
+    fires afterwards to explain a cache that moved backwards.
+
+    Which reader Claude Code starts is genuinely unknown here. That the writer
+    will pull the cache down is not: it is a two-quantity fact about two
+    quantities that were both read. Rule 2 forbids calling an unmeasured thing
+    fine; it does not license staying silent about the measured one.
+    """
+    _stamp_cache(tmp_path / "cache.db", 7)
+    v = sp.probe(
+        cache_db=tmp_path / "cache.db",
+        reader_dir=tmp_path / "no-such-checkout",
+        writer_bin=_fake_writer(tmp_path / "writer", 6),
+    )
+    assert v.reader_version is None, v.explain()
+    assert sp.UNKNOWN in v.states, "the unreadable reader still has to be reported"
+    assert sp.WILL_ROT in v.states, v.explain()
+
+    rot = " ".join(f.text() for f in v.findings if f.state == sp.WILL_ROT).lower()
+    assert "writer" in rot, rot
+    assert "cache" in rot, rot
+    assert "7" in rot and "6" in rot, rot
+    # Same one forward target every other remedy names: the highest measured.
+    assert _remedy_targets(v) == {7}, v.explain()
+
+
+def test_a_writer_above_the_cache_stays_quiet_when_the_reader_is_unknown(tmp_path):
+    """cache 6, reader UNKNOWN, writer 7 — the ordinary deploy, mid-flight.
+
+    The control for the test above, and the reason the widened branch is
+    cache-relative rather than symmetric. A writer ahead of the cache is what
+    every schema bump looks like between the rebuild and the next ingest tick:
+    the tick migrates the cache UP, which is the sanctioned forward direction.
+    Calling that WILL_ROT would need the reader's requirement to know whether
+    the cache is about to overshoot it — and the reader is exactly what could
+    not be read. So the only honest thing to say here is what the UNKNOWN
+    finding already says, and the silence budget is not spent twice.
+    """
+    _stamp_cache(tmp_path / "cache.db", 6)
+    v = sp.probe(
+        cache_db=tmp_path / "cache.db",
+        reader_dir=tmp_path / "no-such-checkout",
+        writer_bin=_fake_writer(tmp_path / "writer", 7),
+    )
+    assert v.reader_version is None, v.explain()
+    assert v.states == [sp.UNKNOWN], v.explain()
+    assert sp.WILL_ROT not in v.states, v.explain()
 
 
 # --- unknown ⇒ warn, never "fine" -------------------------------------------
@@ -457,6 +721,781 @@ def test_probe_does_not_execute_the_writer(tmp_path):
     assert v.state == sp.WILL_ROT, v.explain()
 
 
+# --- one walker, two callers ------------------------------------------------
+
+
+def test_resolve_package_dir_walks_a_nix_wrapper_chain_to_site_packages(tmp_path):
+    """The two-hop chain every install on this host is reached through.
+
+    ``bin/aggregator`` is a shell wrapper; only the env derivation it execs
+    carries ``lib/python3.11/site-packages``. What comes back is the DIRECTORY,
+    not the version, because the verdict reports that path to a human who then
+    has to go and look at the file the number came from.
+    """
+    writer = _fake_writer(tmp_path / "writer", 6)
+    found = sp.resolve_package_dir(writer)
+    assert found == tmp_path / "writer" / "env" / "lib" / "python3.11" / "site-packages"
+    assert sp.read_reader_version(found) == 6
+
+
+def test_resolve_package_dir_is_none_when_no_packaged_source_is_reachable(tmp_path):
+    """A chain that ends nowhere useful, a path that is not a file, and nothing.
+
+    All three are "could not tell". Returning a directory that carries no
+    ``store.py`` would name a place the number did not come from, which is the
+    same lie one layer further from the operator.
+    """
+    assert sp.resolve_package_dir(_fake_writer(tmp_path / "empty", None)) is None
+    assert sp.resolve_package_dir(tmp_path / "no-such-binary") is None
+    assert sp.resolve_package_dir(None) is None
+
+
+def test_the_writer_reads_through_the_one_shared_walker(tmp_path):
+    """The writer keeps its answer, and gets it from the shared helper.
+
+    The reader is reached through a chain of the identical shape, so a second
+    copy of this walk would be a second thing to drift — and the half that
+    drifted would be the half nobody was looking at, which is precisely how the
+    incident this file detects lasted three days.
+    """
+    writer = _fake_writer(tmp_path / "writer", 5)
+    assert sp.read_writer_version(writer) == 5
+
+    # The directory the writer's answer came out of, spelled independently
+    # rather than re-derived from the helper under test — asserting
+    # ``read_writer_version(w) == read_reader_version(resolve_package_dir(w))``
+    # would restate that function's one-line definition and hold even if the
+    # walk found nothing at all.
+    site_packages = tmp_path / "writer" / "env" / "lib" / "python3.11" / "site-packages"
+    assert sp.resolve_package_dir(writer) == site_packages
+    assert (site_packages / "aggregator" / "core" / "store.py").read_text(
+        encoding="utf-8"
+    ) == "SCHEMA_VERSION = 5\n"
+
+
+def test_the_writer_is_the_one_beside_the_reader_not_the_one_on_path(tmp_path):
+    """PATH is the probe's PATH, and in a checkout that is the wrong writer.
+
+    THE WRITER UNDER TEST IS THE DEPLOYED ONE. On this host the ingest timer
+    execs ``pkgs.aggregator`` — the same package the profile's
+    ``aggregator-mcp`` comes from, so the two sit in one ``bin/``. A bare
+    ``_which("aggregator")`` instead answers with whatever is first on the
+    PATH the probe happens to inherit, and inside a checkout, a ``uv run`` or
+    a devShell that is the checkout's own venv CLI. Nobody's ingest timer runs
+    that binary.
+
+    The failure is quiet in both directions: the probe reports the checkout's
+    version as "the writer", so a genuinely lagging deployed writer never
+    fires WILL_ROT, and a checkout that happens to be ahead invents a skew
+    nobody has. Both are the two-quantity blindness this module exists to
+    remove, re-entering through the PATH.
+    """
+    home = tmp_path / "home"
+    reader = _fake_writer(
+        tmp_path / "profile", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _fake_writer(tmp_path / "profile", 6, name="aggregator", outer_dir="bin")
+    checkout = _fake_writer(
+        tmp_path / "checkout", 7, name="aggregator", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(reader), "args": []})
+
+    env = _env(home, path=str(checkout.parent))
+    assert sp.resolve_writer_bin(env) == tmp_path / "profile" / "bin" / "aggregator"
+    assert sp.read_writer_version(sp.resolve_writer_bin(env)) == 6
+
+    # And end to end: the checkout at 7 must not become a skew report.
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.FINE, v.explain()
+    assert v.writer_version == 6, v.explain()
+    assert v.writer_bin == str(tmp_path / "profile" / "bin" / "aggregator")
+
+
+def test_the_sibling_lookup_yields_to_the_override_and_falls_back_to_path(tmp_path):
+    """The new step is a middle one: it must not swallow the two either side.
+
+    ``AGGREGATOR_WRITER_BIN`` stays first — every input here is overridable,
+    and a probe that could only look at the live machine could not be tested.
+    And a profile that ships ``aggregator-mcp`` without the CLI beside it has
+    no sibling to find, so the PATH search still has to answer; a middle step
+    that returned "nothing" rather than deferring would turn a working
+    single-package install into UNKNOWN.
+    """
+    home = tmp_path / "home"
+    reader = _fake_writer(
+        tmp_path / "profile", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _fake_writer(tmp_path / "profile", 6, name="aggregator", outer_dir="bin")
+    on_path = _fake_writer(tmp_path / "elsewhere", 7, name="aggregator", outer_dir="bin")
+    _claude_json(home, {"command": str(reader), "args": []})
+
+    forced = _fake_writer(tmp_path / "forced", 9, name="aggregator", outer_dir="bin")
+    env = _env(home, path=str(on_path.parent))
+    env[sp.WRITER_BIN_ENV] = str(forced)
+    assert sp.resolve_writer_bin(env) == forced
+
+    # No CLI beside the reader: PATH answers, exactly as before.
+    lonely = _fake_writer(
+        tmp_path / "mcp-only", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(lonely), "args": []})
+    assert sp.resolve_writer_bin(_env(home, path=str(on_path.parent))) == on_path
+
+
+def test_a_directory_reader_takes_no_sibling(tmp_path):
+    """``uv run --directory <checkout>``: the command is ``uv``, not a reader.
+
+    Its neighbours are uv's own install, which has no aggregator in it and no
+    business being measured as one. The sibling step is only meaningful when
+    the ``command`` IS the reader — anywhere else it would name a binary
+    chosen by coincidence of directory layout.
+    """
+    home = tmp_path / "home"
+    checkout = _fake_tree(tmp_path / "checkout", 6)
+    uv_bin = tmp_path / "uv" / "bin"
+    uv_bin.mkdir(parents=True)
+    for name in ("uv", "aggregator"):
+        exe = uv_bin / name
+        exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        exe.chmod(0o755)
+    on_path = _fake_writer(tmp_path / "deployed", 6, name="aggregator", outer_dir="bin")
+    _claude_json(
+        home,
+        {"command": str(uv_bin / "uv"), "args": ["run", "--directory", str(checkout)]},
+    )
+
+    env = _env(home, path=str(on_path.parent))
+    assert sp.resolve_reader_dir(env) == checkout
+    assert sp.resolve_writer_bin(env) == on_path
+
+
+def test_resolve_writer_bin_searches_the_path_it_is_handed(tmp_path):
+    """``shutil.which`` semantics, over the environment passed in.
+
+    This is a characterization test, and it is expected to pass BEFORE the code
+    it describes is touched: the next step moves this search into a helper the
+    reader shares, and a refactor with no test underneath it is how the writer
+    half of this file would quietly stop finding anything.
+
+    The environment is a plain dict, never the process's. The systemd unit and
+    a Claude Code session have different ``PATH``s, and a resolver that
+    consulted the wrong one would measure a binary nobody runs.
+
+    EVERY env HERE CARRIES AN EMPTY ``HOME``, and that is not tidiness. The
+    lookup now consults ``~/.claude.json`` for a reader to stand beside, and
+    ``_claude_config_path`` falls back to ``Path.home()`` when the dict it was
+    handed names no HOME — so the HOME-less version of this test read the
+    developer's real config and answered
+    ``/etc/profiles/per-user/jonathan/bin/aggregator``. It found the live host
+    from inside a unit test, which is the machine's answer and not the
+    fixture's.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    binroot = tmp_path / "bin"
+    binroot.mkdir()
+    exe = binroot / "aggregator"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+
+    assert sp.resolve_writer_bin(_env(home, path=str(binroot))) == exe
+    assert sp.resolve_writer_bin(_env(home, path=str(tmp_path / "nowhere"))) is None
+    assert sp.resolve_writer_bin(_env(home)) is None
+    assert sp.resolve_writer_bin({"HOME": str(home)}) is None
+
+    # A file a shell would not run is not the writer.
+    exe.chmod(0o644)
+    assert sp.resolve_writer_bin(_env(home, path=str(binroot))) is None
+
+
+# --- which reader is under test ---------------------------------------------
+
+
+def test_reader_dir_comes_from_the_command_when_there_is_no_directory_arg(tmp_path):
+    """THE BUG. ``{"command": "<nix wrapper>", "args": []}`` — this host, today.
+
+    ``args`` is empty, so the old code found no ``--directory`` and fell back to
+    the checkout the probe file happened to sit in. On 2026-09-05 that checkout
+    was at schema 7 while the deployed reader, the writer and the cache were all
+    at 6, so every new session was told AGGREGATOR RECALL IS DEAD about a
+    machine where recall was fine. The requirement has to come from the binary
+    Claude Code actually execs, and the answer is the site-packages the chain
+    ends in — the directory the number was read from.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(
+        home, {"type": "stdio", "command": str(wrapper), "args": [], "env": {}}
+    )
+
+    found = sp.resolve_reader_dir(_env(home))
+    assert found == tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    assert sp.read_reader_version(found) == 6
+    assert found != Path(sp.__file__).resolve().parent.parent.parent
+
+
+def test_a_bare_command_name_is_looked_up_on_the_path(tmp_path):
+    """``{"command": "aggregator-mcp"}`` with no slash in it.
+
+    Claude Code runs that through a PATH search, so the probe must too — over
+    the PATH it was handed, because the systemd health unit's PATH is not the
+    session's and resolving against the wrong one would measure the wrong
+    binary while looking like it worked.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+
+    found = sp.resolve_reader_dir(_env(home, path=str(wrapper.parent)))
+    assert found == tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+
+
+def test_a_command_that_resolves_nowhere_is_unknown_not_this_checkout(tmp_path):
+    """An entry exists and cannot be resolved. The answer is "I could not tell".
+
+    This is the case the systemd health unit hits: its PATH carries no
+    aggregator at all, so a bare name resolves to nothing. UNKNOWN is loud and
+    correct there. Falling back to this checkout would compare the writer
+    against a tree the reader has never run — the false alarm being fixed,
+    re-entering through the door it left by.
+    """
+    home = tmp_path / "home"
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+    assert sp.resolve_reader_dir(_env(home, path=str(tmp_path / "empty-bin"))) is None
+
+
+def test_a_directory_argument_still_wins_over_the_command(tmp_path):
+    """``uv run --directory <checkout> aggregator-mcp`` — the dev shape, kept.
+
+    A session pointed at a checkout IS running that checkout, and resolving
+    ``uv`` through the wrapper walk would find uv's own install and report
+    nothing useful. So the explicit directory stays first: it names a tree a
+    human chose, while the command is what to consult when nobody chose.
+    """
+    home = tmp_path / "home"
+    checkout = _fake_tree(tmp_path / "checkout", 7)
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+
+    _claude_json(
+        home,
+        {
+            "command": "uv",
+            "args": ["run", "--directory", str(checkout), "aggregator-mcp"],
+        },
+    )
+    assert sp.resolve_reader_dir(_env(home)) == checkout
+
+    # And when BOTH could resolve, the argument is still the answer.
+    _claude_json(home, {"command": str(wrapper), "args": ["--directory", str(checkout)]})
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 7
+
+
+def test_the_joined_directory_spelling_is_read_too(tmp_path):
+    """``--directory=<dir>``, which ``uv run`` accepts exactly as readily.
+
+    Only the split form was parsed, so the joined one fell through to the
+    ``command`` branch — where the command is ``uv``, the wrapper walk finds
+    uv's own install, no ``aggregator/core/store.py`` is there, and the answer
+    is UNKNOWN. A session pointed at a perfectly good checkout got told its
+    recall health could not be verified, on the strength of a space.
+
+    This config is hand-edited and the two spellings are interchangeable to the
+    tool that consumes it, so which one an operator typed cannot be allowed to
+    decide whether the check works.
+    """
+    home = tmp_path / "home"
+    checkout = _fake_tree(tmp_path / "checkout", 7)
+    _claude_json(
+        home,
+        {"command": "uv", "args": ["run", f"--directory={checkout}", "aggregator-mcp"]},
+    )
+    assert sp.resolve_reader_dir(_env(home)) == checkout
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 7
+
+    # The split form keeps working, and an empty value is not a directory.
+    _claude_json(home, {"command": "uv", "args": ["run", "--directory", str(checkout)]})
+    assert sp.resolve_reader_dir(_env(home)) == checkout
+    _claude_json(home, {"command": "uv", "args": ["run", "--directory="]})
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
+def test_an_empty_directory_value_is_never_this_process_s_cwd(tmp_path):
+    """``--directory`` with nothing after it, in BOTH spellings.
+
+    ``Path("")`` is ``Path(".")``. So the split form of the empty value —
+    ``["--directory", ""]`` — did not fall through to the next resolution step
+    the way the joined ``--directory=`` did; it answered with the probe's own
+    working directory, silently. Whatever that directory happens to be gets
+    measured and announced as "the MCP reader", which is the 2026-09-05 false
+    alarm with a worse tree substituted: at least the checkout fallback names a
+    tree that holds an aggregator, while a cwd is wherever systemd or a session
+    hook was started from.
+
+    The two spellings are interchangeable to ``uv run`` and this config is
+    hand-edited, so an operator who typed a space cannot be given a different
+    answer from one who typed an equals sign. Both empty values are passed over
+    and resolution continues at the ``command``.
+    """
+    assert sp._directory_arg(["run", "--directory", ""]) is None
+    assert sp._directory_arg(["run", "--directory="]) is None
+
+    home = tmp_path / "home"
+    for args in (["run", "--directory", "", "aggregator-mcp"], ["run", "--directory="]):
+        _claude_json(home, {"command": "uv", "args": args})
+        found = sp.resolve_reader_dir(_env(home))
+        assert found is None, f"{args} resolved to {found}"
+
+    # And "passed over" means the NEXT step answers, not that the whole entry
+    # is abandoned: a resolvable command is still the reader under test.
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    site_packages = tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    for args in (["--directory", ""], ["--directory="]):
+        _claude_json(home, {"command": str(wrapper), "args": args})
+        found = sp.resolve_reader_dir(_env(home))
+        assert found == site_packages, f"{args} resolved to {found}"
+        assert sp.read_reader_version(found) == 6
+
+
+def test_no_entry_at_all_falls_back_to_this_checkout(tmp_path):
+    """No ``mcpServers.aggregator`` anywhere: a dev tree with no MCP wiring.
+
+    The fallback that caused the false alarm survives for exactly the case it
+    was written for, and is narrowed to it. Still gated on a ``pyproject.toml``
+    beside the package: installed into site-packages this module also sits next
+    to a ``core/store.py``, and reading THAT as the reader's requirement would
+    compare the writer against itself and call every skew healthy.
+    """
+    home = tmp_path / "home"
+    _claude_json(home, None)
+    repo_root = Path(sp.__file__).resolve().parent.parent.parent
+    assert (repo_root / "pyproject.toml").is_file()
+    assert sp.resolve_reader_dir(_env(home)) == repo_root
+
+
+def test_a_missing_claude_json_falls_back_to_this_checkout(tmp_path):
+    """No file at all: there is no entry to be read, so the fallback holds.
+
+    Deliberate, and the narrow reading was chosen on evidence: a HOME with no
+    ``.claude.json`` is every CI run and every fresh clone, and turning those
+    into UNKNOWN would make the probe cry wolf where nothing is wrong — which
+    spends the silence budget rule 2 exists to protect. Absence is the only
+    unreadable shape that gets this benefit; see the next test.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    repo_root = Path(sp.__file__).resolve().parent.parent.parent
+    assert sp.resolve_reader_dir(_env(home)) == repo_root
+
+
+def test_a_present_but_unparseable_claude_json_is_unknown(tmp_path):
+    """The file IS there and cannot be read. Guessing here is the original bug.
+
+    A config that exists says an operator configured something; that it will not
+    parse says nobody knows what. Falling back to this checkout then re-creates
+    the 2026-09-05 false alarm through a second door — the tree would be
+    measured and announced as the reader on a host where the real entry, sitting
+    unparsed in that very file, names a Nix wrapper at a different version.
+    "Fail loudly": a broken config is a fault to report, never a silent licence
+    to substitute a different measurement.
+
+    Absence keeps the fallback (previous test); presence-and-broken does not.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+
+    (home / ".claude.json").write_text("{not json", encoding="utf-8")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    # Valid JSON, but not an object at the top level.
+    (home / ".claude.json").write_text("[1, 2, 3]", encoding="utf-8")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    # An object whose `mcpServers` is not a block of servers, so an entry could
+    # be hiding in there and this probe cannot see it.
+    (home / ".claude.json").write_text('{"mcpServers": "nope"}', encoding="utf-8")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
+def _oversized_claude_json(home: Path, wrapper: Path) -> Path:
+    """A ``~/.claude.json`` that is entirely VALID and larger than the read cap.
+
+    Not a synthetic blob: the shape is the real file's. Claude Code stores
+    per-project history in this same document — ``projects[<dir>].history`` —
+    and on a machine with a few long-lived projects it grows without bound,
+    which is the only reason a JSON config ever passes eight-figure byte
+    counts. The aggregator entry sits AFTER the filler on purpose: it is the
+    part a truncated read loses, so a probe that parses the prefix is not
+    merely unlucky, it is systematically blind to the thing it came to read.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    doc = {
+        "projects": {
+            "/home/jonathan/Repos/something": {"history": ["x" * 4096] * 4200}
+        },
+        "mcpServers": {
+            "research-agent": {"command": "true", "args": []},
+            "aggregator": {"command": str(wrapper), "args": []},
+        },
+    }
+    path = home / ".claude.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    assert path.stat().st_size > sp._CLAUDE_CONFIG_LIMIT, path.stat().st_size
+    return path
+
+
+def test_an_oversized_but_valid_claude_json_names_the_cap_not_a_repair(tmp_path):
+    """A config too big to read is not a config that is broken.
+
+    The probe reads a bounded prefix of ``~/.claude.json`` — deliberately, and
+    it must keep doing so: both consumers run on budgets of a few seconds and
+    this file has no business being scanned without limit. But a bounded read
+    of a valid 17 MB document yields a buffer cut mid-token, ``json.loads``
+    fails on it exactly the way it fails on a corrupt file, and the operator is
+    handed "repair ~/.claude.json — it must be valid JSON" about a file that
+    already is. That remedy is unfollowable: there is nothing to repair, so the
+    check announces an impossible chore every session until someone reads this
+    source to find out why.
+
+    The two causes have to be told apart at the point where they are still
+    distinguishable — before the parse, by the size — and the message has to
+    name the number, the cap, and the override that gets past both.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    path = _oversized_claude_json(home, wrapper)
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.UNKNOWN, v.explain()
+    assert v.reader_version is None
+    assert v.reader_dir is None, "a truncated config must not become a guess"
+
+    said = " ".join(f.text() for f in v.findings if f.state == sp.UNKNOWN)
+    assert str(path) in said, said
+    assert str(path.stat().st_size) in said, said
+    assert str(sp._CLAUDE_CONFIG_LIMIT) in said, said
+    assert sp.READER_DIR_ENV in said, said
+    # The corrupt-file remedy must NOT be the one shown: this file parses.
+    assert "repair" not in said.lower(), said
+
+
+def test_a_config_under_the_cap_still_parses(tmp_path):
+    """The bound is a bound, not a new failure mode.
+
+    A padded-but-legal config — well under the cap and far larger than the
+    fixtures everything else uses — has to resolve the reader normally. A size
+    check that shipped with an off-by-one, or that stat()ed the wrong thing,
+    would turn every real ``~/.claude.json`` on this host into UNKNOWN, which
+    is the false alarm this module has already paid for once.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    doc = {
+        "projects": {"/home/jonathan/Repos/x": {"history": ["y" * 4096] * 64}},
+        "mcpServers": {"aggregator": {"command": str(wrapper), "args": []}},
+    }
+    (home / ".claude.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert (home / ".claude.json").stat().st_size < sp._CLAUDE_CONFIG_LIMIT
+
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 6
+
+
+def test_the_two_config_faults_are_not_equal_to_each_other_or_to_an_entry(tmp_path):
+    """Distinct causes need distinct sentinels, not two spellings of ``{}``.
+
+    Both fault markers were plain empty dicts, so ``==`` said they were the
+    same value — as it did for the ordinary ``{}`` returned for an entry that
+    exists and is empty. Three different facts, one comparison, and the only
+    thing keeping them apart was that every call site happened to use ``is``.
+    That is a property of the readers, not of the values, and the next reader
+    to write the natural ``==`` gets an oversized config reported as corrupt
+    with no test to stop them.
+
+    The distinction is load-bearing in the message an operator reads: one says
+    go and repair a broken file, the other says the file is FINE and too big to
+    read. Sending someone to fix valid JSON is the failure this pair exists to
+    prevent, so it must not hinge on a comparison operator.
+    """
+    assert sp._CONFIG_UNREADABLE != sp._CONFIG_TOO_LARGE
+    assert sp._CONFIG_TOO_LARGE != sp._CONFIG_UNREADABLE
+    assert sp._CONFIG_UNREADABLE != {}
+    assert sp._CONFIG_TOO_LARGE != {}
+    assert sp._CONFIG_UNREADABLE == sp._CONFIG_UNREADABLE
+
+    # And each still says what it is, for anyone reading a traceback.
+    assert "claude.json" in repr(sp._CONFIG_UNREADABLE)
+    assert "claude.json" in repr(sp._CONFIG_TOO_LARGE)
+    assert repr(sp._CONFIG_UNREADABLE) != repr(sp._CONFIG_TOO_LARGE)
+
+    # An entry that is present and empty is a THIRD thing: something is
+    # configured, nothing is resolvable, and no fault was detected reading the
+    # file itself.
+    home = tmp_path / "home"
+    _claude_json(home, {})
+    entry = sp._claude_mcp_entry(_env(home))
+    assert entry == {}
+    assert entry is not sp._CONFIG_UNREADABLE and entry is not sp._CONFIG_TOO_LARGE
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
+def test_the_oversized_and_unparseable_messages_cannot_be_conflated(tmp_path):
+    """The two remedies must not be interchangeable, end to end.
+
+    Asserted on the rendered findings rather than on the sentinels, because the
+    sentinels are an implementation detail and the operator only ever sees
+    these two paragraphs. One must send them at the file; the other must not,
+    and must offer the override instead.
+    """
+    big_home = tmp_path / "big"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _oversized_claude_json(big_home, wrapper)
+    broken_home = tmp_path / "broken"
+    broken_home.mkdir()
+    (broken_home / ".claude.json").write_text("{not json", encoding="utf-8")
+
+    said = {}
+    for key, home in (("big", big_home), ("broken", broken_home)):
+        env = _env(home)
+        env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / f"w-{key}", 6))
+        v = sp.probe(cache_db=_stamp_cache(tmp_path / f"c-{key}.db", 6), env=env)
+        assert v.state == sp.UNKNOWN, v.explain()
+        said[key] = " ".join(f.text() for f in v.findings if f.state == sp.UNKNOWN)
+
+    assert said["big"] != said["broken"]
+    assert "repair" in said["broken"].lower()
+    assert "repair" not in said["big"].lower()
+    assert str(sp._CLAUDE_CONFIG_LIMIT) in said["big"]
+    assert str(sp._CLAUDE_CONFIG_LIMIT) not in said["broken"]
+
+
+def test_an_unparseable_claude_json_says_so_and_names_the_file(tmp_path):
+    """The remedy has to send the operator at the FILE, not at the install.
+
+    Two causes reach the same UNKNOWN state and they have opposite fixes: a
+    config this probe could not parse is the operator's file to repair, while a
+    config that resolves to an install with no packaged source is the install's
+    problem. One generic message for both leaves the reader guessing which,
+    and an announcement nobody can act on gets acknowledged and forgotten.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{not json", encoding="utf-8")
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.UNKNOWN, v.explain()
+    assert v.reader_version is None
+    assert v.reader_dir is None
+    said = " ".join(f.text() for f in v.findings if f.state == sp.UNKNOWN)
+    assert str(home / ".claude.json") in said, said
+    assert "parse" in said, said
+
+
+def test_an_entry_that_is_present_but_unusable_is_unknown(tmp_path):
+    """``mcpServers.aggregator`` exists and carries nothing resolvable.
+
+    Something IS configured, so this checkout is not the reader, and "could not
+    tell" is the only honest answer. Rule 2 at the top of the probe: unknown
+    warns, never "fine" — and never "here is a different thing I measured
+    instead".
+    """
+    home = tmp_path / "home"
+
+    _claude_json(home, {})
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    _claude_json(home, {"command": "", "args": []})
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    _claude_json(home, "not-an-object")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    # And the trap that matters most on a real host: a command that RESOLVES,
+    # through a wrapper chain that carries no ``aggregator/core/store.py``. A
+    # half-installed reader must not silently become this checkout — the
+    # binary exists, so the fallback looks defensible right up until it reports
+    # the wrong version.
+    hollow = _fake_writer(
+        tmp_path / "hollow", None, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(hollow), "args": []})
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
+def test_the_reader_dir_override_beats_everything(tmp_path):
+    """``AGGREGATOR_READER_DIR``: the escape hatch, still first.
+
+    Every input to this probe is overridable, because a health check that can
+    only ever look at the live machine cannot be tested at all — which for a
+    health check is the failure mode, not an inconvenience.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(wrapper), "args": []})
+    forced = _fake_tree(tmp_path / "forced", 9)
+
+    env = _env(home)
+    env[sp.READER_DIR_ENV] = str(forced)
+    assert sp.resolve_reader_dir(env) == forced
+
+
+def test_the_project_scoped_entry_is_never_read(tmp_path):
+    """``~/.claude.json`` also carries per-project blocks. They are not ours.
+
+    This host has a stale one from an unrelated repo whose command resolves to
+    nothing. It applies only to sessions started in that directory. A probe that
+    read it would report on a server nothing runs — while the top-level entry
+    sat right there and resolved.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    path = _claude_json(home, {"command": str(wrapper), "args": []})
+
+    stale = json.loads(path.read_text(encoding="utf-8"))["projects"]
+    assert stale["/home/jonathan/Repos/gdocs-review-mcp"]["mcpServers"]["aggregator"][
+        "args"
+    ] == ["not", "found"]
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 6
+
+
+def test_the_unknown_reader_fix_names_every_place_it_looked(tmp_path):
+    """A remedy has to be actionable at 03:00 by someone who did not write this.
+
+    The entry now has two shapes — a ``command`` and a ``--directory``
+    argument — and the old text named only the second, so an operator whose
+    command had gone stale was sent looking for an argument their config does
+    not contain. An announcement with no action is one that gets acknowledged
+    and forgotten, which is how the original incident survived three days of a
+    tool returning ``ok: false`` on every call.
+    """
+    home = tmp_path / "home"
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+    env = _env(home, path=str(tmp_path / "empty-bin"))
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.UNKNOWN, v.explain()
+    assert v.reader_version is None
+    remedy = " ".join(f.remedy for f in v.findings if f.state == sp.UNKNOWN)
+    assert "command" in remedy, remedy
+    assert "--directory" in remedy, remedy
+    assert sp.READER_DIR_ENV in remedy, remedy
+
+
+def test_probe_reports_the_directory_it_actually_read(tmp_path):
+    """``reader_dir`` in the verdict is evidence, not a guess.
+
+    A human reading the JSON has to be able to go and open the file the number
+    came from. In the deployed case that is the site-packages inside the env
+    derivation — not the profile entry, not the wrapper, and emphatically not a
+    checkout nobody ran.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(wrapper), "args": []})
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.FINE, v.explain()
+    assert v.reader_version == 6
+    assert v.reader_dir == str(
+        tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    )
+    assert v.to_dict()["reader_dir"] == v.reader_dir
+
+
+def test_the_false_alarm_of_2026_09_05_does_not_reproduce(tmp_path):
+    """The incident this task exists for, end to end.
+
+    Deployed reader 6, writer 6, cache 6 — a healthy machine — while the
+    checkout this file lives in is at some other version entirely. The old
+    resolution measured the checkout and reported DEAD. The verdict must be
+    FINE, and it must not have been reached by reading this tree.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(wrapper), "args": []})
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.FINE, v.explain()
+    assert sp.DEAD not in v.states, v.explain()
+    assert v.reader_dir != str(Path(sp.__file__).resolve().parent.parent.parent), (
+        "the checkout was consulted; it is not the reader"
+    )
+
+
+def test_the_script_resolves_the_reader_from_claude_json(tmp_path):
+    """The whole path, through the invocation the consumers actually use.
+
+    Everything above calls into the module. The systemd unit and the
+    SessionStart hook run ``python3 schema_probe.py --json`` as a bare script
+    with no aggregator on ``sys.path``, and the reader resolution now depends on
+    HOME and PATH — two things a systemd unit trims. So it is exercised in a
+    real subprocess with a forged environment, not through an import.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+    _stamp_cache(tmp_path / "cache.db", 5)
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOME": str(home),
+            "PATH": str(wrapper.parent),
+            "AGGREGATOR_CACHE_DB": str(tmp_path / "cache.db"),
+            "AGGREGATOR_WRITER_BIN": str(_fake_writer(tmp_path / "writer", 5)),
+        }
+    )
+    env.pop("AGGREGATOR_READER_DIR", None)
+    env.pop("PYTHONPATH", None)
+
+    proc = subprocess.run(
+        [sys.executable, sp.__file__, "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == sp.EXIT_DEAD, proc.stderr
+    doc = json.loads(proc.stdout)
+    assert doc["reader_version"] == 6
+    assert doc["cache_version"] == 5
+    assert doc["reader_dir"] == str(
+        tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    )
+
+
 # --- the machine-readable verdict -------------------------------------------
 
 
@@ -540,3 +1579,84 @@ def test_probe_agrees_with_the_reader_it_is_installed_beside():
     """
     repo_root = Path(__file__).resolve().parent.parent
     assert sp.read_reader_version(repo_root) == SCHEMA_VERSION
+
+
+# --- the packaged entry point -----------------------------------------------
+
+
+def test_the_console_script_entry_point_is_declared_and_resolves():
+    """``aggregator-schema-probe`` must exist as a packaged console script.
+
+    The SessionStart hook and the systemd health unit have to be able to run the
+    PRODUCTION probe — installed next to ``aggregator-mcp``, built from the same
+    rev as the reader it measures — rather than reaching into a developer
+    checkout. Reaching into a checkout is the coupling that produced a false
+    alarm in the first place, and a unit that executes a working tree is the
+    deployment bug this project has already been bitten by once. This
+    declaration is necessary but not sufficient: the profile only carries the
+    script once nixos-config's overlay enumerates the name too.
+
+    Resolved the way a console script resolves it: import the module named
+    before the colon, look up the attribute named after it.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    with open(repo_root / "pyproject.toml", "rb") as fh:
+        pyproject = tomllib.load(fh)
+
+    target = pyproject["project"]["scripts"]["aggregator-schema-probe"]
+    assert target == "aggregator.health.schema_probe:main"
+
+    module_name, _, attr = target.partition(":")
+    entry = getattr(importlib.import_module(module_name), attr)
+    assert callable(entry)
+
+
+def test_main_returns_the_exit_code_a_console_script_needs(tmp_path, capsys, monkeypatch):
+    """``main(argv)`` takes an argv and RETURNS an int.
+
+    A console script calls ``main()`` with no arguments and hands the result to
+    ``sys.exit``. Returning ``None`` there would exit 0 on every verdict — a
+    health check that always reports success, which is worse than none at all
+    and is exactly the shape of the original incident: exit 0, every time,
+    while recall was dead.
+    """
+    monkeypatch.setenv("AGGREGATOR_CACHE_DB", str(_stamp_cache(tmp_path / "cache.db", 5)))
+    monkeypatch.setenv("AGGREGATOR_READER_DIR", str(_fake_tree(tmp_path / "reader", 6)))
+    monkeypatch.setenv(
+        "AGGREGATOR_WRITER_BIN", str(_fake_writer(tmp_path / "writer", 6))
+    )
+
+    code = sp.main(["--json"])
+    assert code == sp.EXIT_DEAD
+
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["state"] == sp.DEAD
+    assert doc["cache_version"] == 5
+    assert doc["reader_version"] == 6
+
+
+def test_the_packaged_entry_point_imports_nothing_heavy():
+    """The precondition for shipping this as a console script, made permanent.
+
+    The entry point walks ``aggregator`` -> ``aggregator.health`` -> this
+    module: three ``__init__``-shaped opportunities to pull in the dependency
+    tree. Both callers run on budgets measured in single-digit seconds, and a
+    SessionStart hook that overruns has its output DISCARDED — so the light
+    import is not an optimisation, it is the feature. Asserted in a subprocess
+    against ``sys.modules``, because in-process the check would pass on anything
+    pytest had already imported for another test.
+    """
+    code = (
+        "import sys\n"
+        "import aggregator.health.schema_probe\n"
+        "heavy = sorted(m for m in sys.modules if m.split('.')[0] in {\n"
+        "    'torch', 'spacy', 'thinc', 'transformers', 'presidio_analyzer',\n"
+        "    'presidio_anonymizer', 'sentence_transformers', 'numpy',\n"
+        "    'sqlite_vec', 'fastmcp',\n"
+        "})\n"
+        "assert not heavy, heavy\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr

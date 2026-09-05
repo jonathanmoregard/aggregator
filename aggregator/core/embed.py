@@ -120,9 +120,16 @@ def downloads_allowed() -> bool:
 
     An env var cannot fix that from inside this package:
     ``huggingface_hub`` reads ``HF_HUB_OFFLINE`` into a module constant at
-    import time, and it is already imported before ``aggregator.mcp`` finishes
-    loading (``core.scrub`` → spaCy → thinc → transformers). Hence an explicit
-    per-call ``local_files_only``, which no import order can defeat.
+    import time, so setting the variable after that import has no effect, and
+    nothing here controls when the import happens — the first model
+    construction on any path triggers it, from a process this package does not
+    own the environment of. (Until 2026-09 it was even worse: ``core.scrub`` →
+    spaCy → thinc → transformers pulled ``huggingface_hub`` in before
+    ``aggregator.mcp`` had finished importing, so the variable was already read
+    before a single line of aggregator code had run. Presidio initialises
+    lazily now, which removes that particular certainty and changes nothing
+    about the argument.) Hence an explicit per-call ``local_files_only``, which
+    no import order can defeat.
 
     ``aggregator-embed-seed.service`` — human-triggered, never on a timer — is
     the single place in the deployment that sets this.
