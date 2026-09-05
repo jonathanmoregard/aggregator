@@ -376,13 +376,32 @@ def _scrub_pii_presidio(text: str, counts: dict[str, int]) -> str:
 
 
 def scrub(text: str) -> ScrubResult:
-    """Apply secret + PII scrubbing. Idempotent and side-effect-free.
+    """Apply secret + PII scrubbing. Deterministic and idempotent.
 
     Contract:
-    * Same input → same output (deterministic).
+    * Same input → same output (deterministic), for a fixed Presidio state.
     * ``scrub(scrub(x).text).text == scrub(x).text`` (idempotent).
-    * Never raises on well-formed ``str``; degrades to regex-only if Presidio
-      fails at analyse/anonymize time.
+    * An analyse/anonymize failure MID-CALL is logged and swallowed: coverage
+      degrades to regex-only rather than the call failing.
+
+    NOT SIDE-EFFECT-FREE, AND IT CAN RAISE. Both were claimed here and neither
+    survived the warm-up work, so they are spelled out rather than deleted —
+    a caller that believed the old contract would have got the two surprises
+    below in production:
+
+    * The first call in the process — and any call that lands while a warm-up
+      is still building the engines — runs ``ensure_presidio_ready()``, which
+      BLOCKS for the model load (~50 s on this host) and latches the outcome in
+      module globals. That is why ``aggregator/mcp.py``'s ``main()`` kicks the
+      load off on a daemon thread before serving stdio: so the cost is paid in
+      parallel with the handshake instead of in front of the first result.
+      After the latch it is one atomic ``Event`` read.
+    * ``ensure_presidio_ready()`` folds ``Exception`` and ``SystemExit`` into
+      the regex fallback but RE-RAISES everything else — ``KeyboardInterrupt``,
+      ``asyncio.CancelledError`` — after announcing the degradation. Those
+      propagate straight out of this function. Deliberate: a ctrl-c during a
+      50-second model load has to keep killing the process. It simply is not
+      "never raises".
     """
     counts: dict[str, int] = {}
     text = _run_patterns(text, SECRET_PATTERNS, counts)
