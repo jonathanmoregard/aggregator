@@ -771,6 +771,123 @@ def test_the_project_scoped_entry_is_never_read(tmp_path):
     assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 6
 
 
+def test_the_unknown_reader_fix_names_every_place_it_looked(tmp_path):
+    """A remedy has to be actionable at 03:00 by someone who did not write this.
+
+    The entry now has two shapes — a ``command`` and a ``--directory``
+    argument — and the old text named only the second, so an operator whose
+    command had gone stale was sent looking for an argument their config does
+    not contain. An announcement with no action is one that gets acknowledged
+    and forgotten, which is how the original incident survived three days of a
+    tool returning ``ok: false`` on every call.
+    """
+    home = tmp_path / "home"
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+    env = _env(home, path=str(tmp_path / "empty-bin"))
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.UNKNOWN, v.explain()
+    assert v.reader_version is None
+    remedy = " ".join(f.remedy for f in v.findings if f.state == sp.UNKNOWN)
+    assert "command" in remedy, remedy
+    assert "--directory" in remedy, remedy
+    assert sp.READER_DIR_ENV in remedy, remedy
+
+
+def test_probe_reports_the_directory_it_actually_read(tmp_path):
+    """``reader_dir`` in the verdict is evidence, not a guess.
+
+    A human reading the JSON has to be able to go and open the file the number
+    came from. In the deployed case that is the site-packages inside the env
+    derivation — not the profile entry, not the wrapper, and emphatically not a
+    checkout nobody ran.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(wrapper), "args": []})
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.FINE, v.explain()
+    assert v.reader_version == 6
+    assert v.reader_dir == str(
+        tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    )
+    assert v.to_dict()["reader_dir"] == v.reader_dir
+
+
+def test_the_false_alarm_of_2026_09_05_does_not_reproduce(tmp_path):
+    """The incident this task exists for, end to end.
+
+    Deployed reader 6, writer 6, cache 6 — a healthy machine — while the
+    checkout this file lives in is at some other version entirely. The old
+    resolution measured the checkout and reported DEAD. The verdict must be
+    FINE, and it must not have been reached by reading this tree.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(wrapper), "args": []})
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.FINE, v.explain()
+    assert sp.DEAD not in v.states, v.explain()
+    assert v.reader_dir != str(Path(sp.__file__).resolve().parent.parent.parent), (
+        "the checkout was consulted; it is not the reader"
+    )
+
+
+def test_the_script_resolves_the_reader_from_claude_json(tmp_path):
+    """The whole path, through the invocation the consumers actually use.
+
+    Everything above calls into the module. The systemd unit and the
+    SessionStart hook run ``python3 schema_probe.py --json`` as a bare script
+    with no aggregator on ``sys.path``, and the reader resolution now depends on
+    HOME and PATH — two things a systemd unit trims. So it is exercised in a
+    real subprocess with a forged environment, not through an import.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+    _stamp_cache(tmp_path / "cache.db", 5)
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOME": str(home),
+            "PATH": str(wrapper.parent),
+            "AGGREGATOR_CACHE_DB": str(tmp_path / "cache.db"),
+            "AGGREGATOR_WRITER_BIN": str(_fake_writer(tmp_path / "writer", 5)),
+        }
+    )
+    env.pop("AGGREGATOR_READER_DIR", None)
+    env.pop("PYTHONPATH", None)
+
+    proc = subprocess.run(
+        [sys.executable, sp.__file__, "--json"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == sp.EXIT_DEAD, proc.stderr
+    doc = json.loads(proc.stdout)
+    assert doc["reader_version"] == 6
+    assert doc["cache_version"] == 5
+    assert doc["reader_dir"] == str(
+        tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    )
+
+
 # --- the machine-readable verdict -------------------------------------------
 
 

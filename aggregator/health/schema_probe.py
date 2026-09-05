@@ -669,13 +669,15 @@ def probe(
                 UNKNOWN,
                 "aggregator recall health CANNOT BE VERIFIED: the MCP reader's "
                 "required schema version could not be read from "
-                f"{reader_dir or '(no checkout located)'} — expected "
+                f"{reader_dir or '(no reader install located)'} — expected "
                 "`SCHEMA_VERSION = <n>` in aggregator/core/store.py. Without it "
                 "there is no number to compare the cache and the writer against, "
                 "so nothing here can be called healthy.",
-                "FIX: confirm the checkout named by ~/.claude.json's "
-                "mcpServers.aggregator `--directory` argument exists and is a "
-                "real aggregator tree, or set AGGREGATOR_READER_DIR.",
+                "FIX: check ~/.claude.json's top-level mcpServers.aggregator — "
+                "its `command` must resolve to an install carrying "
+                "lib/python3*/site-packages/aggregator/core/store.py, or its "
+                "args must name a real aggregator tree with `--directory`. "
+                "AGGREGATOR_READER_DIR overrides both.",
             )
         )
 
