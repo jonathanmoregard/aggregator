@@ -931,6 +931,45 @@ def test_the_joined_directory_spelling_is_read_too(tmp_path):
     assert sp.resolve_reader_dir(_env(home)) is None
 
 
+def test_an_empty_directory_value_is_never_this_process_s_cwd(tmp_path):
+    """``--directory`` with nothing after it, in BOTH spellings.
+
+    ``Path("")`` is ``Path(".")``. So the split form of the empty value —
+    ``["--directory", ""]`` — did not fall through to the next resolution step
+    the way the joined ``--directory=`` did; it answered with the probe's own
+    working directory, silently. Whatever that directory happens to be gets
+    measured and announced as "the MCP reader", which is the 2026-09-05 false
+    alarm with a worse tree substituted: at least the checkout fallback names a
+    tree that holds an aggregator, while a cwd is wherever systemd or a session
+    hook was started from.
+
+    The two spellings are interchangeable to ``uv run`` and this config is
+    hand-edited, so an operator who typed a space cannot be given a different
+    answer from one who typed an equals sign. Both empty values are passed over
+    and resolution continues at the ``command``.
+    """
+    assert sp._directory_arg(["run", "--directory", ""]) is None
+    assert sp._directory_arg(["run", "--directory="]) is None
+
+    home = tmp_path / "home"
+    for args in (["run", "--directory", "", "aggregator-mcp"], ["run", "--directory="]):
+        _claude_json(home, {"command": "uv", "args": args})
+        found = sp.resolve_reader_dir(_env(home))
+        assert found is None, f"{args} resolved to {found}"
+
+    # And "passed over" means the NEXT step answers, not that the whole entry
+    # is abandoned: a resolvable command is still the reader under test.
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    site_packages = tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    for args in (["--directory", ""], ["--directory="]):
+        _claude_json(home, {"command": str(wrapper), "args": args})
+        found = sp.resolve_reader_dir(_env(home))
+        assert found == site_packages, f"{args} resolved to {found}"
+        assert sp.read_reader_version(found) == 6
+
+
 def test_no_entry_at_all_falls_back_to_this_checkout(tmp_path):
     """No ``mcpServers.aggregator`` anywhere: a dev tree with no MCP wiring.
 

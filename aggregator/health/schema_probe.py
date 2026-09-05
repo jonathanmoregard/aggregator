@@ -560,14 +560,24 @@ def _directory_arg(args: object) -> Path | None:
     a perfectly good checkout was told its recall health could not be verified
     — on the strength of a space.
 
-    An empty value (``--directory=``) is not a directory and is passed over,
-    the same way a trailing bare ``--directory`` with nothing after it is.
+    An empty value is not a directory and is passed over in BOTH spellings,
+    the same way a trailing bare ``--directory`` with nothing after it is. The
+    joined form guarded that from the start; the split form did not, and
+    ``Path("")`` is ``Path(".")`` — so ``["--directory", ""]`` answered with
+    the PROBE'S OWN WORKING DIRECTORY and every downstream message named it as
+    the reader. That is the 2026-09-05 false alarm again with a worse tree
+    substituted: the checkout fallback at least names a tree that holds an
+    aggregator, while a cwd is wherever systemd or a session hook was started.
+    Passing over means resolution CONTINUES — at the ``command``, then at the
+    fallbacks — never that the entry is abandoned.
     """
     if not isinstance(args, list):
         return None
     for i, a in enumerate(args):
         if a == "--directory" and i + 1 < len(args):
-            return Path(str(args[i + 1])).expanduser()
+            value = str(args[i + 1])
+            if value:
+                return Path(value).expanduser()
         if isinstance(a, str) and a.startswith("--directory="):
             value = a.partition("=")[2]
             if value:
