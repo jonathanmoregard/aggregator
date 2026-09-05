@@ -5211,6 +5211,15 @@ def main() -> None:
     # Claude Code gives it 30 s. Before `build_server()` this would contend with
     # the cache read that builds the tool descriptions; after `server.run()` it
     # would never happen, because `run()` serves stdio and does not return.
+    #
+    # HONEST ABOUT WHAT THIS DOES NOT FIX: `scrub()` is synchronous and the tool
+    # handlers are `async def`, so a query landing in the first ~10-50 s waits
+    # for the engine build on the event loop — that one query is slow, and
+    # anything queued behind it waits too. That is the spec'd trade (a result
+    # must not return unscrubbed, and must not race a half-built engine) and it
+    # is bounded by the build. Before this branch the same window was worse in
+    # kind, not just degree: the server never answered `initialize` at all, so
+    # it was absent from the session rather than briefly slow.
     start_background_init()
     server.run(show_banner=False)
 
