@@ -297,6 +297,26 @@ def resolve_cache_db(env: dict[str, str] | None = None) -> Path:
     return Path(root) / "aggregator" / "cache.db"
 
 
+def _which(name: str, env: dict[str, str]) -> Path | None:
+    """``shutil.which`` for one name, over the ``PATH`` in ``env``.
+
+    Spelled out rather than imported to keep this a single self-contained file,
+    and taking the environment as an argument rather than reading the process's:
+    the systemd unit, a Claude Code session and a test all have different
+    ``PATH``s, and a resolver that quietly consulted the wrong one would report
+    on a binary nobody runs. Shared by the writer's own lookup and by the
+    reader's bare-``command`` lookup, for the same reason there is one wrapper
+    walker and not two.
+    """
+    for d in (env.get("PATH") or "").split(os.pathsep):
+        if not d:
+            continue
+        candidate = Path(d) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
     """Which checkout the MCP reader actually runs from.
 
@@ -341,21 +361,14 @@ def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
 def resolve_writer_bin(env: dict[str, str] | None = None) -> Path | None:
     """The ``aggregator`` a human — or the ingest timer — would actually run.
 
-    ``shutil.which`` semantics, spelled out rather than imported so this stays
-    a single self-contained file, and so the ``PATH`` it searches is the one
-    passed in rather than the process's.
+    ``shutil.which`` semantics over the ``PATH`` passed in rather than the
+    process's; the search itself is ``_which``, which the reader shares.
     """
     env = os.environ if env is None else env
     override = env.get(WRITER_BIN_ENV)
     if override:
         return Path(override).expanduser()
-    for d in (env.get("PATH") or "").split(os.pathsep):
-        if not d:
-            continue
-        candidate = Path(d) / "aggregator"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+    return _which("aggregator", env)
 
 
 # --- reading the three quantities -------------------------------------------

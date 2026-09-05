@@ -501,6 +501,34 @@ def test_the_writer_reads_through_the_one_shared_walker(tmp_path):
     )
 
 
+def test_resolve_writer_bin_searches_the_path_it_is_handed(tmp_path):
+    """``shutil.which`` semantics, over the environment passed in.
+
+    This is a characterization test, and it is expected to pass BEFORE the code
+    it describes is touched: the next step moves this search into a helper the
+    reader shares, and a refactor with no test underneath it is how the writer
+    half of this file would quietly stop finding anything.
+
+    The environment is a plain dict, never the process's. The systemd unit and
+    a Claude Code session have different ``PATH``s, and a resolver that
+    consulted the wrong one would measure a binary nobody runs.
+    """
+    binroot = tmp_path / "bin"
+    binroot.mkdir()
+    exe = binroot / "aggregator"
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+
+    assert sp.resolve_writer_bin({"PATH": str(binroot)}) == exe
+    assert sp.resolve_writer_bin({"PATH": str(tmp_path / "nowhere")}) is None
+    assert sp.resolve_writer_bin({"PATH": ""}) is None
+    assert sp.resolve_writer_bin({}) is None
+
+    # A file a shell would not run is not the writer.
+    exe.chmod(0o644)
+    assert sp.resolve_writer_bin({"PATH": str(binroot)}) is None
+
+
 # --- the machine-readable verdict -------------------------------------------
 
 
