@@ -134,7 +134,9 @@ def ensure_presidio_ready() -> bool:
     other caller — including one that arrives mid-build — waits on the lock and
     then returns the same answer. Failure is not an error: it degrades to the
     regex-only path this module documents, and logs the reason exactly once,
-    because initialisation runs exactly once.
+    because initialisation runs exactly once. That holds for a failure this
+    function swallows AND for one it re-raises — either way the decision is
+    latched for the life of the process, so either way it is announced.
     """
     global _analyzer, _anonymizer, _PRESIDIO_OK
     if _INIT_DONE.is_set():
@@ -156,9 +158,21 @@ def ensure_presidio_ready() -> bool:
             _analyzer = None
             _anonymizer = None
             _PRESIDIO_OK = False
+        # Everything the clause above does not cover — KeyboardInterrupt,
+        # asyncio.CancelledError — still lands on the `finally` below, which
+        # latches the decision for the life of the process: PII coverage
+        # narrows to regex and never widens again. That must not happen in
+        # silence. Announce it with the same sentence, then re-raise, so a
+        # KeyboardInterrupt keeps killing the process as the user asked.
+        except BaseException as e:
+            log.warning(
+                "Presidio unavailable (%s); PII scrubbing will use regex fallback only",
+                e,
+            )
+            raise
         finally:
-            # Unconditional, so a BaseException the clause above does not catch
-            # still releases every waiter instead of deadlocking them.
+            # Unconditional, so a BaseException that propagates still releases
+            # every waiter instead of deadlocking them.
             _INIT_DONE.set()
     return _PRESIDIO_OK
 

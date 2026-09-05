@@ -179,13 +179,25 @@ def test_systemexit_from_engine_construction_is_caught(fresh_scrub_state, monkey
 
 
 def test_the_init_event_is_set_even_when_the_builder_raises_baseexception(
-    fresh_scrub_state, monkeypatch
+    fresh_scrub_state, monkeypatch, caplog
 ):
-    """The ``finally`` is the deadlock guard, not decoration.
+    """The ``finally`` is the deadlock guard, not decoration — AND IT MUST NOT
+    DEGRADE THE PROCESS IN SILENCE.
 
     ``except (Exception, SystemExit)`` does not cover every ``BaseException``. If
     one escapes and the event is never set, every other thread — including the
-    MCP server's request threads — waits on the lock forever.
+    MCP server's request threads — waits on the lock forever. So the event is set
+    unconditionally.
+
+    But setting it is a decision: initialisation runs exactly once, so
+    ``_PRESIDIO_OK`` then latches False for the life of the process and every
+    later ``scrub()`` is regex-only. A ``KeyboardInterrupt`` or an
+    ``asyncio.CancelledError`` landing inside the engine build would have
+    narrowed PII coverage for the whole run with nothing in the log to say so —
+    the exact silent-degradation shape the 2026-08-08 "fail loudly" directive
+    exists to forbid. The warning must be emitted on this path too, exactly
+    once, and the exception must still propagate (``KeyboardInterrupt`` has to
+    keep killing the process).
     """
     mod = fresh_scrub_state
 
@@ -197,13 +209,23 @@ def test_the_init_event_is_set_even_when_the_builder_raises_baseexception(
 
     monkeypatch.setattr(mod, "_build_presidio_engines", _boom)
 
-    with pytest.raises(_Weird):
-        mod.ensure_presidio_ready()
+    with caplog.at_level("WARNING", logger="aggregator.core.scrub"):
+        with pytest.raises(_Weird):
+            mod.ensure_presidio_ready()
 
-    assert mod._INIT_DONE.is_set() is True
-    assert mod._PRESIDIO_OK is False
-    # And nothing is wedged: the next caller returns immediately.
-    assert mod.ensure_presidio_ready() is False
+        assert caplog.text.count("PII scrubbing will use regex fallback only") == 1
+        assert mod._INIT_DONE.is_set() is True
+        assert mod._PRESIDIO_OK is False
+        # And nothing is wedged: the next caller returns immediately, and
+        # scrubbing continues on the regex path it just announced.
+        assert mod.ensure_presidio_ready() is False
+        result = mod.scrub("write to bob@example.com and note 123-45-6789")
+        assert "bob@example.com" not in result.text
+        assert "123-45-6789" not in result.text
+        assert result.counts.get("email", 0) >= 1
+        assert result.counts.get("ssn", 0) >= 1
+        # Still announced once, not once per row.
+        assert caplog.text.count("PII scrubbing will use regex fallback only") == 1
 
 
 def test_background_warmup_then_scrub_waits_and_uses_presidio(
