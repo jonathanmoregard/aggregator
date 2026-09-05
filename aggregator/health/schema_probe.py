@@ -86,28 +86,45 @@ which is rule 2 applied to the question "whose version am I even reading".
 
 STATES, AND WHY FOUR RATHER THAN A BOOLEAN
 
-``FINE``     cache >= reader's requirement AND writer >= it. Silent.
-``DEAD``     cache < requirement. Recall is refusing RIGHT NOW.
-``WILL_ROT`` writer < requirement. Recall may work this minute, but the writer
-             re-stamps the cache down to its own version on the next tick, so
-             a hand-run migration reverts within thirty minutes. This is the
+``FINE``     cache == reader's requirement AND writer == it. Silent.
+``DEAD``     cache != requirement. Recall is refusing RIGHT NOW.
+``WILL_ROT`` writer != requirement. Recall may work this minute, but the writer
+             re-stamps the cache at its own version on the next tick, so a
+             hand-run migration reverts within thirty minutes. This is the
              state a two-quantity check cannot see, and it is the one that
              explains why the incident kept coming back.
 ``UNKNOWN``  some quantity could not be read.
+
+``!=``, NOT ``<``, AND THAT IS THE READER'S OWN RULE. The gate in ``mcp.py``
+is ``version != SCHEMA_VERSION`` — ``_ensure_cache_ready``, which splits into
+``_stale_cache_response`` and ``_ahead_cache_response``. This file compared
+only ``<`` for its first life, so a cache stamped ABOVE the reader made every
+``aggregator_search_memory`` call return ``ok:false`` while the probe printed
+"healthy" and exited 0. A probe STRICTER than the gate trains its operator to
+ignore it; a probe LOOSER than the gate is the incident it was written to
+detect, running with the detector's own blessing.
 
 ``DEAD`` and ``WILL_ROT`` co-occur — that was the live incident — and both
 have to survive into the report, because they have different remedies and
 fixing only the first leaves a machine that breaks itself again on the next
 tick.
 
-THE REMEDY IS ALWAYS FORWARD
+THE REMEDY MOVES THE LAGGING SIDE UP, WHICHEVER SIDE THAT IS
 
-Every message here says: bring the WRITER up. Never lower the reader. Two
-components disagreeing on a version is repaired by moving the lagging side up,
-and offering "or make the reader accept the old schema" as the other arm of a
-choice is not a neutral presentation of options — the schema-6 reader wants
-columns a schema-5 cache does not have, so accepting 5 means reading a cache
-that cannot answer, which is the failure wearing a different hat.
+Never down. Two components disagreeing on a version is repaired by bringing
+the older one forward, and offering "or make the newer side accept the old
+schema" as the other arm of a choice is not a neutral presentation of options —
+the schema-6 reader wants columns a schema-5 cache does not have, so accepting
+5 means reading a cache that cannot answer, which is the failure wearing a
+different hat.
+
+Which side lags is not fixed, and getting it wrong is worse than saying
+nothing. When the cache is BEHIND, the writer lags and a newer writer is
+deployed. When the cache is AHEAD, the cache is the current side and the
+READER lags — so those messages name the reader, and name no writer command at
+all, because running an older writer against a newer cache re-stamps
+``user_version`` downward and turns a cache one component cannot read into a
+cache that is wrong for all of them.
 
 CONSUMERS
 
@@ -819,6 +836,34 @@ def probe(
                     "evidence.",
                 )
             )
+        elif cache_version > reader_version:
+            # The mirror, and the half this probe used to call healthy. See
+            # ``_ahead_cache_response`` in mcp.py: the gate is ``!=``, not
+            # ``<``, so a cache ABOVE the reader is refused just as hard —
+            # every call comes back ok:false while a probe comparing only
+            # ``<`` prints "healthy" and exits 0. The remedy is the opposite
+            # one, and naming the writer here would be destructive rather than
+            # merely useless: an older writer re-stamps user_version DOWN.
+            findings.append(
+                Finding(
+                    DEAD,
+                    "AGGREGATOR RECALL IS DEAD: the cache is stamped at schema "
+                    f"{cache_version} and the MCP reader understands exactly "
+                    f"{reader_version}, so every aggregator_search_memory call is "
+                    "returning ok:false. The READER is the lagging side here — "
+                    "the cache was written by a build newer than the one Claude "
+                    "Code is launching.",
+                    "FIX: bring the READER up. The `aggregator-mcp` that "
+                    "~/.claude.json's mcpServers.aggregator starts must be at "
+                    f"least schema {cache_version}: update or redeploy that build "
+                    "and then RESTART the MCP server — a server process is held "
+                    "for the life of the client that spawned it, so new code on "
+                    "disk changes nothing until the process is replaced. Leave "
+                    "the CACHE alone: it is the current side, and no command run "
+                    "against the data can make an older reader understand a newer "
+                    "schema.",
+                )
+            )
         elif meta_version is not None and meta_version != cache_version:
             # Only worth raising once the pragma itself is not already the
             # headline: a DEAD cache has a bigger problem than an inconsistent
@@ -837,23 +882,52 @@ def probe(
                 )
             )
 
-    if writer_version is not None and reader_version is not None and writer_version < reader_version:
-        findings.append(
-            Finding(
-                WILL_ROT,
-                "the aggregator WRITER IS BEHIND THE READER: the packaged writer "
-                f"builds schema {writer_version} while the MCP reader requires "
-                f"{reader_version}. migrate() ends by stamping PRAGMA user_version "
-                "with the writer's own constant, so the writer re-stamps the cache "
-                f"DOWN to {writer_version} on every ingest tick and exits 0 doing "
-                "it. Recall cannot stay healthy while this holds, and a hand-run "
-                "migration will revert within one timer period.",
-                "FIX (forward only): bump nixos-config's `aggregator-src` flake "
-                f"input to a rev whose SCHEMA_VERSION is at least {reader_version} "
-                "and rebuild. Lowering the reader is not the alternative — the "
-                "schema-6 reader needs columns a schema-5 cache does not have.",
+    if writer_version is not None and reader_version is not None:
+        if writer_version < reader_version:
+            findings.append(
+                Finding(
+                    WILL_ROT,
+                    "the aggregator WRITER IS BEHIND THE READER: the packaged writer "
+                    f"builds schema {writer_version} while the MCP reader requires "
+                    f"{reader_version}. migrate() ends by stamping PRAGMA user_version "
+                    "with the writer's own constant, so the writer re-stamps the cache "
+                    f"DOWN to {writer_version} on every ingest tick and exits 0 doing "
+                    "it. Recall cannot stay healthy while this holds, and a hand-run "
+                    "migration will revert within one timer period.",
+                    "FIX (forward only): bump nixos-config's `aggregator-src` flake "
+                    f"input to a rev whose SCHEMA_VERSION is at least {reader_version} "
+                    "and rebuild. Lowering the reader is not the alternative — the "
+                    "schema-6 reader needs columns a schema-5 cache does not have.",
+                )
             )
-        )
+        elif writer_version > reader_version:
+            # The same countdown pointing the other way, and it only became a
+            # fault when the gate became ``!=``. While the reader refused
+            # merely ``<``, a writer past the reader was the sanctioned repair
+            # and flagging it would have argued against this file's own remedy.
+            # Now the next tick stamps the cache ABOVE the reader, and the
+            # reader refuses that too — so this is DEAD on a timer, which is
+            # WILL_ROT by definition.
+            findings.append(
+                Finding(
+                    WILL_ROT,
+                    "the aggregator WRITER IS AHEAD OF THE READER: the packaged "
+                    f"writer builds schema {writer_version} while the MCP reader "
+                    f"understands exactly {reader_version}. migrate() ends by "
+                    "stamping PRAGMA user_version with the writer's own constant, "
+                    f"so the next ingest tick stamps the cache at {writer_version} "
+                    "— which the reader refuses just as hard as one that is too "
+                    "old. Recall may answer this minute and will be returning "
+                    "ok:false within one timer period.",
+                    "FIX: bring the READER up to at least "
+                    f"{writer_version} — the `aggregator-mcp` that ~/.claude.json's "
+                    "mcpServers.aggregator starts, redeployed and then RESTARTED, "
+                    "since a running server keeps the code it was launched with. "
+                    "Do NOT pin the writer back down to make the numbers meet: "
+                    "that re-stamps caches downward and is the incident this check "
+                    "exists to detect.",
+                )
+            )
 
     states = sorted({f.state for f in findings}) or [FINE]
     primary = next(s for s in _SEVERITY_ORDER if s in states or s == FINE)

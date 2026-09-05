@@ -289,28 +289,62 @@ def test_the_live_incident_reports_both_states_at_once(world):
     assert v.exit_code() == sp.EXIT_DEAD
 
 
-def test_a_cache_ahead_of_the_reader_is_not_a_fault(world):
-    """Mirrors the gate's ``<``, which is deliberate and not a typo.
+def test_a_cache_ahead_of_the_reader_is_dead_too(world):
+    """The mirror of the incident, and the half the probe used to call healthy.
 
-    ``mcp.py`` refuses only a cache OLDER than it requires. A newer cache is
-    readable, so the probe must not invent a fault the reader does not have —
-    a check stricter than the thing it checks trains its operator to ignore
-    it.
+    THIS TEST USED TO ASSERT THE OPPOSITE, on the strength of ``mcp.py``'s gate
+    being ``version < SCHEMA_VERSION``. That gate is now ``!=`` — see
+    ``_ensure_cache_ready`` and ``_ahead_cache_response``, which exist because
+    serving a cache the reader cannot describe is the WORSE half of the two
+    failures: it answers, with rows out of tables this build has no description
+    of, so nothing about it prompts anyone to look. A probe that reported
+    "healthy, exit 0" while every ``aggregator_search_memory`` call came back
+    ``ok:false`` would be the original incident wearing the other shoe.
+
+    The probe must mirror the gate it reports on. Stricter than the reader
+    trains an operator to ignore it; LOOSER than the reader is the failure this
+    module exists to prevent.
     """
     v = world(cache=7, reader=6, writer=7)
-    assert v.state == sp.FINE, v.explain()
-    assert v.exit_code() == 0
+    assert v.state != sp.FINE, v.explain()
+    assert sp.DEAD in v.states, v.explain()
+    assert v.exit_code() == sp.EXIT_DEAD
+    assert "7" in v.explain() and "6" in v.explain()
 
 
-def test_writer_ahead_of_the_reader_is_not_a_fault(world):
-    """The forward-fix direction, which must never be flagged.
+def test_the_cache_ahead_remedy_moves_the_reader_never_the_cache(world):
+    """Opposite cause, opposite fix — and one fix here is actively destructive.
 
-    Bringing the writer up past the reader is the sanctioned repair for this
-    incident. If the probe called that a fault it would argue against its own
-    remedy while the operator was applying it.
+    In the stale direction the writer lags and a newer writer is deployed. Here
+    the CACHE is the current side: whatever wrote it is already ahead, and the
+    reader is the lagging one. Running an older writer against it re-stamps
+    ``user_version`` DOWNWARD, which turns a cache one component cannot read
+    into a cache that is wrong for all of them. So the remedy must send the
+    operator at the reader binary Claude Code launches, and must not name the
+    cache or a downgrade as an option at all.
+    """
+    v = world(cache=7, reader=6, writer=7)
+    fix = " ".join(f.remedy for f in v.findings if f.state == sp.DEAD)
+    assert "restart" in fix.lower(), fix
+    assert "reader" in fix.lower(), fix
+    assert "downgrad" not in fix.lower(), fix
+
+
+def test_writer_ahead_of_the_reader_will_rot(world):
+    """The writer stamps what the reader must accept, so ahead rots too.
+
+    ALSO INVERTED FROM WHAT IT ONCE ASSERTED, and for the same reason: while
+    the gate was ``<``, a writer past the reader was the sanctioned forward
+    fix and flagging it would have argued against the probe's own remedy. Under
+    ``!=`` it is a countdown. ``migrate()`` ends by stamping the writer's own
+    constant, so the next ingest tick puts the cache at 7 against a reader that
+    requires exactly 6 — recall works this minute and is refused within one
+    timer period, which is the WILL_ROT shape exactly.
     """
     v = world(cache=6, reader=6, writer=7)
-    assert v.state == sp.FINE, v.explain()
+    assert v.state != sp.FINE, v.explain()
+    assert sp.WILL_ROT in v.states, v.explain()
+    assert v.exit_code() == sp.EXIT_WILL_ROT
 
 
 # --- unknown ⇒ warn, never "fine" -------------------------------------------
