@@ -174,12 +174,16 @@
               units=${hmFixture.config.home-files}/.config/systemd/user
               fail() { echo "FAIL: $*" >&2; exit 1; }
 
-              # Every unit this module generates. The two notifiers are
-              # separate on purpose — see step 3.
+              # Every unit this module generates. The notifiers are separate
+              # per failing unit on purpose — see step 3. The tag units ride
+              # the same hygiene: store-artifact ExecStart, no /home/, no
+              # uv run, their own notifier with their own debounce stamp.
               all_units="aggregator-embed.service aggregator-embed.timer \
                          aggregator-embed-seed.service \
                          aggregator-embed-failure-notify.service \
-                         aggregator-embed-seed-failure-notify.service"
+                         aggregator-embed-seed-failure-notify.service \
+                         aggregator-tag.service aggregator-tag.timer \
+                         aggregator-tag-failure-notify.service"
 
               for u in $all_units; do
                 [ -e "$units/$u" ] || fail "$u was not generated"
@@ -253,7 +257,8 @@
 
               for pair in \
                 "aggregator-embed.service:aggregator-embed-failure-notify.service" \
-                "aggregator-embed-seed.service:aggregator-embed-seed-failure-notify.service"; do
+                "aggregator-embed-seed.service:aggregator-embed-seed-failure-notify.service" \
+                "aggregator-tag.service:aggregator-tag-failure-notify.service"; do
                 failing=''${pair%%:*}
                 notifier=''${pair##*:}
 
@@ -269,7 +274,9 @@
                   || fail "$notifier never points at 'journalctl --user -u $failing' — the operator is sent to the wrong unit's journal"
 
                 # ...and must not send them to the other one's.
-                for other in aggregator-embed.service aggregator-embed-seed.service; do
+                for other in aggregator-embed.service \
+                             aggregator-embed-seed.service \
+                             aggregator-tag.service; do
                   [ "$other" = "$failing" ] && continue
                   if grep -qF "journalctl --user -u $other" "$script"; then
                     grep -nF "journalctl --user -u $other" "$script" >&2
@@ -344,7 +351,8 @@
               }
 
               for notifier in aggregator-embed-failure-notify.service \
-                              aggregator-embed-seed-failure-notify.service; do
+                              aggregator-embed-seed-failure-notify.service \
+                              aggregator-tag-failure-notify.service; do
                 script=$(notify_script_for "$notifier")
 
                 run_notify "$script" 1
@@ -398,6 +406,28 @@
                 fail "a seed failure silenced the embed worker's notification for 24h — see above"
               fi
               rm -rf "$work"
+
+              # ---- 3d. Every notifier has its OWN debounce stamp ----------
+              # The executed pairwise proof above covers the two embed units;
+              # with a third notifier the pair count grows quadratically, so
+              # the general property is asserted structurally instead: the
+              # stamp filename each rendered script arms must be unique. A
+              # shared stamp is exactly the round-3 bug (one unit's failure
+              # buying 24h of silence for a different unit's problem).
+              stamps=""
+              for n in aggregator-embed-failure-notify.service \
+                       aggregator-embed-seed-failure-notify.service \
+                       aggregator-tag-failure-notify.service; do
+                script=$(notify_script_for "$n")
+                stamp_name=$(sed -n 's|.*stamp="$stamp_dir/\([^"]*\)".*|\1|p' "$script")
+                [ -n "$stamp_name" ] \
+                  || fail "$n: could not locate its debounce stamp assignment — the structural uniqueness check below would assert nothing"
+                stamps="$stamps$stamp_name
+"
+              done
+              dupes=$(printf '%s' "$stamps" | sort | uniq -d)
+              [ -z "$dupes" ] \
+                || fail "failure notifiers share a debounce stamp ($dupes) — one unit's failure would silence another unit's notification for 24h"
 
               # ---- 4. Weights are never fetched by the unattended unit ----
               grep -q 'HF_HUB_OFFLINE=1' "$svc" \
@@ -573,7 +603,9 @@
               # line and every ExecStart script, so the two cannot drift.
               for u in aggregator-embed.service aggregator-embed.timer \
                        aggregator-embed-failure-notify.service \
-                       aggregator-embed-seed-failure-notify.service; do
+                       aggregator-embed-seed-failure-notify.service \
+                       aggregator-tag.service aggregator-tag.timer \
+                       aggregator-tag-failure-notify.service; do
                 f=$(readlink -f "$units/$u")
                 if grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD' "$f"; then
                   fail "$u sets AGGREGATOR_ALLOW_MODEL_DOWNLOAD — only the human-triggered seed unit may enable model downloads"
@@ -706,6 +738,38 @@
               # offline worker and fatal here.
               if grep -q '^PrivateNetwork=' "$seed_svc"; then
                 fail "aggregator-embed-seed.service sets PrivateNetwork — it exists to fetch 2.4 GB of weights over the internet"
+              fi
+
+              # ---- 8c. The tag unit's sandbox ------------------------------
+              # `aggregator tag` shells out to `claude -p` with
+              # attacker-influenced record bodies in the prompt, so the unit
+              # carries the sibling sandbox to the extent the claude CLI
+              # tolerates. Every directive below was verified on the host
+              # (2026-09-04): `claude -p --model haiku` under exactly this
+              # set via `systemd-run --user` answered and exited 0.
+              tag_svc="$units/aggregator-tag.service"
+              for directive in \
+                'NoNewPrivileges=true' \
+                'PrivateTmp=true' \
+                'RestrictRealtime=true' \
+                'RestrictSUIDSGID=true' \
+                'LockPersonality=true' \
+                'ProtectSystem=full' \
+                'ProtectKernelTunables=true' \
+                'ProtectControlGroups=true'; do
+                grep -qxF "$directive" "$tag_svc" \
+                  || fail "aggregator-tag.service is missing '$directive' — it feeds attacker-influenced record bodies to a subprocess and must not run with the user's full ambient authority"
+              done
+
+              # ...and the directives that would BREAK it, step-8b style.
+              if grep -q '^ProtectHome=' "$tag_svc"; then
+                fail "aggregator-tag.service sets ProtectHome — claude -p must read ~/.claude config+credentials and write its own state under \$HOME"
+              fi
+              if grep -q '^PrivateNetwork=' "$tag_svc"; then
+                fail "aggregator-tag.service sets PrivateNetwork — the claude CLI exists to reach its API; this unit is network-permitted like aggregator-github"
+              fi
+              if grep -q '^IPAddressDeny=any$' "$tag_svc"; then
+                fail "aggregator-tag.service sets IPAddressDeny=any — that blocks the API call this unit exists to make"
               fi
 
               # ---- 9. The score behind step 8, and why it is not asserted -

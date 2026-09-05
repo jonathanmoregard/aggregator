@@ -173,7 +173,14 @@ def test_hostile_query_text_on_a_healthy_cache_is_answered_not_refused(healthy_d
     ``fts5_match_query`` whitelists the text before it reaches ``MATCH``, so
     the operators and the stray quote are gone and the words are answered.
 
-    The concern that test guarded is not dropped, it moved: what must never
+    Pre-relaxation this pinned zero hits: ``'"voting" "AND" "OR"'`` AND-matched
+    and the corpus holds only the first token. The relaxation ladder rescues
+    exactly that shape now — strict AND finds nothing, the OR tier returns the
+    ``voting`` rows — so the honest expectation is the seeded corpus back,
+    FLAGGED: the page must carry the ``lexical_relaxation`` marker so relaxed
+    hits cannot masquerade as exact conjunction matches.
+
+    The concern the old test guarded is not dropped, it moved: what must never
     happen is a CACHE failure being labelled a query-text problem, and
     ``test_a_malformed_cache_is_not_reported_as_an_fts5_syntax_error`` above is
     now the only test that owns that distinction. Here the mirror image is
@@ -182,10 +189,15 @@ def test_hostile_query_text_on_a_healthy_cache_is_answered_not_refused(healthy_d
     """
     result = aggregator_query('voting AND OR "', _store=_reader(healthy_db))
     assert result["ok"] is True, result
-    # '"voting" "AND" "OR"' — all three tokens, AND-ed. The corpus has the
-    # first and not the others, so the honest answer is zero hits.
-    assert result["total"] == 0
-    assert aggregator_query("voting", _store=_reader(healthy_db))["total"] > 0
+    # OR-tier rescue: every seeded observation says "voting", none says the
+    # literal tokens "AND"/"OR", so the ladder's second tier answers with the
+    # whole corpus — and must disclose that these are not exact AND matches.
+    assert result["total"] == 400
+    assert result["lexical_relaxation"] == "or", result.get("lexical_relaxation")
+    # An exact match stays unmarked — absence IS the exact-match claim.
+    exact = aggregator_query("voting", _store=_reader(healthy_db))
+    assert exact["total"] > 0
+    assert "lexical_relaxation" not in exact
 
 
 def test_a_lock_released_between_the_two_probes_is_still_a_cache_failure(

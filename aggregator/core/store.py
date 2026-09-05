@@ -97,7 +97,9 @@ import os
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -118,7 +120,11 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+# v7: porter stemming on both FTS5 tables. The version stamp is bookkeeping
+# only — the migration itself is guarded by probing the artifact (the
+# ``tokenize=`` clause in ``sqlite_master``), so a half-applied state
+# converges rather than skips. See ``Store._ensure_porter_fts_tokenizer``.
+SCHEMA_VERSION = 7
 
 #: How long SQLite's own busy handler waits for the write lock before raising
 #: ``database is locked``, in milliseconds.
@@ -660,6 +666,102 @@ def fts5_query_terms(text: str | None) -> list[str]:
     return _FTS5_TOKEN_RE.findall(text or "")
 
 
+#: The two relaxed tiers, by name. These strings travel all the way to the
+#: tool boundary (``lexical_relaxation`` in the MCP response, a ``#`` line in
+#: CLI output), so they are part of the response vocabulary, not internals.
+LEXICAL_RELAX_OR = "or"
+LEXICAL_RELAX_PREFIX = "prefix"
+
+#: Tier depth, for the sticky-deepest marker: ``None`` (exact) < or < prefix.
+_LEXICAL_RELAX_DEPTH = {None: 0, LEXICAL_RELAX_OR: 1, LEXICAL_RELAX_PREFIX: 2}
+
+
+@dataclass
+class LexicalProbe:
+    """What the relaxation ladder did inside one scope. Two facts, not one.
+
+    ``tier`` alone could not answer the question the empty-page notice asks,
+    and that is the whole reason this type exists. ``tier is None`` conflates
+    "the STRICT tier answered" with "no tier matched anything at all" —
+    indistinguishable states in the marker, opposite states in a diagnosis.
+    When a ``tag:``/``source:``/``from:`` filter then removes every matching
+    row, the page is empty for a reason that has nothing to do with the words,
+    and the notice built on ``tier`` alone told the caller the corpus contains
+    none of their terms. It does; the filter took them.
+
+    ``matched`` is the missing half: how many rows the tier that answered
+    returned, AS THE LADDER SAW THEM — that is, before the outer SELECT
+    applied ``tag:``, ``source:``, ``from:``/``to:`` or the id-scope keys. It
+    is a count the ladder already had in hand (``len(rows)``), so this costs
+    no extra query.
+
+    THREE-VALUED ON PURPOSE, the same discipline as ``lexical_ids`` in
+    ``mcp.py``: ``None`` means the ladder never ran (a pure-filter query, or
+    ``search_mode='vector'``), ``0`` means it ran and matched nothing, and
+    ``> 0`` means the words are in the corpus. A notice that collapsed the
+    first two would state a fact about the corpus out of a query that never
+    asked it.
+    """
+
+    #: Deepest relaxation tier that returned rows in this scope.
+    tier: str | None = None
+    #: Pre-filter rows the answering tier returned; ``None`` = ladder unused.
+    matched: int | None = None
+
+
+def fts5_relaxation_tiers(
+    conjuncts: list[str],
+) -> list[tuple[str | None, str]]:
+    """The progressive-relaxation ladder: ``(tier, MATCH expression)`` pairs.
+
+    THE FAILURE THIS REMOVES is the index's documented worst one: free text
+    is an implicit AND inside one row, so a remembered-gist query of several
+    words reliably returned nothing at all. The ladder keeps strict AND as
+    tier 1 — a query that matches exactly returns identical rows to before —
+    and adds two fallbacks a caller only ever sees when every earlier tier
+    was EMPTY: the same conjuncts joined with ``OR``, then ``OR`` with a
+    prefix ``*`` on the final conjunct (the token most likely to be
+    half-remembered or half-typed).
+
+    TAKES SANITIZED CONJUNCTS, NOT RAW TEXT, and that is deliberate twice
+    over. First, the safety property: every character of user origin inside
+    the returned expressions was emitted by :func:`fts5_match_conjuncts` —
+    quoted ``\\w+`` runs — and the ``OR`` and trailing ``*`` are written
+    HERE, by this function, so no operator can be smuggled in through the
+    ladder. (``"a b"*`` is FTS5's phrase-prefix form: adjacency is kept and
+    only the last token of the phrase prefix-matches — a caller's quoted
+    phrase stays a phrase in every tier.) Second, the enumeration rule:
+    ``tests/test_fts5_match_site_enumeration.py`` requires the function that
+    OWNS a ``MATCH`` statement to call the sanitizer itself, so the binding
+    sites call ``fts5_match_conjuncts`` and hand the result here rather than
+    passing raw text through one more layer.
+
+    THE OR TIER IS SKIPPED FOR A SINGLE CONJUNCT — it would be byte-identical
+    to the strict tier, and re-running an FTS scan to learn nothing is how a
+    "cheap" fallback stops being cheap.
+
+    A NOTE ON PREFIX UNDER PORTER: the index holds STEMMED tokens, and FTS5
+    does not stem a prefix query's token (stem-then-prefix is incoherent), so
+    ``configurati*`` misses a corpus that only holds ``configur``. The prefix
+    tier is therefore a genuine last resort for truncated tokens
+    (``alphab*``), not a general recall widener — which matches its position
+    at the bottom of the ladder.
+
+    Callers run the tiers IN ORDER and stop at the first tier with rows:
+    exactly one tier's rows are ever returned, so relaxed and exact results
+    can never interleave, and the tier that answered is recorded via
+    :meth:`Store._note_lexical_relaxation` for the output layer to surface.
+    """
+    if not conjuncts:
+        return []
+    tiers: list[tuple[str | None, str]] = [(None, " ".join(conjuncts))]
+    if len(conjuncts) > 1:
+        tiers.append((LEXICAL_RELAX_OR, " OR ".join(conjuncts)))
+    prefixed = [*conjuncts[:-1], conjuncts[-1] + "*"]
+    tiers.append((LEXICAL_RELAX_PREFIX, " OR ".join(prefixed)))
+    return tiers
+
+
 def _table_present(c: sqlite3.Connection, table: str) -> bool:
     """Whether ``table`` exists. Probed once per write group, not per row."""
     return (
@@ -848,6 +950,123 @@ class EmptyRebuildRefusedError(RuntimeError):
 # ---------------------------------------------------------------------------
 # DDL — three tables + three FTS shadows, all under one migration.
 # ---------------------------------------------------------------------------
+
+#: ONE tokenizer string for BOTH FTS tables, and the reason it is a constant:
+#: the v7 migration probes the stored ``sqlite_master`` SQL against it, so a
+#: second spelling in a second CREATE would make one table migrate and the
+#: other silently keep the old tokenizer.
+#:
+#: ``porter`` IS THE v7 CHANGE. Without it, ``report`` and ``reports`` are
+#: different terms, and a multi-word gist query — every term ANDed — loses to
+#: morphology before the conjunction even gets its turn. Porter stems the
+#: indexed tokens AND the query tokens with the same rules, so ``running``
+#: finds ``run fast`` and ``run`` finds ``running shoes``. It wraps
+#: ``unicode61 remove_diacritics 2``, which keeps the existing case- and
+#: diacritic-folding exactly as it was.
+_FTS_TOKENIZE = "porter unicode61 remove_diacritics 2"
+
+#: The FTS table CREATEs and the obs sync triggers, as named constants rather
+#: than inline ``_DDL`` strings, because the v7 migration has to recreate
+#: exactly these artifacts (a tokenizer cannot be ALTERed — see
+#: ``Store._ensure_porter_fts_tokenizer``) and a second copy of the text is
+#: how the migrated shape and the fresh shape drift apart.
+
+# FTS5 external-content over observations.body. Sync via the triggers below.
+_OBS_FTS_DDL = f"""
+    CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
+        body,
+        content='observations',
+        content_rowid='rowid',
+        tokenize='{_FTS_TOKENIZE}'
+    );
+"""
+
+_OBS_FTS_TRIGGERS: tuple[str, ...] = (
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations
+    BEGIN
+        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations
+    BEGIN
+        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+    END;
+    """,
+    # ``OF body`` IS THE WHOLE POINT, and it is not a micro-optimisation.
+    #
+    # Without the column list this fires on ANY update to ANY column — an
+    # ``embedding_state`` flip, a ``provenance`` stamp — and each firing is a
+    # full FTS5 ``'delete'`` plus re-insert of the entire body. With
+    # ``auto_vacuum=0`` the pages that frees are never handed back, which is the
+    # same mechanism documented at the ingest UPSERT below. Measured on a
+    # throwaway database at 1/5 of live scale: a chunked column-only rewrite
+    # took 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth
+    # narrow.
+    # Extrapolated to the live 549,952 rows that is 12x wall clock and
+    # 380-640 MB of permanent bloat on a 1.4 GB file.
+    #
+    # IT INDEXES EXACTLY AS MUCH AS BEFORE. SQLite fires ``UPDATE OF body``
+    # whenever ``body`` appears in the SET clause, whether or not the value
+    # actually moved, and the ingest UPSERT always names ``body =
+    # excluded.body``. Pinned by ``tests/core/test_store_fts_trigger_narrowing
+    # .py::test_upsert_keeps_the_fts_index_correct``, which matches a sentinel
+    # token through the real upsert rather than restating this paragraph.
+    #
+    # ``IF NOT EXISTS`` will NOT replace a trigger that is already there, so
+    # every database created before this change needs ``_ensure_narrow_fts_
+    # update_trigger`` to drop the wide one first — and those are the databases
+    # the narrowing is for.
+    """
+    CREATE TRIGGER IF NOT EXISTS observations_au
+    AFTER UPDATE OF body ON observations
+    BEGIN
+        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
+    END;
+    """,
+)
+
+_RECORDS_FTS_DDL = f"""
+    CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
+        stable_id UNINDEXED,
+        source    UNINDEXED,
+        subject,
+        body,
+        tags,
+        tokenize='{_FTS_TOKENIZE}'
+    );
+"""
+
+#: The text the ``records_fts`` ``tags`` column indexes for one row: the
+#: space-joined UNION of the source-written ``tags`` array and the LLM-written
+#: ``llm_tags`` array, read from the ``records`` row itself. One SQL
+#: expression shared by every site that (re)builds a ``records_fts`` row —
+#: the porter rebuild, the row-write path and ``write_llm_tags`` — because a
+#: second spelling is how the index and the columns would come to disagree
+#: about whether a record is reachable by its tags. ``COALESCE`` on
+#: ``llm_tags``: NULL means "never tagged" and must read as no tags, not as a
+#: ``json_each`` error.
+_RECORDS_FTS_TAGS_SQL = (
+    "TRIM(COALESCE((SELECT group_concat(je.value, ' ') "
+    "FROM json_each(records.tags) AS je), '') || ' ' || "
+    "COALESCE((SELECT group_concat(je.value, ' ') "
+    "FROM json_each(COALESCE(records.llm_tags, '[]')) AS je), ''))"
+)
+
+#: Rebuild one record's ``records_fts`` row from the stored row. Callers
+#: DELETE the old FTS row first (records_fts is not external-content, so
+#: delete+insert is the update idiom — see ``_write_one_record``). Reading
+#: from ``records`` rather than from caller-held values is what keeps the
+#: index equal to the columns by construction: whatever the row holds — a
+#: fresh ingest's body, a tag write's llm_tags — is what gets indexed.
+_RECORDS_FTS_REFRESH_SQL = (
+    "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
+    "SELECT stable_id, source, subject, body, " + _RECORDS_FTS_TAGS_SQL + " "
+    "FROM records WHERE stable_id = ?"
+)
+
 _DDL: list[str] = [
     # --- v2: sessions (Langfuse "trace") ------------------------------
     """
@@ -920,58 +1139,10 @@ _DDL: list[str] = [
     # row already classified — 1,100 chunks over 549,952 rows, each starting
     # further in than the last. Indexed it is a seek. It also serves ``by:``.
     "CREATE INDEX IF NOT EXISTS obs_provenance ON observations(provenance);",
-    # FTS5 external-content over observations.body. Sync via triggers below.
-    """
-    CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
-        body,
-        content='observations',
-        content_rowid='rowid',
-        tokenize='unicode61 remove_diacritics 2'
-    );
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations
-    BEGIN
-        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
-    END;
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations
-    BEGIN
-        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
-    END;
-    """,
-    # ``OF body`` IS THE WHOLE POINT, and it is not a micro-optimisation.
-    #
-    # Without the column list this fires on ANY update to ANY column — an
-    # ``embedding_state`` flip, a ``provenance`` stamp — and each firing is a
-    # full FTS5 ``'delete'`` plus re-insert of the entire body. With
-    # ``auto_vacuum=0`` the pages that frees are never handed back, which is the
-    # same mechanism documented at the ingest UPSERT below. Measured on a
-    # throwaway database at 1/5 of live scale: a chunked column-only UPDATE ran
-    # 87.5 s and grew the file 128 MB wide, versus 7.4 s and no growth narrow.
-    # Extrapolated to the live 549,952 rows that is 12x wall clock and
-    # 380-640 MB of permanent bloat on a 1.4 GB file.
-    #
-    # IT INDEXES EXACTLY AS MUCH AS BEFORE. SQLite fires ``UPDATE OF body``
-    # whenever ``body`` appears in the SET clause, whether or not the value
-    # actually moved, and the ingest UPSERT always names ``body =
-    # excluded.body``. Pinned by ``tests/core/test_store_fts_trigger_narrowing
-    # .py::test_upsert_keeps_the_fts_index_correct``, which matches a sentinel
-    # token through the real upsert rather than restating this paragraph.
-    #
-    # ``IF NOT EXISTS`` will NOT replace a trigger that is already there, so
-    # every database created before this change needs ``_ensure_narrow_fts_
-    # update_trigger`` to drop the wide one first — and those are the databases
-    # the narrowing is for.
-    """
-    CREATE TRIGGER IF NOT EXISTS observations_au
-    AFTER UPDATE OF body ON observations
-    BEGIN
-        INSERT INTO obs_fts(obs_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
-        INSERT INTO obs_fts(rowid, body) VALUES (new.rowid, new.body);
-    END;
-    """,
+    # FTS5 shadow + sync triggers — shared with the v7 rebuild migration,
+    # which is why they are module constants rather than inline strings here.
+    _OBS_FTS_DDL,
+    *_OBS_FTS_TRIGGERS,
     # --- Legacy: records + records_fts for GitHub-shaped sources -------
     """
     CREATE TABLE IF NOT EXISTS records (
@@ -979,26 +1150,19 @@ _DDL: list[str] = [
         source     TEXT NOT NULL,
         subject    TEXT NOT NULL,
         body       TEXT NOT NULL,
-        tags       TEXT NOT NULL,       -- JSON array
+        tags       TEXT NOT NULL,       -- JSON array; SOURCE-written, pristine
         created_at TEXT,
         updated_at TEXT,
         extra      TEXT NOT NULL DEFAULT '{}',
         src_hash   TEXT,             -- v4; see ``_src_hash``
-        embedding_state TEXT         -- v5; NULL = not embedded yet
+        embedding_state TEXT,        -- v5; NULL = not embedded yet
+        llm_tags   TEXT,             -- JSON array; see ``_ensure_llm_tags_columns``
+        llm_tags_src_hash TEXT       -- src_hash the llm_tags were computed from
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_records_source ON records(source);",
     "CREATE INDEX IF NOT EXISTS idx_records_updated ON records(updated_at);",
-    """
-    CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-        stable_id UNINDEXED,
-        source    UNINDEXED,
-        subject,
-        body,
-        tags,
-        tokenize='unicode61 remove_diacritics 2'
-    );
-    """,
+    _RECORDS_FTS_DDL,
     """
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
@@ -1591,6 +1755,13 @@ class Store:
         #: ``read_only`` — see :meth:`_session_scope_cached` for why, and for
         #: the 200x it saves on a session-card page.
         self._session_scope_memo: dict[tuple, Any] = {}
+        #: The lexical-ladder observation stack. Element 0 is the REQUEST's
+        #: probe — what :meth:`lexical_relaxation` and :meth:`lexical_matches`
+        #: report — and :meth:`lexical_probe` pushes narrower ones on top so a
+        #: caller driving two ontologies from one query can ask what EACH arm
+        #: did. Every recorder writes to every probe on the stack, so the
+        #: request-wide answer is unaffected by who is watching.
+        self._lexical_probes: list[LexicalProbe] = [LexicalProbe()]
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -1829,7 +2000,9 @@ class Store:
         self._ensure_src_hash_columns(c)
         self._ensure_embedding_state_columns(c)
         self._ensure_provenance_column(c)
+        self._ensure_llm_tags_columns(c)
         self._ensure_narrow_fts_update_trigger(c)
+        self._ensure_porter_fts_tokenizer(c)
         for stmt in _DDL:
             c.executescript(stmt)
         if self._vector_available:
@@ -2362,6 +2535,34 @@ class Store:
         Store._ensure_column(c, "observations", "provenance", "TEXT")
 
     @staticmethod
+    def _ensure_llm_tags_columns(c: sqlite3.Connection) -> None:
+        """Additive (no version bump): ``records.llm_tags`` + its watermark.
+
+        ``llm_tags`` holds a JSON array of LLM-generated topic tags;
+        ``llm_tags_src_hash`` records the ``records.src_hash`` value those
+        tags were computed FROM. NULL for every existing row, and — the same
+        contract as ``embedding_state`` and ``provenance`` above — that NULL
+        is the whole watermark: ``aggregator tag`` selects rows whose
+        ``llm_tags_src_hash`` is NULL or disagrees with the current
+        ``src_hash``, so a pre-existing corpus comes out of this migration
+        QUEUED FOR TAGGING and a record whose content changes re-queues
+        itself. No sidecar ledger, nothing to fall out of step.
+
+        SOURCE TAGS STAY PRISTINE. The LLM never writes into ``records.tags``
+        — the union of the two is computed at query/index time
+        (:data:`_RECORDS_FTS_TAGS_SQL`, ``_build_where``) so a bad tagging
+        run can always be re-done without having corrupted source data.
+
+        Additive columns ship WITHOUT a schema-version bump, per the rule at
+        the top of ``_DDL``: old readers ignore columns they do not know.
+        Metadata-only ALTERs, like every ``_ensure_*`` above. Must run BEFORE
+        ``_ensure_porter_fts_tokenizer``, whose records repopulate reads the
+        ``llm_tags`` column through :data:`_RECORDS_FTS_TAGS_SQL`.
+        """
+        Store._ensure_column(c, "records", "llm_tags", "TEXT")
+        Store._ensure_column(c, "records", "llm_tags_src_hash", "TEXT")
+
+    @staticmethod
     def _ensure_narrow_fts_update_trigger(c: sqlite3.Connection) -> None:
         """Replace a wide ``observations_au`` with the ``OF body`` form.
 
@@ -2389,6 +2590,138 @@ class Store:
         if "UPDATE OF body" in row[0]:
             return
         c.execute("DROP TRIGGER observations_au")
+
+    @staticmethod
+    def _fts_table_sql(c: sqlite3.Connection, table: str) -> str | None:
+        """The stored CREATE text of ``table``, or None when absent."""
+        row = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    @staticmethod
+    def _ensure_porter_fts_tokenizer(c: sqlite3.Connection) -> None:
+        """v6 → v7: rebuild both FTS5 tables with porter stemming.
+
+        A TOKENIZER CANNOT BE ALTERED. It is baked into the FTS5 shadow tables
+        at CREATE time, so the only path from ``unicode61`` to
+        ``porter unicode61`` is drop + recreate + re-tokenize every row:
+        ``obs_fts`` is external-content, so its rebuild is FTS5's own
+        ``INSERT INTO obs_fts(obs_fts) VALUES('rebuild')`` over the
+        observations table it shadows; ``records_fts`` is standalone, so it is
+        repopulated from ``records`` — with ``tags`` space-joined out of the
+        stored JSON array via ``json_each``, exactly the shape the row-write
+        path stores (see the INSERT in ``_write_record_group``).
+
+        PROBES THE ARTIFACT, NOT ``user_version`` — the same rule as every
+        ``_ensure_*`` helper above, and here it is what makes an interrupted
+        migration safe rather than silent: the whole swap for each table runs
+        inside one SAVEPOINT, so a process killed mid-rebuild rolls back to
+        the intact old-tokenizer table and the next ``migrate()`` (one runs on
+        every CLI invocation) starts over. The probe can therefore never see
+        ``porter`` in ``sqlite_master`` next to a partial index — which is the
+        invariant that matters, because a migrated database that silently
+        served an empty or half-built FTS index would look exactly like a
+        corpus with nothing to say.
+
+        THE COST IS PAID HERE, ON PURPOSE, AND ANNOUNCED OUT LOUD. On the live
+        cache this re-tokenizes ~657k observation rows (~772 MB of text) and
+        runs for minutes, on whichever process first executes the new build —
+        possibly the MCP reader or the embed worker while other writers queue
+        on the write lock. The alternative — a chunked background backfill —
+        would mean a window in which queries silently answer from a partial
+        index, the exact empty-looks-like-success failure this project bans by
+        name. A migration that blocks once, says why, and leaves a complete
+        index behind is the honest trade. The recommended controlled first
+        run is one ``aggregator status`` immediately after deploy, so the
+        rebuild happens in a terminal a human is watching rather than under a
+        timer.
+
+        Runs BEFORE the ``_DDL`` pass. On a fresh database neither table
+        exists yet, so this no-ops and the DDL creates them with porter
+        directly. The triggers are recreated inside the same savepoint — not
+        left to the DDL pass — so "the savepoint committed" and "the index is
+        complete AND kept in sync" are the same fact.
+        """
+        obs_sql = Store._fts_table_sql(c, "obs_fts")
+        rec_sql = Store._fts_table_sql(c, "records_fts")
+        obs_stale = obs_sql is not None and "porter" not in obs_sql
+        rec_stale = rec_sql is not None and "porter" not in rec_sql
+        if not obs_stale and not rec_stale:
+            return
+        obs_rows = (
+            c.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            if obs_stale
+            else 0
+        )
+        rec_rows = (
+            c.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+            if rec_stale
+            else 0
+        )
+        log.warning(
+            "Rebuilding the FTS5 index with porter stemming (schema v7): "
+            "re-tokenizing %d observation row(s) and %d record row(s). This "
+            "is a one-time migration — a tokenizer cannot be changed in "
+            "place — and on the full cache it takes MINUTES while holding "
+            "the write lock. Do not interrupt it; an interrupted run rolls "
+            "back and starts over on the next command.",
+            obs_rows,
+            rec_rows,
+        )
+        c.execute("SAVEPOINT porter_fts")
+        try:
+            if obs_stale:
+                for trig in (
+                    "observations_ai",
+                    "observations_ad",
+                    "observations_au",
+                ):
+                    c.execute(f"DROP TRIGGER IF EXISTS {trig}")
+                # Porter migration: FTS5 tokenizer cannot be ALTERed; this is
+                # the deliberate drop+recreate+rebuild inside the SAVEPOINT.
+                # arftl-allow: sql-drop
+                c.execute("DROP TABLE obs_fts")
+                c.execute(_OBS_FTS_DDL)
+                c.execute("INSERT INTO obs_fts(obs_fts) VALUES('rebuild')")
+                for stmt in _OBS_FTS_TRIGGERS:
+                    c.execute(stmt)
+            if rec_stale:
+                # arftl-allow: sql-drop — same porter migration, records side.
+                c.execute("DROP TABLE records_fts")
+                c.execute(_RECORDS_FTS_DDL)
+                c.execute(
+                    "INSERT INTO records_fts"
+                    "(stable_id, source, subject, body, tags) "
+                    "SELECT stable_id, source, subject, body, "
+                    + _RECORDS_FTS_TAGS_SQL
+                    + " FROM records"
+                )
+        except BaseException:
+            c.execute("ROLLBACK TO SAVEPOINT porter_fts")
+            c.execute("RELEASE SAVEPOINT porter_fts")
+            raise
+        c.execute("RELEASE SAVEPOINT porter_fts")
+        # The commit makes the minutes-long rebuild durable NOW, so a failure
+        # later in migrate() cannot roll it back and pay the cost twice — but
+        # ``_WriteLockedConnection.commit`` also hands the flock baton back,
+        # and the REST of migrate() (DDL pass, vec reconcile, version stamp)
+        # must not run unlocked on the first post-deploy invocation. Re-queue
+        # immediately: ``take_cache_write_lock`` is idempotent, and if another
+        # writer slipped in between commit and re-acquire it saw a consistent,
+        # fully-rebuilt index. Guarded because the parameter type is the plain
+        # ``sqlite3.Connection`` protocol; migrate() always passes the
+        # write-locked subclass.
+        c.commit()
+        if isinstance(c, _WriteLockedConnection):
+            c.take_cache_write_lock()
+        log.info(
+            "FTS5 porter rebuild complete: %d observation row(s), %d record "
+            "row(s) re-tokenized.",
+            obs_rows,
+            rec_rows,
+        )
 
     def schema_version(self) -> int:
         """Return the DB's ``PRAGMA user_version`` (0 for a fresh file)."""
@@ -4789,17 +5122,14 @@ class Store:
         if existed and vec_usable:
             _drop_row_vectors(c, "vec_records", "stable_id", r.stable_id)
         c.execute("DELETE FROM records_fts WHERE stable_id = ?", (r.stable_id,))
-        c.execute(
-            "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                r.stable_id,
-                r.source,
-                scrubbed_subject,
-                scrubbed_body,
-                " ".join(r.tags),
-            ),
-        )
+        # INSERT..SELECT FROM the row just written, not VALUES from the
+        # incoming Record. The difference is ``llm_tags``: the tagger's
+        # columns survive an upsert (they are not in the SET list above), so
+        # the FTS row has to carry them too or every ingest tick would strip
+        # the LLM tags from the lexical index while the columns still claimed
+        # the record tagged. The SELECT reads the scrubbed subject/body the
+        # statement above stored, so the indexed text is identical either way.
+        c.execute(_RECORDS_FTS_REFRESH_SQL, (r.stable_id,))
 
     # -- reads: legacy Record-shaped path (GitHub) ------------------------
 
@@ -4819,8 +5149,30 @@ class Store:
             iso = ast.to_date.isoformat()
             params.extend([iso, iso])
         for tag in ast.tags:
-            clauses.append("tags LIKE ?")
-            params.append(f'%"{tag}"%')
+            # UNION of the source-written and LLM-written tag arrays: a
+            # ``tag:`` filter must reach a record however it earned the tag.
+            #
+            # EXACT membership via json_each, not the old ``LIKE '%"tag"%'``
+            # substring probe, which had two real defects: LIKE wildcards in
+            # the tag value leaked through (``tag:a_b`` matched a record
+            # tagged ``axb``), and source tags are stored ensure_ascii
+            # ``json.dumps``-escaped, so a non-ASCII tag (``blåbär`` →
+            # ``blåbär`` on disk) could never match the raw JSON
+            # text. json_each decodes the escapes and ``=`` has no wildcard
+            # vocabulary, so both go away without any ESCAPE bookkeeping.
+            # COLLATE NOCASE keeps LIKE's ASCII case folding — callers copy
+            # tag values from capabilities, but a hand-typed ``tag:bug`` must
+            # still find the github label ``Bug`` like it always did.
+            # ``COALESCE(llm_tags, '[]')``: NULL means never tagged and must
+            # read as no tags — the same guard ``_RECORDS_FTS_TAGS_SQL`` uses.
+            clauses.append(
+                "(EXISTS (SELECT 1 FROM json_each(records.tags) "
+                "WHERE json_each.value = ? COLLATE NOCASE) "
+                "OR EXISTS (SELECT 1 FROM json_each(COALESCE(records.llm_tags, '[]')) "
+                "WHERE json_each.value = ? COLLATE NOCASE))"
+            )
+            params.append(tag)
+            params.append(tag)
         self._apply_id_scope(ast, "stable_id", clauses, params)
         return " AND ".join(clauses), params
 
@@ -4862,6 +5214,110 @@ class Store:
         clauses.append(_json_id_clause(column))
         params.append(json.dumps(sorted(ast.id_scope)))
 
+    @property
+    def lexical_relaxation(self) -> str | None:
+        """Which relaxation tier answered the lexical arm, if any.
+
+        ``None`` means every lexical evaluation on this store since the last
+        :meth:`reset_lexical_relaxation` was answered by the STRICT tier (or
+        found nothing at any tier) — so ``None`` is a hard guarantee that no
+        relaxed row is in the caller's hands. ``"or"`` / ``"prefix"`` name
+        the DEEPEST tier that contributed rows to any evaluation in the
+        request: a request can run the lexical arm more than once (the page
+        and its count, the union's two ontologies), and "did anything on this
+        page come from a relaxed tier" is the question the output layer has
+        to answer — so the marker over-discloses across sub-evaluations
+        rather than ever under-disclosing. The direction is deliberate: a
+        relaxed match reported as exact is the lie this field exists to
+        prevent; an exact match reported alongside a relaxed sibling is
+        merely cautious.
+
+        RESET AT THE REQUEST BOUNDARY, NOT PER CALL. ``aggregator_query``
+        resets on entry; within one request every evaluation runs the same
+        ladder over the same text and corpus, so the recorded tier is
+        deterministic for the response it describes.
+
+        NOT A DIAGNOSIS ON ITS OWN. ``None`` here is two different worlds —
+        the strict tier answered, or nothing matched anywhere — and telling
+        them apart is :meth:`lexical_matches`. See :class:`LexicalProbe`.
+        """
+        return self._lexical_probes[0].tier
+
+    @property
+    def lexical_matches(self) -> int | None:
+        """How many rows the lexical ladder matched BEFORE the query's filters.
+
+        ``None`` = the ladder never ran on this request. ``0`` = it ran and
+        no tier matched. ``> 0`` = the terms are in the corpus, whatever the
+        page ended up showing. See :class:`LexicalProbe` for why the empty-page
+        notice cannot be honest without this.
+        """
+        return self._lexical_probes[0].matched
+
+    @contextmanager
+    def lexical_probe(
+        self, probe: LexicalProbe | None = None
+    ) -> Iterator[LexicalProbe]:
+        """Watch what the ladder does inside this block, per arm.
+
+        The union route runs the ladder once per ontology and the request-wide
+        marker keeps the DEEPEST of the two — correct as an over-disclosure,
+        wrong as an attribution, which is the bug this exists to fix: a page
+        showing exact RECORD hits was stamped "NOT exact matches" because the
+        observations arm, whose rows are not on the page, had relaxed.
+
+        Pass an existing ``probe`` to keep accumulating into it across
+        non-adjacent blocks — a route evaluates its arm in two places (the
+        fused-scope build, then the store query underneath it) and both belong
+        to the same arm.
+
+        Re-entrant and exception-safe: the probe is removed by identity, so a
+        nested block cannot pop somebody else's.
+        """
+        probe = probe if probe is not None else LexicalProbe()
+        self._lexical_probes.append(probe)
+        try:
+            yield probe
+        finally:
+            # By identity, and only once: the same probe may legitimately be
+            # re-entered later, and ``list.remove`` drops the first match.
+            for i in range(len(self._lexical_probes) - 1, 0, -1):
+                if self._lexical_probes[i] is probe:
+                    del self._lexical_probes[i]
+                    break
+
+    def reset_lexical_relaxation(self) -> None:
+        """Start a fresh request: forget what the last one's ladder did.
+
+        Drops any per-arm probes along with the request probe. Called at the
+        request boundary, where no arm can still be open.
+        """
+        self._lexical_probes = [LexicalProbe()]
+
+    def _note_lexical_relaxation(self, tier: str | None) -> None:
+        """Record ``tier`` if it is deeper than what this probe has seen."""
+        for probe in self._lexical_probes:
+            if _LEXICAL_RELAX_DEPTH[tier] > _LEXICAL_RELAX_DEPTH[probe.tier]:
+                probe.tier = tier
+
+    def _note_lexical_matched(self, matched: int) -> None:
+        """Record that the ladder RAN, and how many rows it saw pre-filter.
+
+        ``max`` for the same reason the tier is sticky-deepest: one request can
+        evaluate the arm several times (the page and its count, a session
+        projection), and "did the words match anything at all" must survive a
+        later evaluation that happened to see fewer rows.
+
+        ONLY EVER CALLED BY A SITE THAT ACTUALLY RAN A STATEMENT. Recording a
+        zero for a ladder that never ran collapses the three-valued contract
+        this method exists to serve: ``None`` means nobody looked, and an arm
+        that returns early on text with no word characters looked at nothing.
+        Each arm below therefore checks its tier list (or its conjuncts) BEFORE
+        the loop and returns without a note when there is nothing to run.
+        """
+        for probe in self._lexical_probes:
+            probe.matched = max(probe.matched or 0, matched)
+
     def _fts_rows(self, sql: str, params: Sequence, text: str) -> list[sqlite3.Row]:
         """Run one MATCH-bearing SELECT, and be LOUD if it still fails.
 
@@ -4888,16 +5344,32 @@ class Store:
             raise
 
     def _fts_ids(self, text: str) -> set[str]:
-        """Records-path FTS5 arm. Empty set when the text has no word chars."""
-        match_expr = fts5_match_query(text)
-        if not match_expr:
+        """Records-path FTS5 arm. Empty set when the text has no word chars.
+
+        RUNS THE RELAXATION LADDER — strict AND first, and only when a tier
+        matches NOTHING the next one: OR, then OR with a prefix on the final
+        conjunct. The tier that answered is recorded on the store for the
+        output layer to surface; see :func:`fts5_relaxation_tiers` and
+        :meth:`lexical_relaxation`. A main user-facing arm, which is why it
+        relaxes — the narrow internal helpers (``probe_fts``, the
+        ``scope:session`` conjunct intersection) deliberately do not.
+        """
+        tiers = fts5_relaxation_tiers(fts5_match_conjuncts(text))
+        if not tiers:
+            # No word characters: no tier ran, so there is nothing to record.
             return set()
-        rows = self._fts_rows(
-            "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
-            (match_expr,),
-            text,
-        )
-        return {row["stable_id"] for row in rows}
+        for tier, match_expr in tiers:
+            rows = self._fts_rows(
+                "SELECT stable_id FROM records_fts WHERE records_fts MATCH ?",
+                (match_expr,),
+                text,
+            )
+            if rows:
+                self._note_lexical_relaxation(tier)
+                self._note_lexical_matched(len(rows))
+                return {row["stable_id"] for row in rows}
+        self._note_lexical_matched(0)
+        return set()
 
     def query(
         self,
@@ -4988,6 +5460,152 @@ class Store:
                 "SELECT COUNT(*) AS n FROM records WHERE source = ?", (source,)
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    # -- LLM topic tags on records (``aggregator tag``) -------------------
+    #
+    # The watermark predicate, spelled once. A record NEEDS tagging when it
+    # was never tagged (``llm_tags_src_hash IS NULL``) or when its content
+    # moved on since the tags were computed (the hashes disagree). The second
+    # clause requires ``src_hash IS NOT NULL``: a pre-v4 row with no hash at
+    # all cannot "disagree" with anything, so once tagged (the write stores
+    # ``''`` for the missing hash) it stays tagged until ingest stamps a real
+    # hash — at which point ``'' != hash`` re-queues it, correctly, because
+    # the tags describe text the hash does not.
+    _LLM_TAGS_NEEDED = (
+        "(llm_tags_src_hash IS NULL "
+        "OR (src_hash IS NOT NULL AND llm_tags_src_hash != src_hash))"
+    )
+
+    def ids_needing_llm_tags(self, sources: Sequence[str]) -> list[str]:
+        """Stable ids of records the tag backfill still owes, newest first.
+
+        IDS, NOT ROWS, and that is the streaming story: the CLI snapshots
+        this list once per run (a few thousand short strings) and then pulls
+        each batch's full rows via :meth:`records_for_tagging`, so bodies are
+        only ever held one batch at a time. Snapshotting also gives the run a
+        poison-loop guarantee for free — a record whose tagging fails is
+        simply not revisited until the NEXT run, rather than re-selected by
+        the very predicate its failure left unchanged.
+
+        Newest first because tags exist to make recent material findable; on
+        an interrupted first backfill that is the half worth having.
+        """
+        placeholders = ",".join("?" * len(sources))
+        return [
+            row["stable_id"]
+            for row in self._c().execute(
+                f"SELECT stable_id FROM records "  # noqa: S608 - placeholders only
+                f"WHERE source IN ({placeholders}) AND {self._LLM_TAGS_NEEDED} "
+                f"ORDER BY updated_at DESC, stable_id",
+                list(sources),
+            )
+        ]
+
+    def records_for_tagging(self, ids: Sequence[str]) -> list[sqlite3.Row]:
+        """The fields one prompt batch needs, for the given stable ids.
+
+        ``src_hash`` is read HERE, before the LLM call, and the caller hands
+        it back to :meth:`write_llm_tags` unchanged — never re-read at write
+        time. If ingest rewrites the row while the model is thinking, the
+        stored watermark then disagrees with the new ``src_hash`` and the
+        record re-queues on the next run, which is the truthful outcome: the
+        tags were computed from text the row no longer holds.
+        """
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        return self._c().execute(
+            f"SELECT stable_id, source, subject, body, src_hash "  # noqa: S608 - placeholders only
+            f"FROM records WHERE stable_id IN ({placeholders})",
+            list(ids),
+        ).fetchall()
+
+    def write_llm_tags(
+        self, items: Sequence[tuple[str, Sequence[str], str | None]]
+    ) -> int:
+        """Write one committed batch of ``(stable_id, tags, src_hash)``.
+
+        ONE COMMIT PER CALL — this is the tag backfill's checkpoint, so a
+        kill at any moment costs at most one batch and the watermark (which
+        lives in the same rows, same transaction) can never get ahead of the
+        tags it describes.
+
+        ``src_hash`` is the value read at SELECT time (see
+        :meth:`records_for_tagging`); ``None`` — a pre-v4 row — is stored as
+        ``''`` so the row does not re-queue forever, per the predicate note
+        above. Touches NOTHING else: not ``tags`` (source-written, pristine),
+        not ``src_hash``, not ``embedding_state`` — a tag write must never
+        cost the corpus a re-scrub or the vector arm its work. The record's
+        ``records_fts`` row is rebuilt (delete + insert, the table's update
+        idiom) so the lexical index carries the union immediately.
+
+        Returns how many rows were actually updated; an id that vanished
+        between select and write (source rebuild) counts zero and its FTS
+        refresh is skipped rather than resurrecting a deleted row's index
+        entry.
+        """
+        if not items:
+            return 0
+        self._ensure_writable()
+        c = self._c()
+        written = 0
+        for stable_id, tags, src_hash in items:
+            cur = c.execute(
+                "UPDATE records SET llm_tags = ?, llm_tags_src_hash = ? "
+                "WHERE stable_id = ?",
+                (json.dumps(list(tags)), src_hash or "", stable_id),
+            )
+            if cur.rowcount == 0:
+                continue
+            written += 1
+            c.execute(
+                "DELETE FROM records_fts WHERE stable_id = ?", (stable_id,)
+            )
+            c.execute(_RECORDS_FTS_REFRESH_SQL, (stable_id,))
+        c.commit()
+        return written
+
+    def llm_tag_progress_by_source(self) -> list[dict]:
+        """How far the tag backfill has got, PER SOURCE — the truth surface.
+
+        Same argument as :meth:`embed_progress_by_source`: a partially-tagged
+        corpus must never look fully tagged, and one global percentage cannot
+        say which sources a ``tag:`` filter can be trusted for. One row per
+        source actually present in ``records`` (the population the tagger
+        walks), each with ``total``, ``tagged``, ``pending`` and a ``state``
+        from the same vocabulary the vector surfaces use: ``not_started`` /
+        ``in_progress`` / ``complete``. No ``degraded`` here — a failed
+        record keeps its NULL watermark and stays honestly in ``pending``;
+        the failure itself is reported loudly by the run that hit it.
+
+        Cheap by construction (one grouped count over a ~4.4k-row table), so
+        unlike the embed tally it CAN ride along on ``capabilities()``.
+        """
+        rows = self._c().execute(
+            f"SELECT source, COUNT(*) AS total, "  # noqa: S608 - fixed predicate
+            f"SUM(CASE WHEN {self._LLM_TAGS_NEEDED} THEN 0 ELSE 1 END) "
+            f"AS tagged FROM records GROUP BY source ORDER BY source"
+        ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            total = int(row["total"])
+            tagged = int(row["tagged"] or 0)
+            if tagged == 0:
+                state = "not_started"
+            elif tagged < total:
+                state = "in_progress"
+            else:
+                state = "complete"
+            out.append(
+                {
+                    "source": row["source"],
+                    "total": total,
+                    "tagged": tagged,
+                    "pending": total - tagged,
+                    "state": state,
+                }
+            )
+        return out
 
     def count_sessions_by_origin(self, origins: Sequence[str] | None = None) -> int:
         """Rows in ``sessions``, optionally restricted to ``origins``.
@@ -5105,6 +5723,12 @@ class Store:
         """
         clauses = ["1=1"]
         params: list = []
+        if ast.tags:
+            # Sessions carry no tags, so a ``tag:`` filter can match NO
+            # session row — ever. Without this clause a ``tag:``-only query
+            # (which union-routes) got its sessions arm back UNFILTERED:
+            # every session in the store, drowning the actual tagged records.
+            clauses.append("1=0")
         if ast.source == "sessions":
             clauses.append("kind = ? AND origin = 'claude-code'")
             params.append("session")
@@ -5221,6 +5845,11 @@ class Store:
         """
         clauses = ["1=1"]
         params: list = []
+        if ast.tags:
+            # Observations carry no tags either — same invariant as
+            # ``_sessions_where``: an item without tags cannot match a
+            # ``tag:`` filter.
+            clauses.append("1=0")
         if ast.source in ("sessions", "subagents"):
             kind = "session" if ast.source == "sessions" else "subagent"
             clauses.append(
@@ -5305,6 +5934,7 @@ class Store:
             ast.top_session_id
             and not sessions
             and not ast.text
+            and not ast.tags
             and ast.id_scope is None
             and offset == 0
         ):
@@ -5335,6 +5965,7 @@ class Store:
             n == 0
             and ast.top_session_id
             and not ast.text
+            and not ast.tags
             and ast.id_scope is None
             and self._synthesise_orphan_root(ast.top_session_id) is not None
         ):
@@ -5522,28 +6153,42 @@ class Store:
         query's filters; a ``by:`` filter left out of this projection would
         surface cards whose only matching observation the caller just excluded
         — the same silent over-surfacing, one filter later.
+
+        RUNS THE RELAXATION LADDER, because this is the session-card face of
+        the same user-facing search the two arms above serve — a gist query
+        that observations rescue and session cards do not would answer the
+        same question two ways. The filters ride inside each tier, so a tier
+        "matched" only when it matched rows the query can actually see.
         """
-        match_expr = fts5_match_query(text)
-        if not match_expr:
-            return set(), set()
+        conjuncts = fts5_match_conjuncts(text)
         sql = """
             SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
             FROM obs_fts f
             JOIN observations o ON o.rowid = f.rowid
             WHERE obs_fts MATCH ?
         """
-        params: list = [match_expr]
+        extra_params: list = []
         if obs_type:
             sql += " AND o.type = ?"
-            params.append(obs_type)
+            extra_params.append(obs_type)
         if provenance:
             clause, extra = self._provenance_clause(provenance, "o.provenance")
             sql += f" AND {clause}"
-            params.extend(extra)
-        rows = self._fts_rows(sql, params, text)
-        roots = {r["root"] for r in rows if r["root"]}
-        exacts = {r["sid"] for r in rows if r["sid"]}
-        return roots, exacts
+            extra_params.extend(extra)
+        tiers = fts5_relaxation_tiers(conjuncts)
+        if not tiers:
+            # No word characters: no tier ran, so there is nothing to record.
+            return set(), set()
+        for tier, match_expr in tiers:
+            rows = self._fts_rows(sql, [match_expr, *extra_params], text)
+            if rows:
+                self._note_lexical_relaxation(tier)
+                self._note_lexical_matched(len(rows))
+                roots = {r["root"] for r in rows if r["root"]}
+                exacts = {r["sid"] for r in rows if r["sid"]}
+                return roots, exacts
+        self._note_lexical_matched(0)
+        return set(), set()
 
     def _session_hit_scope(
         self,
@@ -5586,9 +6231,22 @@ class Store:
     def _compute_session_hit_scope(
         self, text: str, obs_type: str | None, provenance: str | None
     ) -> tuple[set[str], set[str]]:
-        """:meth:`_session_hit_scope` without the memo. Owns the ``MATCH``."""
+        """:meth:`_session_hit_scope` without the memo. Owns the ``MATCH``.
+
+        RECORDS WHAT THE INTERSECTION FOUND, like every other lexical arm, and
+        the omission was the ``scope:session`` half of the empty-page lie. This
+        probe never relaxes — so it noted no tier — but it is still a lexical
+        evaluation, and ``lexical_matches`` staying ``None`` through it left the
+        notice with nothing to tell "the terms are not in any one session" from
+        "a filter removed the sessions that hold them". It then said the first
+        about queries where the second was true. The count is the SESSIONS the
+        intersection qualified, measured BEFORE the outer SELECT applies the
+        query's row filters — which is exactly the pre-filter reading
+        :class:`LexicalProbe` documents.
+        """
         conjuncts = fts5_match_conjuncts(text)
         if not conjuncts:
+            # No word characters: nothing ran, so nothing is recorded.
             return set(), set()
         base = """
             SELECT DISTINCT o.root_session_id AS root, o.session_id AS sid
@@ -5614,8 +6272,11 @@ class Store:
             roots = got_roots if roots is None else roots & got_roots
             exacts = got_exacts if exacts is None else exacts & got_exacts
             if not roots and not exacts:
+                self._note_lexical_matched(0)
                 return set(), set()
-        return roots or set(), exacts or set()
+        roots, exacts = roots or set(), exacts or set()
+        self._note_lexical_matched(len(roots))
+        return roots, exacts
 
     def _session_scope_cached(self, key: tuple, compute: Callable[[], Any]) -> Any:
         """Memoise one ``scope:session`` answer, on a READ-ONLY store only.
@@ -5737,21 +6398,35 @@ class Store:
         return roots, exacts
 
     def _fts_obs_ids(self, text: str) -> list[str]:
-        """Observations-path FTS5 arm. Empty when the text has no word chars."""
-        match_expr = fts5_match_query(text)
-        if not match_expr:
+        """Observations-path FTS5 arm. Empty when the text has no word chars.
+
+        RUNS THE RELAXATION LADDER — the same contract as ``_fts_ids``: one
+        tier's rows only, deepest-used tier recorded on the store. This is
+        the arm behind ``query_observations``/``count_observations`` AND the
+        hybrid retriever's keyword side (via ``_scoped_obs_ids``), so both
+        the FTS5-only route and the fused route relax identically.
+        """
+        tiers = fts5_relaxation_tiers(fts5_match_conjuncts(text))
+        if not tiers:
+            # No word characters: no tier ran, so there is nothing to record.
             return []
-        rows = self._fts_rows(
-            """
-            SELECT o.obs_id AS obs_id
-            FROM obs_fts f
-            JOIN observations o ON o.rowid = f.rowid
-            WHERE obs_fts MATCH ?
-            """,
-            (match_expr,),
-            text,
-        )
-        return [r["obs_id"] for r in rows]
+        for tier, match_expr in tiers:
+            rows = self._fts_rows(
+                """
+                SELECT o.obs_id AS obs_id
+                FROM obs_fts f
+                JOIN observations o ON o.rowid = f.rowid
+                WHERE obs_fts MATCH ?
+                """,
+                (match_expr,),
+                text,
+            )
+            if rows:
+                self._note_lexical_relaxation(tier)
+                self._note_lexical_matched(len(rows))
+                return [r["obs_id"] for r in rows]
+        self._note_lexical_matched(0)
+        return []
 
     def _session_scope_obs_ids(self, text: str, roots: set[str]) -> list[str]:
         """Observations under ``roots`` matching ANY conjunct.
@@ -5766,12 +6441,21 @@ class Store:
         One statement per conjunct rather than an ``OR``-joined expression, so
         the invariant that only quoted ``\\w+`` runs reach ``MATCH`` survives
         a widening that had no reason to spend it.
+
+        THE ROWS IT SEES ARE WHAT ``lexical_matches`` MEANS on this path: this
+        is the row set a ``scope:session`` drilldown page is built from, and the
+        query's row filters (``from:``/``to:``, the id-scope keys) are applied
+        by the SELECT above it, so the count recorded here is the pre-filter one
+        the empty-page diagnosis needs. ``roots`` being empty is not a
+        no-measurement: the intersection that produced it already recorded its
+        own zero, and re-recording here would only repeat it.
         """
-        if not roots:
+        conjuncts = fts5_match_conjuncts(text)
+        if not roots or not conjuncts:
             return []
         scope_json = json.dumps(sorted(roots))
         ids: set[str] = set()
-        for expr in fts5_match_conjuncts(text):
+        for expr in conjuncts:
             rows = self._fts_rows(
                 "SELECT o.obs_id AS obs_id FROM obs_fts f "  # noqa: S608 - placeholders only
                 "JOIN observations o ON o.rowid = f.rowid "
@@ -5781,6 +6465,7 @@ class Store:
                 text,
             )
             ids.update(r["obs_id"] for r in rows)
+        self._note_lexical_matched(len(ids))
         return sorted(ids)
 
     def _scoped_obs_ids(self, ast: QueryAST) -> list[str]:
@@ -5858,9 +6543,16 @@ class Store:
             freshness[s] = row["m"] if row else None
             tag_counter: dict[str, int] = {}
             for row in c.execute(
-                "SELECT tags FROM records WHERE source = ?", (s,)
+                "SELECT tags, llm_tags FROM records WHERE source = ?", (s,)
             ):
-                for t in json.loads(row["tags"]):
+                # UNION of source and LLM tags, mirroring what ``tag:``
+                # actually filters on — an llm-only tag value must show up in
+                # the advertised inventory or callers can never discover it.
+                # Per-record set, so a tag both arrays carry counts once.
+                for t in {
+                    *json.loads(row["tags"]),
+                    *json.loads(row["llm_tags"] or "[]"),
+                }:
                     tag_counter[t] = tag_counter.get(t, 0) + 1
             tags_by_source[s] = [
                 t for t, _ in sorted(
@@ -5941,6 +6633,10 @@ class Store:
             "schema_version": SCHEMA_VERSION,
             "counts": counts,
             "vector_index": self.vector_index_state(),
+            # Cheap (one grouped count over records) unlike the embed tally,
+            # so it rides the connect path: an agent deciding whether a
+            # ``tag:`` filter can be trusted needs this BEFORE it searches.
+            "llm_tag_coverage": self.llm_tag_progress_by_source(),
         }
 
     def vector_index_state(self) -> dict:
@@ -6033,6 +6729,13 @@ class Store:
 
 
 def _row_to_record(row: sqlite3.Row) -> Record:
+    # ``llm_tags`` guarded by presence: the column is ensured by migrate(),
+    # but a few pure-SQL tests build rows without it, and a missing key must
+    # read as "never tagged" rather than raise on the way out of a query.
+    # ``.keys()`` is LOAD-BEARING (noqa SIM118): bare ``in`` on sqlite3.Row
+    # iterates VALUES, so it would test whether some column holds the string
+    # "llm_tags" — a different question that is almost always False.
+    llm_tags_raw = row["llm_tags"] if "llm_tags" in row.keys() else None  # noqa: SIM118
     return Record(
         stable_id=row["stable_id"],
         source=row["source"],
@@ -6042,6 +6745,7 @@ def _row_to_record(row: sqlite3.Row) -> Record:
         created_at=_parse_iso(row["created_at"]),
         updated_at=_parse_iso(row["updated_at"]),
         extra=json.loads(row["extra"] or "{}"),
+        llm_tags=json.loads(llm_tags_raw) if llm_tags_raw else [],
     )
 
 

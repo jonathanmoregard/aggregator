@@ -635,13 +635,6 @@ class Abstention:
 
 
 ABSTENTIONS = (
-    Abstention("fn-pr-link-status-report",
-               'source:sessions type:user "PR link" "status report"',
-               True, "D"),
-    Abstention("fn-spec-long-phrase",
-               "source:sessions type:user hand back control only when done "
-               "clickable PR link executive summary",
-               True, "D"),
     Abstention("neg-helm-rollback",
                'source:sessions type:user "kubernetes helm chart rollback"',
                False, "D"),
@@ -656,21 +649,52 @@ ABSTENTIONS = (
                False, "D+B"),
 )
 
+#: The two multi-conjunct abstentions v7 RESCUES. Pre-relaxation they were
+#: the mission's second-best outcome — nothing, with an explanation — and
+#: they are kept here, not deleted, because the ranking's FIRST outcome is
+#: returning the right turn: under OR relaxation both now surface the mined
+#: pair's answer row, flagged so the looser match cannot pose as exact. The
+#: four single-phrase negatives above are untouched by relaxation on
+#: purpose — a quoted phrase has one conjunct, so there is no OR tier, and
+#: the prefix tier preserves adjacency (``"terraform state lock"*`` still
+#: requires the phrase) — which is what keeps them honest abstentions.
+RESCUED = (
+    ("fn-pr-link-status-report",
+     'source:sessions type:user "PR link" "status report"',
+     "o-report-answer"),
+    ("fn-spec-long-phrase",
+     "source:sessions type:user hand back control only when done "
+     "clickable PR link executive summary",
+     "o-report-answer"),
+)
+
 
 @pytest.mark.parametrize("case", ABSTENTIONS, ids=lambda c: c.id)
 def test_an_unanswerable_query_returns_nothing_and_says_so(corpus, case):
     """MISSION RANKING OF OUTCOMES: the right turn is best, nothing WITH an
     explanation is acceptable, and a silent pile of irrelevant rows is the
-    worst. These six are the second outcome, made explicit."""
+    worst. These are the second outcome, made explicit — and v7's relaxation
+    must NOT dilute them: each is a single quoted phrase, so no OR tier
+    exists and the phrase-prefix tier still demands the adjacency the corpus
+    does not contain."""
     result = _query(corpus, case.dsl)
     assert result["total"] == 0, (case.id, _ids(result))
     assert result["records"] == []
+    assert "lexical_relaxation" not in result, case.id
     notice = result.get("notice") or ""
     assert "abstention" in notice, (case.id, notice)
-    if case.conjunction_notice:
-        assert "ONE observation" in notice, (case.id, notice)
-        assert "scope:" in notice, (case.id, notice)
-        assert "one phrase" in notice or "single quoted phrase" in notice, notice
+
+
+@pytest.mark.parametrize("case", RESCUED, ids=lambda c: c[0])
+def test_a_formerly_abstaining_conjunction_is_rescued_and_flagged(corpus, case):
+    """The mission's FIRST outcome, reached by relaxation: the AND-dead gist
+    query now returns the answer row — marked, never posing as exact."""
+    case_id, dsl, answer_obs = case
+    result = _query(corpus, dsl)
+    assert result["total"] > 0, case_id
+    assert answer_obs in _ids(result), (case_id, _ids(result))
+    assert result["lexical_relaxation"] == "or", case_id
+    assert "RELAXATION" in result["notice"], (case_id, result["notice"])
 
 
 def test_the_negatives_are_real_conjunctions_not_an_empty_corpus(corpus):
@@ -783,23 +807,38 @@ def test_scope_session_is_the_widening_and_it_is_asked_for_by_name(corpus):
     """The default is one observation, and it always was — ``obs_fts`` holds
     one row per observation, so ``MATCH`` has never spanned turns. What was
     missing was a way to ASK for the wider unit, and a page that says the
-    wider unit would have found something."""
+    wider unit would have found something.
+
+    v7 note: the AND-dead default-scope page is no longer empty — relaxation
+    fills it with ANY-phrase rows, FLAGGED. ``scope:session`` is still the
+    named way to ask the exact-conjunction question, and its answer is still
+    exact: no relaxation marker, only the rows carrying every conjunct.
+    """
     dsl = 'source:sessions type:user "PR link" "status report"'
-    assert _query(corpus, dsl)["total"] == 0
+    relaxed = _query(corpus, dsl)
+    assert relaxed["lexical_relaxation"] == "or"
     widened = _query(corpus, "source:sessions type:user scope:session "
                              '"PR link" "status report"')
     assert sorted(_ids(widened)) == ["o-split-1", "o-split-2"]
+    assert "lexical_relaxation" not in widened
 
 
-def test_the_empty_page_names_the_widening_that_would_have_worked(corpus):
-    """THE MOST USEFUL SENTENCE AN EMPTY PAGE CAN CARRY. Not "nothing", but
-    "nothing in one turn, and here is the key that finds it"."""
+def test_the_rescued_page_still_names_the_widening_that_answers_exactly(corpus):
+    """THE MOST USEFUL SENTENCE THIS PAGE CAN CARRY, v7 edition. Pre-v7 the
+    AND-dead page was empty and the notice pointed at ``scope:session``; now
+    relaxation fills the page with ANY-phrase rows, and the same pointer must
+    survive on the rescued page — the looser rows are leads, and the
+    exact-conjunction answer the caller actually asked for is still one
+    ``scope:session`` away."""
     result = _query(corpus,
                     'source:sessions type:user "PR link" "status report"')
+    assert result["total"] > 0
+    assert result["lexical_relaxation"] == "or"
     notice = result["notice"]
+    assert "RELAXATION" in notice, notice
     assert "scope:session" in notice, notice
     assert "1 session" in notice, notice
-    assert "does not stem" in notice, notice
+    assert "does not stem" not in notice, notice
 
 
 # ---------------------------------------------------------------------------
@@ -1171,29 +1210,35 @@ def test_acceptance_2_the_caller_who_does_not_know_the_exact_phrase(corpus):
     conjunction and suggesting single-phrase queries. **Silently returning 36
     irrelevant sessions is the worst of the three outcomes.**
 
-    It returns nothing, and the reason is honest: the answer says "link prs",
-    not "PR link", and this index does not stem. The rows that DO satisfy the
-    four loose words are hook prompts quoting a transcript — which is what the
-    silent version handed back.
+    v7 reaches the FIRST outcome. Strict AND still matches nothing — the
+    answer says "link prs", not "PR link", and a quoted run means ADJACENCY;
+    stemming folds ``prs`` into ``pr`` but cannot reorder a phrase — so the
+    OR tier fires and the answer turn comes back ON the page, flagged
+    ``lexical_relaxation: "or"`` so the loose match cannot pose as exact.
+    The loose (unquoted) four-word query is also transformed: porter carries
+    it to the human answer row, where pre-v7 it drowned in hook prompts
+    quoting a transcript.
     """
     result = mcp.aggregator_query(
         dsl='source:sessions type:user "PR link" "status report"',
         fields="summary", drilldown=True, _store=corpus,
     )
     assert result["ok"] is True, result
-    assert result["total"] == 0
-    assert result["records"] == []
+    assert result["total"] > 0
+    assert "o-report-answer" in _ids(result), _ids(result)
+    assert result["lexical_relaxation"] == "or"
 
     notice = result["notice"]
-    assert "ONE observation" in notice, notice
-    assert '"PR link"' in notice and '"status report"' in notice, notice
-    assert "one phrase" in notice or "single quoted phrase" in notice, notice
+    assert "RELAXATION" in notice, notice
+    assert "NOT exact" in notice, notice
     assert "scope:session" in notice, notice
 
-    # The worst outcome, reproduced so the difference is visible: drop the
-    # quotes and the page fills with a machine row that quotes a transcript.
+    # The loose query, for contrast. Pre-v7 this page held ONLY machine rows
+    # quoting a transcript — the silent worst outcome. Under porter stemming
+    # "prs" and "PR" are one term, so the same four loose words now reach the
+    # human answer row as well. The machine rows still ride along; the quoted
+    # form above is still what asks the precise question.
     silent = _query(corpus, "source:sessions type:user PR link status report")
     assert silent["total"] > 0
-    assert all(r["provenance"] in MACHINE_VALUES for r in silent["records"]), [
-        (r["obs_id"], r["provenance"]) for r in silent["records"]
-    ]
+    by_id = {r["obs_id"]: r["provenance"] for r in silent["records"]}
+    assert by_id.get("o-report-answer") == "human", by_id

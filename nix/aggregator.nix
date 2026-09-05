@@ -284,6 +284,53 @@ let
     exec ${aggregatorBin} embed --seed-models
   '';
 
+  # ---- LLM record tagging -----------------------------------------------
+  #
+  # Daily backfill of LLM topic tags onto the records-shaped sources
+  # (`aggregator tag`). Needs the network — the `claude` CLI talks to the
+  # API — so it is shaped like aggregator-github (network-permitted oneshot
+  # + timer + OnFailure notifier), not like the sandboxed-offline embed
+  # worker.
+  #
+  # HOW `claude` IS FOUND, and why that satisfies the 2026-08-16 deployment
+  # constraint: the CLI subprocesses the bare name `claude` from PATH,
+  # exactly as the github ingest finds `gh` — and PATH is an environment
+  # fact no comment can pin, so the preflight below ENFORCES it at unit
+  # start instead of asserting it. On this machine the user manager's PATH
+  # is the NixOS profile chain (/etc/profiles/per-user/<user>/bin,
+  # /run/current-system/sw/bin, ...), whose `claude` is a symlink into the
+  # Nix store — a pinned artifact. What the guard exists to refuse is the
+  # OTHER install: ~/.local/bin's self-updating native build, which is a
+  # working-tree-shaped dependency by another name (unpinned, mutates
+  # underneath the unit). No /home/ path is ever written into the unit or
+  # this script; the guard resolves whatever PATH offers and requires the
+  # real binary to live in the store.
+  tagRunner = pkgs.writeShellScript "aggregator-tag" ''
+    set -uo pipefail
+
+    if ! command -v claude >/dev/null 2>&1; then
+      echo "aggregator-tag: no 'claude' CLI on the unit's PATH ($PATH)." >&2
+      echo "aggregator-tag: install claude-code into the system or home-manager profile; the tag backfill cannot run without it." >&2
+      exit 1
+    fi
+
+    resolved=$(command -v claude)
+    real=$(readlink -f "$resolved")
+    case "$real" in
+      /nix/store/*) ;;
+      *)
+        echo "aggregator-tag: 'claude' resolved to $resolved -> $real, which is not a Nix store artifact." >&2
+        echo "aggregator-tag: a service must run a deployed, pinned binary — not a self-updating install. Put claude-code in the system or home-manager profile and make sure the unit's PATH prefers it." >&2
+        exit 1
+        ;;
+    esac
+
+    # `exec` so the CLI's exit status IS the unit's: `aggregator tag` exits
+    # non-zero whenever any record failed, and that status must reach
+    # systemd unaltered for OnFailure= to fire (constraint: fail loudly).
+    exec ${aggregatorBin} tag
+  '';
+
   # OnFailure target, generated PER FAILING UNIT. Mirrors the deployed
   # aggregator-ingest-failure-notify unit (journal line + CRITICAL libnotify
   # popup), with one addition: the popup is debounced to once per day.
@@ -385,6 +432,20 @@ let
       + " not being filled. Likely: Qwen3 weights missing from the HF cache"
       + " (fix: systemctl --user start aggregator-embed-seed.service), or the"
       + " sqlite-vec extension did not load. Keyword search is unaffected.";
+  };
+
+  tagFailureNotify = mkFailureNotify {
+    name = "aggregator-tag-failure-notify";
+    unit = "aggregator-tag.service";
+    stamp = "tag-failure-notified";
+    summary = "aggregator tag FAILED";
+    body =
+      "The LLM record-tagging run exited non-zero, so some records are"
+      + " missing topic tags and tag: search under-selects for them."
+      + " Likely: the claude CLI is not on the unit's PATH, its auth"
+      + " expired, a rate limit, or records the model kept mis-answering"
+      + " (those are named on stderr). Free-text search is unaffected;"
+      + " the next daily run retries what failed.";
   };
 
   # The seeder's own notification. Pointing this one at the worker's journal
@@ -718,6 +779,34 @@ in {
       };
     };
 
+    tag = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Whether to install the daily LLM record-tagging timer
+          (`aggregator tag`). Off means records keep only their
+          source-written tags: `tag:` search still works, it just never
+          gains the LLM topic layer, and llm_tag_coverage reports
+          not_started forever. Requires the `claude` CLI in the deployed
+          profile (subscription auth — no API key is configured here).
+        '';
+      };
+
+      interval = lib.mkOption {
+        type = lib.types.str;
+        default = "daily";
+        example = "weekly";
+        description = ''
+          systemd OnCalendar spec for the tag timer. Daily is deliberate:
+          the watermark (llm_tags_src_hash vs src_hash) makes a run over
+          an already-tagged corpus a fast no-op, so the cost of a tick is
+          proportional to what actually changed that day — a handful of
+          records, one or two claude invocations.
+        '';
+      };
+    };
+
     mcp.autoRegister = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -1036,6 +1125,82 @@ in {
           RestrictAddressFamilies = "AF_UNIX AF_NETLINK AF_INET AF_INET6";
         };
       };
+
+      # ---- LLM record tagging -------------------------------------------
+      # Network-permitted like the github ingest: the claude CLI needs the
+      # API. Deliberately NOT under the torch sandbox — this unit runs no
+      # model locally, it shells out to a CLI that must reach its endpoint.
+      systemd.user.services.aggregator-tag = lib.mkIf cfg.tag.enable {
+        Unit = {
+          Description = "Aggregator: LLM topic tags for records (fills llm_tags)";
+          OnFailure = "aggregator-tag-failure-notify.service";
+        };
+        Service = {
+          Type = "oneshot";
+          # Type=oneshot defaults TimeoutStartSec to infinity, which is
+          # right here for the same reason as the embed worker: the FIRST
+          # backfill over ~4.4k records is hours of claude invocations, and
+          # a wall clock cannot tell that from a wedge. What bounds a wedge:
+          # the CLI's per-invocation timeout (300s, bounded retries), the
+          # per-batch committed checkpoint (a SIGTERM costs at most one
+          # batch — graceful_shutdown stops at the boundary), and the timer
+          # not stacking runs (a oneshot still `activating` is not
+          # re-triggered).
+          ExecStart = "${tagRunner}";
+          StandardOutput = "journal";
+          StandardError = "journal";
+          # The sandbox its siblings carry, to the extent the claude CLI
+          # tolerates — every directive below verified on this host
+          # (2026-09-04): `claude -p --model haiku` under exactly this set
+          # via `systemd-run --user` answered and exited 0. The prompt
+          # carries attacker-influenced record bodies, so the unit gets the
+          # same "shrink the ambient surface" treatment as the torch pair.
+          #
+          # DELIBERATELY ABSENT, each load-bearing for `claude -p`:
+          #   ProtectHome — the CLI must READ ~/.claude config+credentials
+          #     and WRITE its own state under $HOME. `ProtectSystem=full`
+          #     still makes /usr, /boot and /etc read-only.
+          #   PrivateNetwork / IPAddressDeny — the CLI exists to reach the
+          #     API; this unit is network-permitted like aggregator-github.
+          # The hygiene check asserts both directions (present + absent).
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          ProtectSystem = "full";
+          ProtectKernelTunables = true;
+          ProtectControlGroups = true;
+        };
+      };
+
+      systemd.user.timers.aggregator-tag = lib.mkIf cfg.tag.enable {
+        Unit.Description = "Aggregator: LLM record tagging timer";
+        Timer = {
+          OnCalendar = cfg.tag.interval;
+          # Wide jitter on purpose: this tick spends API rate-limit quota
+          # from the same subscription the interactive tooling uses, so it
+          # should not land at a predictable minute — and unlike the embed
+          # timer there is no phase relationship with the ingest ticks worth
+          # preserving at daily granularity.
+          RandomizedDelaySec = "45min";
+          # A laptop closed over the scheduled time still tags that day's
+          # records on resume.
+          Persistent = true;
+        };
+        Install.WantedBy = [ "timers.target" ];
+      };
+
+      systemd.user.services.aggregator-tag-failure-notify =
+        lib.mkIf cfg.tag.enable {
+          Unit.Description = "Desktop notification: aggregator tag run failed";
+          Service = {
+            Type = "oneshot";
+            ExecStart = "${tagFailureNotify}";
+            StandardOutput = "journal";
+            StandardError = "journal";
+          };
+        };
 
       systemd.user.services.aggregator-embed-failure-notify =
         lib.mkIf cfg.embed.enable {
