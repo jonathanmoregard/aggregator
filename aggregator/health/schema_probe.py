@@ -265,23 +265,43 @@ _WRAPPER_EXEC = re.compile(r"^\s*exec\s+(?:-a\s+\S+\s+)?[\"']?([^\"'\s]+)", re.M
 # UNKNOWN instead of spinning.
 _MAX_WRAPPER_HOPS = 8
 
-# ``~/.claude.json`` is present but could not be understood. Returned INSTEAD
-# of ``None`` so the own-checkout fallback is skipped, and compared by IDENTITY
-# rather than equality — it is an ordinary empty dict, so it also flows through
-# the normal "an entry exists and is unusable" path without a second branch.
-# The distinction it carries is the one the fallback turns on: absent means
-# nobody configured a reader, broken means somebody did and this cannot tell
-# what.
-_CONFIG_UNREADABLE: dict = {}
 
-# Present, valid as far as anyone knows, and larger than ``_CLAUDE_CONFIG_LIMIT``.
-# A SECOND sentinel rather than a flag on the first, because the two have
-# different remedies and the difference is the whole point: an unparseable
-# config is a file to fix, an oversized one is a file this probe declines to
-# read and gets past with ``AGGREGATOR_READER_DIR``. Same identity trick, same
-# reason — it is an ordinary empty dict, so it flows through the "an entry
-# exists and is unusable" path without a second branch anywhere else.
-_CONFIG_TOO_LARGE: dict = {}
+class _ConfigFault:
+    """Why ``~/.claude.json`` yielded no entry, when the answer is not "none".
+
+    Returned INSTEAD of ``None`` so the own-checkout fallback is skipped: the
+    distinction the fallback turns on is that absent means nobody configured a
+    reader, while a fault means somebody did and this probe cannot tell what.
+
+    A CLASS, AND NOT TWO EMPTY DICTS. Both markers used to be plain ``{}``, so
+    ``==`` said the two faults were the same value — and also that either was
+    the same value as the ordinary ``{}`` returned for an entry that exists and
+    is empty. Three different facts behind one comparison, kept apart only by
+    every call site happening to use ``is``. That is a property of the readers
+    rather than of the values, and it is load-bearing in what an operator is
+    told: one fault says go and repair a broken file, the other says the file
+    is FINE and merely too big to read. Sending someone to repair valid JSON is
+    the whole thing this pair exists to prevent, so it must not hinge on which
+    operator the next reader reaches for.
+    """
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<claude.json {self.name}>"
+
+
+#: Present, and could not be understood — bad JSON, not an object, or an
+#: ``mcpServers`` this cannot read. The operator's file to repair.
+_CONFIG_UNREADABLE = _ConfigFault("unreadable")
+
+#: Present, valid as far as anyone knows, and larger than
+#: ``_CLAUDE_CONFIG_LIMIT``. Nothing to repair: this probe declines to read it
+#: on a session-start budget, and ``AGGREGATOR_READER_DIR`` gets past it.
+_CONFIG_TOO_LARGE = _ConfigFault("too-large")
 
 
 @dataclass(frozen=True)
@@ -407,7 +427,7 @@ def _claude_config_path(env: dict[str, str]) -> Path:
     return Path(env.get("HOME") or str(Path.home())) / ".claude.json"
 
 
-def _claude_mcp_entry(env: dict[str, str]) -> dict | None:
+def _claude_mcp_entry(env: dict[str, str]) -> dict | _ConfigFault | None:
     """``~/.claude.json``'s TOP-LEVEL ``mcpServers.aggregator``, or ``None``.
 
     Top-level only, deliberately. The same file carries per-project
@@ -640,6 +660,13 @@ def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
     if entry is None:
         own = Path(__file__).resolve().parent.parent.parent
         return own if (own / "pyproject.toml").is_file() else None
+    if isinstance(entry, _ConfigFault):
+        # Step 5, said out loud. While both faults were spelled ``{}`` this
+        # branch did not need to exist: an empty dict answers ``.get`` with
+        # ``None`` twice and falls out of the bottom returning ``None`` by
+        # accident. Accidentally right is not a contract, and the accident
+        # died the moment the two faults became distinguishable values.
+        return None
 
     directory = _directory_arg(entry.get("args"))
     if directory is not None:

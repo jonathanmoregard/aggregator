@@ -1081,6 +1081,76 @@ def test_a_config_under_the_cap_still_parses(tmp_path):
     assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 6
 
 
+def test_the_two_config_faults_are_not_equal_to_each_other_or_to_an_entry(tmp_path):
+    """Distinct causes need distinct sentinels, not two spellings of ``{}``.
+
+    Both fault markers were plain empty dicts, so ``==`` said they were the
+    same value — as it did for the ordinary ``{}`` returned for an entry that
+    exists and is empty. Three different facts, one comparison, and the only
+    thing keeping them apart was that every call site happened to use ``is``.
+    That is a property of the readers, not of the values, and the next reader
+    to write the natural ``==`` gets an oversized config reported as corrupt
+    with no test to stop them.
+
+    The distinction is load-bearing in the message an operator reads: one says
+    go and repair a broken file, the other says the file is FINE and too big to
+    read. Sending someone to fix valid JSON is the failure this pair exists to
+    prevent, so it must not hinge on a comparison operator.
+    """
+    assert sp._CONFIG_UNREADABLE != sp._CONFIG_TOO_LARGE
+    assert sp._CONFIG_TOO_LARGE != sp._CONFIG_UNREADABLE
+    assert sp._CONFIG_UNREADABLE != {}
+    assert sp._CONFIG_TOO_LARGE != {}
+    assert sp._CONFIG_UNREADABLE == sp._CONFIG_UNREADABLE
+
+    # And each still says what it is, for anyone reading a traceback.
+    assert "claude.json" in repr(sp._CONFIG_UNREADABLE)
+    assert "claude.json" in repr(sp._CONFIG_TOO_LARGE)
+    assert repr(sp._CONFIG_UNREADABLE) != repr(sp._CONFIG_TOO_LARGE)
+
+    # An entry that is present and empty is a THIRD thing: something is
+    # configured, nothing is resolvable, and no fault was detected reading the
+    # file itself.
+    home = tmp_path / "home"
+    _claude_json(home, {})
+    entry = sp._claude_mcp_entry(_env(home))
+    assert entry == {}
+    assert entry is not sp._CONFIG_UNREADABLE and entry is not sp._CONFIG_TOO_LARGE
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
+def test_the_oversized_and_unparseable_messages_cannot_be_conflated(tmp_path):
+    """The two remedies must not be interchangeable, end to end.
+
+    Asserted on the rendered findings rather than on the sentinels, because the
+    sentinels are an implementation detail and the operator only ever sees
+    these two paragraphs. One must send them at the file; the other must not,
+    and must offer the override instead.
+    """
+    big_home = tmp_path / "big"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _oversized_claude_json(big_home, wrapper)
+    broken_home = tmp_path / "broken"
+    broken_home.mkdir()
+    (broken_home / ".claude.json").write_text("{not json", encoding="utf-8")
+
+    said = {}
+    for key, home in (("big", big_home), ("broken", broken_home)):
+        env = _env(home)
+        env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / f"w-{key}", 6))
+        v = sp.probe(cache_db=_stamp_cache(tmp_path / f"c-{key}.db", 6), env=env)
+        assert v.state == sp.UNKNOWN, v.explain()
+        said[key] = " ".join(f.text() for f in v.findings if f.state == sp.UNKNOWN)
+
+    assert said["big"] != said["broken"]
+    assert "repair" in said["broken"].lower()
+    assert "repair" not in said["big"].lower()
+    assert str(sp._CLAUDE_CONFIG_LIMIT) in said["big"]
+    assert str(sp._CLAUDE_CONFIG_LIMIT) not in said["broken"]
+
+
 def test_an_unparseable_claude_json_says_so_and_names_the_file(tmp_path):
     """The remedy has to send the operator at the FILE, not at the install.
 
