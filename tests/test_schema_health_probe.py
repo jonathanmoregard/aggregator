@@ -606,6 +606,102 @@ def test_the_writer_reads_through_the_one_shared_walker(tmp_path):
     ) == "SCHEMA_VERSION = 5\n"
 
 
+def test_the_writer_is_the_one_beside_the_reader_not_the_one_on_path(tmp_path):
+    """PATH is the probe's PATH, and in a checkout that is the wrong writer.
+
+    THE WRITER UNDER TEST IS THE DEPLOYED ONE. On this host the ingest timer
+    execs ``pkgs.aggregator`` — the same package the profile's
+    ``aggregator-mcp`` comes from, so the two sit in one ``bin/``. A bare
+    ``_which("aggregator")`` instead answers with whatever is first on the
+    PATH the probe happens to inherit, and inside a checkout, a ``uv run`` or
+    a devShell that is the checkout's own venv CLI. Nobody's ingest timer runs
+    that binary.
+
+    The failure is quiet in both directions: the probe reports the checkout's
+    version as "the writer", so a genuinely lagging deployed writer never
+    fires WILL_ROT, and a checkout that happens to be ahead invents a skew
+    nobody has. Both are the two-quantity blindness this module exists to
+    remove, re-entering through the PATH.
+    """
+    home = tmp_path / "home"
+    reader = _fake_writer(
+        tmp_path / "profile", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _fake_writer(tmp_path / "profile", 6, name="aggregator", outer_dir="bin")
+    checkout = _fake_writer(
+        tmp_path / "checkout", 7, name="aggregator", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(reader), "args": []})
+
+    env = _env(home, path=str(checkout.parent))
+    assert sp.resolve_writer_bin(env) == tmp_path / "profile" / "bin" / "aggregator"
+    assert sp.read_writer_version(sp.resolve_writer_bin(env)) == 6
+
+    # And end to end: the checkout at 7 must not become a skew report.
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.FINE, v.explain()
+    assert v.writer_version == 6, v.explain()
+    assert v.writer_bin == str(tmp_path / "profile" / "bin" / "aggregator")
+
+
+def test_the_sibling_lookup_yields_to_the_override_and_falls_back_to_path(tmp_path):
+    """The new step is a middle one: it must not swallow the two either side.
+
+    ``AGGREGATOR_WRITER_BIN`` stays first — every input here is overridable,
+    and a probe that could only look at the live machine could not be tested.
+    And a profile that ships ``aggregator-mcp`` without the CLI beside it has
+    no sibling to find, so the PATH search still has to answer; a middle step
+    that returned "nothing" rather than deferring would turn a working
+    single-package install into UNKNOWN.
+    """
+    home = tmp_path / "home"
+    reader = _fake_writer(
+        tmp_path / "profile", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _fake_writer(tmp_path / "profile", 6, name="aggregator", outer_dir="bin")
+    on_path = _fake_writer(tmp_path / "elsewhere", 7, name="aggregator", outer_dir="bin")
+    _claude_json(home, {"command": str(reader), "args": []})
+
+    forced = _fake_writer(tmp_path / "forced", 9, name="aggregator", outer_dir="bin")
+    env = _env(home, path=str(on_path.parent))
+    env[sp.WRITER_BIN_ENV] = str(forced)
+    assert sp.resolve_writer_bin(env) == forced
+
+    # No CLI beside the reader: PATH answers, exactly as before.
+    lonely = _fake_writer(
+        tmp_path / "mcp-only", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(lonely), "args": []})
+    assert sp.resolve_writer_bin(_env(home, path=str(on_path.parent))) == on_path
+
+
+def test_a_directory_reader_takes_no_sibling(tmp_path):
+    """``uv run --directory <checkout>``: the command is ``uv``, not a reader.
+
+    Its neighbours are uv's own install, which has no aggregator in it and no
+    business being measured as one. The sibling step is only meaningful when
+    the ``command`` IS the reader — anywhere else it would name a binary
+    chosen by coincidence of directory layout.
+    """
+    home = tmp_path / "home"
+    checkout = _fake_tree(tmp_path / "checkout", 6)
+    uv_bin = tmp_path / "uv" / "bin"
+    uv_bin.mkdir(parents=True)
+    for name in ("uv", "aggregator"):
+        exe = uv_bin / name
+        exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        exe.chmod(0o755)
+    on_path = _fake_writer(tmp_path / "deployed", 6, name="aggregator", outer_dir="bin")
+    _claude_json(
+        home,
+        {"command": str(uv_bin / "uv"), "args": ["run", "--directory", str(checkout)]},
+    )
+
+    env = _env(home, path=str(on_path.parent))
+    assert sp.resolve_reader_dir(env) == checkout
+    assert sp.resolve_writer_bin(env) == on_path
+
+
 def test_resolve_writer_bin_searches_the_path_it_is_handed(tmp_path):
     """``shutil.which`` semantics, over the environment passed in.
 
@@ -617,21 +713,32 @@ def test_resolve_writer_bin_searches_the_path_it_is_handed(tmp_path):
     The environment is a plain dict, never the process's. The systemd unit and
     a Claude Code session have different ``PATH``s, and a resolver that
     consulted the wrong one would measure a binary nobody runs.
+
+    EVERY env HERE CARRIES AN EMPTY ``HOME``, and that is not tidiness. The
+    lookup now consults ``~/.claude.json`` for a reader to stand beside, and
+    ``_claude_config_path`` falls back to ``Path.home()`` when the dict it was
+    handed names no HOME — so the HOME-less version of this test read the
+    developer's real config and answered
+    ``/etc/profiles/per-user/jonathan/bin/aggregator``. It found the live host
+    from inside a unit test, which is the machine's answer and not the
+    fixture's.
     """
+    home = tmp_path / "home"
+    home.mkdir()
     binroot = tmp_path / "bin"
     binroot.mkdir()
     exe = binroot / "aggregator"
     exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     exe.chmod(0o755)
 
-    assert sp.resolve_writer_bin({"PATH": str(binroot)}) == exe
-    assert sp.resolve_writer_bin({"PATH": str(tmp_path / "nowhere")}) is None
-    assert sp.resolve_writer_bin({"PATH": ""}) is None
-    assert sp.resolve_writer_bin({}) is None
+    assert sp.resolve_writer_bin(_env(home, path=str(binroot))) == exe
+    assert sp.resolve_writer_bin(_env(home, path=str(tmp_path / "nowhere"))) is None
+    assert sp.resolve_writer_bin(_env(home)) is None
+    assert sp.resolve_writer_bin({"HOME": str(home)}) is None
 
     # A file a shell would not run is not the writer.
     exe.chmod(0o644)
-    assert sp.resolve_writer_bin({"PATH": str(binroot)}) is None
+    assert sp.resolve_writer_bin(_env(home, path=str(binroot))) is None
 
 
 # --- which reader is under test ---------------------------------------------

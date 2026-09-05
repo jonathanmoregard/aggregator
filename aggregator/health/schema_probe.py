@@ -505,14 +505,76 @@ def _reader_dir_from_command(command: object, env: dict[str, str]) -> Path | Non
     no aggregator package — the caller turns that into UNKNOWN, which is the
     honest verdict and the loud one.
     """
+    return resolve_package_dir(_command_binary(command, env))
+
+
+def _command_binary(command: object, env: dict[str, str]) -> Path | None:
+    """The FILE a ``command`` string names, resolved the way a shell would.
+
+    Split out from ``_reader_dir_from_command`` because the writer needs the
+    binary and not the package: its own lookup starts from the reader's
+    ``bin/`` directory, which only exists as a fact about the file, not about
+    the site-packages the chain ends in.
+    """
     if not isinstance(command, str) or not command:
         return None
-    binary = (
+    return (
         Path(command).expanduser()
         if os.sep in command or command.startswith("~")
         else _which(command, env)
     )
-    return resolve_package_dir(binary)
+
+
+def _directory_arg(args: object) -> Path | None:
+    """``--directory <dir>`` out of an entry's ``args`` list, or ``None``.
+
+    One reading of the dev shape, asked by two callers now: the reader wants
+    the tree, and the writer wants to know that the ``command`` is ``uv``
+    rather than a reader — so a second copy would be a second thing to drift.
+    """
+    if not isinstance(args, list):
+        return None
+    for i, a in enumerate(args):
+        if a == "--directory" and i + 1 < len(args):
+            return Path(str(args[i + 1])).expanduser()
+    return None
+
+
+def _writer_beside_the_reader(env: dict[str, str]) -> Path | None:
+    """The ``aggregator`` sitting in the same ``bin/`` as the MCP reader.
+
+    THE WRITER UNDER TEST IS THE DEPLOYED ONE, and a PATH search does not
+    reliably name it. ``aggregator-ingest.timer`` execs ``pkgs.aggregator``;
+    the profile's ``aggregator-mcp`` is a program of that same package, so on
+    this host the two are neighbours in one ``bin/``. Inside a checkout, a
+    ``uv run``, or a devShell, the first ``aggregator`` on PATH is instead the
+    checkout's own venv CLI — a binary no timer runs. Measuring it is wrong
+    twice over: a deployed writer that really has fallen behind never fires
+    WILL_ROT, and a checkout that happens to be ahead invents a skew nobody
+    has.
+
+    Only when the reader was resolved from a ``command``. A ``--directory``
+    entry means the command is ``uv``, whose neighbours are uv's install, and
+    an ``AGGREGATOR_READER_DIR`` override means the config does not describe
+    the reader at all — in both cases a sibling would be a binary picked by
+    coincidence of directory layout.
+
+    ``None`` defers to the PATH search rather than concluding anything: a
+    profile that ships the MCP server without the CLI beside it has no sibling
+    to find, and turning that into UNKNOWN would break a working install.
+    """
+    if env.get(READER_DIR_ENV):
+        return None
+    entry = _claude_mcp_entry(env)
+    if not isinstance(entry, dict):
+        return None
+    if _directory_arg(entry.get("args")) is not None:
+        return None
+    binary = _command_binary(entry.get("command"), env)
+    if binary is None:
+        return None
+    sibling = binary.parent / "aggregator"
+    return sibling if sibling.is_file() and os.access(sibling, os.X_OK) else None
 
 
 def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
@@ -564,26 +626,41 @@ def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
         own = Path(__file__).resolve().parent.parent.parent
         return own if (own / "pyproject.toml").is_file() else None
 
-    args = entry.get("args")
-    if isinstance(args, list):
-        for i, a in enumerate(args):
-            if a == "--directory" and i + 1 < len(args):
-                return Path(str(args[i + 1])).expanduser()
+    directory = _directory_arg(entry.get("args"))
+    if directory is not None:
+        return directory
 
     return _reader_dir_from_command(entry.get("command"), env)
 
 
 def resolve_writer_bin(env: dict[str, str] | None = None) -> Path | None:
-    """The ``aggregator`` a human — or the ingest timer — would actually run.
+    """The ``aggregator`` THE INGEST TIMER would actually run, in priority order.
 
-    ``shutil.which`` semantics over the ``PATH`` passed in rather than the
-    process's; the search itself is ``_which``, which the reader shares.
+    1. ``AGGREGATOR_WRITER_BIN`` — the escape hatch every input here has.
+    2. The ``aggregator`` beside the resolved reader command. On this host
+       ``aggregator-ingest.timer`` execs ``pkgs.aggregator`` and the profile's
+       ``aggregator-mcp`` is a program of that same package, so the deployed
+       writer is the reader's neighbour in one ``bin/``. See
+       ``_writer_beside_the_reader`` for when this step declines to answer.
+    3. ``_which("aggregator", env)`` — ``shutil.which`` semantics over the
+       ``PATH`` passed in rather than the process's, sharing the reader's
+       lookup.
+
+    STEP 2 IS NOT A SHORTCUT, IT IS THE CORRECTION. Step 3 alone answers with
+    whatever is first on the probe's PATH, and in a checkout, a ``uv run`` or
+    a devShell that is the checkout's own venv CLI — a binary no timer runs
+    and no cache is ever stamped by. Reporting it as "the writer" hides a
+    deployed writer that has genuinely fallen behind and invents a skew when
+    the checkout is merely ahead. Step 3 survives underneath because a profile
+    can ship the MCP server without the CLI beside it, and the verdict keeps
+    reporting ``writer_bin`` either way, so which one was read is never a
+    guess the operator has to make.
     """
     env = os.environ if env is None else env
     override = env.get(WRITER_BIN_ENV)
     if override:
         return Path(override).expanduser()
-    return _which("aggregator", env)
+    return _writer_beside_the_reader(env) or _which("aggregator", env)
 
 
 # --- reading the three quantities -------------------------------------------
