@@ -902,6 +902,35 @@ def test_a_directory_argument_still_wins_over_the_command(tmp_path):
     assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 7
 
 
+def test_the_joined_directory_spelling_is_read_too(tmp_path):
+    """``--directory=<dir>``, which ``uv run`` accepts exactly as readily.
+
+    Only the split form was parsed, so the joined one fell through to the
+    ``command`` branch — where the command is ``uv``, the wrapper walk finds
+    uv's own install, no ``aggregator/core/store.py`` is there, and the answer
+    is UNKNOWN. A session pointed at a perfectly good checkout got told its
+    recall health could not be verified, on the strength of a space.
+
+    This config is hand-edited and the two spellings are interchangeable to the
+    tool that consumes it, so which one an operator typed cannot be allowed to
+    decide whether the check works.
+    """
+    home = tmp_path / "home"
+    checkout = _fake_tree(tmp_path / "checkout", 7)
+    _claude_json(
+        home,
+        {"command": "uv", "args": ["run", f"--directory={checkout}", "aggregator-mcp"]},
+    )
+    assert sp.resolve_reader_dir(_env(home)) == checkout
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 7
+
+    # The split form keeps working, and an empty value is not a directory.
+    _claude_json(home, {"command": "uv", "args": ["run", "--directory", str(checkout)]})
+    assert sp.resolve_reader_dir(_env(home)) == checkout
+    _claude_json(home, {"command": "uv", "args": ["run", "--directory="]})
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
 def test_no_entry_at_all_falls_back_to_this_checkout(tmp_path):
     """No ``mcpServers.aggregator`` anywhere: a dev tree with no MCP wiring.
 

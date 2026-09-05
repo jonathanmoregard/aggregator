@@ -526,17 +526,32 @@ def _command_binary(command: object, env: dict[str, str]) -> Path | None:
 
 
 def _directory_arg(args: object) -> Path | None:
-    """``--directory <dir>`` out of an entry's ``args`` list, or ``None``.
+    """``--directory <dir>`` or ``--directory=<dir>``, or ``None``.
 
     One reading of the dev shape, asked by two callers now: the reader wants
     the tree, and the writer wants to know that the ``command`` is ``uv``
     rather than a reader — so a second copy would be a second thing to drift.
+
+    BOTH SPELLINGS. ``uv run`` accepts them interchangeably and this config is
+    hand-edited, so which one an operator typed cannot decide whether the check
+    works. Parsing only the split form sent the joined one down the ``command``
+    branch, where the command is ``uv``: the wrapper walk finds uv's own
+    install, no ``aggregator/core/store.py`` is there, and a session pointed at
+    a perfectly good checkout was told its recall health could not be verified
+    — on the strength of a space.
+
+    An empty value (``--directory=``) is not a directory and is passed over,
+    the same way a trailing bare ``--directory`` with nothing after it is.
     """
     if not isinstance(args, list):
         return None
     for i, a in enumerate(args):
         if a == "--directory" and i + 1 < len(args):
             return Path(str(args[i + 1])).expanduser()
+        if isinstance(a, str) and a.startswith("--directory="):
+            value = a.partition("=")[2]
+            if value:
+                return Path(value).expanduser()
     return None
 
 
@@ -589,10 +604,10 @@ def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
     The order, and the reason for each step:
 
     1. ``AGGREGATOR_READER_DIR`` — the escape hatch every input here has.
-    2. ``args`` carrying ``--directory <dir>`` — the dev shape,
-       ``uv run --directory <checkout> aggregator-mcp``. A session pointed at a
-       checkout IS running that checkout, and resolving ``uv`` through the
-       wrapper walk would find uv's own install.
+    2. ``args`` carrying ``--directory <dir>`` or ``--directory=<dir>`` — the
+       dev shape, ``uv run --directory <checkout> aggregator-mcp``. A session
+       pointed at a checkout IS running that checkout, and resolving ``uv``
+       through the wrapper walk would find uv's own install.
     3. ``command`` — the deployed shape, ``{"command": "<nix wrapper>",
        "args": []}``. Resolved through the wrapper chain to the site-packages
        that carries ``aggregator/core/store.py``: the directory the number is
