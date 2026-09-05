@@ -92,29 +92,44 @@ def _fake_tree(root: Path, version: int) -> Path:
     return root
 
 
-def _fake_writer(root: Path, version: int | None) -> Path:
-    """A Nix-shaped writer install, wrapper indirection and all.
+def _fake_writer(
+    root: Path,
+    version: int | None,
+    *,
+    name: str = "aggregator",
+    outer_dir: str = "wrapper",
+) -> Path:
+    """A Nix-shaped install, wrapper indirection and all.
 
-    Reproduces the real chain measured on this host: ``bin/aggregator`` is a
-    shell wrapper whose last line execs a second ``bin/aggregator`` inside an
-    env derivation, and only that env carries
-    ``lib/python3.11/site-packages/aggregator/core/store.py``. A probe that
-    only handled the direct case would report UNKNOWN against every real
-    NixOS install, which is the only kind this host has.
+    Reproduces the real chain measured on this host: ``bin/<name>`` is a shell
+    wrapper whose last line execs a second ``bin/<name>`` inside an env
+    derivation, and only that env carries
+    ``lib/python3.11/site-packages/aggregator/core/store.py``. A probe that only
+    handled the direct case would report UNKNOWN against every real NixOS
+    install, which is the only kind this host has.
 
-    ``version=None`` builds the wrapper chain but no packaged source, i.e. a
-    writer whose version cannot be determined.
+    ONE fixture builds both sides, because the reader's chain has the identical
+    shape — ``/etc/profiles/.../bin/aggregator-mcp`` -> a wrapper in an
+    ``aggregator-0.0.1`` derivation -> a console script in an
+    ``aggregator-env`` derivation that owns site-packages. ``name`` picks the
+    program, and ``outer_dir`` puts the outer wrapper in a real ``bin/`` when
+    the test needs it found on a ``PATH``. Mirrors the source, which resolves
+    both through one walker: if the two ever needed different fixtures, they
+    would need different walkers, and that is the drift this design refuses.
+
+    ``version=None`` builds the wrapper chain but no packaged source, i.e. an
+    install whose version cannot be determined.
     """
     env = root / "env"
-    binroot = root / "wrapper"
+    binroot = root / outer_dir
     (env / "bin").mkdir(parents=True, exist_ok=True)
     binroot.mkdir(parents=True, exist_ok=True)
 
-    inner = env / "bin" / "aggregator"
+    inner = env / "bin" / name
     inner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     inner.chmod(0o755)
 
-    outer = binroot / "aggregator"
+    outer = binroot / name
     outer.write_text(
         "#!/bin/sh\n"
         "PYTHONPATH=${PYTHONPATH%':'}\n"
@@ -131,6 +146,52 @@ def _fake_writer(root: Path, version: int | None) -> Path:
             f"SCHEMA_VERSION = {int(version)}\n", encoding="utf-8"
         )
     return outer
+
+
+def _claude_json(home: Path, entry: object | None) -> Path:
+    """A ``~/.claude.json`` shaped like this host's, with one aggregator entry.
+
+    ``entry=None`` means the file exists and configures no aggregator server.
+    Anything else is written verbatim, including shapes that are not objects at
+    all — the probe has to survive a hand-edited config, not only a valid one.
+
+    The two decorations are not decoration. The real file carries FIVE
+    top-level servers, so a probe that took "the only server" or "the first
+    server" would pass a one-entry fixture and fail on the host. And it carries
+    a stale PROJECT-scoped block —
+    ``projects["/home/jonathan/Repos/gdocs-review-mcp"].mcpServers.aggregator``
+    with ``args: ["not", "found"]``, left over from an unrelated repo — which
+    applies only to sessions started in that directory. Both are in every
+    fixture so a probe that ever starts reading either fails here rather than on
+    the machine.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    doc: dict = {
+        "projects": {
+            "/home/jonathan/Repos/gdocs-review-mcp": {
+                "mcpServers": {
+                    "aggregator": {"command": "aggregator-mcp", "args": ["not", "found"]}
+                }
+            }
+        },
+        "mcpServers": {"research-agent": {"command": "true", "args": []}},
+    }
+    if entry is not None:
+        doc["mcpServers"]["aggregator"] = entry
+    path = home / ".claude.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _env(home: Path, *, path: str = "") -> dict[str, str]:
+    """The two environment values the reader resolution reads, and nothing else.
+
+    A plain dict rather than a monkeypatched ``os.environ``: every resolver in
+    the probe takes its environment as an argument, and that is the property
+    that makes a PATH lookup testable without a shell and without leaking one
+    test's PATH into the next.
+    """
+    return {"HOME": str(home), "PATH": path}
 
 
 @pytest.fixture
@@ -527,6 +588,187 @@ def test_resolve_writer_bin_searches_the_path_it_is_handed(tmp_path):
     # A file a shell would not run is not the writer.
     exe.chmod(0o644)
     assert sp.resolve_writer_bin({"PATH": str(binroot)}) is None
+
+
+# --- which reader is under test ---------------------------------------------
+
+
+def test_reader_dir_comes_from_the_command_when_there_is_no_directory_arg(tmp_path):
+    """THE BUG. ``{"command": "<nix wrapper>", "args": []}`` — this host, today.
+
+    ``args`` is empty, so the old code found no ``--directory`` and fell back to
+    the checkout the probe file happened to sit in. On 2026-09-05 that checkout
+    was at schema 7 while the deployed reader, the writer and the cache were all
+    at 6, so every new session was told AGGREGATOR RECALL IS DEAD about a
+    machine where recall was fine. The requirement has to come from the binary
+    Claude Code actually execs, and the answer is the site-packages the chain
+    ends in — the directory the number was read from.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(
+        home, {"type": "stdio", "command": str(wrapper), "args": [], "env": {}}
+    )
+
+    found = sp.resolve_reader_dir(_env(home))
+    assert found == tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+    assert sp.read_reader_version(found) == 6
+    assert found != Path(sp.__file__).resolve().parent.parent.parent
+
+
+def test_a_bare_command_name_is_looked_up_on_the_path(tmp_path):
+    """``{"command": "aggregator-mcp"}`` with no slash in it.
+
+    Claude Code runs that through a PATH search, so the probe must too — over
+    the PATH it was handed, because the systemd health unit's PATH is not the
+    session's and resolving against the wrong one would measure the wrong
+    binary while looking like it worked.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+
+    found = sp.resolve_reader_dir(_env(home, path=str(wrapper.parent)))
+    assert found == tmp_path / "install" / "env" / "lib" / "python3.11" / "site-packages"
+
+
+def test_a_command_that_resolves_nowhere_is_unknown_not_this_checkout(tmp_path):
+    """An entry exists and cannot be resolved. The answer is "I could not tell".
+
+    This is the case the systemd health unit hits: its PATH carries no
+    aggregator at all, so a bare name resolves to nothing. UNKNOWN is loud and
+    correct there. Falling back to this checkout would compare the writer
+    against a tree the reader has never run — the false alarm being fixed,
+    re-entering through the door it left by.
+    """
+    home = tmp_path / "home"
+    _claude_json(home, {"command": "aggregator-mcp", "args": []})
+    assert sp.resolve_reader_dir(_env(home, path=str(tmp_path / "empty-bin"))) is None
+
+
+def test_a_directory_argument_still_wins_over_the_command(tmp_path):
+    """``uv run --directory <checkout> aggregator-mcp`` — the dev shape, kept.
+
+    A session pointed at a checkout IS running that checkout, and resolving
+    ``uv`` through the wrapper walk would find uv's own install and report
+    nothing useful. So the explicit directory stays first: it names a tree a
+    human chose, while the command is what to consult when nobody chose.
+    """
+    home = tmp_path / "home"
+    checkout = _fake_tree(tmp_path / "checkout", 7)
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+
+    _claude_json(
+        home,
+        {
+            "command": "uv",
+            "args": ["run", "--directory", str(checkout), "aggregator-mcp"],
+        },
+    )
+    assert sp.resolve_reader_dir(_env(home)) == checkout
+
+    # And when BOTH could resolve, the argument is still the answer.
+    _claude_json(home, {"command": str(wrapper), "args": ["--directory", str(checkout)]})
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 7
+
+
+def test_no_entry_at_all_falls_back_to_this_checkout(tmp_path):
+    """No ``mcpServers.aggregator`` anywhere: a dev tree with no MCP wiring.
+
+    The fallback that caused the false alarm survives for exactly the case it
+    was written for, and is narrowed to it. Still gated on a ``pyproject.toml``
+    beside the package: installed into site-packages this module also sits next
+    to a ``core/store.py``, and reading THAT as the reader's requirement would
+    compare the writer against itself and call every skew healthy.
+    """
+    home = tmp_path / "home"
+    _claude_json(home, None)
+    repo_root = Path(sp.__file__).resolve().parent.parent.parent
+    assert (repo_root / "pyproject.toml").is_file()
+    assert sp.resolve_reader_dir(_env(home)) == repo_root
+
+
+def test_an_unreadable_claude_json_is_treated_as_no_entry(tmp_path):
+    """Missing or malformed: there is no entry to be read, so the fallback holds.
+
+    Deliberate, and the stricter reading was rejected on evidence: a HOME with
+    no ``.claude.json`` is every CI run and every fresh clone, and turning those
+    into UNKNOWN would make the probe cry wolf where nothing is wrong — which
+    spends the silence budget rule 2 exists to protect.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    repo_root = Path(sp.__file__).resolve().parent.parent.parent
+    assert sp.resolve_reader_dir(_env(home)) == repo_root
+
+    (home / ".claude.json").write_text("{not json", encoding="utf-8")
+    assert sp.resolve_reader_dir(_env(home)) == repo_root
+
+
+def test_an_entry_that_is_present_but_unusable_is_unknown(tmp_path):
+    """``mcpServers.aggregator`` exists and carries nothing resolvable.
+
+    Something IS configured, so this checkout is not the reader, and "could not
+    tell" is the only honest answer. Rule 2 at the top of the probe: unknown
+    warns, never "fine" — and never "here is a different thing I measured
+    instead".
+    """
+    home = tmp_path / "home"
+
+    _claude_json(home, {})
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    _claude_json(home, {"command": "", "args": []})
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    _claude_json(home, "not-an-object")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
+def test_the_reader_dir_override_beats_everything(tmp_path):
+    """``AGGREGATOR_READER_DIR``: the escape hatch, still first.
+
+    Every input to this probe is overridable, because a health check that can
+    only ever look at the live machine cannot be tested at all — which for a
+    health check is the failure mode, not an inconvenience.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(wrapper), "args": []})
+    forced = _fake_tree(tmp_path / "forced", 9)
+
+    env = _env(home)
+    env[sp.READER_DIR_ENV] = str(forced)
+    assert sp.resolve_reader_dir(env) == forced
+
+
+def test_the_project_scoped_entry_is_never_read(tmp_path):
+    """``~/.claude.json`` also carries per-project blocks. They are not ours.
+
+    This host has a stale one from an unrelated repo whose command resolves to
+    nothing. It applies only to sessions started in that directory. A probe that
+    read it would report on a server nothing runs — while the top-level entry
+    sat right there and resolved.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    path = _claude_json(home, {"command": str(wrapper), "args": []})
+
+    stale = json.loads(path.read_text(encoding="utf-8"))["projects"]
+    assert stale["/home/jonathan/Repos/gdocs-review-mcp"]["mcpServers"]["aggregator"][
+        "args"
+    ] == ["not", "found"]
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 6
 
 
 # --- the machine-readable verdict -------------------------------------------

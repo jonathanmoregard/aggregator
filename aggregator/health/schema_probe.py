@@ -5,8 +5,10 @@ WHAT WENT WRONG, AND WHY NOTHING SAW IT
 Three components share one SQLite cache and each of them knows only its own
 half of the contract:
 
-  * the READER — ``aggregator-mcp``, run by Claude Code out of the live
-    working tree — opens the cache ``mode=ro`` and refuses every call when
+  * the READER — ``aggregator-mcp``, the binary ``~/.claude.json``'s
+    ``mcpServers.aggregator.command`` names, which on this host is a Nix
+    wrapper chain ending in an ``-env`` derivation's site-packages — opens the
+    cache ``mode=ro`` and refuses every call when
     ``PRAGMA user_version < SCHEMA_VERSION`` (``mcp.py``,
     ``_ensure_cache_ready``). It can never migrate: read-only by construction.
   * the WRITER — the ``aggregator`` on ``$PATH`` and the code
@@ -60,6 +62,27 @@ of those are "no news". They are "could not tell", they are announced under
 the DOWN headline, and the reasoning is the operator's own: a reader that does
 not recognise the value must treat the thing as possibly broken and warn, never
 as "unparseable, therefore fine".
+
+WHICH READER, AND WHY IT IS NOT THIS CHECKOUT
+
+The reader under test is whatever ``~/.claude.json``'s ``mcpServers.aggregator``
+starts. Nothing else is evidence of what Claude Code executes. Until 2026-09-05
+this file read only the ``--directory`` argument of that entry, and when there
+was none — the entry now names a Nix wrapper directly, with empty ``args`` — it
+fell back to its OWN checkout. On a host whose checkout sat at schema 7 while
+the deployed reader, the writer and the cache were all at 6, that fallback
+announced RECALL IS DEAD to every new session. A false alarm is not a cheap
+error here: this check's entire value is that it stays quiet unless something is
+wrong, and one confident lie spends the credibility the next real alarm needs.
+
+So ``command`` is resolved the way the writer's binary always was: follow the
+``exec`` line of each wrapper hop and take the first
+``<prefix>/lib/python3*/site-packages`` that carries
+``aggregator/core/store.py``. One walker, ``_wrapper_chain_prefixes``, serves
+both. The own-checkout fallback survives only for the case it was written for —
+no ``mcpServers.aggregator`` entry at all, and this file sitting in a tree with
+a ``pyproject.toml``. An entry that exists and cannot be resolved is UNKNOWN,
+which is rule 2 applied to the question "whose version am I even reading".
 
 STATES, AND WHY FOUR RATHER THAN A BOOLEAN
 
@@ -317,45 +340,112 @@ def _which(name: str, env: dict[str, str]) -> Path | None:
     return None
 
 
+def _claude_mcp_entry(env: dict[str, str]) -> dict | None:
+    """``~/.claude.json``'s TOP-LEVEL ``mcpServers.aggregator``, or ``None``.
+
+    Top-level only, deliberately. The same file carries per-project
+    ``projects["<dir>"].mcpServers`` blocks, and this host has a stale one from
+    an unrelated repo pointing at a command that resolves to nothing. Those
+    apply only to sessions started in that directory; reading them here would
+    let a dead entry from someone else's project decide what this probe
+    measures.
+
+    ``None`` means "there is no entry to be had": the file is missing,
+    unreadable, not JSON, or simply carries no aggregator server. All four are
+    the same fact to a caller, and the last of them — a HOME with no
+    ``.claude.json`` — is every CI run, so it must not be an alarm. An entry
+    that EXISTS but is not an object comes back as ``{}`` instead: something is
+    configured, so the caller must not fall back to this checkout.
+    """
+    home = env.get("HOME") or str(Path.home())
+    try:
+        with open(os.path.join(home, ".claude.json"), "rb") as fh:
+            doc = json.loads(fh.read(_SOURCE_SCAN_LIMIT * 8).decode("utf-8", "replace"))
+        servers = doc.get("mcpServers")
+        if not isinstance(servers, dict) or "aggregator" not in servers:
+            return None
+        entry = servers["aggregator"]
+        return entry if isinstance(entry, dict) else {}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _reader_dir_from_command(command: object, env: dict[str, str]) -> Path | None:
+    """The install directory behind ``mcpServers.aggregator.command``.
+
+    That command is what Claude Code execs, so its chain is the only statement
+    of which reader is under test that cannot be stale. A bare name (no
+    separator) is looked up on the PATH this probe was handed, exactly as a
+    shell would; anything with a separator, or a ``~``, is a path. The chain
+    from there to a packaged ``store.py`` is the writer's chain in every
+    respect, so it goes through the same walker.
+
+    ``None`` when the name resolves nowhere, or resolves to something carrying
+    no aggregator package — the caller turns that into UNKNOWN, which is the
+    honest verdict and the loud one.
+    """
+    if not isinstance(command, str) or not command:
+        return None
+    binary = (
+        Path(command).expanduser()
+        if os.sep in command or command.startswith("~")
+        else _which(command, env)
+    )
+    return resolve_package_dir(binary)
+
+
 def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
-    """Which checkout the MCP reader actually runs from.
+    """Which install the MCP reader actually runs from, in priority order.
 
     Asked of ``~/.claude.json`` rather than assumed, because that file is what
-    Claude Code executes — ``{"command": "uv", "args": ["run", "--directory",
-    "<dir>", "aggregator-mcp"]}`` — so it is the only source that cannot be
-    out of date with respect to the reader under test. A hard-coded
-    ``~/Repos/aggregator`` would keep reporting on a checkout the reader had
-    stopped using, and would do it silently.
+    Claude Code executes, so it is the only source that cannot be out of date
+    with respect to the reader under test. A hard-coded ``~/Repos/aggregator``
+    would keep reporting on a checkout the reader had stopped using, and would
+    do it silently.
 
-    Falls back to this file's own checkout, but only when that checkout has a
-    ``pyproject.toml``: installed into site-packages this module sits beside a
-    ``core/store.py`` too, and reading THAT as "the reader's requirement"
-    would compare the writer against itself and report every skew as healthy.
-    The discriminator is cheap and the failure it prevents is total.
+    The order, and the reason for each step:
+
+    1. ``AGGREGATOR_READER_DIR`` — the escape hatch every input here has.
+    2. ``args`` carrying ``--directory <dir>`` — the dev shape,
+       ``uv run --directory <checkout> aggregator-mcp``. A session pointed at a
+       checkout IS running that checkout, and resolving ``uv`` through the
+       wrapper walk would find uv's own install.
+    3. ``command`` — the deployed shape, ``{"command": "<nix wrapper>",
+       "args": []}``. Resolved through the wrapper chain to the site-packages
+       that carries ``aggregator/core/store.py``: the directory the number is
+       actually read from, which is what the verdict then reports.
+    4. No ``mcpServers.aggregator`` entry AT ALL — a checkout with no MCP
+       wiring. Only here does this file fall back to its own tree, and only when
+       that tree has a ``pyproject.toml``: installed into site-packages this
+       module also sits beside a ``core/store.py``, and reading THAT as the
+       reader's requirement would compare the writer against itself and report
+       every skew as healthy.
+    5. Otherwise ``None`` — an entry exists and could not be resolved. UNKNOWN,
+       never a substitute measurement of something else.
+
+    Step 3 is the whole point of this function's second life. Until 2026-09-05
+    only step 2 existed, and an entry with empty ``args`` fell straight through
+    to step 4: on a host whose checkout was at schema 7 while the deployed
+    reader, writer and cache were all at 6, every session was told RECALL IS
+    DEAD about a machine where recall was fine.
     """
     env = os.environ if env is None else env
     override = env.get(READER_DIR_ENV)
     if override:
         return Path(override).expanduser()
 
-    home = env.get("HOME") or str(Path.home())
-    try:
-        with open(os.path.join(home, ".claude.json"), "rb") as fh:
-            doc = json.loads(fh.read(_SOURCE_SCAN_LIMIT * 8).decode("utf-8", "replace"))
-        args = (((doc.get("mcpServers") or {}).get("aggregator") or {}).get("args")) or []
+    entry = _claude_mcp_entry(env)
+    if entry is None:
+        own = Path(__file__).resolve().parent.parent.parent
+        return own if (own / "pyproject.toml").is_file() else None
+
+    args = entry.get("args")
+    if isinstance(args, list):
         for i, a in enumerate(args):
             if a == "--directory" and i + 1 < len(args):
                 return Path(str(args[i + 1])).expanduser()
-    except (OSError, ValueError, AttributeError, TypeError):
-        # Missing, unreadable or a shape this does not know. Fall through to
-        # the checkout fallback; if that fails too the caller reports UNKNOWN,
-        # which is the correct answer and not an error to raise here.
-        pass
 
-    own = Path(__file__).resolve().parent.parent.parent
-    if (own / "pyproject.toml").is_file():
-        return own
-    return None
+    return _reader_dir_from_command(entry.get("command"), env)
 
 
 def resolve_writer_bin(env: dict[str, str] | None = None) -> Path | None:
@@ -513,10 +603,13 @@ def resolve_package_dir(binary: Path | None) -> Path | None:
 def read_reader_version(reader_dir: Path | None) -> int | None:
     """The version the MCP reader will refuse anything below.
 
-    Read as text out of the checkout's ``store.py``. Emphatically not an
-    import: ``aggregator.core.store`` pulls sentence-transformers and torch,
-    which is seconds of model-loading machinery, and both consumers here run
-    on budgets measured in single-digit seconds.
+    Read as text out of whichever directory holds the reader's package — a
+    checkout in dev, an env derivation's site-packages once deployed. The same
+    reading serves the writer, whose directory is found the same way.
+    Emphatically not an import: ``aggregator.core.store`` pulls
+    sentence-transformers and torch, which is seconds of model-loading
+    machinery, and both consumers here run on budgets measured in single-digit
+    seconds.
     """
     if reader_dir is None:
         return None
