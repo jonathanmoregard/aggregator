@@ -8,9 +8,12 @@ from a tool whose annotations say ``openWorldHint=False``. The hardened path
 was hardened and the interactive one was fail-open.
 
 An env var cannot fix this from here: ``huggingface_hub`` reads
-``HF_HUB_OFFLINE`` into a module constant at import time, and it is already
-imported by the time ``aggregator.mcp`` finishes loading (via
-``core.scrub`` → spaCy → thinc → transformers). So the refusal is passed
+``HF_HUB_OFFLINE`` into a module constant at import time, and nothing in this
+package controls when that import happens — the first model construction on any
+path triggers it, inside a process whose environment belongs to the editor that
+launched it. (It used to be pulled in before ``aggregator.mcp`` had even
+finished importing, via ``core.scrub`` → spaCy → thinc → transformers; Presidio
+is lazy now, which does not change the conclusion.) So the refusal is passed
 explicitly, per call, as ``local_files_only``.
 
 Fail CLOSED, with one opt-in. ``aggregator-embed-seed.service`` is the single

@@ -87,9 +87,11 @@ def test_the_script_uses_the_shipped_sanitizer_and_not_a_copy(
     """A second implementation would drift, silently, and be believed.
 
     Asserted by substitution rather than by identity: the script imports
-    ``aggregator`` names inside the call (a module-level import would drag
-    spaCy in through ``core.scrub``), so what is checked is that the shipped
-    function is the one doing the work at call time.
+    ``aggregator`` names inside the call — historically because a module-level
+    import dragged spaCy in through ``core.scrub``, and still today because a
+    measurement script should not pay for the store's import graph merely to be
+    loaded. So what is checked is that the shipped function is the one doing the
+    work at call time.
     """
     seen: list[str] = []
     real = store_mod.fts5_match_query
