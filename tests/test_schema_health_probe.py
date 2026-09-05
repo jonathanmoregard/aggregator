@@ -782,6 +782,96 @@ def test_a_present_but_unparseable_claude_json_is_unknown(tmp_path):
     assert sp.resolve_reader_dir(_env(home)) is None
 
 
+def _oversized_claude_json(home: Path, wrapper: Path) -> Path:
+    """A ``~/.claude.json`` that is entirely VALID and larger than the read cap.
+
+    Not a synthetic blob: the shape is the real file's. Claude Code stores
+    per-project history in this same document — ``projects[<dir>].history`` —
+    and on a machine with a few long-lived projects it grows without bound,
+    which is the only reason a JSON config ever passes eight-figure byte
+    counts. The aggregator entry sits AFTER the filler on purpose: it is the
+    part a truncated read loses, so a probe that parses the prefix is not
+    merely unlucky, it is systematically blind to the thing it came to read.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    doc = {
+        "projects": {
+            "/home/jonathan/Repos/something": {"history": ["x" * 4096] * 4200}
+        },
+        "mcpServers": {
+            "research-agent": {"command": "true", "args": []},
+            "aggregator": {"command": str(wrapper), "args": []},
+        },
+    }
+    path = home / ".claude.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    assert path.stat().st_size > sp._CLAUDE_CONFIG_LIMIT, path.stat().st_size
+    return path
+
+
+def test_an_oversized_but_valid_claude_json_names_the_cap_not_a_repair(tmp_path):
+    """A config too big to read is not a config that is broken.
+
+    The probe reads a bounded prefix of ``~/.claude.json`` — deliberately, and
+    it must keep doing so: both consumers run on budgets of a few seconds and
+    this file has no business being scanned without limit. But a bounded read
+    of a valid 17 MB document yields a buffer cut mid-token, ``json.loads``
+    fails on it exactly the way it fails on a corrupt file, and the operator is
+    handed "repair ~/.claude.json — it must be valid JSON" about a file that
+    already is. That remedy is unfollowable: there is nothing to repair, so the
+    check announces an impossible chore every session until someone reads this
+    source to find out why.
+
+    The two causes have to be told apart at the point where they are still
+    distinguishable — before the parse, by the size — and the message has to
+    name the number, the cap, and the override that gets past both.
+    """
+    home = tmp_path / "home"
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    path = _oversized_claude_json(home, wrapper)
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.UNKNOWN, v.explain()
+    assert v.reader_version is None
+    assert v.reader_dir is None, "a truncated config must not become a guess"
+
+    said = " ".join(f.text() for f in v.findings if f.state == sp.UNKNOWN)
+    assert str(path) in said, said
+    assert str(path.stat().st_size) in said, said
+    assert str(sp._CLAUDE_CONFIG_LIMIT) in said, said
+    assert sp.READER_DIR_ENV in said, said
+    # The corrupt-file remedy must NOT be the one shown: this file parses.
+    assert "repair" not in said.lower(), said
+
+
+def test_a_config_under_the_cap_still_parses(tmp_path):
+    """The bound is a bound, not a new failure mode.
+
+    A padded-but-legal config — well under the cap and far larger than the
+    fixtures everything else uses — has to resolve the reader normally. A size
+    check that shipped with an off-by-one, or that stat()ed the wrong thing,
+    would turn every real ``~/.claude.json`` on this host into UNKNOWN, which
+    is the false alarm this module has already paid for once.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    wrapper = _fake_writer(
+        tmp_path / "install", 6, name="aggregator-mcp", outer_dir="bin"
+    )
+    doc = {
+        "projects": {"/home/jonathan/Repos/x": {"history": ["y" * 4096] * 64}},
+        "mcpServers": {"aggregator": {"command": str(wrapper), "args": []}},
+    }
+    (home / ".claude.json").write_text(json.dumps(doc), encoding="utf-8")
+    assert (home / ".claude.json").stat().st_size < sp._CLAUDE_CONFIG_LIMIT
+
+    assert sp.read_reader_version(sp.resolve_reader_dir(_env(home))) == 6
+
+
 def test_an_unparseable_claude_json_says_so_and_names_the_file(tmp_path):
     """The remedy has to send the operator at the FILE, not at the install.
 

@@ -233,6 +233,22 @@ WRITER_BIN_ENV = "AGGREGATOR_WRITER_BIN"
 # fault in itself, not something to spend a session-start budget scanning.
 _SOURCE_SCAN_LIMIT = 2 * 1024 * 1024
 
+# ``~/.claude.json`` gets its own, larger bound, because it is not a source
+# file and legitimately gets big: Claude Code stores per-project ``history``
+# arrays in the same document, so a machine with a few long-lived projects
+# carries a config two orders of magnitude past any store.py.
+#
+# A BOUND ON A DOCUMENT THAT MUST BE PARSED WHOLE IS A DECISION, NOT A CLAMP.
+# Truncating a source file is harmless — the constant either appeared in the
+# prefix or it did not. Truncating JSON yields a buffer cut mid-token, and
+# ``json.loads`` rejects it in the same breath and with the same exception it
+# uses for genuine corruption. So the size is checked BEFORE the read and a
+# file past the cap is never parsed at all: the two causes are only
+# distinguishable here, and conflating them hands the operator "repair
+# ~/.claude.json" about a file that is already valid — an unfollowable chore,
+# announced every session.
+_CLAUDE_CONFIG_LIMIT = 16 * 1024 * 1024
+
 # ``SCHEMA_VERSION = 6`` at column zero. Matched as TEXT rather than imported,
 # because importing either side's ``store.py`` costs the whole dependency
 # tree. Anchored to the line start so a mention inside a comment or a string
@@ -257,6 +273,15 @@ _MAX_WRAPPER_HOPS = 8
 # nobody configured a reader, broken means somebody did and this cannot tell
 # what.
 _CONFIG_UNREADABLE: dict = {}
+
+# Present, valid as far as anyone knows, and larger than ``_CLAUDE_CONFIG_LIMIT``.
+# A SECOND sentinel rather than a flag on the first, because the two have
+# different remedies and the difference is the whole point: an unparseable
+# config is a file to fix, an oversized one is a file this probe declines to
+# read and gets past with ``AGGREGATOR_READER_DIR``. Same identity trick, same
+# reason — it is an ordinary empty dict, so it flows through the "an entry
+# exists and is unusable" path without a second branch anywhere else.
+_CONFIG_TOO_LARGE: dict = {}
 
 
 @dataclass(frozen=True)
@@ -409,10 +434,34 @@ def _claude_mcp_entry(env: dict[str, str]) -> dict | None:
 
     An entry that EXISTS but is not an object also comes back as ``{}``:
     something is configured, so the checkout is not the answer.
+
+    A FOURTH outcome, ``_CONFIG_TOO_LARGE``, splits off the one shape that used
+    to masquerade as the third. The file is read under a bound
+    (``_CLAUDE_CONFIG_LIMIT``) and a bounded read of a VALID document that is
+    bigger than the bound comes back cut mid-token, which ``json.loads``
+    rejects exactly the way it rejects corruption. So the size decides first
+    and an oversized file is never parsed: reporting a 17 MB valid config as
+    unparseable told the operator to go and repair a file with nothing wrong
+    with it, every session, forever.
     """
+    path = _claude_config_path(env)
     try:
-        with open(_claude_config_path(env), "rb") as fh:
-            raw = fh.read(_SOURCE_SCAN_LIMIT * 8)
+        size = os.stat(path).st_size
+    except (FileNotFoundError, NotADirectoryError):
+        # Genuinely absent. The one silent case.
+        return None
+    except OSError:
+        return _CONFIG_UNREADABLE
+    if size > _CLAUDE_CONFIG_LIMIT:
+        return _CONFIG_TOO_LARGE
+
+    try:
+        with open(path, "rb") as fh:
+            # One byte past the cap, so a file that GREW between the stat and
+            # this read is caught by length rather than parsed truncated. The
+            # stat is what makes the common case cheap; this is what makes it
+            # correct.
+            raw = fh.read(_CLAUDE_CONFIG_LIMIT + 1)
     except (FileNotFoundError, NotADirectoryError):
         # Genuinely absent. The one silent case.
         return None
@@ -420,6 +469,8 @@ def _claude_mcp_entry(env: dict[str, str]) -> dict | None:
         # Present and this process cannot read it — a permission or IO fault,
         # which is a fault to report rather than a licence to guess.
         return _CONFIG_UNREADABLE
+    if len(raw) > _CLAUDE_CONFIG_LIMIT:
+        return _CONFIG_TOO_LARGE
 
     try:
         doc = json.loads(raw.decode("utf-8", "replace"))
@@ -491,9 +542,11 @@ def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
        beside a ``core/store.py``, and reading THAT as the reader's requirement
        would compare the writer against itself and report every skew as healthy.
     5. Otherwise ``None`` — an entry exists and could not be resolved, or the
-       config itself could not be parsed. UNKNOWN, never a substitute
-       measurement of something else. A config that is PRESENT and broken gets
-       no fallback: somebody configured a reader, so this tree is not it.
+       config itself could not be parsed, or it was past
+       ``_CLAUDE_CONFIG_LIMIT`` and deliberately not parsed at all. UNKNOWN,
+       never a substitute measurement of something else. A config that is
+       PRESENT and unusable gets no fallback: somebody configured a reader, so
+       this tree is not it.
 
     Step 3 is the whole point of this function's second life. Until 2026-09-05
     only step 2 existed, and an entry with empty ``args`` fell straight through
@@ -736,13 +789,42 @@ def probe(
     # skipped into silence.
 
     if reader_version is None:
-        # Two causes land here with OPPOSITE fixes, so they get different
+        # THREE causes land here with three different fixes, so they get three
         # remedies. A config this probe could not parse is the operator's file
-        # to repair; a config that resolved to an install with no packaged
-        # source is the install's problem. Only asked when the resolution
-        # already failed, so the healthy path pays nothing for it.
-        if reader_dir is None and _claude_mcp_entry(env) is _CONFIG_UNREADABLE:
-            config = _claude_config_path(env)
+        # to repair; a config too big to read under this probe's budget is a
+        # file with nothing wrong with it and needs the override instead; a
+        # config that resolved to an install with no packaged source is the
+        # install's problem. Only asked when the resolution already failed, so
+        # the healthy path pays nothing for it.
+        config = _claude_config_path(env)
+        entry = _claude_mcp_entry(env) if reader_dir is None else None
+        if entry is _CONFIG_TOO_LARGE:
+            try:
+                size = os.stat(config).st_size
+            except OSError:  # pragma: no cover - it was there a moment ago
+                size = -1
+            findings.append(
+                Finding(
+                    UNKNOWN,
+                    "aggregator recall health CANNOT BE VERIFIED: "
+                    f"{config} is {size} bytes, past the {_CLAUDE_CONFIG_LIMIT}-byte "
+                    "cap this probe reads it under, so which MCP reader Claude "
+                    "Code starts is unknown. The file was NOT parsed and is NOT "
+                    "being called corrupt: a bounded read of a valid document "
+                    "comes back cut mid-token, and there is nothing wrong with "
+                    "the JSON. Claude Code keeps per-project `history` arrays in "
+                    "this same document, which is what grows it. This probe runs "
+                    "on a session-start budget and will not scan an unbounded "
+                    "file to find one server entry.",
+                    f"FIX: set {READER_DIR_ENV} to the directory the MCP reader's "
+                    "package lives in — lib/python3*/site-packages for a deployed "
+                    "build, the checkout root for a dev one — which skips this "
+                    f"file entirely. Or bring {config} back under "
+                    f"{_CLAUDE_CONFIG_LIMIT} bytes by pruning its per-project "
+                    "`history` entries.",
+                )
+            )
+        elif entry is _CONFIG_UNREADABLE:
             findings.append(
                 Finding(
                     UNKNOWN,
