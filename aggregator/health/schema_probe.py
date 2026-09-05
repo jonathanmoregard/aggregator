@@ -89,15 +89,17 @@ STATES, AND WHY FOUR RATHER THAN A BOOLEAN
 ``FINE``     cache == reader's requirement AND writer == it. Silent.
 ``DEAD``     cache != requirement. Recall is refusing RIGHT NOW.
 ``WILL_ROT`` the writer does not already stamp what the cache must end up at —
-             it differs from the reader's requirement, or it is below a cache
-             that is currently above the reader. Recall may work this minute,
-             but the writer re-stamps the cache at its own version on the next
-             tick, so a hand-run migration reverts within thirty minutes. This
-             is the state a two-quantity check cannot see, and it is the one
-             that explains why the incident kept coming back. Measured against
-             ALL THREE for the same reason ``_forward_target`` is: at cache 7,
-             reader 6, writer 6 a writer-versus-reader test is silent while
-             that writer is queued to undo the DEAD finding's own remedy.
+             it differs from the reader's requirement, or it is below the
+             cache. Recall may work this minute, but the writer re-stamps the
+             cache at its own version on the next tick, so a hand-run migration
+             reverts within thirty minutes. This is the state a two-quantity
+             check cannot see, and it is the one that explains why the incident
+             kept coming back. Measured against ALL THREE for the same reason
+             ``_forward_target`` is: at cache 7, reader 6, writer 6 a
+             writer-versus-reader test is silent while that writer is queued to
+             undo the DEAD finding's own remedy. The writer-below-cache half
+             needs NO reader at all — it is a two-quantity fact — so it is
+             still reported when the reader is UNKNOWN.
 ``UNKNOWN``  some quantity could not be read.
 
 ``!=``, NOT ``<``, AND THAT IS THE READER'S OWN RULE. The gate in ``mcp.py``
@@ -1130,7 +1132,7 @@ def probe(
                 )
             )
 
-    if writer_version is not None and reader_version is not None:
+    if writer_version is not None:
         # BEHIND IS MEASURED AGAINST THE HIGHEST SIDE, NOT AGAINST THE READER.
         # The writer is the component that STAMPS, so any cache above it is a
         # cache it pulls down on the next tick. Comparing writer to reader
@@ -1141,8 +1143,20 @@ def probe(
         # minutes later, exits 0 doing it, and no finding had named it. The
         # operator follows the remedy, redeploys the reader, and watches the
         # cache revert with nothing to explain why.
+        #
+        # AND THE READER IS NOT REQUIRED FOR THAT HALF. This block used to be
+        # gated on a known reader, so an unresolvable or oversized
+        # ~/.claude.json made a MEASURED writer-versus-cache skew unspeakable:
+        # at cache 7, reader UNKNOWN, writer 6 the operator was sent to repair
+        # a config file while the schema-6 writer down-stamped the cache to 6
+        # on the next tick, exiting 0. Which reader Claude Code starts is
+        # genuinely unknown there; that the writer will pull a schema-7 cache
+        # down to 6 is not, and rule 2 (never call an unmeasured thing fine)
+        # does not license staying silent about the thing that WAS measured.
+        # The reader-relative branches still require a reader; the
+        # cache-relative one does not.
         writer_target = _forward_target(reader_version, cache_version)
-        if writer_version < reader_version:
+        if reader_version is not None and writer_version < reader_version:
             findings.append(
                 Finding(
                     WILL_ROT,
@@ -1160,10 +1174,14 @@ def probe(
                 )
             )
         elif writer_target is not None and writer_version < writer_target:
-            # Reached only when the writer agrees with the reader, or is past
-            # it, while the CACHE is higher than both — so a cache-ahead DEAD
-            # finding is always sitting beside this one, and this is the half
-            # that says why fixing the reader alone does not hold.
+            # Reached when the CACHE is above the writer and the reader is not
+            # the lagging side: either the writer agrees with the reader or is
+            # past it — a cache-ahead DEAD finding is then sitting beside this
+            # one, and this is the half that says why fixing the reader alone
+            # does not hold — or the reader could not be measured at all, in
+            # which case the UNKNOWN finding is what sits beside it. Both
+            # neighbours describe a machine whose cache is about to be pulled
+            # down, and neither of them names the writer that does it.
             findings.append(
                 Finding(
                     WILL_ROT,
@@ -1182,7 +1200,7 @@ def probe(
                     "— down-stamping is the incident this check exists to detect.",
                 )
             )
-        elif writer_version > reader_version:
+        elif reader_version is not None and writer_version > reader_version:
             # The same countdown pointing the other way, and it only became a
             # fault when the gate became ``!=``. While the reader refused
             # merely ``<``, a writer past the reader was the sanctioned repair

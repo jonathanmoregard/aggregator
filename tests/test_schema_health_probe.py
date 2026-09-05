@@ -457,6 +457,63 @@ def test_a_writer_that_agrees_with_a_current_cache_stays_silent(world):
     assert v.findings == [], v.explain()
 
 
+def test_a_writer_below_the_cache_is_named_even_with_an_unknown_reader(tmp_path):
+    """cache 7, reader UNKNOWN, writer 6 — the skew was measured, so say it.
+
+    Both skew blocks used to be gated on a known reader, so an unresolvable or
+    oversized ``~/.claude.json`` swallowed a comparison that never needed the
+    reader in the first place. The operator was handed one instruction —
+    repair the config — while the schema-6 writer beside it re-stamped a
+    schema-7 cache DOWN to 6 on the next ingest tick and exited 0 doing it.
+    Repairing the config does not slow that down by one second, and nothing
+    fires afterwards to explain a cache that moved backwards.
+
+    Which reader Claude Code starts is genuinely unknown here. That the writer
+    will pull the cache down is not: it is a two-quantity fact about two
+    quantities that were both read. Rule 2 forbids calling an unmeasured thing
+    fine; it does not license staying silent about the measured one.
+    """
+    _stamp_cache(tmp_path / "cache.db", 7)
+    v = sp.probe(
+        cache_db=tmp_path / "cache.db",
+        reader_dir=tmp_path / "no-such-checkout",
+        writer_bin=_fake_writer(tmp_path / "writer", 6),
+    )
+    assert v.reader_version is None, v.explain()
+    assert sp.UNKNOWN in v.states, "the unreadable reader still has to be reported"
+    assert sp.WILL_ROT in v.states, v.explain()
+
+    rot = " ".join(f.text() for f in v.findings if f.state == sp.WILL_ROT).lower()
+    assert "writer" in rot, rot
+    assert "cache" in rot, rot
+    assert "7" in rot and "6" in rot, rot
+    # Same one forward target every other remedy names: the highest measured.
+    assert _remedy_targets(v) == {7}, v.explain()
+
+
+def test_a_writer_above_the_cache_stays_quiet_when_the_reader_is_unknown(tmp_path):
+    """cache 6, reader UNKNOWN, writer 7 — the ordinary deploy, mid-flight.
+
+    The control for the test above, and the reason the widened branch is
+    cache-relative rather than symmetric. A writer ahead of the cache is what
+    every schema bump looks like between the rebuild and the next ingest tick:
+    the tick migrates the cache UP, which is the sanctioned forward direction.
+    Calling that WILL_ROT would need the reader's requirement to know whether
+    the cache is about to overshoot it — and the reader is exactly what could
+    not be read. So the only honest thing to say here is what the UNKNOWN
+    finding already says, and the silence budget is not spent twice.
+    """
+    _stamp_cache(tmp_path / "cache.db", 6)
+    v = sp.probe(
+        cache_db=tmp_path / "cache.db",
+        reader_dir=tmp_path / "no-such-checkout",
+        writer_bin=_fake_writer(tmp_path / "writer", 7),
+    )
+    assert v.reader_version is None, v.explain()
+    assert v.states == [sp.UNKNOWN], v.explain()
+    assert sp.WILL_ROT not in v.states, v.explain()
+
+
 # --- unknown ⇒ warn, never "fine" -------------------------------------------
 #
 # Every branch below is a way the probe can fail to measure. The rule, taken
