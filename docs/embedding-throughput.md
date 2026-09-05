@@ -245,6 +245,41 @@ open items below were meant to be three independent shots at the problem; two of
 them are now closed by measurement, so the model itself is the only remaining
 lever on the 40 tok/s.
 
+## gguf Q4_K_M — pending bench
+
+The Q4_K_M backend in `aggregator/core/embed.py` has never produced a number
+in this file, and as of 2026-09-04 it cannot: `QWEN3_EMBEDDING_GGUF_REVISION`
+is `None` — no sha of the separate `-GGUF` repository has been verified — the
+loader refuses an unpinned download by design, and agent sessions on this
+machine have no network. What exists is the harness.
+`scripts/measure_embed_rate.py --backend gguf` runs the same size curve as
+the table at the top (4000/2000/1000/500/250 chars, batch 1) on both gguf and
+the shipping st fp32 backend, with token counts from the st tokenizer for
+both so the tok/s columns divide cleanly, and reports per-text cosine between
+the two backends' vectors — 768-dim, L2-normalized, the same space the
+abstention floor is calibrated in.
+
+One human run with network closes the loop, from the repo root:
+
+    AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1 uv run --extra embed-gguf python scripts/measure_embed_rate.py --backend gguf --resolve-and-pin
+
+It resolves the `-GGUF` repo's current commit sha via `huggingface_hub`,
+downloads the Q4_K_M file at that sha, benches both backends, and ends by
+printing tok/s per backend, the speedup ratio, the cos-sim stats, and the
+exact `QWEN3_EMBEDDING_GGUF_REVISION` line to paste over the `= None` line in
+`aggregator/core/embed.py`. A candidate sha can also be validated *before*
+being hardcoded: `--gguf-revision <sha>` (env
+`AGGREGATOR_GGUF_BENCH_REVISION`) benches at a named revision without
+touching the constant — the harness injects it into the loader's own pin
+path for the load and restores it after.
+
+**Decision rule: adopt gguf for the backfill if it measures ≥2.5× the st
+tok/s at this geometry with an acceptable cos-sim/retrieval delta.**
+Otherwise the pin stays `None` and st remains the only benched backend. The
+int8 section above is the prior to weigh, not a prediction: the same
+compute-bound argument applies to any quantization on this part, so the 3-5x
+sometimes quoted for Q4 is a claim the bench must earn.
+
 ## Open, and the user's to decide
 
 * **A smaller embedding model — now the ONLY lever.** Costs MTEB-Code, which is
@@ -259,7 +294,8 @@ lever on the 40 tok/s.
   revision pinned (`QWEN3_EMBEDDING_GGUF_REVISION is None`) and verified. Its
   plausible 3-5x overlaps with what int8 was supposed to deliver, and int8
   measured 1.06x, so the same compute-bound argument applies and this should be
-  weighed accordingly rather than assumed.
+  weighed accordingly rather than assumed. The bench harness and the
+  one-command human run now exist — see "gguf Q4_K_M — pending bench" above.
 * ~~int8 dynamic quantization or an ONNX Runtime export~~ — **closed by
   measurement**, see the section above. ONNX Runtime is untested and would be a
   separate measurement, not a continuation of this one.
