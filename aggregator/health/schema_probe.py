@@ -426,6 +426,77 @@ def _read_schema_const(store_py: Path) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _wrapper_chain_prefixes(binary: Path) -> list[Path]:
+    """Every ``<prefix>`` of a ``<prefix>/bin/<name>`` seen along a wrapper chain.
+
+    ONE walker, for the reader and the writer both. They are reached through
+    chains of the identical shape on this host — a profile entry symlinked into
+    a derivation's ``bin/``, a shell wrapper there whose last line ``exec``s a
+    console script inside an ``-env`` derivation, and only that env carrying
+    ``lib/python3.11/site-packages`` — and two copies of this walk would be two
+    chances to drift. The half that drifted would be the half nobody was
+    looking at.
+
+    Every prefix along the way is recorded, in order, because which hop owns
+    site-packages is not knowable in advance: a plain venv answers on the first,
+    the Nix chain on the second. The walk stops at a file that is not a script
+    (a real ELF binary is the end of the road), at a script with no ``exec``
+    line, at a cycle, and at ``_MAX_WRAPPER_HOPS`` — so a symlink loop reports
+    UNKNOWN instead of spinning.
+    """
+    prefixes: list[Path] = []
+    seen: set[str] = set()
+    current: Path | None = Path(binary)
+
+    for _ in range(_MAX_WRAPPER_HOPS):
+        if current is None:
+            break
+        try:
+            real = current.resolve()
+        except OSError:
+            break
+        key = str(real)
+        if key in seen or not real.is_file():
+            break
+        seen.add(key)
+
+        # ``<prefix>/bin/<name>`` -> ``<prefix>``.
+        if real.parent.name == "bin":
+            prefixes.append(real.parent.parent)
+
+        try:
+            with open(real, "rb") as fh:
+                head = fh.read(_SOURCE_SCAN_LIMIT)
+        except OSError:
+            break
+        if not head.startswith(b"#!"):
+            # A real ELF binary: the chain ends here.
+            break
+        m = _WRAPPER_EXEC.search(head.decode("utf-8", "replace"))
+        current = Path(m.group(1)) if m else None
+
+    return prefixes
+
+
+def resolve_package_dir(binary: Path | None) -> Path | None:
+    """The directory an installed binary's chain puts the aggregator package in.
+
+    A directory rather than a version, because both callers need different
+    things from it: the writer wants the number, and the reader wants the
+    number AND a path to report. It is the first prefix the constant can
+    actually be READ from, never merely the first that exists — so a verdict
+    naming this directory names a file the number came out of. That is worth
+    reading a sub-2 MB source file twice.
+    """
+    if binary is None:
+        return None
+    for prefix in _wrapper_chain_prefixes(binary):
+        for lib in sorted(prefix.glob("lib/python3*/site-packages")):
+            if _read_schema_const(lib / "aggregator" / "core" / "store.py") is not None:
+                return lib
+    return None
+
+
 def read_reader_version(reader_dir: Path | None) -> int | None:
     """The version the MCP reader will refuse anything below.
 
@@ -443,60 +514,19 @@ def read_writer_version(writer_bin: Path | None) -> int | None:
     """The version the packaged writer will stamp the cache with.
 
     Obtained by READING the writer's packaged source, never by executing it.
-    Three reasons, all load-bearing: running it would migrate the cache (rule
-    1 at the top of this file); a wedged install would hang the probe, which
-    on a hook budget means the output is discarded and nothing is reported;
-    and the binary being broken is itself one of the conditions the probe must
-    survive in order to speak.
+    Three reasons, all load-bearing: running it would migrate the cache (rule 1
+    at the top of this file); a wedged install would hang the probe, which on a
+    hook budget means the output is discarded and nothing is reported; and the
+    binary being broken is itself one of the conditions the probe must survive
+    in order to speak.
 
-    The path from binary to source is a Nix wrapper chain. On this host
-    ``/etc/profiles/.../bin/aggregator`` is a shell script whose last line
-    execs a second ``bin/aggregator`` inside an ``-env`` derivation, and only
-    that far end carries ``lib/python3.11/site-packages``. Every prefix along
-    the way is tried, in order, so a plain venv (no wrapper at all) and a
-    two-hop Nix chain both resolve without a special case.
+    Nothing below this line is writer-specific any more. The path from a binary
+    to its packaged ``store.py`` is a Nix wrapper chain, the reader is reached
+    through one of exactly the same shape, and both go through
+    ``resolve_package_dir`` — see ``_wrapper_chain_prefixes`` for why there is
+    one walker and not two.
     """
-    if writer_bin is None:
-        return None
-
-    prefixes: list[Path] = []
-    seen: set[str] = set()
-    current: Path | None = Path(writer_bin)
-
-    for _ in range(_MAX_WRAPPER_HOPS):
-        if current is None:
-            break
-        try:
-            real = current.resolve()
-        except OSError:
-            break
-        key = str(real)
-        if key in seen or not real.is_file():
-            break
-        seen.add(key)
-
-        # ``<prefix>/bin/aggregator`` -> ``<prefix>``. Recorded for every hop
-        # because which one owns site-packages is not knowable in advance.
-        if real.parent.name == "bin":
-            prefixes.append(real.parent.parent)
-
-        try:
-            with open(real, "rb") as fh:
-                head = fh.read(_SOURCE_SCAN_LIMIT)
-        except OSError:
-            break
-        if not head.startswith(b"#!"):
-            # A real ELF binary: the chain ends here.
-            break
-        m = _WRAPPER_EXEC.search(head.decode("utf-8", "replace"))
-        current = Path(m.group(1)) if m else None
-
-    for prefix in prefixes:
-        for lib in sorted(prefix.glob("lib/python3*/site-packages")):
-            version = _read_schema_const(lib / "aggregator" / "core" / "store.py")
-            if version is not None:
-                return version
-    return None
+    return read_reader_version(resolve_package_dir(writer_bin))
 
 
 # --- the predicate ----------------------------------------------------------

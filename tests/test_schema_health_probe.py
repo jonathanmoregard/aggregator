@@ -457,6 +457,50 @@ def test_probe_does_not_execute_the_writer(tmp_path):
     assert v.state == sp.WILL_ROT, v.explain()
 
 
+# --- one walker, two callers ------------------------------------------------
+
+
+def test_resolve_package_dir_walks_a_nix_wrapper_chain_to_site_packages(tmp_path):
+    """The two-hop chain every install on this host is reached through.
+
+    ``bin/aggregator`` is a shell wrapper; only the env derivation it execs
+    carries ``lib/python3.11/site-packages``. What comes back is the DIRECTORY,
+    not the version, because the verdict reports that path to a human who then
+    has to go and look at the file the number came from.
+    """
+    writer = _fake_writer(tmp_path / "writer", 6)
+    found = sp.resolve_package_dir(writer)
+    assert found == tmp_path / "writer" / "env" / "lib" / "python3.11" / "site-packages"
+    assert sp.read_reader_version(found) == 6
+
+
+def test_resolve_package_dir_is_none_when_no_packaged_source_is_reachable(tmp_path):
+    """A chain that ends nowhere useful, a path that is not a file, and nothing.
+
+    All three are "could not tell". Returning a directory that carries no
+    ``store.py`` would name a place the number did not come from, which is the
+    same lie one layer further from the operator.
+    """
+    assert sp.resolve_package_dir(_fake_writer(tmp_path / "empty", None)) is None
+    assert sp.resolve_package_dir(tmp_path / "no-such-binary") is None
+    assert sp.resolve_package_dir(None) is None
+
+
+def test_the_writer_reads_through_the_one_shared_walker(tmp_path):
+    """The writer keeps its answer, and gets it from the shared helper.
+
+    The reader is reached through a chain of the identical shape, so a second
+    copy of this walk would be a second thing to drift — and the half that
+    drifted would be the half nobody was looking at, which is precisely how the
+    incident this file detects lasted three days.
+    """
+    writer = _fake_writer(tmp_path / "writer", 5)
+    assert sp.read_writer_version(writer) == 5
+    assert sp.read_writer_version(writer) == sp.read_reader_version(
+        sp.resolve_package_dir(writer)
+    )
+
+
 # --- the machine-readable verdict -------------------------------------------
 
 
