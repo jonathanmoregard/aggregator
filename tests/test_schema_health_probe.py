@@ -559,9 +559,17 @@ def test_the_writer_reads_through_the_one_shared_walker(tmp_path):
     """
     writer = _fake_writer(tmp_path / "writer", 5)
     assert sp.read_writer_version(writer) == 5
-    assert sp.read_writer_version(writer) == sp.read_reader_version(
-        sp.resolve_package_dir(writer)
-    )
+
+    # The directory the writer's answer came out of, spelled independently
+    # rather than re-derived from the helper under test — asserting
+    # ``read_writer_version(w) == read_reader_version(resolve_package_dir(w))``
+    # would restate that function's one-line definition and hold even if the
+    # walk found nothing at all.
+    site_packages = tmp_path / "writer" / "env" / "lib" / "python3.11" / "site-packages"
+    assert sp.resolve_package_dir(writer) == site_packages
+    assert (site_packages / "aggregator" / "core" / "store.py").read_text(
+        encoding="utf-8"
+    ) == "SCHEMA_VERSION = 5\n"
 
 
 def test_resolve_writer_bin_searches_the_path_it_is_handed(tmp_path):
@@ -696,21 +704,72 @@ def test_no_entry_at_all_falls_back_to_this_checkout(tmp_path):
     assert sp.resolve_reader_dir(_env(home)) == repo_root
 
 
-def test_an_unreadable_claude_json_is_treated_as_no_entry(tmp_path):
-    """Missing or malformed: there is no entry to be read, so the fallback holds.
+def test_a_missing_claude_json_falls_back_to_this_checkout(tmp_path):
+    """No file at all: there is no entry to be read, so the fallback holds.
 
-    Deliberate, and the stricter reading was rejected on evidence: a HOME with
-    no ``.claude.json`` is every CI run and every fresh clone, and turning those
+    Deliberate, and the narrow reading was chosen on evidence: a HOME with no
+    ``.claude.json`` is every CI run and every fresh clone, and turning those
     into UNKNOWN would make the probe cry wolf where nothing is wrong — which
-    spends the silence budget rule 2 exists to protect.
+    spends the silence budget rule 2 exists to protect. Absence is the only
+    unreadable shape that gets this benefit; see the next test.
     """
     home = tmp_path / "home"
     home.mkdir()
     repo_root = Path(sp.__file__).resolve().parent.parent.parent
     assert sp.resolve_reader_dir(_env(home)) == repo_root
 
+
+def test_a_present_but_unparseable_claude_json_is_unknown(tmp_path):
+    """The file IS there and cannot be read. Guessing here is the original bug.
+
+    A config that exists says an operator configured something; that it will not
+    parse says nobody knows what. Falling back to this checkout then re-creates
+    the 2026-09-05 false alarm through a second door — the tree would be
+    measured and announced as the reader on a host where the real entry, sitting
+    unparsed in that very file, names a Nix wrapper at a different version.
+    "Fail loudly": a broken config is a fault to report, never a silent licence
+    to substitute a different measurement.
+
+    Absence keeps the fallback (previous test); presence-and-broken does not.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+
     (home / ".claude.json").write_text("{not json", encoding="utf-8")
-    assert sp.resolve_reader_dir(_env(home)) == repo_root
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    # Valid JSON, but not an object at the top level.
+    (home / ".claude.json").write_text("[1, 2, 3]", encoding="utf-8")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    # An object whose `mcpServers` is not a block of servers, so an entry could
+    # be hiding in there and this probe cannot see it.
+    (home / ".claude.json").write_text('{"mcpServers": "nope"}', encoding="utf-8")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+
+def test_an_unparseable_claude_json_says_so_and_names_the_file(tmp_path):
+    """The remedy has to send the operator at the FILE, not at the install.
+
+    Two causes reach the same UNKNOWN state and they have opposite fixes: a
+    config this probe could not parse is the operator's file to repair, while a
+    config that resolves to an install with no packaged source is the install's
+    problem. One generic message for both leaves the reader guessing which,
+    and an announcement nobody can act on gets acknowledged and forgotten.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{not json", encoding="utf-8")
+    env = _env(home)
+    env[sp.WRITER_BIN_ENV] = str(_fake_writer(tmp_path / "writer", 6))
+
+    v = sp.probe(cache_db=_stamp_cache(tmp_path / "cache.db", 6), env=env)
+    assert v.state == sp.UNKNOWN, v.explain()
+    assert v.reader_version is None
+    assert v.reader_dir is None
+    said = " ".join(f.text() for f in v.findings if f.state == sp.UNKNOWN)
+    assert str(home / ".claude.json") in said, said
+    assert "parse" in said, said
 
 
 def test_an_entry_that_is_present_but_unusable_is_unknown(tmp_path):
@@ -730,6 +789,17 @@ def test_an_entry_that_is_present_but_unusable_is_unknown(tmp_path):
     assert sp.resolve_reader_dir(_env(home)) is None
 
     _claude_json(home, "not-an-object")
+    assert sp.resolve_reader_dir(_env(home)) is None
+
+    # And the trap that matters most on a real host: a command that RESOLVES,
+    # through a wrapper chain that carries no ``aggregator/core/store.py``. A
+    # half-installed reader must not silently become this checkout — the
+    # binary exists, so the fallback looks defensible right up until it reports
+    # the wrong version.
+    hollow = _fake_writer(
+        tmp_path / "hollow", None, name="aggregator-mcp", outer_dir="bin"
+    )
+    _claude_json(home, {"command": str(hollow), "args": []})
     assert sp.resolve_reader_dir(_env(home)) is None
 
 
@@ -981,12 +1051,14 @@ def test_probe_agrees_with_the_reader_it_is_installed_beside():
 def test_the_console_script_entry_point_is_declared_and_resolves():
     """``aggregator-schema-probe`` must exist as a packaged console script.
 
-    The SessionStart hook and the systemd health unit have to run the PRODUCTION
-    probe — a sibling of ``aggregator-mcp`` in the same profile, built from the
-    same rev as the reader it measures — rather than reaching into a developer
+    The SessionStart hook and the systemd health unit have to be able to run the
+    PRODUCTION probe — installed next to ``aggregator-mcp``, built from the same
+    rev as the reader it measures — rather than reaching into a developer
     checkout. Reaching into a checkout is the coupling that produced a false
     alarm in the first place, and a unit that executes a working tree is the
-    deployment bug this project has already been bitten by once.
+    deployment bug this project has already been bitten by once. This
+    declaration is necessary but not sufficient: the profile only carries the
+    script once nixos-config's overlay enumerates the name too.
 
     Resolved the way a console script resolves it: import the module named
     before the colon, look up the attribute named after it.

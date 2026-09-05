@@ -120,12 +120,15 @@ machine is healthy is worse than either half alone:
   * a Claude Code **SessionStart** hook, which reaches the actual victim — a
     session that would otherwise believe recall works.
 
-Either can invoke this file two ways, and the packaged one is preferred:
-``aggregator-schema-probe``, the console script declared in pyproject.toml,
-which lands in the same profile as ``aggregator-mcp`` and is therefore built
-from the same rev as the reader it measures; or, in a dev checkout with nothing
-deployed, as a bare script under plain ``python3``:
-``python3 .../schema_probe.py --json``.
+Either can invoke this file two ways, and the packaged one is preferred where
+it exists: ``aggregator-schema-probe``, the console script declared in
+pyproject.toml, so that it CAN be installed next to ``aggregator-mcp`` — built
+from the same rev as the reader it measures — once the packaging enumerates it.
+Declaring the script is only half of that; until nixos-config's
+``overlays/aggregator.nix`` lists the name among the programs it wraps, the
+profile does not carry it and the fallback is what runs: a bare script under
+plain ``python3``, ``python3 .../schema_probe.py --json``, which is also the
+normal shape in a dev checkout with nothing deployed.
 
 Both routes must stay cheap, so this file is STDLIB ONLY and must stay that way,
 and ``aggregator/__init__.py`` and ``aggregator/health/__init__.py`` must stay
@@ -228,6 +231,15 @@ _WRAPPER_EXEC = re.compile(r"^\s*exec\s+(?:-a\s+\S+\s+)?[\"']?([^\"'\s]+)", re.M
 # two deep in practice; the bound is here so a symlink or exec cycle reports
 # UNKNOWN instead of spinning.
 _MAX_WRAPPER_HOPS = 8
+
+# ``~/.claude.json`` is present but could not be understood. Returned INSTEAD
+# of ``None`` so the own-checkout fallback is skipped, and compared by IDENTITY
+# rather than equality — it is an ordinary empty dict, so it also flows through
+# the normal "an entry exists and is unusable" path without a second branch.
+# The distinction it carries is the one the fallback turns on: absent means
+# nobody configured a reader, broken means somebody did and this cannot tell
+# what.
+_CONFIG_UNREADABLE: dict = {}
 
 
 @dataclass(frozen=True)
@@ -348,6 +360,11 @@ def _which(name: str, env: dict[str, str]) -> Path | None:
     return None
 
 
+def _claude_config_path(env: dict[str, str]) -> Path:
+    """The config that decides which reader is under test."""
+    return Path(env.get("HOME") or str(Path.home())) / ".claude.json"
+
+
 def _claude_mcp_entry(env: dict[str, str]) -> dict | None:
     """``~/.claude.json``'s TOP-LEVEL ``mcpServers.aggregator``, or ``None``.
 
@@ -358,24 +375,52 @@ def _claude_mcp_entry(env: dict[str, str]) -> dict | None:
     let a dead entry from someone else's project decide what this probe
     measures.
 
-    ``None`` means "there is no entry to be had": the file is missing,
-    unreadable, not JSON, or simply carries no aggregator server. All four are
-    the same fact to a caller, and the last of them — a HOME with no
-    ``.claude.json`` — is every CI run, so it must not be an alarm. An entry
-    that EXISTS but is not an object comes back as ``{}`` instead: something is
-    configured, so the caller must not fall back to this checkout.
+    Three outcomes, and the split between the last two is the whole point:
+
+    * a dict — the entry, ready to resolve.
+    * ``None`` — "there is no entry to be had", and no reason to doubt that:
+      the file does not exist, or it parses and simply configures no aggregator
+      server. Only this outcome lets the caller fall back to its own checkout,
+      because a HOME with no ``.claude.json`` is every CI run and every fresh
+      clone and must not be an alarm.
+    * ``_CONFIG_UNREADABLE`` — the file IS there and could not be understood.
+      Not the same fact at all. An operator configured something and this probe
+      cannot see what, so guessing "the checkout" would announce a measurement
+      of a tree that may have nothing to do with the reader — which is exactly
+      the 2026-09-05 false alarm, re-entering through a second door. Fail
+      loudly: the caller turns this into UNKNOWN.
+
+    An entry that EXISTS but is not an object also comes back as ``{}``:
+    something is configured, so the checkout is not the answer.
     """
-    home = env.get("HOME") or str(Path.home())
     try:
-        with open(os.path.join(home, ".claude.json"), "rb") as fh:
-            doc = json.loads(fh.read(_SOURCE_SCAN_LIMIT * 8).decode("utf-8", "replace"))
-        servers = doc.get("mcpServers")
-        if not isinstance(servers, dict) or "aggregator" not in servers:
-            return None
-        entry = servers["aggregator"]
-        return entry if isinstance(entry, dict) else {}
-    except (OSError, ValueError, AttributeError, TypeError):
+        with open(_claude_config_path(env), "rb") as fh:
+            raw = fh.read(_SOURCE_SCAN_LIMIT * 8)
+    except (FileNotFoundError, NotADirectoryError):
+        # Genuinely absent. The one silent case.
         return None
+    except OSError:
+        # Present and this process cannot read it — a permission or IO fault,
+        # which is a fault to report rather than a licence to guess.
+        return _CONFIG_UNREADABLE
+
+    try:
+        doc = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return _CONFIG_UNREADABLE
+    if not isinstance(doc, dict):
+        return _CONFIG_UNREADABLE
+
+    servers = doc.get("mcpServers")
+    if servers is None:
+        return None
+    if not isinstance(servers, dict):
+        # An entry could be hiding in a shape this cannot read.
+        return _CONFIG_UNREADABLE
+    if "aggregator" not in servers:
+        return None
+    entry = servers["aggregator"]
+    return entry if isinstance(entry, dict) else {}
 
 
 def _reader_dir_from_command(command: object, env: dict[str, str]) -> Path | None:
@@ -422,14 +467,16 @@ def resolve_reader_dir(env: dict[str, str] | None = None) -> Path | None:
        "args": []}``. Resolved through the wrapper chain to the site-packages
        that carries ``aggregator/core/store.py``: the directory the number is
        actually read from, which is what the verdict then reports.
-    4. No ``mcpServers.aggregator`` entry AT ALL — a checkout with no MCP
-       wiring. Only here does this file fall back to its own tree, and only when
-       that tree has a ``pyproject.toml``: installed into site-packages this
-       module also sits beside a ``core/store.py``, and reading THAT as the
-       reader's requirement would compare the writer against itself and report
-       every skew as healthy.
-    5. Otherwise ``None`` — an entry exists and could not be resolved. UNKNOWN,
-       never a substitute measurement of something else.
+    4. No ``mcpServers.aggregator`` entry AT ALL, in a config that was readable
+       (or absent entirely) — a checkout with no MCP wiring. Only here does this
+       file fall back to its own tree, and only when that tree has a
+       ``pyproject.toml``: installed into site-packages this module also sits
+       beside a ``core/store.py``, and reading THAT as the reader's requirement
+       would compare the writer against itself and report every skew as healthy.
+    5. Otherwise ``None`` — an entry exists and could not be resolved, or the
+       config itself could not be parsed. UNKNOWN, never a substitute
+       measurement of something else. A config that is PRESENT and broken gets
+       no fallback: somebody configured a reader, so this tree is not it.
 
     Step 3 is the whole point of this function's second life. Until 2026-09-05
     only step 2 existed, and an entry with empty ``args`` fell straight through
@@ -672,22 +719,45 @@ def probe(
     # skipped into silence.
 
     if reader_version is None:
-        findings.append(
-            Finding(
-                UNKNOWN,
-                "aggregator recall health CANNOT BE VERIFIED: the MCP reader's "
-                "required schema version could not be read from "
-                f"{reader_dir or '(no reader install located)'} — expected "
-                "`SCHEMA_VERSION = <n>` in aggregator/core/store.py. Without it "
-                "there is no number to compare the cache and the writer against, "
-                "so nothing here can be called healthy.",
-                "FIX: check ~/.claude.json's top-level mcpServers.aggregator — "
-                "its `command` must resolve to an install carrying "
-                "lib/python3*/site-packages/aggregator/core/store.py, or its "
-                "args must name a real aggregator tree with `--directory`. "
-                "AGGREGATOR_READER_DIR overrides both.",
+        # Two causes land here with OPPOSITE fixes, so they get different
+        # remedies. A config this probe could not parse is the operator's file
+        # to repair; a config that resolved to an install with no packaged
+        # source is the install's problem. Only asked when the resolution
+        # already failed, so the healthy path pays nothing for it.
+        if reader_dir is None and _claude_mcp_entry(env) is _CONFIG_UNREADABLE:
+            config = _claude_config_path(env)
+            findings.append(
+                Finding(
+                    UNKNOWN,
+                    "aggregator recall health CANNOT BE VERIFIED: "
+                    f"{config} exists but could not be parsed, so which MCP "
+                    "reader Claude Code starts is unknown. This probe will NOT "
+                    "guess by reading its own checkout — that guess is what "
+                    "announced a false RECALL IS DEAD on 2026-09-05, on a host "
+                    "where the real entry sat unparsed in this very file.",
+                    f"FIX: repair {config} — it must be valid JSON whose "
+                    "top-level mcpServers.aggregator names the reader, via a "
+                    "`command` or a `--directory` argument. "
+                    "AGGREGATOR_READER_DIR overrides the file entirely.",
+                )
             )
-        )
+        else:
+            findings.append(
+                Finding(
+                    UNKNOWN,
+                    "aggregator recall health CANNOT BE VERIFIED: the MCP reader's "
+                    "required schema version could not be read from "
+                    f"{reader_dir or '(no reader install located)'} — expected "
+                    "`SCHEMA_VERSION = <n>` in aggregator/core/store.py. Without it "
+                    "there is no number to compare the cache and the writer against, "
+                    "so nothing here can be called healthy.",
+                    "FIX: check ~/.claude.json's top-level mcpServers.aggregator — "
+                    "its `command` must resolve to an install carrying "
+                    "lib/python3*/site-packages/aggregator/core/store.py, or its "
+                    "args must name a real aggregator tree with `--directory`. "
+                    "AGGREGATOR_READER_DIR overrides both.",
+                )
+            )
 
     if cache_version is None:
         findings.append(

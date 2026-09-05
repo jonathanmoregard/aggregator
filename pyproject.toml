@@ -39,10 +39,13 @@ dependencies = [
 [project.scripts]
 aggregator = "aggregator.cli:main"
 aggregator-mcp = "aggregator.mcp:main"
-# The schema-health probe, packaged so the SessionStart hook and the systemd
-# health unit can run the PRODUCTION artifact — a sibling of `aggregator-mcp` in
-# the same profile, built from the same rev as the reader it measures — instead
-# of reaching into a developer checkout. Exposing it as a console script is only
+# The schema-health probe, declared so the SessionStart hook and the systemd
+# health unit CAN run the PRODUCTION artifact — installed next to
+# `aggregator-mcp`, built from the same rev as the reader it measures — instead
+# of reaching into a developer checkout. Declaring it here is necessary and not
+# sufficient: until nixos-config's `overlays/aggregator.nix` enumerates the name
+# among the programs it wraps, the profile will not carry the script and the
+# callers keep using the checkout. Exposing it as a console script is only
 # safe because `aggregator/__init__.py`, `aggregator/health/__init__.py` and the
 # module itself are stdlib-only: the entry point imports all three, and a heavy
 # import here would blow the single-digit-second budget both callers run on.
