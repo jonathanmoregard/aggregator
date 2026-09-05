@@ -68,6 +68,19 @@ the longest document the corpus happens to contain. There is still no
 ``MemoryMax`` on the editor's process, and that part remains uncloseable from
 here.
 
+STARTUP CONTRACT: NO MODEL STACK ON THE IMPORT PATH. Importing this module must
+not import ``torch``, ``spacy``, ``thinc``, ``transformers``,
+``presidio_analyzer`` or ``presidio_anonymizer``, and ``build_server()`` must not
+either. Claude Code allows an MCP server 30 s to answer ``initialize``; this
+process used to spend 57.6 s of that on imports it did not need yet — 49.0 s of
+it inside ``core.scrub``, which built Presidio's engines at module scope — and
+from 2026-09-04 every session's connect timed out. ``main()`` now calls
+``start_background_init()`` between building the server and serving stdio, so the
+handshake is answered while the PII engines load on a daemon thread; the first
+result that needs them blocks on that build rather than racing it.
+``tests/test_mcp_cold_start.py`` fails if any of those six modules reappears on
+the import path.
+
 Routing: two ontologies, one DSL surface.
 
 * ``records`` + ``records_fts`` — row-per-unit-of-work sources (GitHub PRs +
@@ -129,6 +142,13 @@ from aggregator.core.dsl import DSLError, format_help, parse
 # the ones that never run a vector query. They are imported inside
 # ``_get_embedder`` / ``_get_reranker``; ``tests/test_mcp_cold_start.py``
 # fails if that ever regresses. ``hybrid`` is pure Python and free.
+#
+# ``aggregator.core.scrub`` IS imported here, and is free for the same reason
+# by a different mechanism: it builds its Presidio engines lazily. It used not
+# to, and that cost 49.0 s of a 57.6 s import — the whole reason this server
+# stopped answering Claude Code's 30 s connect handshake. ``main()`` starts the
+# engine build on a daemon thread, so it runs while stdio is already being
+# served. Same test file guards it.
 from aggregator.core.hybrid import (
     FUSION_ARM_DEPTH,
     has_standout,
@@ -136,7 +156,7 @@ from aggregator.core.hybrid import (
     vector_floor,
 )
 from aggregator.core.provenance import MACHINE_VALUES
-from aggregator.core.scrub import scrub
+from aggregator.core.scrub import scrub, start_background_init
 from aggregator.core.store import (
     CHAT_ORIGINS,
     LEXICAL_RELAX_OR,
@@ -5185,6 +5205,13 @@ def build_server(_store: Store | None = None) -> FastMCP:
 
 def main() -> None:
     server = build_server()
+    # BETWEEN build and run, on a daemon thread, and not joined. Presidio is
+    # ~50 s of model loading on this host and every result path needs it
+    # (scrub-on-return), but the `initialize` handshake needs none of it and
+    # Claude Code gives it 30 s. Before `build_server()` this would contend with
+    # the cache read that builds the tool descriptions; after `server.run()` it
+    # would never happen, because `run()` serves stdio and does not return.
+    start_background_init()
     server.run(show_banner=False)
 
 
