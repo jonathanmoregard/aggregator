@@ -66,12 +66,25 @@ def test_main_does_not_wait_for_the_warmup(monkeypatch):
 
 
 def test_mcp_reexports_the_warmup_entry_point():
-    """The test above patches ``aggregator.mcp.start_background_init``. That only
+    """The tests above patch ``aggregator.mcp.start_background_init``. That only
     works while mcp.py binds the name into its own namespace with
     ``from aggregator.core.scrub import …``. Pin it, so a refactor to
     ``import aggregator.core.scrub as scrub_mod`` fails here rather than turning
-    the order test into a no-op."""
-    import aggregator.core.scrub as scrub_mod
+    the order test into a no-op.
+
+    ASSERTED BY NAME-BINDING, NOT BY IDENTITY, AND THAT IS NOT PEDANTRY.
+    ``tests/core/test_scrub.py`` calls ``importlib.reload`` on
+    ``aggregator.core.scrub`` four times, which rebinds that module's attributes
+    to NEW function objects while ``aggregator.mcp`` keeps the one it imported.
+    So ``mcp_mod.x is scrub_mod.x`` answers "was aggregator.mcp imported before
+    or after those reloads" — it passes on this file alone and fails in the full
+    suite. What the monkeypatching actually needs is that the name lives in
+    mcp.py's own ``__dict__`` and came from the scrub module, which no reload
+    can perturb.
+    """
     import aggregator.mcp as mcp_mod
 
-    assert mcp_mod.start_background_init is scrub_mod.start_background_init
+    warm = mcp_mod.__dict__.get("start_background_init")
+    assert warm is not None, "mcp.py must bind the name in its own namespace"
+    assert warm.__module__ == "aggregator.core.scrub"
+    assert warm.__name__ == "start_background_init"
