@@ -1,8 +1,13 @@
 """``main()`` answers ``initialize`` first and loads Presidio in parallel.
 
 ORDER IS THE ENTIRE PROPERTY. Presidio is ~50 s of model loading on this host
-and every result path needs it (scrub-on-return, `aggregator/mcp.py` lines 2333,
-3535, 4818, 4882, 4888). Starting the warm-up BEFORE ``build_server()`` would put
+and every result path needs it — scrub-on-return, called from ``mcp.py``'s
+``_scrub_record``, ``_observation_to_item``, ``_first_user_prompt`` and
+``_session_body_preview`` (twice). Named rather than numbered: the line numbers
+that used to stand here had already drifted onto unrelated comments and a blank
+line, and a citation that points at the wrong place is worse than none, because
+it is checked once and believed after that. Starting the warm-up BEFORE
+``build_server()`` would put
 lock contention in front of the cache read that builds the tool descriptions;
 starting it AFTER ``server.run()`` would never happen at all, because ``run()``
 serves stdio and does not return. Between the two, on a daemon thread, is the
