@@ -88,11 +88,16 @@ STATES, AND WHY FOUR RATHER THAN A BOOLEAN
 
 ``FINE``     cache == reader's requirement AND writer == it. Silent.
 ``DEAD``     cache != requirement. Recall is refusing RIGHT NOW.
-``WILL_ROT`` writer != requirement. Recall may work this minute, but the writer
-             re-stamps the cache at its own version on the next tick, so a
-             hand-run migration reverts within thirty minutes. This is the
-             state a two-quantity check cannot see, and it is the one that
-             explains why the incident kept coming back.
+``WILL_ROT`` the writer does not already stamp what the cache must end up at —
+             it differs from the reader's requirement, or it is below a cache
+             that is currently above the reader. Recall may work this minute,
+             but the writer re-stamps the cache at its own version on the next
+             tick, so a hand-run migration reverts within thirty minutes. This
+             is the state a two-quantity check cannot see, and it is the one
+             that explains why the incident kept coming back. Measured against
+             ALL THREE for the same reason ``_forward_target`` is: at cache 7,
+             reader 6, writer 6 a writer-versus-reader test is silent while
+             that writer is queued to undo the DEAD finding's own remedy.
 ``UNKNOWN``  some quantity could not be read.
 
 ``!=``, NOT ``<``, AND THAT IS THE READER'S OWN RULE. The gate in ``mcp.py``
@@ -1126,6 +1131,17 @@ def probe(
             )
 
     if writer_version is not None and reader_version is not None:
+        # BEHIND IS MEASURED AGAINST THE HIGHEST SIDE, NOT AGAINST THE READER.
+        # The writer is the component that STAMPS, so any cache above it is a
+        # cache it pulls down on the next tick. Comparing writer to reader
+        # alone left one world entirely unspoken: cache 7, reader 6, writer 6.
+        # The DEAD finding there correctly calls the cache the current side and
+        # says bring the READER up to 7, never down-stamp the cache — and the
+        # schema-6 writer beside it does precisely that down-stamp thirty
+        # minutes later, exits 0 doing it, and no finding had named it. The
+        # operator follows the remedy, redeploys the reader, and watches the
+        # cache revert with nothing to explain why.
+        writer_target = _forward_target(reader_version, cache_version)
         if writer_version < reader_version:
             findings.append(
                 Finding(
@@ -1141,6 +1157,29 @@ def probe(
                     f"input to a rev whose SCHEMA_VERSION is at least {target} "
                     "and rebuild. Lowering the reader is not the alternative — a "
                     "newer reader wants columns an older cache does not have.",
+                )
+            )
+        elif writer_target is not None and writer_version < writer_target:
+            # Reached only when the writer agrees with the reader, or is past
+            # it, while the CACHE is higher than both — so a cache-ahead DEAD
+            # finding is always sitting beside this one, and this is the half
+            # that says why fixing the reader alone does not hold.
+            findings.append(
+                Finding(
+                    WILL_ROT,
+                    "the aggregator WRITER WILL DOWN-STAMP THE CACHE: the packaged "
+                    f"writer builds schema {writer_version} while the cache is "
+                    f"stamped at {cache_version}. migrate() ends by stamping PRAGMA "
+                    "user_version with the writer's own constant, so the next ingest "
+                    f"tick re-stamps the cache DOWN to {writer_version} and exits 0 "
+                    "doing it. Bringing the reader up on its own therefore does not "
+                    "hold: the cache the reader was raised to meet is gone within "
+                    "one timer period, and nothing fires to say so.",
+                    "FIX (forward only): bump nixos-config's `aggregator-src` flake "
+                    f"input to a rev whose SCHEMA_VERSION is at least {target} and "
+                    "rebuild, together with the reader. Do NOT let an older writer "
+                    "keep running against the newer cache to make the numbers meet "
+                    "— down-stamping is the incident this check exists to detect.",
                 )
             )
         elif writer_version > reader_version:

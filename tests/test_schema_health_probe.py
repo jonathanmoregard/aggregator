@@ -420,6 +420,43 @@ def test_writer_ahead_of_the_reader_will_rot(world):
     assert v.exit_code() == sp.EXIT_WILL_ROT
 
 
+def test_a_writer_level_with_the_reader_still_down_stamps_a_newer_cache(world):
+    """cache 7, reader 6, writer 6 — and nothing used to name the writer.
+
+    WILL_ROT was computed against the reader alone, so a writer that agrees
+    with the reader was silent by construction. Here that silence is wrong: the
+    DEAD finding correctly says the cache is the current side, bring the READER
+    up to 7 and never down-stamp the cache — and the writer sitting at 6 does
+    exactly that down-stamp on the next ingest tick, and exits 0 doing it. The
+    operator follows the remedy, redeploys the reader, and thirty minutes later
+    the cache is back at 6 with no new alarm to explain why.
+
+    "Behind" is therefore a comparison against the highest version anything
+    here is at, not against the reader: the writer is what STAMPS, so a cache
+    above it is a cache it will pull down.
+    """
+    v = world(cache=7, reader=6, writer=6)
+    assert sp.DEAD in v.states, v.explain()
+    assert sp.WILL_ROT in v.states, v.explain()
+
+    rot = " ".join(f.text() for f in v.findings if f.state == sp.WILL_ROT).lower()
+    assert "writer" in rot, rot
+    assert "cache" in rot, rot
+    assert _remedy_targets(v) == {7}, v.explain()
+
+
+def test_a_writer_that_agrees_with_a_current_cache_stays_silent(world):
+    """The control for the test above: agreement is still agreement.
+
+    Widening "behind" to the maximum must not make a healthy machine speak.
+    Cache, reader and writer all at 6 is the FINE case, and the silence budget
+    is spent the moment a probe finds something to say about it.
+    """
+    v = world(cache=6, reader=6, writer=6)
+    assert v.state == sp.FINE, v.explain()
+    assert v.findings == [], v.explain()
+
+
 # --- unknown ⇒ warn, never "fine" -------------------------------------------
 #
 # Every branch below is a way the probe can fail to measure. The rule, taken
