@@ -181,9 +181,17 @@ def test_ipv6_full_length_still_redacted():
 
 # --- Presidio degradation: absence must fall back, never abort -------------
 #
-# Both tests reload the module, because the Presidio decision is made once at
-# import time. Each restores the real module in a `finally` so ordering with
-# the rest of the suite cannot matter.
+# Both tests reload the module, because reload is the only way to prove the
+# module can be imported at all under the condition being simulated. Each
+# restores the real module in a `finally` so ordering with the rest of the suite
+# cannot matter.
+#
+# BOTH DRIVE ``ensure_presidio_ready()`` EXPLICITLY. Presidio is initialised
+# lazily now, so ``_PRESIDIO_OK`` is False on a freshly reloaded module before
+# anything has been attempted — asserting it straight after the reload would be
+# true for a reason that has nothing to do with degradation, and would stay true
+# if the fallback broke. The initialiser has to have run for the assertion to
+# mean anything.
 
 
 def _reload_scrub():
@@ -197,7 +205,7 @@ def test_missing_spacy_model_degrades_to_regex_instead_of_exiting():
 
     Presidio builds its NLP engine on construction and, when the model is
     absent, calls ``spacy.cli.download`` — which on failure calls
-    ``sys.exit(1)``. ``SystemExit`` is a ``BaseException``, so the module's
+    ``sys.exit(1)``. ``SystemExit`` is a ``BaseException``, so an
     ``except Exception`` never saw it and the import took the interpreter
     down: CI aborted during collection with ``INTERNALERROR> SystemExit: 1``
     on every run from 2026-08-08 onward.
@@ -209,6 +217,7 @@ def test_missing_spacy_model_degrades_to_regex_instead_of_exiting():
     try:
         mod = _reload_scrub()
         assert mod._spacy_model_present() is False
+        assert mod.ensure_presidio_ready() is False
         assert mod._PRESIDIO_OK is False
         # The regex layer is unaffected by Presidio's absence.
         assert mod.scrub("write to bob@example.com").counts.get("email", 0) >= 1
@@ -243,7 +252,9 @@ def test_systemexit_from_engine_construction_is_caught():
     spacy.util.get_installed_models = lambda: configured
     presidio_analyzer.AnalyzerEngine = _exit_like_spacy_download
     try:
-        mod = _reload_scrub()  # must not propagate SystemExit
+        mod = _reload_scrub()
+        # must not propagate SystemExit
+        assert mod.ensure_presidio_ready() is False
         assert mod._PRESIDIO_OK is False
         assert mod.scrub("write to bob@example.com").counts.get("email", 0) >= 1
     finally:
