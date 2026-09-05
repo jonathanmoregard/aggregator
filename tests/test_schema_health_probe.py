@@ -27,12 +27,14 @@ exists to detect.
 """
 from __future__ import annotations
 
+import importlib
 import itertools
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -971,3 +973,82 @@ def test_probe_agrees_with_the_reader_it_is_installed_beside():
     """
     repo_root = Path(__file__).resolve().parent.parent
     assert sp.read_reader_version(repo_root) == SCHEMA_VERSION
+
+
+# --- the packaged entry point -----------------------------------------------
+
+
+def test_the_console_script_entry_point_is_declared_and_resolves():
+    """``aggregator-schema-probe`` must exist as a packaged console script.
+
+    The SessionStart hook and the systemd health unit have to run the PRODUCTION
+    probe — a sibling of ``aggregator-mcp`` in the same profile, built from the
+    same rev as the reader it measures — rather than reaching into a developer
+    checkout. Reaching into a checkout is the coupling that produced a false
+    alarm in the first place, and a unit that executes a working tree is the
+    deployment bug this project has already been bitten by once.
+
+    Resolved the way a console script resolves it: import the module named
+    before the colon, look up the attribute named after it.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    with open(repo_root / "pyproject.toml", "rb") as fh:
+        pyproject = tomllib.load(fh)
+
+    target = pyproject["project"]["scripts"]["aggregator-schema-probe"]
+    assert target == "aggregator.health.schema_probe:main"
+
+    module_name, _, attr = target.partition(":")
+    entry = getattr(importlib.import_module(module_name), attr)
+    assert callable(entry)
+
+
+def test_main_returns_the_exit_code_a_console_script_needs(tmp_path, capsys, monkeypatch):
+    """``main(argv)`` takes an argv and RETURNS an int.
+
+    A console script calls ``main()`` with no arguments and hands the result to
+    ``sys.exit``. Returning ``None`` there would exit 0 on every verdict — a
+    health check that always reports success, which is worse than none at all
+    and is exactly the shape of the original incident: exit 0, every time,
+    while recall was dead.
+    """
+    monkeypatch.setenv("AGGREGATOR_CACHE_DB", str(_stamp_cache(tmp_path / "cache.db", 5)))
+    monkeypatch.setenv("AGGREGATOR_READER_DIR", str(_fake_tree(tmp_path / "reader", 6)))
+    monkeypatch.setenv(
+        "AGGREGATOR_WRITER_BIN", str(_fake_writer(tmp_path / "writer", 6))
+    )
+
+    code = sp.main(["--json"])
+    assert code == sp.EXIT_DEAD
+
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["state"] == sp.DEAD
+    assert doc["cache_version"] == 5
+    assert doc["reader_version"] == 6
+
+
+def test_the_packaged_entry_point_imports_nothing_heavy():
+    """The precondition for shipping this as a console script, made permanent.
+
+    The entry point walks ``aggregator`` -> ``aggregator.health`` -> this
+    module: three ``__init__``-shaped opportunities to pull in the dependency
+    tree. Both callers run on budgets measured in single-digit seconds, and a
+    SessionStart hook that overruns has its output DISCARDED — so the light
+    import is not an optimisation, it is the feature. Asserted in a subprocess
+    against ``sys.modules``, because in-process the check would pass on anything
+    pytest had already imported for another test.
+    """
+    code = (
+        "import sys\n"
+        "import aggregator.health.schema_probe\n"
+        "heavy = sorted(m for m in sys.modules if m.split('.')[0] in {\n"
+        "    'torch', 'spacy', 'thinc', 'transformers', 'presidio_analyzer',\n"
+        "    'presidio_anonymizer', 'sentence_transformers', 'numpy',\n"
+        "    'sqlite_vec', 'fastmcp',\n"
+        "})\n"
+        "assert not heavy, heavy\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr

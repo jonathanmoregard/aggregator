@@ -39,6 +39,15 @@ dependencies = [
 [project.scripts]
 aggregator = "aggregator.cli:main"
 aggregator-mcp = "aggregator.mcp:main"
+# The schema-health probe, packaged so the SessionStart hook and the systemd
+# health unit can run the PRODUCTION artifact — a sibling of `aggregator-mcp` in
+# the same profile, built from the same rev as the reader it measures — instead
+# of reaching into a developer checkout. Exposing it as a console script is only
+# safe because `aggregator/__init__.py`, `aggregator/health/__init__.py` and the
+# module itself are stdlib-only: the entry point imports all three, and a heavy
+# import here would blow the single-digit-second budget both callers run on.
+# Locked by tests/test_schema_health_probe.py::test_the_packaged_entry_point_imports_nothing_heavy.
+aggregator-schema-probe = "aggregator.health.schema_probe:main"
 
 [project.optional-dependencies]
 dev = [

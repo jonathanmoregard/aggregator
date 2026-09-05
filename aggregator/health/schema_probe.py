@@ -111,20 +111,28 @@ that cannot answer, which is the failure wearing a different hat.
 
 CONSUMERS
 
-Two, and they share this one implementation rather than each growing their
-own copy of the predicate — a detector that disagrees with itself about
-whether the machine is healthy is worse than either half alone:
+Two of them, sharing this one implementation rather than each growing their own
+copy of the predicate — a detector that disagrees with itself about whether the
+machine is healthy is worse than either half alone:
 
   * a systemd **user** timer, which reaches the operator through ``notify-send``
     on a machine with no agent session open;
   * a Claude Code **SessionStart** hook, which reaches the actual victim — a
     session that would otherwise believe recall works.
 
-Both invoke this file as a bare script under plain ``python3``:
-``python3 .../schema_probe.py --json``. It is therefore STDLIB ONLY and must
-stay that way. Importing the aggregator package here would drag in torch and
-sentence-transformers, and a SessionStart hook that blows its budget has its
-output DISCARDED — which for a health check is the same as never noticing.
+Either can invoke this file two ways, and the packaged one is preferred:
+``aggregator-schema-probe``, the console script declared in pyproject.toml,
+which lands in the same profile as ``aggregator-mcp`` and is therefore built
+from the same rev as the reader it measures; or, in a dev checkout with nothing
+deployed, as a bare script under plain ``python3``:
+``python3 .../schema_probe.py --json``.
+
+Both routes must stay cheap, so this file is STDLIB ONLY and must stay that way,
+and ``aggregator/__init__.py`` and ``aggregator/health/__init__.py`` must stay
+EMPTY — the console script walks through both on its way here. Pulling the
+package in would drag in torch and sentence-transformers, and a SessionStart
+hook that blows its budget has its output DISCARDED — which for a health check
+is the same as never noticing.
 """
 from __future__ import annotations
 
