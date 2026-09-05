@@ -37,9 +37,13 @@
           # the SHAPE of the generated units — store-path ExecStart, no home
           # path, trust store, OnFailure, stagger — and a store-path stub is
           # faithful for all of it.
+          # The names mirror `[project.scripts]` in pyproject.toml. A unit that
+          # execs `${cfg.package}/bin/<name>` can only be asserted on if the
+          # fixture carries that name, so a console script missing here would
+          # make the hygiene check pass by never reaching the assertion.
           fixturePackage = pkgs.runCommand "aggregator-unit-fixture" { } ''
             mkdir -p "$out/bin"
-            for b in aggregator aggregator-mcp; do
+            for b in aggregator aggregator-mcp aggregator-schema-probe; do
               printf '#!/bin/sh\nexit 0\n' > "$out/bin/$b"
               chmod +x "$out/bin/$b"
             done
