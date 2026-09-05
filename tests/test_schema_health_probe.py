@@ -31,6 +31,7 @@ import importlib
 import itertools
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -328,6 +329,78 @@ def test_the_cache_ahead_remedy_moves_the_reader_never_the_cache(world):
     assert "restart" in fix.lower(), fix
     assert "reader" in fix.lower(), fix
     assert "downgrad" not in fix.lower(), fix
+
+
+def _remedy_targets(verdict) -> set[int]:
+    """Every version number the SKEW remedies tell an operator to reach.
+
+    Remedies only — never ``detail``. The details legitimately quote numbers
+    that are below the cache, because that is what they measured; it is the
+    instructions that must not send anyone backwards. UNKNOWN findings are
+    excluded too: their remedies carry ``lib/python3*`` and byte counts, which
+    are not versions.
+    """
+    return {
+        int(n)
+        for f in verdict.findings
+        if f.state in (sp.DEAD, sp.WILL_ROT)
+        for n in re.findall(r"\d+", f.remedy)
+    }
+
+
+def test_a_three_way_skew_does_not_advise_undoing_its_own_other_remedy(world):
+    """cache 7, reader 6, writer 5 — and the two remedies used to disagree.
+
+    Each finding was computed against the READER alone, so with three distinct
+    versions the advice forked. The DEAD finding said the cache is the current
+    side, leave it alone, bring the reader to 7. The WILL_ROT finding said bump
+    the writer to "at least 6" — and a schema-6 writer re-stamps that
+    schema-7 cache DOWN on the next tick, destroying the thing the other half
+    of the same message had just called authoritative.
+
+    An operator who follows both instructions must not end up worse off than
+    one who follows either. So every remedy names ONE target: the highest
+    version anything here is at, because that is the only number nothing has to
+    move backwards to reach.
+    """
+    v = world(cache=7, reader=6, writer=5)
+    assert sp.DEAD in v.states and sp.WILL_ROT in v.states, v.explain()
+
+    targets = _remedy_targets(v)
+    assert targets == {7}, v.explain()
+    assert min(targets) >= v.cache_version, "a remedy advised down-stamping the cache"
+
+
+def test_the_mirror_three_way_skew_agrees_with_itself_too(world):
+    """cache 5, reader 6, writer 7. Same defect, pointing the other way.
+
+    Here the DEAD finding used to say "bring the WRITER up to at least 6" about
+    a writer already at 7 — which is either inert or, read literally, an
+    instruction to install a SIXES writer in place of the seven and start
+    down-stamping. Meanwhile the WILL_ROT finding correctly asked for a reader
+    at 7. One number, derived from all three quantities, is what makes those
+    the same instruction.
+    """
+    v = world(cache=5, reader=6, writer=7)
+    assert sp.DEAD in v.states and sp.WILL_ROT in v.states, v.explain()
+
+    targets = _remedy_targets(v)
+    assert targets == {7}, v.explain()
+    assert min(targets) >= v.cache_version, "a remedy advised down-stamping the cache"
+
+
+def test_two_way_skews_keep_naming_the_reader_s_requirement(world):
+    """The target only moves when a third version exists to move it.
+
+    Every two-quantity world — the live incident included — has its highest
+    version at the reader or the cache, so the number in these messages is the
+    one that was always there. Stated so the generalisation is visibly a
+    generalisation and not a rewrite of the texts the incident produced.
+    """
+    assert _remedy_targets(world(cache=5, reader=6, writer=6)) == {6}
+    assert _remedy_targets(world(cache=6, reader=6, writer=5)) == {6}
+    assert _remedy_targets(world(cache=5, reader=6, writer=5)) == {6}
+    assert _remedy_targets(world(cache=7, reader=6, writer=7)) == {7}
 
 
 def test_writer_ahead_of_the_reader_will_rot(world):

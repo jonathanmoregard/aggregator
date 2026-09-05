@@ -840,6 +840,34 @@ def read_writer_version(writer_bin: Path | None) -> int | None:
 # --- the predicate ----------------------------------------------------------
 
 
+def _forward_target(*versions: int | None) -> int | None:
+    """The one version every remedy names: the highest anything is at.
+
+    ONE NUMBER FOR ALL OF THEM, because the findings are handed to an operator
+    together and get followed together. Computed pairwise against the reader
+    alone, a three-way skew forked into advice that undid itself: at cache 7,
+    reader 6, writer 5 the DEAD finding called the cache the current side and
+    said leave it alone, while the WILL_ROT finding beside it asked for a
+    writer "at least 6" — and a schema-6 writer re-stamps that schema-7 cache
+    DOWN on the next tick. The mirror, cache 5 / reader 6 / writer 7, told the
+    operator to bring a writer already at 7 "up to at least 6", which is inert
+    read charitably and an instruction to install a downgrade read literally.
+
+    The maximum is the only choice that cannot ask anything to move backwards:
+    it is at or above every quantity measured, so each component either already
+    satisfies it or has to come up. ``None`` when nothing was measured, and
+    unreadable quantities simply do not vote — a missing writer version must
+    not drag the target below a cache that was read.
+
+    Note this is deliberately the max over ALL THREE and not over the reader
+    and cache alone. The writer is the component that stamps, so a writer above
+    both is precisely the case where a reader-and-cache target names a version
+    something would have to be downgraded to.
+    """
+    known = [v for v in versions if v is not None]
+    return max(known) if known else None
+
+
 def probe(
     *,
     cache_db: Path | None = None,
@@ -860,6 +888,10 @@ def probe(
     writer_version = read_writer_version(writer_bin)
 
     findings: list[Finding] = []
+    # One number for every remedy below. See ``_forward_target``: computed
+    # pairwise against the reader alone, a three-way skew produced advice
+    # that undid itself.
+    target = _forward_target(cache_version, reader_version, writer_version)
 
     # --- could-not-measure first. Each of these makes some later comparison
     # unanswerable, and an unanswerable comparison must never be quietly
@@ -987,7 +1019,7 @@ def probe(
                     "returning ok:false and an agent that relies on recall is "
                     "silently falling back to grepping transcripts.",
                     "FIX (forward only): bring the WRITER up to at least "
-                    f"{reader_version} — bump nixos-config's `aggregator-src` input "
+                    f"{target} — bump nixos-config's `aggregator-src` input "
                     "past the schema bump and rebuild — then let one ingest tick "
                     "re-stamp the cache. Do NOT run `aggregator status` to "
                     "investigate: every subcommand but `embed` calls migrate(), "
@@ -1014,7 +1046,7 @@ def probe(
                     "Code is launching.",
                     "FIX: bring the READER up. The `aggregator-mcp` that "
                     "~/.claude.json's mcpServers.aggregator starts must be at "
-                    f"least schema {cache_version}: update or redeploy that build "
+                    f"least schema {target}: update or redeploy that build "
                     "and then RESTART the MCP server — a server process is held "
                     "for the life of the client that spawned it, so new code on "
                     "disk changes nothing until the process is replaced. Leave "
@@ -1054,9 +1086,9 @@ def probe(
                     "it. Recall cannot stay healthy while this holds, and a hand-run "
                     "migration will revert within one timer period.",
                     "FIX (forward only): bump nixos-config's `aggregator-src` flake "
-                    f"input to a rev whose SCHEMA_VERSION is at least {reader_version} "
-                    "and rebuild. Lowering the reader is not the alternative — the "
-                    "schema-6 reader needs columns a schema-5 cache does not have.",
+                    f"input to a rev whose SCHEMA_VERSION is at least {target} "
+                    "and rebuild. Lowering the reader is not the alternative — a "
+                    "newer reader wants columns an older cache does not have.",
                 )
             )
         elif writer_version > reader_version:
@@ -1079,7 +1111,7 @@ def probe(
                     "old. Recall may answer this minute and will be returning "
                     "ok:false within one timer period.",
                     "FIX: bring the READER up to at least "
-                    f"{writer_version} — the `aggregator-mcp` that ~/.claude.json's "
+                    f"{target} — the `aggregator-mcp` that ~/.claude.json's "
                     "mcpServers.aggregator starts, redeployed and then RESTARTED, "
                     "since a running server keeps the code it was launched with. "
                     "Do NOT pin the writer back down to make the numbers meet: "
