@@ -619,9 +619,14 @@ def _fts_ranked(
     that has quietly stopped measuring the product is worse than no script.
 
     THE SHIPPED FUNCTION, NOT A COPY OF IT. Imported inside the call like every
-    other ``aggregator`` import in this file — the module-level form would drag
-    spaCy in through ``core.scrub`` at import time — and looked up per call, so
-    it cannot drift from what the store does.
+    other ``aggregator`` import in this file, and looked up per call, so it
+    cannot drift from what the store does. The import used to be deferred
+    because a module-level form dragged spaCy in through ``core.scrub`` at
+    import time; since 2026-09 ``core.scrub`` builds its Presidio engines
+    lazily — behind ``ensure_presidio_ready()``, warmed on a background thread
+    by the MCP server — so nothing here loads the model stack at all. The
+    deferral stays for the reason that outlived that one: a measurement script
+    should not pay for the store's import graph merely to be loaded.
 
     An empty rewrite means "no word characters at all", and the store then runs
     NO MATCH. Reproduced here rather than approximated: ``MATCH ''`` is a
