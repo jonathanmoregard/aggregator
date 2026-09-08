@@ -921,7 +921,13 @@ in {
           OnFailure = "aggregator-embed-failure-notify.service";
         };
         Service = {
-          Type = "oneshot";
+          # The catch-up worker is expected to stay alive for weeks while the
+          # initial index fills. Type=oneshot leaves its start job active for
+          # that whole run, which makes Home Manager's sd-switch wait during
+          # activation and can block nixos-rebuild indefinitely. Type=simple
+          # reports startup as soon as systemd spawns the worker; systemd still
+          # owns the process and propagates its eventual failure to OnFailure.
+          Type = "simple";
           ExecStart = "${embedRunner}";
           Environment = embedBaseEnvironment ++ [
             # Offline by construction. The weights are seeded once by
