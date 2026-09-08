@@ -478,7 +478,17 @@
                 fi
               done
 
-              # ---- 6. The start timeout must not fire on a healthy run ----
+              # ---- 6. The worker must start in the background -------------
+              # A full catch-up takes weeks. Type=oneshot keeps the start job
+              # active for that whole run, so Home Manager's sd-switch waits
+              # for it during activation and blocks nixos-rebuild switch.
+              # Type=simple considers the unit started once the worker is
+              # spawned while preserving its exit status and OnFailure path.
+              service_type=$(sed -n 's/^Type=//p' "$svc")
+              [ "$service_type" = "simple" ] \
+                || fail "aggregator-embed.service Type=$service_type — a long-running oneshot blocks Home Manager activation instead of starting in the background"
+
+              # ---- 7. The start timeout must not fire on a healthy run ----
               # Task M measured the real corpus: 483,193 observations /
               # 422,261 chunks / 609M chars at 249.6 chars per wall-second,
               # CPU-only. A full backfill is ~25-30 days of continuous work.
@@ -510,7 +520,7 @@
               [ "$stop_timeout" != "infinity" ] \
                 || fail "aggregator-embed.service sets TimeoutStopSec=infinity — the manual stop is the last bound on a wedged worker and must not hang"
 
-              # ---- 6b. A mistyped start timeout must fail at EVAL time ----
+              # ---- 7b. A mistyped start timeout must fail at EVAL time ----
               # Assertion 6 above only sees the fixture's default. A real
               # deployment sets this option in its own home-manager config,
               # where a typo never reaches this check — it reaches systemd,
