@@ -20,7 +20,7 @@ Design docs: `docs/superpowers/plans/2026-08-01-aggregator-plan.md` (chunked bui
 | source | reads | credential | refreshes unattended? |
 |---|---|---|---|
 | `sessions` | `~/.claude/projects/**/*.jsonl` — Claude Code session + subagent transcripts | none | yes — local scan, already timer-driven |
-| `github` | PRs + issues via `gh api /search/issues` | the `gh` CLI's own auth token; refuses a write-capable token unless `AGGREGATOR_ALLOW_WRITE_TOKEN=1` | yes — already timer-driven |
+| `github` | PRs + issues via explicit GET requests to allowlisted `gh api /search/issues` paths | the `gh` CLI's own keyring credential | yes — already timer-driven |
 | `dropbox` | local `~/Dropbox` tree (override `AGGREGATOR_DROPBOX_ROOT`); prose/docs only, see below | none — Dropbox's own client keeps the tree synced | yes — local scan |
 | `research` | `~/Repos/research-agent/reports/*.md` (top level only; `_quarantine/` is never read) | none | yes — local scan |
 | `sota-watch` | `~/Repos/sota-watch/proposals/*.md` | none | yes — local scan |
@@ -165,7 +165,7 @@ some session and `scope:session` will show them. The index does **not** stem:
 
 ## Non-negotiables (from spec)
 
-- Read-only credentials only. GitHub ingester refuses to run against a write-capable token unless `AGGREGATOR_ALLOW_WRITE_TOKEN=1`.
+- GitHub authority is constrained at the operation boundary: only explicit GET requests to the source's fixed `/search/issues` paths are accepted. OAuth scopes are reported by `aggregator github-token-status`, not used as the safety boundary.
 - MCP has NO write tools in v1.
 - Scrub (Presidio + gitleaks) pre-store AND pre-return.
 - All returned content wrapped in `<ExternalContent source="…">` delimiters.

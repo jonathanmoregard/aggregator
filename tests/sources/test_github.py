@@ -22,7 +22,6 @@ from aggregator.sources.github import (
     GhApiError,
     GitHubSource,
     ScopeFetchError,
-    WriteCapableTokenError,
     _default_api_fetcher,
     _default_scope_fetcher,
     _has_write_scope,
@@ -126,113 +125,22 @@ def test_default_scope_fetcher_raises_when_scopes_header_absent():
         _default_scope_fetcher()
 
 
-# -- fail-closed on scope-fetch failure (HIGH-2) ---------------------------
-
-
-def test_check_scopes_raises_when_scope_fetch_fails(monkeypatch):
-    """Advisor round-1 HIGH-2: pre-fix, gh CLI failure returned [] which the
-    scope check treated as read-only. Post-fix, unverifiable scopes must
-    fail-closed with ``WriteCapableTokenError`` unless the operator has
-    explicitly overridden via ``AGGREGATOR_ALLOW_WRITE_TOKEN=1``.
-    """
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
-
-    def boom() -> list[str]:
-        raise FileNotFoundError("gh binary missing")
-
-    src = GitHubSource(_scope_fetcher=boom, _api_fetcher=lambda p: [])
-    with pytest.raises(WriteCapableTokenError) as excinfo:
-        src._check_scopes()
-    msg = str(excinfo.value)
-    assert "cannot verify" in msg.lower() or "verify" in msg.lower()
-    assert "AGGREGATOR_ALLOW_WRITE_TOKEN" in msg
-
-
-def test_check_scopes_env_override_bypasses_fetch_failure(monkeypatch):
-    """Same failure mode as above, but with the override set: proceed."""
-    monkeypatch.setenv("AGGREGATOR_ALLOW_WRITE_TOKEN", "1")
-
-    def boom() -> list[str]:
-        raise FileNotFoundError("gh binary missing")
-
-    src = GitHubSource(_scope_fetcher=boom, _api_fetcher=lambda p: [])
-    # Should not raise.
-    src._check_scopes()
-
-
-def test_check_scopes_raises_on_generic_exception(monkeypatch):
-    """Any exception from the scope fetcher is treated as unverifiable."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
-
-    def boom() -> list[str]:
-        raise RuntimeError("transport error")
-
-    src = GitHubSource(_scope_fetcher=boom, _api_fetcher=lambda p: [])
-    with pytest.raises(WriteCapableTokenError):
-        src._check_scopes()
-
-
-def test_ingest_fails_closed_when_gh_missing(monkeypatch):
-    """End-to-end: ingest must refuse to run rather than treat a failed
-    scope check as "read-only OK"."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
-
-    def gh_missing():
-        # Simulate the default fetcher's real failure mode by wrapping the
-        # scope-fetch subprocess call.
-        raise FileNotFoundError("gh")
-
-    src = GitHubSource(_scope_fetcher=gh_missing, _api_fetcher=lambda p: [])
-    with pytest.raises(WriteCapableTokenError):
-        src.ingest(since=None)
-
-
-# -- ingest scope enforcement ----------------------------------------------
-
-
-def test_ingest_refuses_write_scope_without_override(monkeypatch):
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
-    src = GitHubSource(_scope_fetcher=lambda: ["repo", "admin:repo_hook"])
-    with pytest.raises(WriteCapableTokenError):
-        src.ingest(since=None)
-
-
-def test_ingest_allows_write_scope_with_override(monkeypatch):
-    monkeypatch.setenv("AGGREGATOR_ALLOW_WRITE_TOKEN", "1")
+def test_ingest_accepts_write_scoped_keyring_token_without_override(monkeypatch):
+    """Safety lives at GET-only API boundary, not credential scope."""
+    monkeypatch.delenv("GH_TOKEN", raising=False)
     src = GitHubSource(
-        _scope_fetcher=lambda: ["repo"],
+        _scope_fetcher=lambda: ["repo", "gist", "workflow"],
         _api_fetcher=lambda path: [],
-    )
-    # should not raise
-    result = src.ingest(since=None)
-    assert result.errors == []
-
-
-def test_ingest_allows_readonly_scope_without_override(monkeypatch):
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
-    src = GitHubSource(
-        _scope_fetcher=lambda: ["public_repo", "repo:status", "read:org"],
-        _api_fetcher=lambda path: [],
+        _gh_token_fetcher=lambda: "keyring-token",
     )
     result = src.ingest(since=None)
     assert result.errors == []
-
-
-def test_ingest_error_message_is_actionable(monkeypatch):
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
-    src = GitHubSource(_scope_fetcher=lambda: ["repo"])
-    with pytest.raises(WriteCapableTokenError) as excinfo:
-        src.ingest(since=None)
-    msg = str(excinfo.value)
-    assert "AGGREGATOR_ALLOW_WRITE_TOKEN" in msg
-    assert "repo" in msg
 
 
 # -- ingest happy path counts records --------------------------------------
 
 
 def test_ingest_counts_records_from_all_endpoints(monkeypatch):
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     pr = json.loads((FIX / "pr_open_passing.json").read_text())
     issue = json.loads((FIX / "issue_assigned.json").read_text())
 
@@ -338,6 +246,36 @@ def test_default_api_fetcher_jsonl_tolerates_empty_output():
     assert result == []
 
 
+def test_default_api_fetcher_uses_explicit_get():
+    fake = subprocess.CompletedProcess(
+        args=["gh"], returncode=0, stdout="", stderr=""
+    )
+    with patch(
+        "aggregator.sources.github.subprocess.run", return_value=fake
+    ) as run:
+        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+
+    assert run.call_args.args[0][0:4] == ["gh", "api", "--method", "GET"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/repos/o/r/issues/1",
+        "--method=DELETE",
+        "/search/issues?q=is:pr+author:@me\n--method DELETE",
+    ],
+)
+def test_default_api_fetcher_rejects_paths_outside_capability(path):
+    with (
+        patch("aggregator.sources.github.subprocess.run") as run,
+        pytest.raises(GhApiError, match="refusing"),
+    ):
+        _default_api_fetcher(path)
+
+    run.assert_not_called()
+
+
 def test_iter_records_records_all_four_endpoint_errors_when_fetcher_raises(
     monkeypatch,
 ):
@@ -346,7 +284,6 @@ def test_iter_records_records_all_four_endpoint_errors_when_fetcher_raises(
     per endpoint in the shared errors sink and yield zero records. Combined
     with the round-3 --rebuild guard, this makes the CLI refuse the wipe
     that pre-fix silently committed."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     def always_raise(path: str) -> list[dict]:
         raise GhApiError(f"gh api {path} failed: mocked")
@@ -364,7 +301,6 @@ def test_iter_records_records_all_four_endpoint_errors_when_fetcher_raises(
 
 
 def test_ingest_records_errors_without_crashing(monkeypatch):
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     def boom(path: str) -> list[dict]:
         raise RuntimeError("gh api transport failure")
@@ -464,7 +400,6 @@ def test_iter_records_appends_updated_filter_to_all_endpoints(monkeypatch):
     must be pushed into the GitHub search query as ``+updated:>=YYYY-MM-DD``
     so the endpoint returns only the freshness window we want.
     """
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     called_paths: list[str] = []
 
     def spy(path: str) -> list[dict]:
@@ -497,7 +432,6 @@ def test_iter_records_since_normalises_to_utc_for_search_query(monkeypatch):
     """
     from datetime import timedelta, timezone
 
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     called_paths: list[str] = []
 
     def spy(path: str) -> list[dict]:
@@ -629,7 +563,6 @@ def test_iter_records_distinguishes_pr_from_issue_via_pull_request_marker(
     respect the endpoint's KIND (which is what already drives dispatch) —
     this test just documents that PR-endpoint rows shouldn't be issue-shaped
     in the fixtures we ship."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     pr_row = _search_pr_row(
         repository_url="https://api.github.com/repos/acme/api", number=42
     )
@@ -656,7 +589,6 @@ def _orphan_rows(path: str) -> list[dict]:
 
 def test_dropped_rows_reach_the_errors_sink(monkeypatch):
     """The measured defect: four rows dropped, ``errors=0``, exit 0."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     src = GitHubSource(
         _scope_fetcher=lambda: ["public_repo"], _api_fetcher=_orphan_rows
     )
@@ -668,7 +600,6 @@ def test_dropped_rows_reach_the_errors_sink(monkeypatch):
 
 def test_dropped_rows_do_not_abort_the_rest_of_the_endpoint(monkeypatch):
     """Per-item faults are collected, not fatal (spec §Error handling)."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     good = _search_pr_row(
         repository_url="https://api.github.com/repos/acme/api", number=1
     )
@@ -690,7 +621,6 @@ def test_a_flood_of_dropped_rows_is_one_error_naming_five(monkeypatch):
     """A wholesale schema change must not write one error per row into a
     desktop notification; the count is what matters, plus enough identifiers
     to go looking with."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     def fetcher(path: str) -> list[dict]:
         if "is:pr+author" in path:
@@ -707,7 +637,6 @@ def test_a_flood_of_dropped_rows_is_one_error_naming_five(monkeypatch):
 
 def test_iter_records_omits_updated_filter_when_since_is_none(monkeypatch):
     """No ``since`` = no filter; behaviour unchanged from the pre-fix path."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     called_paths: list[str] = []
 
     def spy(path: str) -> list[dict]:

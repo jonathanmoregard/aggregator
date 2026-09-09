@@ -48,7 +48,6 @@ async def _drain(adapter):
 
 
 def test_adapter_yields_the_same_records_the_source_produces(monkeypatch):
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     def api(path: str) -> list[dict]:
         return [_PR_ROW] if "is:pr+author" in path else []
@@ -75,7 +74,6 @@ def test_endpoint_failure_surfaces_through_drain_errors_without_aborting(
 ):
     """Partial ingest beats total loss, but the loss must still be reported:
     three of four endpoints answering is not a clean run."""
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     def api(path: str) -> list[dict]:
         if "review-requested" in path:

@@ -24,8 +24,6 @@ the MCP with Claude Code.
     sources.github = {
       enable = true;
       interval = "*:0/30";
-      # Read-only PAT via agenix (see "Read-only PAT flow" below):
-      githubTokenFile = "/run/agenix/github-readonly-pat";
     };
 
     mcp.autoRegister = false;       # true = run `claude mcp add` on activation
@@ -50,35 +48,17 @@ service and timer are omitted from the generated home-manager config — no
 services.aggregator.sources.github.enable = false;
 ```
 
-## Read-only PAT flow (github source)
+## GitHub credential flow
 
-The github ingester refuses to run if the token in scope has any
-write-capable scopes (`repo`, `gist`, `workflow`, `delete_repo`, …). The
-supported production flow is:
+Authenticate once with `gh auth login`. The systemd user service consumes
+that same GitHub CLI keyring credential; it does not copy the token into Nix,
+an environment file, or an agenix secret.
 
-1. Create a **read-only** PAT at github.com/settings/tokens/new. Scopes:
-   `public_repo`, `repo:status`, `read:org`. Nothing else. 90-day
-   expiration recommended.
-2. Store it as an agenix-managed secret. In your NixOS config, add
-   `age.secrets.github-readonly-pat.file = ./secrets/github-readonly-pat.age`
-   (owned by your user, mode 0400). agenix decrypts at boot to
-   `/run/agenix/github-readonly-pat`.
-3. Point the module at that file:
-
-   ```nix
-   services.aggregator.sources.github.githubTokenFile =
-     "/run/agenix/github-readonly-pat";
-   ```
-
-The systemd unit wraps its `ExecStart` in a small `bash -c` shim that reads
-the file at unit start (`export GH_TOKEN="$(cat …)"`), so agenix rotation
-is picked up automatically on the next timer tick — no home-manager
-rebuild needed. If the file is missing the unit fails loudly (`set -e`)
-rather than silently ingesting anonymously and hitting rate limits.
-
-Leave `githubTokenFile` unset (default `null`) to fall back to whatever
-`gh auth` has cached — fine for interactive machines, blocked by the
-write-scope refusal on tokens with `repo`/`gist`/`workflow`.
+The source constrains authority at its subprocess boundary. It accepts only
+the four fixed `/search/issues` query shapes it generates and always invokes
+`gh api` with explicit HTTP `GET`. `aggregator github-token-status` reports
+the credential's scopes for diagnosis, but broad OAuth scopes do not require
+a second, expiring PAT.
 
 ## First-run cost
 

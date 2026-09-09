@@ -3993,10 +3993,6 @@ def _cmd_github_token_status(
     else:
         print("scopes:       (none / unverified)")
     print(f"write_capable: {status.write_capable}")
-    print(
-        f"override:     "
-        f"{'AGGREGATOR_ALLOW_WRITE_TOKEN=1' if status.override_active else 'unset'}"
-    )
     if status.scope_error:
         print(f"scope_error:  {status.scope_error}")
     print(f"recommendation: {status.recommendation}")
