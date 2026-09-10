@@ -1,10 +1,10 @@
 """The GitHub source on the import port.
 
 github is the only source that already auto-imports (a systemd user timer runs
-``aggregator ingest github``), so this adapter's job is to change nothing
-observable: same ``iter_records`` walk, same fail-closed scope check, same
-per-endpoint error policy. It exists so the one timer this repo is heading
-towards can drive github alongside the other seven instead of beside them.
+``aggregator ingest github``), so this adapter's job is to preserve the same
+``iter_records`` walk, GET-only fixed-path capability, and per-endpoint error
+policy. It exists so the one timer this repo is heading towards can drive
+github alongside the other seven instead of beside them.
 
 ``source`` is the injection seam. ``GitHubSource`` already carries its own
 ``_scope_fetcher`` / ``_api_fetcher`` / ``_gh_token_fetcher`` seams, and

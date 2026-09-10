@@ -4,37 +4,15 @@ let
   aggregatorBin = "${cfg.package}/bin/aggregator";
   aggregatorMcpBin = "${cfg.package}/bin/aggregator-mcp";
 
-  # Build the ExecStart command for a source, threading in optional --since.
-  # Written as `sh -c '...'` so ``GH_TOKEN=$(cat …)`` (see githubTokenFile
-  # branch below) is expanded by the shell at unit-start, not by systemd's
-  # own env parser (which does no command substitution).
-  mkExecStart = { source, since, tokenFile }:
+  # Build the store-pinned ExecStart command for a source, threading in
+  # optional --since. GitHub authentication stays owned by the gh CLI keyring;
+  # the source constrains its subprocess boundary to GET-only search requests.
+  mkExecStart = { source, since }:
     let
       base = "${aggregatorBin} ingest ${source}"
         + lib.optionalString (since != "") " --since ${lib.escapeShellArg since}";
     in
-      if tokenFile == null then
-        # No token wiring — plain exec, no shell wrapper needed.
-        base
-      else
-        # Read the token from disk at unit start so agenix rotation is
-        # picked up without a rebuild. Fail loudly (`set -e`) if the file
-        # is missing rather than silently ingesting anonymously and
-        # hitting rate limits.
-        #
-        # Round-1 MEDIUM: keep the assignment and the export on separate
-        # lines. `export FOO=$(cmd)` masks `cmd`'s exit — the outer
-        # `export` builtin returns 0 regardless — so `set -e` never
-        # trips on a missing token file. Splitting into `token=$(cat ...)`
-        # then `export GH_TOKEN="$token"` lets `set -e` see the cat
-        # failure and abort the unit before we hand off to the CLI.
-        "${pkgs.bash}/bin/bash -c '"
-          + "set -e; "
-          + "token=\"$(${pkgs.coreutils}/bin/cat "
-          + lib.escapeShellArg tokenFile + ")\"; "
-          + "export GH_TOKEN=\"$token\"; "
-          + "exec ${base}"
-          + "'";
+      base;
 
   # ---- embed worker plumbing --------------------------------------------
   #
@@ -625,23 +603,6 @@ in {
         description = "systemd OnCalendar spec for the GitHub ingest timer.";
       };
 
-      githubTokenFile = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        example = "/run/agenix/github-readonly-pat";
-        description = ''
-          Absolute path to a file whose contents are a **read-only**
-          GitHub PAT (scopes `public_repo`, `repo:status`, `read:org`
-          only). Typically an agenix-managed secret. When set, the
-          github ingest service reads the file at unit start and
-          exports its contents as `GH_TOKEN` for the CLI invocation,
-          overriding whatever `gh auth` has cached.
-
-          When null (default), the CLI uses the existing `gh auth`
-          token, which will refuse to ingest if the token has any
-          write-capable scopes (see `pending_for_human.md`).
-        '';
-      };
     };
 
     embed = {
@@ -854,7 +815,6 @@ in {
           ExecStart = mkExecStart {
             source = "sessions";
             since = cfg.sources.sessions.since;
-            tokenFile = null;  # sessions ingest reads only local filesystem
           };
           StandardOutput = "journal";
           StandardError = "journal";
@@ -885,7 +845,6 @@ in {
           ExecStart = mkExecStart {
             source = "github";
             since = "";  # github source paginates by /search/issues, --since not wired end-to-end
-            tokenFile = cfg.sources.github.githubTokenFile;
           };
           StandardOutput = "journal";
           StandardError = "journal";

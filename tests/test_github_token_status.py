@@ -8,10 +8,8 @@ Part B of the aggregator source-alignment work:
 * ``aggregator github-token-status`` CLI wraps the same call and prints
   either a human-readable summary or ``--json`` for scripting.
 
-The read-only contract stays intact: even with ``GH_TOKEN`` set, the ingest
-path still scope-checks the token and refuses write-capable scopes unless
-``AGGREGATOR_ALLOW_WRITE_TOKEN=1`` is set. The new surface just makes the
-current state visible + actionable.
+Scope reporting is diagnostic. Ingest safety comes from explicit GET-only,
+allowlisted API calls rather than requiring a second, narrower credential.
 """
 from __future__ import annotations
 
@@ -30,7 +28,6 @@ from aggregator.sources.github import (
 
 def test_token_status_uses_gh_token_env_when_set(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "ghp_readonly_from_env")
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     status = token_status(
         _scope_fetcher=lambda: ["public_repo", "read:org"],
         _gh_token_fetcher=lambda: "ghp_from_gh_cli_should_not_be_used",
@@ -39,12 +36,10 @@ def test_token_status_uses_gh_token_env_when_set(monkeypatch):
     assert status.source == "env"
     assert status.scopes == ["public_repo", "read:org"]
     assert status.write_capable is False
-    assert status.override_active is False
 
 
 def test_token_status_falls_back_to_gh_auth_when_env_unset(monkeypatch):
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     status = token_status(
         _scope_fetcher=lambda: ["public_repo"],
         _gh_token_fetcher=lambda: "ghp_from_gh_cli",
@@ -55,39 +50,22 @@ def test_token_status_falls_back_to_gh_auth_when_env_unset(monkeypatch):
 
 
 def test_token_status_reports_write_scopes(monkeypatch):
-    """Even without the override, ``token_status`` REPORTS scopes rather
-    than raising — it's a diagnostic surface, not an enforcement point."""
+    """Broad scopes are reported; GET-only capability remains enforcement."""
     monkeypatch.setenv("GH_TOKEN", "ghp_full_repo")
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     status = token_status(
         _scope_fetcher=lambda: ["repo", "gist", "workflow"],
         _gh_token_fetcher=lambda: None,
     )
     assert status.write_capable is True
-    # The offending scopes should surface in the recommendation.
     assert "repo" in status.recommendation
-    assert "GH_TOKEN" in status.recommendation
-
-
-def test_token_status_flags_override_when_env_set(monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "x")
-    monkeypatch.setenv("AGGREGATOR_ALLOW_WRITE_TOKEN", "1")
-    status = token_status(
-        _scope_fetcher=lambda: ["repo"],
-        _gh_token_fetcher=lambda: None,
-    )
-    assert status.override_active is True
-    # With override active AND write scopes, recommendation mentions both.
-    assert (
-        "AGGREGATOR_ALLOW_WRITE_TOKEN" in status.recommendation
-        or "override" in status.recommendation.lower()
-    )
+    assert "GET-only" in status.recommendation
+    assert "PAT" not in status.recommendation
+    assert not hasattr(status, "override_active")
 
 
 def test_token_status_handles_no_token_at_all(monkeypatch):
     """Neither env nor gh-cli produced a token: recommend logging in / setting."""
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     status = token_status(
         _scope_fetcher=lambda: [],
         _gh_token_fetcher=lambda: None,
@@ -104,7 +82,6 @@ def test_token_status_handles_scope_fetch_failure(monkeypatch):
     """Scope fetch failing shouldn't raise from token_status — surface a
     diagnostic recommendation instead."""
     monkeypatch.setenv("GH_TOKEN", "x")
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     def boom() -> list[str]:
         raise FileNotFoundError("gh missing")
@@ -131,13 +108,10 @@ def test_token_status_handles_scope_fetch_failure(monkeypatch):
 def test_github_source_reports_gh_token_as_env_source(monkeypatch):
     """When ``GH_TOKEN`` is set, ingest resolves it as the token source.
 
-    The scope check is still performed against whichever token gh api
-    picks up — same read-only contract as before. This test just pins
-    the resolution behaviour so a future refactor can't accidentally
-    prefer gh's stored credential over the explicit env var.
+    This pins resolution behaviour so a future refactor cannot accidentally
+    prefer gh's stored credential over an explicit environment value.
     """
     monkeypatch.setenv("GH_TOKEN", "ghp_readonly")
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     src = GitHubSource(
         _scope_fetcher=lambda: ["public_repo"],
         _api_fetcher=lambda p: [],
@@ -152,7 +126,6 @@ def test_github_source_reports_gh_token_as_env_source(monkeypatch):
 
 def test_github_source_token_status_uses_gh_cli_when_env_unset(monkeypatch):
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     src = GitHubSource(
         _scope_fetcher=lambda: ["public_repo"],
         _api_fetcher=lambda p: [],
@@ -171,7 +144,6 @@ def test_cli_github_token_status_prints_human_summary(tmp_data_home, capsys, mon
     from aggregator.core.store import Store
 
     monkeypatch.setenv("GH_TOKEN", "ghp_readonly")
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     class StubSource:
         name = "github"
@@ -181,7 +153,6 @@ def test_cli_github_token_status_prints_human_summary(tmp_data_home, capsys, mon
                 source="env",
                 scopes=["public_repo", "read:org"],
                 write_capable=False,
-                override_active=False,
                 scope_error=None,
                 recommendation="Token looks good — scopes are read-only.",
             )
@@ -207,7 +178,6 @@ def test_cli_github_token_status_json_output(
     from aggregator.core.store import Store
 
     monkeypatch.setenv("GH_TOKEN", "ghp_x")
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     class StubSource:
         name = "github"
@@ -217,12 +187,10 @@ def test_cli_github_token_status_json_output(
                 source="env",
                 scopes=["repo", "workflow"],
                 write_capable=True,
-                override_active=False,
                 scope_error=None,
                 recommendation=(
-                    "Token has write scopes ['repo', 'workflow']. Either "
-                    "export GH_TOKEN=<readonly PAT> or set "
-                    "AGGREGATOR_ALLOW_WRITE_TOKEN=1."
+                    "Token has write scopes ['repo', 'workflow']; GitHub "
+                    "ingest remains constrained to GET-only search."
                 ),
             )
 
@@ -251,7 +219,6 @@ def test_cli_github_token_status_is_idempotent_and_side_effect_free(
     from aggregator.core.store import Store
 
     monkeypatch.setenv("GH_TOKEN", "ghp_x")
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
 
     class StubSource:
         name = "github"
@@ -265,7 +232,6 @@ def test_cli_github_token_status_is_idempotent_and_side_effect_free(
                 source="env",
                 scopes=["public_repo"],
                 write_capable=False,
-                override_active=False,
                 scope_error=None,
                 recommendation="ok",
             )
@@ -326,7 +292,6 @@ def test_cli_github_token_status_unknown_source(
 def test_token_status_resolution_matrix(
     monkeypatch, gh_token, ghauth, expected_source
 ):
-    monkeypatch.delenv("AGGREGATOR_ALLOW_WRITE_TOKEN", raising=False)
     if gh_token:
         monkeypatch.setenv("GH_TOKEN", gh_token)
     else:

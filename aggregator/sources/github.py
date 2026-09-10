@@ -1,15 +1,15 @@
-"""GitHub source: uses `gh api` under the hood to cache PRs + issues.
+"""GitHub source: cache PRs + issues through a GET-only ``gh api`` seam.
 
-Read-only credential enforcement: refuses to run if `gh auth` scopes include
-any write-capable scope, unless AGGREGATOR_ALLOW_WRITE_TOKEN=1 is set.
-
-See spec §Security constraint 1 and plan M1b for the contract.
+Credential scopes are diagnostic. Capability safety lives at the subprocess
+boundary: only the source's fixed search paths are accepted, and every request
+explicitly uses HTTP GET.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import subprocess
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -44,21 +44,8 @@ WRITE_SCOPES = {
 #   repo:status, public_repo, read:org, read:user, read:discussion, read:packages
 
 
-class WriteCapableTokenError(RuntimeError):
-    """Raised when the gh token has write scopes and the override env var is
-    not set — OR when scope verification failed (advisor round-1 HIGH-2:
-    fail-closed on unverifiable scopes, not fail-open)."""
-
-
 class ScopeFetchError(RuntimeError):
-    """Raised by ``_default_scope_fetcher`` when it cannot determine scopes.
-
-    Kept distinct from ``WriteCapableTokenError`` so custom fetchers can
-    signal "I don't know" without pretending to have parsed a response.
-    ``_check_scopes`` catches this AND arbitrary exceptions from the fetcher
-    and re-raises as ``WriteCapableTokenError`` (unless the operator has
-    set ``AGGREGATOR_ALLOW_WRITE_TOKEN=1``).
-    """
+    """Raised by ``_default_scope_fetcher`` when it cannot determine scopes."""
 
 
 class GhApiError(RuntimeError):
@@ -74,6 +61,21 @@ class GhApiError(RuntimeError):
     try/except records the error and — combined with the round-3
     ``--rebuild`` guard — refuses the wipe.
     """
+
+
+_SEARCH_PATH = re.compile(
+    r"/search/issues\?q=is:"
+    r"(?:pr\+(?:author|review-requested)|issue\+(?:author|assignee))"
+    r":@me(?:\+updated:>=\d{4}-\d{2}-\d{2})?\Z"
+)
+
+
+def _validate_search_path(path: str) -> None:
+    """Reject anything outside this source's fixed read-only API surface."""
+    if _SEARCH_PATH.fullmatch(path) is None:
+        raise GhApiError(
+            "refusing GitHub API path outside GET-only search capability"
+        )
 
 
 def _parse_scopes(scopes_header: str) -> list[str]:
@@ -99,10 +101,8 @@ def _default_scope_fetcher() -> list[str]:
     """Call `gh api -i /rate_limit` and parse X-Oauth-Scopes from headers.
 
     On failure (missing gh, non-zero exit, timeout) raises
-    ``ScopeFetchError``. ``_check_scopes`` converts that to a
-    ``WriteCapableTokenError`` unless ``AGGREGATOR_ALLOW_WRITE_TOKEN=1`` is
-    set. This is a change from the pre-HIGH-2 behaviour where failure
-    returned ``[]`` and was silently treated as read-only.
+    ``ScopeFetchError`` so diagnostics never turn an unavailable scope check
+    into a false claim that the token is narrow.
 
     An empty ``X-Oauth-Scopes`` header (no scopes assigned) is still
     returned as ``[]`` — that's a valid response from GitHub, not a fetch
@@ -110,7 +110,7 @@ def _default_scope_fetcher() -> list[str]:
     """
     try:
         result = subprocess.run(
-            ["gh", "api", "-i", "/rate_limit"],
+            ["gh", "api", "--method", "GET", "-i", "/rate_limit"],
             check=True,
             capture_output=True,
             text=True,
@@ -178,9 +178,6 @@ class TokenStatus:
       /rate_limit``. Empty on scope-fetch failure (see ``scope_error``).
     * ``write_capable`` — True when any scope in ``scopes`` is in
       ``WRITE_SCOPES``.
-    * ``override_active`` — True when ``AGGREGATOR_ALLOW_WRITE_TOKEN=1``
-      is set — the operator has explicitly opted out of the read-only
-      contract.
     * ``scope_error`` — string form of the fetcher exception when scope
       fetch failed. ``None`` on success.
     * ``recommendation`` — human-readable single-line-ish advice: what
@@ -191,7 +188,6 @@ class TokenStatus:
     source: str
     scopes: list[str]
     write_capable: bool
-    override_active: bool
     scope_error: str | None
     recommendation: str
 
@@ -200,7 +196,6 @@ def _recommendation_for(
     source: str,
     scopes: list[str],
     write_capable: bool,
-    override_active: bool,
     scope_error: str | None,
 ) -> str:
     """Compose the human-readable advice string for a TokenStatus.
@@ -211,28 +206,19 @@ def _recommendation_for(
     """
     if source == "none":
         return (
-            "No token found. Either export GH_TOKEN=<readonly PAT> "
-            "(preferred) or run `gh auth login` and rerun ingest."
+            "No token found. Run `gh auth login` and rerun ingest; the "
+            "GitHub adapter permits only GET-only search requests."
         )
     if scope_error is not None:
         return (
-            f"Cannot verify token scopes ({scope_error}). Ingest will "
-            "fail-closed unless AGGREGATOR_ALLOW_WRITE_TOKEN=1 is set. "
-            "Fix: install gh, or set the override if you accept the risk."
+            f"Cannot report token scopes ({scope_error}). Ingest remains "
+            "constrained to GET-only search requests."
         )
     offending = sorted(set(scopes) & WRITE_SCOPES)
     if write_capable:
-        if override_active:
-            return (
-                f"Token has write scopes {offending}; ingest ALLOWED "
-                "because AGGREGATOR_ALLOW_WRITE_TOKEN=1 is set. "
-                "Recommended: unset the override and export "
-                "GH_TOKEN=<readonly PAT> instead."
-            )
         return (
-            f"Token has write scopes {offending}. Either export "
-            "GH_TOKEN=<readonly PAT> (recommended) or set "
-            "AGGREGATOR_ALLOW_WRITE_TOKEN=1 to accept the risk."
+            f"Token has write scopes {offending}; GitHub ingest remains "
+            "constrained to GET-only search requests."
         )
     return (
         f"Token is read-only (scopes={scopes}, source={source}). "
@@ -248,9 +234,8 @@ def token_status(
 
     Read-only diagnostic — no side effects, no writes, safe to call any
     number of times. Wraps the scope fetcher in try/except so scope
-    lookup failure surfaces as ``scope_error`` on the return value
-    rather than raising (unlike ``_check_scopes`` which fails closed by
-    design in the ingest path).
+    lookup failure surfaces as ``scope_error`` on the return value rather
+    than raising. Scope reporting is not the ingest authorization boundary.
 
     Args:
       _scope_fetcher: injectable seam; defaults to gh-CLI-backed. Tests
@@ -262,7 +247,6 @@ def token_status(
       ``TokenStatus`` snapshot; see the dataclass docstring.
     """
     env_token = os.environ.get("GH_TOKEN", "").strip()
-    override_active = os.environ.get("AGGREGATOR_ALLOW_WRITE_TOKEN") == "1"
 
     if env_token:
         source = "env"
@@ -286,10 +270,9 @@ def token_status(
         source=source,
         scopes=list(scopes),
         write_capable=write_capable,
-        override_active=override_active,
         scope_error=scope_error,
         recommendation=_recommendation_for(
-            source, scopes, write_capable, override_active, scope_error,
+            source, scopes, write_capable, scope_error,
         ),
     )
 
@@ -312,9 +295,19 @@ def _default_api_fetcher(path: str) -> list[dict]:
     failure raises ``GhApiError``; ``iter_records`` surfaces it through
     the shared errors sink instead of degrading silently to zero-adds.
     """
+    _validate_search_path(path)
     try:
         result = subprocess.run(
-            ["gh", "api", "--paginate", "--jq", ".items[]", path],
+            [
+                "gh",
+                "api",
+                "--method",
+                "GET",
+                "--paginate",
+                "--jq",
+                ".items[]",
+                path,
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -408,34 +401,6 @@ class GitHubSource:
             "url": "str",
             "body_excerpt": "str (first 500 chars)",
         }
-
-    def _check_scopes(self) -> None:
-        override = os.environ.get("AGGREGATOR_ALLOW_WRITE_TOKEN") == "1"
-        try:
-            scopes = self._scope_fetcher()
-        except Exception as e:  # noqa: BLE001 -- ANY fetch failure is fail-closed
-            # Advisor round-1 HIGH-2: pre-fix, subprocess errors returned []
-            # which the check treated as read-only. Post-fix, unverifiable
-            # scopes are fail-closed unless the operator has explicitly opted
-            # out via AGGREGATOR_ALLOW_WRITE_TOKEN=1.
-            if override:
-                log.warning(
-                    "scope check bypassed (AGGREGATOR_ALLOW_WRITE_TOKEN=1); "
-                    "scope fetch failed: %s",
-                    e,
-                )
-                return
-            raise WriteCapableTokenError(
-                f"cannot verify GitHub token scope: {e}. "
-                "Set AGGREGATOR_ALLOW_WRITE_TOKEN=1 to proceed anyway."
-            ) from e
-        if _has_write_scope(scopes) and not override:
-            offending = sorted(set(scopes) & WRITE_SCOPES)
-            raise WriteCapableTokenError(
-                f"gh token has write-capable scopes {offending}. "
-                "Set AGGREGATOR_ALLOW_WRITE_TOKEN=1 to override, or re-scope the token "
-                "(recommended: public_repo, repo:status, read:org)."
-            )
 
     def _pr_to_record(self, pr: dict) -> Record | None:
         """Convert a /search/issues search hit (PR variant) to a ``Record``.
@@ -540,9 +505,9 @@ class GitHubSource:
     ) -> Iterator[Record]:
         """Yield PR + issue records from all four search endpoints.
 
-        Enforces the read-only scope check up front (same fail-closed policy
-        as ``ingest``). Per-endpoint transport failures are logged and
-        skipped — partial ingest beats total loss (spec §Error handling).
+        Per-endpoint transport failures are logged and skipped — partial
+        ingest beats total loss (spec §Error handling). The default fetcher
+        validates each path and explicitly requests GET before starting gh.
         When ``errors`` is provided, per-endpoint failures are appended
         (``f"{path}: {e}"``) so callers that need structured error surfacing
         (``ingest`` returns them in ``IngestResult.errors``) can share the
@@ -563,7 +528,6 @@ class GitHubSource:
         still not aborting the ingest (per-item faults are collected by
         design, spec §Error handling).
         """
-        self._check_scopes()
         for kind, subkind, path in self._ENDPOINTS:
             scoped_path = self._apply_since(path, since)
             try:
