@@ -177,6 +177,8 @@ from aggregator.sources.base import (
 
 log = logging.getLogger(__name__)
 
+_BACKEND_TOKEN_FILE_ENV = "AGGREGATOR_MCP_BACKEND_TOKEN_FILE"
+
 _DEFAULT_PAGE_SIZE_SUMMARY = 200
 _DEFAULT_PAGE_SIZE_FULL = 40
 
@@ -5158,7 +5160,7 @@ def _live_inventory(store: Store | None = None) -> str:
     return f"Cached sources at server start: {listed}{span}."
 
 
-def build_server(_store: Store | None = None) -> FastMCP:
+def build_server(_store: Store | None = None, *, _auth: Any | None = None) -> FastMCP:
     """Assemble the FastMCP surface.
 
     Two usage-assurance levers are applied here rather than in the tool
@@ -5180,7 +5182,7 @@ def build_server(_store: Store | None = None) -> FastMCP:
     if inventory:
         search_description = f"{search_description}\n{inventory}\n"
 
-    server = FastMCP("aggregator", instructions=instructions)
+    server = FastMCP("aggregator", instructions=instructions, auth=_auth)
     server.tool(
         name=SEARCH_TOOL_NAME,
         description=search_description,
@@ -5200,18 +5202,51 @@ def build_server(_store: Store | None = None) -> FastMCP:
     return server
 
 
+def _backend_token() -> str | None:
+    """Read local backend credential without placing it in argv or env."""
+    token_file = os.environ.get(_BACKEND_TOKEN_FILE_ENV, "").strip()
+    if not token_file:
+        return None
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError as exc:
+        raise RuntimeError(f"unable to read backend token file: {token_file}") from exc
+    if not token:
+        raise RuntimeError(f"backend token file is empty: {token_file}")
+    return token
+
+
 def main() -> None:
     backend_url = os.environ.get("AGGREGATOR_MCP_BACKEND_URL", "").strip()
+    backend_token = _backend_token()
     if backend_url:
         # Import only in proxy mode. More importantly, return before
         # build_server() or Presidio warm-up: each editor child must remain a
         # lightweight transport bridge, never a silent private model server.
+        from fastmcp.client.transports import StreamableHttpTransport
         from fastmcp.server import create_proxy
 
-        create_proxy(backend_url).run(show_banner=False)
+        target: str | StreamableHttpTransport = backend_url
+        if backend_token is not None:
+            target = StreamableHttpTransport(backend_url, auth=backend_token)
+        create_proxy(target).run(show_banner=False)
         return
 
-    server = build_server()
+    if backend_token is None:
+        server = build_server()
+    else:
+        from fastmcp.server.auth import StaticTokenVerifier
+
+        auth = StaticTokenVerifier(
+            tokens={
+                backend_token: {
+                    "client_id": "aggregator-local-proxy",
+                    "scopes": [],
+                }
+            }
+        )
+        server = build_server(_auth=auth)
     # BETWEEN build and run, on a daemon thread, and not joined. Presidio is
     # ~50 s of model loading on this host and every result path needs it
     # (scrub-on-return), but the `initialize` handshake needs none of it and
