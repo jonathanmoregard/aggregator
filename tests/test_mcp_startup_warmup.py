@@ -18,9 +18,17 @@ No engine is built here: ``start_background_init`` is monkeypatched, so this tes
 costs milliseconds and touches no model.
 """
 
+import pytest
 
-def test_main_builds_then_warms_then_serves(monkeypatch):
+
+@pytest.mark.parametrize("backend_url", [None, "", "   "])
+def test_main_builds_then_warms_then_serves(monkeypatch, backend_url):
     import aggregator.mcp as mcp_mod
+
+    if backend_url is None:
+        monkeypatch.delenv("AGGREGATOR_MCP_BACKEND_URL", raising=False)
+    else:
+        monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_URL", backend_url)
 
     order: list[str] = []
 
@@ -40,6 +48,136 @@ def test_main_builds_then_warms_then_serves(monkeypatch):
     mcp_mod.main()
 
     assert order == ["build", "warm", "run"]
+
+
+def test_main_proxies_without_building_or_warming(monkeypatch):
+    import fastmcp.server
+
+    import aggregator.mcp as mcp_mod
+
+    backend_url = "http://127.0.0.1:8765/mcp"
+    calls: list[tuple[str, object]] = []
+
+    class _FakeProxy:
+        def run(self, **kwargs):
+            calls.append(("run", kwargs))
+
+    def _fake_create_proxy(target):
+        calls.append(("proxy", target))
+        return _FakeProxy()
+
+    def _unexpected_local_server():
+        pytest.fail("proxy mode must not build a local aggregator server")
+
+    def _unexpected_warmup():
+        pytest.fail("proxy mode must not initialize local Presidio state")
+
+    monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_URL", backend_url)
+    monkeypatch.setattr(fastmcp.server, "create_proxy", _fake_create_proxy)
+    monkeypatch.setattr(mcp_mod, "build_server", _unexpected_local_server)
+    monkeypatch.setattr(mcp_mod, "start_background_init", _unexpected_warmup)
+
+    mcp_mod.main()
+
+    assert calls == [
+        ("proxy", backend_url),
+        ("run", {"show_banner": False}),
+    ]
+
+
+def test_main_authenticates_proxy_from_token_file(monkeypatch, tmp_path):
+    import fastmcp.client.transports
+    import fastmcp.server
+
+    import aggregator.mcp as mcp_mod
+
+    backend_url = "http://127.0.0.1:8765/mcp"
+    token_file = tmp_path / "backend-token"
+    token_file.write_text("local-secret\n", encoding="utf-8")
+    calls: list[tuple[str, object]] = []
+
+    class _FakeTransport:
+        def __init__(self, url, auth):
+            calls.append(("transport", (url, auth)))
+
+    class _FakeProxy:
+        def run(self, **kwargs):
+            calls.append(("run", kwargs))
+
+    def _fake_create_proxy(target):
+        calls.append(("proxy", target.__class__.__name__))
+        return _FakeProxy()
+
+    monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_URL", backend_url)
+    monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(
+        fastmcp.client.transports, "StreamableHttpTransport", _FakeTransport
+    )
+    monkeypatch.setattr(fastmcp.server, "create_proxy", _fake_create_proxy)
+
+    mcp_mod.main()
+
+    assert calls == [
+        ("transport", (backend_url, "local-secret")),
+        ("proxy", "_FakeTransport"),
+        ("run", {"show_banner": False}),
+    ]
+
+
+def test_main_authenticates_backend_from_same_token_file(monkeypatch, tmp_path):
+    import fastmcp.server.auth
+
+    import aggregator.mcp as mcp_mod
+
+    token_file = tmp_path / "backend-token"
+    token_file.write_text("local-secret\n", encoding="utf-8")
+    calls: list[tuple[str, object]] = []
+
+    class _FakeVerifier:
+        def __init__(self, *, tokens):
+            calls.append(("auth", tokens))
+
+    class _FakeServer:
+        def run(self, **kwargs):
+            calls.append(("run", kwargs))
+
+    def _fake_build_server(*, _auth):
+        calls.append(("build", _auth.__class__.__name__))
+        return _FakeServer()
+
+    monkeypatch.delenv("AGGREGATOR_MCP_BACKEND_URL", raising=False)
+    monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(fastmcp.server.auth, "StaticTokenVerifier", _FakeVerifier)
+    monkeypatch.setattr(mcp_mod, "build_server", _fake_build_server)
+    monkeypatch.setattr(
+        mcp_mod, "start_background_init", lambda: calls.append(("warm", None))
+    )
+
+    mcp_mod.main()
+
+    assert calls == [
+        (
+            "auth",
+            {"local-secret": {"client_id": "aggregator-local-proxy", "scopes": []}},
+        ),
+        ("build", "_FakeVerifier"),
+        ("warm", None),
+        ("run", {"show_banner": False}),
+    ]
+
+
+def test_main_refuses_an_empty_backend_token_file(monkeypatch, tmp_path):
+    import aggregator.mcp as mcp_mod
+
+    token_file = tmp_path / "backend-token"
+    token_file.write_text("\n", encoding="utf-8")
+    monkeypatch.setenv(
+        "AGGREGATOR_MCP_BACKEND_URL", "http://127.0.0.1:8765/mcp"
+    )
+    monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_TOKEN_FILE", str(token_file))
+
+    with pytest.raises(RuntimeError, match="token file is empty"):
+        mcp_mod.main()
 
 
 def test_main_does_not_wait_for_the_warmup(monkeypatch):

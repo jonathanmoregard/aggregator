@@ -26,18 +26,16 @@ Security invariants (spec §Security):
    them is gone: ``fts5_match_query`` whitelists every string before it
    reaches MATCH, so malformed query text can no longer be constructed.
 
-KNOWN, ACCEPTED EXPOSURE — ``rerank=True`` RUNS TORCH IN THIS PROCESS.
+KNOWN EXPOSURE — ``rerank=True`` RUNS TORCH IN THE SERVER PROCESS.
 
-Written down rather than fixed, because the fix that suggests itself does not
-exist. ``_get_reranker().score`` runs a native tokenizer and torch, in-process,
-over corpus text. This process is registered bare — ``claude mcp add
-aggregator <store-path>/bin/aggregator-mcp``, a stdio child of the editor. It
-has no systemd unit, therefore none of the hardening the embed worker gets for
-doing the identical work on the identical data: no ``NoNewPrivileges``, no
-``ProtectSystem``, no ``RestrictAddressFamilies``, no ``MemoryMax``.
+``_get_reranker().score`` runs a native tokenizer and torch, in-process, over
+corpus text. Production deploys one loopback HTTP backend inside a hardened,
+memory-bounded systemd user service; each editor's stdio child is only a
+FastMCP proxy selected by ``AGGREGATOR_MCP_BACKEND_URL``. Direct stdio mode is
+still supported when that variable is absent, so callers using it outside the
+managed deployment own the server process and its resource boundary.
 
-An in-process MCP server cannot sandbox itself, so the asymmetry is not
-closeable from here. What bounds it:
+What bounds the model path itself:
 
 * The input is the user's OWN already-ingested corpus, at the same trust level
   as the text the FTS5 path already handles. Nothing reaches the tokenizer
@@ -65,8 +63,7 @@ that held a 25941-token record OOM-killed the process at 20.2 GB RSS and
 asked a question. ``rerank.MAX_PAIR_TOKENS`` now caps each pair at 512 tokens,
 so the peak is a function of ``_RERANK_WINDOW`` and that cap rather than of
 the longest document the corpus happens to contain. There is still no
-``MemoryMax`` on the editor's process, and that part remains uncloseable from
-here.
+in-process hard limit in direct stdio mode; the managed backend supplies one.
 
 STARTUP CONTRACT: NO MODEL STACK ON THE IMPORT PATH. Importing this module must
 not import ``torch``, ``spacy``, ``thinc``, ``transformers``,
@@ -179,6 +176,8 @@ from aggregator.sources.base import (
 )
 
 log = logging.getLogger(__name__)
+
+_BACKEND_TOKEN_FILE_ENV = "AGGREGATOR_MCP_BACKEND_TOKEN_FILE"
 
 _DEFAULT_PAGE_SIZE_SUMMARY = 200
 _DEFAULT_PAGE_SIZE_FULL = 40
@@ -5161,7 +5160,7 @@ def _live_inventory(store: Store | None = None) -> str:
     return f"Cached sources at server start: {listed}{span}."
 
 
-def build_server(_store: Store | None = None) -> FastMCP:
+def build_server(_store: Store | None = None, *, _auth: Any | None = None) -> FastMCP:
     """Assemble the FastMCP surface.
 
     Two usage-assurance levers are applied here rather than in the tool
@@ -5183,7 +5182,7 @@ def build_server(_store: Store | None = None) -> FastMCP:
     if inventory:
         search_description = f"{search_description}\n{inventory}\n"
 
-    server = FastMCP("aggregator", instructions=instructions)
+    server = FastMCP("aggregator", instructions=instructions, auth=_auth)
     server.tool(
         name=SEARCH_TOOL_NAME,
         description=search_description,
@@ -5203,8 +5202,51 @@ def build_server(_store: Store | None = None) -> FastMCP:
     return server
 
 
+def _backend_token() -> str | None:
+    """Read local backend credential without placing it in argv or env."""
+    token_file = os.environ.get(_BACKEND_TOKEN_FILE_ENV, "").strip()
+    if not token_file:
+        return None
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError as exc:
+        raise RuntimeError(f"unable to read backend token file: {token_file}") from exc
+    if not token:
+        raise RuntimeError(f"backend token file is empty: {token_file}")
+    return token
+
+
 def main() -> None:
-    server = build_server()
+    backend_url = os.environ.get("AGGREGATOR_MCP_BACKEND_URL", "").strip()
+    backend_token = _backend_token()
+    if backend_url:
+        # Import only in proxy mode. More importantly, return before
+        # build_server() or Presidio warm-up: each editor child must remain a
+        # lightweight transport bridge, never a silent private model server.
+        from fastmcp.client.transports import StreamableHttpTransport
+        from fastmcp.server import create_proxy
+
+        target: str | StreamableHttpTransport = backend_url
+        if backend_token is not None:
+            target = StreamableHttpTransport(backend_url, auth=backend_token)
+        create_proxy(target).run(show_banner=False)
+        return
+
+    if backend_token is None:
+        server = build_server()
+    else:
+        from fastmcp.server.auth import StaticTokenVerifier
+
+        auth = StaticTokenVerifier(
+            tokens={
+                backend_token: {
+                    "client_id": "aggregator-local-proxy",
+                    "scopes": [],
+                }
+            }
+        )
+        server = build_server(_auth=auth)
     # BETWEEN build and run, on a daemon thread, and not joined. Presidio is
     # ~50 s of model loading on this host and every result path needs it
     # (scrub-on-return), but the `initialize` handshake needs none of it and
