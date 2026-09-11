@@ -18,9 +18,17 @@ No engine is built here: ``start_background_init`` is monkeypatched, so this tes
 costs milliseconds and touches no model.
 """
 
+import pytest
 
-def test_main_builds_then_warms_then_serves(monkeypatch):
+
+@pytest.mark.parametrize("backend_url", [None, "", "   "])
+def test_main_builds_then_warms_then_serves(monkeypatch, backend_url):
     import aggregator.mcp as mcp_mod
+
+    if backend_url is None:
+        monkeypatch.delenv("AGGREGATOR_MCP_BACKEND_URL", raising=False)
+    else:
+        monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_URL", backend_url)
 
     order: list[str] = []
 
@@ -40,6 +48,41 @@ def test_main_builds_then_warms_then_serves(monkeypatch):
     mcp_mod.main()
 
     assert order == ["build", "warm", "run"]
+
+
+def test_main_proxies_without_building_or_warming(monkeypatch):
+    import fastmcp.server
+
+    import aggregator.mcp as mcp_mod
+
+    backend_url = "http://127.0.0.1:8765/mcp"
+    calls: list[tuple[str, object]] = []
+
+    class _FakeProxy:
+        def run(self, **kwargs):
+            calls.append(("run", kwargs))
+
+    def _fake_create_proxy(target):
+        calls.append(("proxy", target))
+        return _FakeProxy()
+
+    def _unexpected_local_server():
+        pytest.fail("proxy mode must not build a local aggregator server")
+
+    def _unexpected_warmup():
+        pytest.fail("proxy mode must not initialize local Presidio state")
+
+    monkeypatch.setenv("AGGREGATOR_MCP_BACKEND_URL", backend_url)
+    monkeypatch.setattr(fastmcp.server, "create_proxy", _fake_create_proxy)
+    monkeypatch.setattr(mcp_mod, "build_server", _unexpected_local_server)
+    monkeypatch.setattr(mcp_mod, "start_background_init", _unexpected_warmup)
+
+    mcp_mod.main()
+
+    assert calls == [
+        ("proxy", backend_url),
+        ("run", {"show_banner": False}),
+    ]
 
 
 def test_main_does_not_wait_for_the_warmup(monkeypatch):
