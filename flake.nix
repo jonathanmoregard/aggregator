@@ -185,20 +185,14 @@
             file = ./aggregator/core/embed.py;
             const = "DEFAULT_BACKEND";
           };
-          # The port every process that does not export AGGREGATOR_EMBED_URL
-          # dials — the MCP server is registered bare, so this IS where its
-          # queries go. The unit must bind exactly this.
-          pyEmbedPort =
-            let
-              url = pythonDefaultModel {
-                file = ./aggregator/core/embed.py;
-                const = "DEFAULT_EMBED_URL";
-              };
-              m = builtins.match "http://127\\.0\\.0\\.1:([0-9]+)/?" url;
-            in
-              if m == null
-              then throw "flake check: DEFAULT_EMBED_URL (${url}) is not a 127.0.0.1:<port> URL; the server unit binds loopback only"
-              else builtins.head m;
+          # The socket (relative to $XDG_RUNTIME_DIR) every process that does
+          # not export AGGREGATOR_EMBED_URL dials — the MCP server is
+          # registered bare, so this IS where its queries go. The unit must
+          # bind exactly this.
+          pyEmbedSocket = pythonDefaultModel {
+            file = ./aggregator/core/embed.py;
+            const = "EMBED_SOCKET_NAME";
+          };
           pyRerankModel = pythonDefaultModel {
             file = ./aggregator/core/rerank.py;
             const = "_DEFAULT_MODEL";
@@ -626,6 +620,7 @@
               # wrong revision; one gating on a stale sha would refuse forever
               # on a correctly seeded machine.
               py_embed_path=${pkgs.lib.escapeShellArg "hub/${hfCacheDirOf pyEmbedModel}/snapshots/${pyEmbedRevision}/${pyEmbedFile}"}
+              py_embed_socket=${pkgs.lib.escapeShellArg pyEmbedSocket}
 
               for repo in "$py_embed_model" "$py_rerank_model"; do
                 grep -qF "$repo" "$seed_script" \
@@ -733,16 +728,22 @@
                   || fail "aggregator-embed-seed.service is missing '$directive' — it downloads 2.4 GB off the internet and loads it into torch, and it must not be less sandboxed than the offline worker on anything except the network"
               done
 
-              # The worker's network directives. It dials exactly one socket,
-              # the embed server on 127.0.0.1, so it gets AF_INET and loopback
-              # and nothing else; the seeder is the one unit allowed the
-              # internet.
-              for directive in \
-                'RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET' \
-                'IPAddressDeny=any' \
-                'IPAddressAllow=localhost'; do
-                grep -qxF "$directive" "$svc" \
-                  || fail "aggregator-embed.service is missing '$directive' — it must reach the loopback embed server and nothing else"
+              # The worker's network: NONE. It reads the whole untrusted corpus,
+              # and it reaches the encoder over a unix socket, so it needs no
+              # IP family at all; the seeder is the one unit allowed the
+              # internet. Asserted twice over — the exact directive, and the
+              # absence of either IP family on any RestrictAddressFamilies line
+              # — because the second is the property: an AF_INET "for
+              # loopback" was measured to reach the LAN on this host, whose
+              # user manager has no cgroup BPF to fence it with.
+              grep -qxF 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' "$svc" \
+                || fail "aggregator-embed.service is missing 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' — it must reach the embed server's unix socket and nothing else"
+              for u in aggregator-embed.service aggregator-embed-server.service; do
+                if grep -E '^RestrictAddressFamilies=.*AF_INET' "$units/$u"; then
+                  fail "$u permits an IP address family — it processes untrusted text, needs only the unix socket, and IPAddressDeny/Allow cannot fence IP in this user manager"
+                fi
+                grep -qE '^RestrictAddressFamilies=' "$units/$u" \
+                  || fail "$u sets no RestrictAddressFamilies at all, i.e. every family including IP"
               done
 
               # The seeder MUST still restrict address families — dropping the
@@ -871,8 +872,14 @@
               # depends on.
               mkdir -p "$(dirname "$work/hf/$py_embed_path")"
               : > "$work/hf/$py_embed_path"
-              HF_HOME="$work/hf" "$server_script" > "$work/argv" 2>&1 \
+              # A socket file left by a SIGKILLed predecessor: llama-server
+              # refuses to bind over it, so the launcher must clear it.
+              mkdir -p "$(dirname "$work/rt/$py_embed_socket")"
+              : > "$work/rt/$py_embed_socket"
+              XDG_RUNTIME_DIR="$work/rt" HF_HOME="$work/hf" "$server_script" > "$work/argv" 2>&1 \
                 || { cat "$work/argv" >&2; fail "the server launcher failed on a seeded cache"; }
+              [ ! -e "$work/rt/$py_embed_socket" ] \
+                || fail "the server launcher leaves a stale socket file in place — llama-server then fails with 'couldn't bind HTTP server socket' after any unclean exit"
               argv_has() { grep -qxF -- "$1" "$work/argv"; }
               argv_pair() {
                 # $1 flag, $2 value: the value must follow the flag.
@@ -886,12 +893,17 @@
               # only place it is pinned.
               argv_pair --pooling last \
                 || fail "the server is not started with --pooling last — any other pooling yields well-formed vectors in a different space, and nothing downstream can tell"
-              argv_pair --host 127.0.0.1 \
-                || fail "the server does not bind 127.0.0.1 only"
-              argv_pair --port ${pyEmbedPort} \
-                || fail "the server does not bind port ${pyEmbedPort}, the port embed.py's DEFAULT_EMBED_URL dials — the bare-registered MCP server would find nothing and every query would silently lose its vector arm"
+              argv_pair --host "$work/rt/$py_embed_socket" \
+                || fail "the server does not bind \$XDG_RUNTIME_DIR/$py_embed_socket, the socket embed.py's EMBED_SOCKET_NAME dials — the bare-registered MCP server would find nothing and every query would silently lose its vector arm"
+              # The socket's directory is the unit's own RuntimeDirectory:
+              # private to the user, and removed on stop so that "stopped"
+              # means "no socket" to every client.
+              grep -qxF "RuntimeDirectory=''${py_embed_socket%%/*}" "$server_svc" \
+                || fail "aggregator-embed-server.service's RuntimeDirectory is not ''${py_embed_socket%%/*} — the socket directory would not exist, or would not be writable under ProtectHome=read-only (which covers /run/user)"
+              grep -qxF 'RuntimeDirectoryMode=0700' "$server_svc" \
+                || fail "aggregator-embed-server.service's socket directory is not 0700 — another local user could reach the encoder"
 
-              # (c) Always on, restarted on failure, loopback-only sandbox, and
+              # (c) Always on, restarted on failure, IP-free sandbox, and
               # the GPU still visible.
               grep -qxF 'WantedBy=default.target' "$server_svc" \
                 || fail "aggregator-embed-server.service is not wanted by default.target — queries would embed against a server nobody started"
@@ -905,9 +917,7 @@
                 'LockPersonality=true' \
                 'ProtectSystem=full' \
                 'ProtectHome=read-only' \
-                'RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET' \
-                'IPAddressDeny=any' \
-                'IPAddressAllow=localhost'; do
+                'RestrictAddressFamilies=AF_UNIX AF_NETLINK'; do
                 grep -qxF "$directive" "$server_svc" \
                   || fail "aggregator-embed-server.service is missing '$directive' — it tokenizes the whole untrusted corpus in C++"
               done

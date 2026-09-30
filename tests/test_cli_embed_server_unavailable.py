@@ -21,7 +21,7 @@ import pytest
 
 import aggregator.core.embed as embed_mod
 from aggregator.core.store import Store
-from tests.embed_server_stub import EmbedServerStub, closed_port_url
+from tests.embed_server_stub import EmbedServerStub, short_socket_path
 
 ROWS = 6
 
@@ -86,7 +86,8 @@ def _ledger_and_states(cache):
 
 
 def test_a_stopped_server_fails_the_run_and_touches_nothing(cache, monkeypatch, capsys):
-    monkeypatch.setenv(embed_mod.EMBED_URL_ENV, closed_port_url())
+    # The deployed transport, stopped: systemd has removed the socket.
+    monkeypatch.setenv(embed_mod.EMBED_URL_ENV, f"unix://{short_socket_path()}")
 
     rc = _run(cache)
 
@@ -102,7 +103,7 @@ def test_a_stopped_server_fails_the_run_and_touches_nothing(cache, monkeypatch, 
 
 def test_a_server_stopped_mid_run_blames_no_row(cache, monkeypatch, capsys):
     """One request served, then the unit goes away under the worker."""
-    with EmbedServerStub() as stub:
+    with EmbedServerStub(unix_path=short_socket_path()) as stub:
         monkeypatch.setenv(embed_mod.EMBED_URL_ENV, stub.url)
         # A row is one request here (each body is a single chunk), plus the
         # health probe after the failure. Serving exactly one means one row

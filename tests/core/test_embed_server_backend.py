@@ -27,13 +27,18 @@ import aggregator.core.embed as embed_mod
 from tests.embed_server_stub import (
     EmbedServerStub,
     closed_port_url,
+    short_socket_path,
     vector_for,
 )
 
 
-@pytest.fixture
-def stub(monkeypatch):
-    with EmbedServerStub() as s:
+@pytest.fixture(params=["unix", "http"])
+def stub(request, monkeypatch):
+    """Every behaviour below holds over BOTH transports: the unix socket the
+    deployment uses, and the http:// override a developer may point at a
+    scratch instance."""
+    path = short_socket_path() if request.param == "unix" else None
+    with EmbedServerStub(unix_path=path) as s:
         monkeypatch.setenv(embed_mod.EMBED_URL_ENV, s.url)
         yield s
 
@@ -161,3 +166,45 @@ def test_a_server_still_loading_its_model_is_waited_out(stub):
     stub.loading_replies = 2
     e = embed_mod.Embedder(backend="server")
     assert e.embed_documents(["x"]).shape == (1, 768)
+
+
+# -- the deployed transport: a unix socket in the runtime dir ------------------
+
+
+def test_with_nothing_exported_the_backend_dials_the_runtime_dir_socket(monkeypatch):
+    """The MCP server is registered bare: no AGGREGATOR_EMBED_URL, just the
+    session's XDG_RUNTIME_DIR. That alone must lead to the unit's socket."""
+    sock = short_socket_path(embed_mod.EMBED_SOCKET_NAME)
+    runtime = sock[: -len(embed_mod.EMBED_SOCKET_NAME) - 1]
+    monkeypatch.delenv(embed_mod.EMBED_URL_ENV, raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+    with EmbedServerStub(unix_path=sock) as stub:
+        out = embed_mod.Embedder(backend="server").embed_documents(["x"])
+    assert out.shape == (1, 768)
+    assert stub.embed_requests == [["x"]]
+
+
+def test_a_scrubbed_environment_still_finds_the_socket(monkeypatch):
+    """No XDG_RUNTIME_DIR at all: fall back to where logind puts it."""
+    import os
+
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    assert embed_mod.default_embed_url() == (
+        f"unix:///run/user/{os.getuid()}/{embed_mod.EMBED_SOCKET_NAME}"
+    )
+
+
+def test_a_missing_socket_file_is_the_stopped_unit(monkeypatch):
+    """systemd removes the RuntimeDirectory when the unit stops, so the usual
+    shape of "stopped" is ENOENT, not a refused connection."""
+    monkeypatch.setenv(embed_mod.EMBED_URL_ENV, f"unix://{short_socket_path()}")
+    with pytest.raises(embed_mod.EmbedServerUnavailableError) as excinfo:
+        embed_mod.Embedder(backend="server")
+    assert "aggregator-embed-server" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", ["tcp://127.0.0.1:1", "unix://", "/run/x.sock", "http://"])
+def test_a_malformed_url_is_refused_by_name(monkeypatch, bad):
+    monkeypatch.setenv(embed_mod.EMBED_URL_ENV, bad)
+    with pytest.raises(ValueError, match=embed_mod.EMBED_URL_ENV):
+        embed_mod.Embedder(backend="server")

@@ -20,7 +20,7 @@ import aggregator.core.embed as embed_mod
 import aggregator.mcp as mcp_mod
 from aggregator.core.store import Store
 from aggregator.mcp import aggregator_query
-from tests.embed_server_stub import EmbedServerStub, closed_port_url
+from tests.embed_server_stub import EmbedServerStub, short_socket_path
 from tests.test_mcp_hybrid import _embed, _seed_sessions
 
 
@@ -39,7 +39,8 @@ def store(tmp_path, monkeypatch):
 
 
 def test_a_server_stopped_before_the_first_query(store, monkeypatch):
-    monkeypatch.setenv(embed_mod.EMBED_URL_ENV, closed_port_url())
+    # The deployed transport, stopped: systemd has removed the socket.
+    monkeypatch.setenv(embed_mod.EMBED_URL_ENV, f"unix://{short_socket_path()}")
 
     result = aggregator_query("voting", _store=store)
 
@@ -52,7 +53,7 @@ def test_a_server_stopped_before_the_first_query(store, monkeypatch):
 
 
 def test_a_server_stopped_after_the_embedder_was_built(store, monkeypatch):
-    with EmbedServerStub() as stub:
+    with EmbedServerStub(unix_path=short_socket_path()) as stub:
         monkeypatch.setenv(embed_mod.EMBED_URL_ENV, stub.url)
         warm = aggregator_query("voting", _store=store)
         assert warm["ok"] is True

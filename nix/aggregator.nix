@@ -72,14 +72,24 @@ let
   # seeder's report all test this one path.
   embedModelRelPath = "hub/${embedModelDir}/snapshots/${embedModelRevision}/${embedModelFile}";
 
-  # The loopback port the server binds. NOT an option, deliberately: the MCP
-  # server is registered bare and finds the embedder at the source default
-  # (aggregator/core/embed.py::DEFAULT_EMBED_URL), so a configurable port would
-  # silently split the worker from every query — the worker would follow the
-  # option and the MCP server would not, and search would degrade to FTS5 with
-  # nothing saying why. One value, asserted equal to the Python default by the
-  # hygiene check. 8717/8718 are taken by the offline-AI chat models.
-  embedServerPort = 8719;
+  # The server's unix socket, relative to $XDG_RUNTIME_DIR. Its first
+  # component is the unit's RuntimeDirectory (mode 0700, removed on stop).
+  #
+  # A SOCKET, NOT A TCP PORT, so the worker can keep `RestrictAddressFamilies=
+  # AF_UNIX AF_NETLINK` — no IP at all — while it reads the untrusted corpus.
+  # TCP was tried first and measured: the loopback-only fence for AF_INET
+  # (`IPAddressDeny=any` + `IPAddressAllow=localhost`) is cgroup BPF, which
+  # this host's user manager does not get, so a connect to the host's own LAN
+  # address went straight through. TCP would have widened the worker from no
+  # network to all of it.
+  #
+  # NOT an option, deliberately: the MCP server is registered bare and finds
+  # the embedder at the source default (aggregator/core/embed.py::
+  # EMBED_SOCKET_NAME), so a configurable path would silently split the
+  # worker from every query. One value, asserted equal to the Python default
+  # by the hygiene check.
+  embedSocketName = "aggregator-embed-server/embed.sock";
+  embedRuntimeDir = builtins.head (lib.splitString "/" embedSocketName);
 
   # The cross-encoder the MCP server loads on `rerank=True`
   # (aggregator/core/rerank.py::_DEFAULT_MODEL).
@@ -110,7 +120,7 @@ let
   #
   # ONE, since the worker stopped computing embeddings. The encoder runs in
   # `aggregator-embed-server` on the GPU; what is left in this process is
-  # chunking, sha256 of each chunk, JSON over loopback and SQLite writes —
+  # chunking, sha256 of each chunk, JSON over a unix socket and SQLite writes —
   # single-threaded Python that never loads torch at all on the `server`
   # backend. It was FOUR while the worker ran sentence-transformers on the
   # CPU, and that number was measured, not chosen: `1d 7h 51min` of CPU over
@@ -136,8 +146,8 @@ let
   # Exporting it from the unit would make every deploy look like exactly that
   # accident — and would let the unit and the bare-registered MCP server
   # disagree about which index they are reading. No `AGGREGATOR_EMBED_URL`
-  # either, for the same reason: the port is the source default, see
-  # `embedServerPort`.
+  # either, for the same reason: the socket is the source default, see
+  # `embedSocketName`.
   #
   # THE THREE THREAD VARIABLES ARE THREE DIFFERENT POOLS, not belt-and-braces
   # spellings of one. torch's kernels run on OpenMP (`OMP_NUM_THREADS`), its
@@ -304,7 +314,7 @@ let
   '';
 
   # The embedding model server. Always on; the worker and every MCP query
-  # talk to it over loopback.
+  # talk to it over a unix socket in the user's runtime directory.
   #
   # WHY A SERVER AT ALL. The worker used to run sentence-transformers on the
   # CPU at ~40 tokens/second — a 25-30 day backfill for this corpus. The same
@@ -327,8 +337,11 @@ let
   #                     base64) stays well inside it.
   #   -b/-ub 8192       an embedding input must fit ONE micro-batch in
   #                     llama.cpp, so the physical batch is the context.
-  #   --host 127.0.0.1  loopback only; the sandbox below backs it up.
-  #   --no-webui        nothing here wants a chat UI on a loopback port.
+  #   --host <x>.sock   llama-server binds a unix socket when the host ends in
+  #                     .sock (verified on build 10273, /v1/models and
+  #                     /v1/embeddings both answer over it). The same path
+  #                     rule as embed.py::default_embed_url, fallback included.
+  #   --no-webui        nothing here wants a chat UI.
   #
   # Refuses, with the fix named, when the pinned file is absent — and exits
   # 78 (EX_CONFIG) so `RestartPreventExitStatus` stops Restart=on-failure
@@ -345,11 +358,18 @@ let
       exit 78
     fi
 
+    runtime_dir="''${XDG_RUNTIME_DIR:-/run/user/$(${pkgs.coreutils}/bin/id -u)}"
+    sock="$runtime_dir/${embedSocketName}"
+    # llama-server will not bind over a socket file left by a SIGKILLed
+    # predecessor ("couldn't bind HTTP server socket"). RuntimeDirectory= is
+    # normally removed on stop, so this only matters for an unclean exit.
+    ${pkgs.coreutils}/bin/rm -f "$sock"
+
     exec ${cfg.embed.server.package}/bin/llama-server \
       -m "$embed_model" \
       --embedding --pooling last \
       -ngl 99 -c 8192 -b 8192 -ub 8192 \
-      --host 127.0.0.1 --port ${toString embedServerPort} \
+      --host "$sock" \
       --no-webui
   '';
 
@@ -1113,31 +1133,23 @@ in {
           # var is a request, not a boundary: any library that ignores it, or
           # any subprocess spawned along the way, had the entire network.
           #
-          # RestrictAddressFamilies is seccomp, supported in a USER manager,
-          # and it makes a socket() of any other family fail outright. It was
-          # `AF_UNIX AF_NETLINK`, no IP at all, while the worker encoded
-          # in-process. It gains AF_INET now and ONLY that, because the
-          # encoder is `aggregator-embed-server` on 127.0.0.1: no AF_INET6
-          # (nothing listens on ::1), no AF_PACKET. AF_UNIX stays for journal
-          # and dbus; AF_NETLINK because glibc probes interfaces during
-          # resolver setup even when nothing ever connects.
-          RestrictAddressFamilies = "AF_UNIX AF_NETLINK AF_INET";
-          # Meant to keep AF_INET from meaning "the internet": deny every
-          # address, then allow loopback back. IT IS A NO-OP ON THE DEPLOYING
-          # HOST, measured rather than assumed: IP filtering is cgroup BPF, and
-          # this user manager does not get it. On 2026-10-01, under exactly
-          # these three directives via `systemd-run --user`, a TCP connect to
-          # the host's own LAN address succeeded (AF_INET6 was refused, so the
-          # seccomp half is live). So on tuxedo the worker CAN open an IPv4
-          # connection anywhere, and its offline property rests on what it
-          # always rested on before round 1: HF_HUB_OFFLINE, the loaders'
-          # explicit `local_files_only`, and code that only ever dials the
-          # embed URL. Kept because it costs nothing and holds wherever the
-          # manager has BPF. The alternative that WOULD keep the old boundary —
-          # a unix socket (llama-server accepts `--host <path>.sock`), leaving
-          # this unit at `AF_UNIX AF_NETLINK` — is recorded in nix/README.md.
-          IPAddressDeny = "any";
-          IPAddressAllow = "localhost";
+          # RestrictAddressFamilies is the load-bearing line here. seccomp,
+          # supported in a USER manager, and it makes an AF_INET socket()
+          # fail outright — so "does not talk to the network" stops resting
+          # on every library agreeing to read HF_HUB_OFFLINE. AF_UNIX is also
+          # the transport to the encoder (`aggregator-embed-server`'s socket
+          # in $XDG_RUNTIME_DIR), plus journal and dbus; AF_NETLINK because
+          # glibc probes interfaces during resolver setup even when nothing
+          # ever connects.
+          #
+          # NO IPAddressDeny/IPAddressAllow. They are cgroup BPF, and this
+          # host's user manager does not get it: measured 2026-10-01 under
+          # `systemd-run --user`, `IPAddressDeny=any` let a TCP connect to the
+          # host's own LAN address through. With no IP family at all there is
+          # nothing for them to add, and a directive that reads as a fence
+          # but is not one is worse than none. The hygiene check asserts this
+          # unit has no AF_INET/AF_INET6, which is the property that matters.
+          RestrictAddressFamilies = "AF_UNIX AF_NETLINK";
         };
       };
 
@@ -1161,7 +1173,7 @@ in {
       # why every flag is fixed.
       systemd.user.services.aggregator-embed-server = lib.mkIf cfg.embed.enable {
         Unit = {
-          Description = "Aggregator: Qwen3 embedding server (llama.cpp, loopback :${toString embedServerPort})";
+          Description = "Aggregator: Qwen3 embedding server (llama.cpp, unix socket %t/${embedSocketName})";
           # A crash loop must end somewhere a human can see it; the defaults
           # (5 starts in 10s) are too tight for a GPU driver that needs a
           # moment after resume.
@@ -1176,6 +1188,14 @@ in {
           Type = "simple";
           ExecStart = "${embedServerRunner}";
           Environment = [ "HF_HOME=${hfHome}" ];
+          # $XDG_RUNTIME_DIR/aggregator-embed-server: where the socket lives.
+          # 0700 so only this user can reach the encoder; removed by systemd
+          # on stop, so "unit stopped" means "socket absent" to every client.
+          # Also the one writable spot under /run/user: ProtectHome=read-only
+          # below covers /run/user too, and llama-server could not bind there
+          # without it (observed: "couldn't bind HTTP server socket").
+          RuntimeDirectory = embedRuntimeDir;
+          RuntimeDirectoryMode = "0700";
           Restart = "on-failure";
           RestartSec = "10s";
           # 78 is the launcher's "weights not seeded": restarting cannot fix
@@ -1189,10 +1209,10 @@ in {
           # a C++ tokenizer and hands it to a GPU driver, so it gets the same
           # "shrink the ambient surface" treatment as the worker. Verified by
           # running llama-server under exactly this set with
-          # `systemd-run --user` on the deploying host (2026-10-01): it
-          # answered at 2448 tokens/s against 2500 for an unsandboxed
-          # instance, i.e. still on the GPU, with vectors matching that
-          # instance at cosine >= 0.9998.
+          # `systemd-run --user` on the deploying host (2026-10-01), unix
+          # socket and all (RuntimeDirectory, no AF_INET): /v1/models and
+          # /v1/embeddings answered over the socket at 2270 tokens/s, against
+          # ~2500 for an unsandboxed TCP instance, i.e. still on the GPU.
           #
           # DELIBERATELY ABSENT:
           #   PrivateDevices: hides /dev/dri, so the model silently runs on
@@ -1216,12 +1236,8 @@ in {
           ProtectKernelTunables = true;
           ProtectKernelModules = true;
           ProtectControlGroups = true;
-          # Listens on 127.0.0.1 and dials nothing. The IP pair is a no-op in
-          # the deploying host's user manager (see the worker's sandbox); the
-          # `--host 127.0.0.1` flag is what actually keeps it off the LAN.
-          RestrictAddressFamilies = "AF_UNIX AF_NETLINK AF_INET";
-          IPAddressDeny = "any";
-          IPAddressAllow = "localhost";
+          # Listens on a unix socket and dials nothing: no IP family at all.
+          RestrictAddressFamilies = "AF_UNIX AF_NETLINK";
         };
       };
 

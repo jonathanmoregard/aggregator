@@ -27,12 +27,13 @@ the fallback for a load that cannot expose one.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
+import socket
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 
@@ -131,20 +132,69 @@ QWEN3_EMBEDDING_GGUF_FILENAME = "Qwen3-Embedding-0.6B-Q8_0.gguf"
 #: only author is an exported variable.
 DEFAULT_BACKEND = "server"
 
-#: Where the ``server`` backend finds llama-server. An environment value
+#: Override for where the ``server`` backend finds llama-server:
+#: ``unix:///abs/path.sock`` or ``http://host:port``. An environment value
 #: because WHERE is deployment plumbing — the test suite points it at a stub,
 #: a developer at a scratch instance — while WHAT is served is not: the
 #: backend refuses a server that is not serving
 #: ``QWEN3_EMBEDDING_GGUF_FILENAME``, so this can move the socket and never
-#: the stamp.
+#: the stamp. Unset in every deployed unit; see :func:`default_embed_url`.
 EMBED_URL_ENV = "AGGREGATOR_EMBED_URL"
 
-#: Port 8719 because 8717/8718 are taken by the offline-AI chat models on the
-#: deploying host. ``nix/aggregator.nix`` binds the server unit to exactly this
-#: port; the flake check reads it out of this line, so the unit and every
-#: process that does not export ``AGGREGATOR_EMBED_URL`` — the MCP server is
-#: registered bare — agree without anybody configuring them to.
-DEFAULT_EMBED_URL = "http://127.0.0.1:8719"
+#: The server's socket, relative to ``$XDG_RUNTIME_DIR``. A UNIX SOCKET, NOT A
+#: TCP PORT, because of the worker's sandbox: it reads the whole untrusted
+#: corpus, and "offline by design" there means ``RestrictAddressFamilies=
+#: AF_UNIX AF_NETLINK`` — no IP at all. The loopback-only alternative,
+#: ``AF_INET`` plus ``IPAddressDeny=any``/``IPAddressAllow=localhost``, was
+#: measured to confine NOTHING in the deploying host's user manager (no cgroup
+#: BPF there: a connect to the host's LAN address went through), so TCP would
+#: have widened the worker from no network to the whole network.
+#:
+#: The directory is the server unit's ``RuntimeDirectory=`` — mode 0700, so
+#: only this user can reach the socket, and removed by systemd when the unit
+#: stops, so a stale socket cannot outlive it. ``nix/aggregator.nix`` binds
+#: exactly this path; the flake check reads it out of this line, so the unit
+#: and every process that does not export ``AGGREGATOR_EMBED_URL`` — the MCP
+#: server is registered bare — agree without anybody configuring them to.
+EMBED_SOCKET_NAME = "aggregator-embed-server/embed.sock"
+
+
+def default_embed_url() -> str:
+    """``unix://$XDG_RUNTIME_DIR/<EMBED_SOCKET_NAME>`` for this process.
+
+    Falls back to ``/run/user/<uid>`` — which is what systemd-logind makes
+    ``XDG_RUNTIME_DIR`` anyway — for a process started with a scrubbed
+    environment, so an MCP server launched without it still finds the unit.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip() or f"/run/user/{os.getuid()}"
+    return f"unix://{runtime.rstrip('/')}/{EMBED_SOCKET_NAME}"
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """``http.client`` over ``AF_UNIX``. Stdlib only, no new dependency."""
+
+    def __init__(self, path: str, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(self._socket_path)
+        except BaseException:
+            sock.close()
+            raise
+        self.sock = sock
+
+
+class _HTTPStatusError(Exception):
+    """A non-2xx reply, carried to the one place that classifies it."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+        self.detail = detail
 
 #: The unit a "server is unreachable" message sends the operator to.
 EMBED_SERVER_UNIT = "aggregator-embed-server.service"
@@ -471,8 +521,16 @@ class Embedder:
                     f"{_DEFAULT_MODEL_GGUF} ({QWEN3_EMBEDDING_GGUF_FILENAME}); "
                     f"model_name={model_name!r} cannot be honoured"
                 )
-            url = os.environ.get(EMBED_URL_ENV, "").strip() or DEFAULT_EMBED_URL
+            url = os.environ.get(EMBED_URL_ENV, "").strip() or default_embed_url()
             self._server_url = url.rstrip("/")
+            parsed = urllib.parse.urlsplit(self._server_url)
+            if parsed.scheme not in ("unix", "http") or not (
+                parsed.path if parsed.scheme == "unix" else parsed.netloc
+            ):
+                raise ValueError(
+                    f"{EMBED_URL_ENV}={url!r} is neither unix:///path.sock nor "
+                    f"http://host:port"
+                )
             self._server_model = self._verify_server()
         elif self.backend == "st":
             from sentence_transformers import SentenceTransformer
@@ -669,31 +727,43 @@ class Embedder:
         probe can find out whether it discriminates between rows.
         """
         assert self._server_url is not None
-        url = f"{self._server_url}{path}"
-        data = None if payload is None else json.dumps(payload).encode()
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/json"} if data else {},
-            method="GET" if data is None else "POST",
-        )
+        where = f"{self._server_url}{path}"
+        parsed = urllib.parse.urlsplit(self._server_url)
+        if parsed.scheme == "unix":
+            conn: http.client.HTTPConnection = _UnixHTTPConnection(parsed.path, timeout)
+        else:
+            conn = http.client.HTTPConnection(parsed.netloc, timeout=timeout)
+        body = None if payload is None else json.dumps(payload).encode()
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - loopback URL from our own config
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            detail = e.read()[:500].decode("utf-8", "replace")
-            if e.code == 503:
+            try:
+                conn.request(
+                    "GET" if body is None else "POST",
+                    path,
+                    body=body,
+                    headers={"Content-Type": "application/json"} if body else {},
+                )
+                resp = conn.getresponse()
+                raw = resp.read()
+            finally:
+                conn.close()
+            if resp.status >= 300:
+                raise _HTTPStatusError(resp.status, raw[:500].decode("utf-8", "replace"))
+            return json.loads(raw)
+        except _HTTPStatusError as e:
+            if e.status == 503:
                 raise EmbedServerUnavailableError(
-                    f"{url} answered 503 ({detail}); llama-server says this "
+                    f"{where} answered 503 ({e.detail}); llama-server says this "
                     f"while its model is still loading"
                 ) from e
-            raise RuntimeError(f"{url} answered HTTP {e.code}: {detail}") from e
-        except (OSError, ValueError) as e:
-            # URLError, ConnectionError, TimeoutError and http.client's
-            # RemoteDisconnected are all OSError; ValueError is a body that is
-            # not JSON — a half-written reply from a process that died.
+            raise RuntimeError(f"{where} answered HTTP {e.status}: {e.detail}") from e
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            # A missing socket file (unit stopped: systemd removed its runtime
+            # directory), a refused or reset connection, a timeout, and a reply
+            # cut off mid-body are all OSError or HTTPException; ValueError is
+            # a body that is not JSON — a half-written reply from a process
+            # that died.
             raise EmbedServerUnavailableError(
-                f"the embed server at {url} is not answering "
+                f"the embed server at {where} is not answering "
                 f"({type(e).__name__}: {e}). It is the {EMBED_SERVER_UNIT} "
                 f"user unit — check `systemctl --user status "
                 f"{EMBED_SERVER_UNIT}`; offline-AI mode stops it on purpose. "
@@ -726,7 +796,7 @@ class Embedder:
                 listing = self._server_request("/v1/models")
                 break
             except EmbedServerUnavailableError as e:
-                loading = isinstance(e.__cause__, urllib.error.HTTPError)
+                loading = isinstance(e.__cause__, _HTTPStatusError)
                 if not loading or time.monotonic() >= deadline:
                     raise
                 time.sleep(0.5)

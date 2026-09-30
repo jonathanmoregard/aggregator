@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import socketserver
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -50,7 +52,11 @@ class EmbedServerStub:
         model_path: str = f"/models/{SERVED_FILE}",
         n_embd: int = NATIVE_DIM,
         ftype: str | None = "Q8_0",
+        unix_path: str | None = None,
     ) -> None:
+        #: Listen on this AF_UNIX path — the deployed transport — instead of
+        #: a loopback TCP port.
+        self.unix_path = unix_path
         self.model_path = model_path
         self.n_embd = n_embd
         self.ftype = ftype
@@ -162,7 +168,15 @@ class EmbedServerStub:
                     # running inside it.
                     threading.Thread(target=stub.stop, daemon=True).start()
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if self.unix_path is not None:
+
+            class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
+                daemon_threads = True
+
+            os.makedirs(os.path.dirname(self.unix_path), exist_ok=True)
+            self._httpd = UnixHTTPServer(self.unix_path, Handler)
+        else:
+            self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
         return self
@@ -172,6 +186,10 @@ class EmbedServerStub:
             httpd, self._httpd = self._httpd, None
             httpd.shutdown()
             httpd.server_close()
+            # What systemd does to the unit's RuntimeDirectory on stop: the
+            # socket file goes away, so "stopped" looks like the real thing.
+            if self.unix_path is not None and os.path.exists(self.unix_path):
+                os.unlink(self.unix_path)
 
     def __exit__(self, *exc) -> None:
         self.stop()
@@ -179,6 +197,8 @@ class EmbedServerStub:
     @property
     def url(self) -> str:
         assert self._httpd is not None
+        if self.unix_path is not None:
+            return f"unix://{self.unix_path}"
         host, port = self._httpd.server_address[:2]
         return f"http://{host}:{port}"
 
@@ -196,3 +216,15 @@ def closed_port_url() -> str:
     port = s.getsockname()[1]
     s.close()
     return f"http://127.0.0.1:{port}"
+
+
+def short_socket_path(name: str = "embed.sock") -> str:
+    """A fresh AF_UNIX path short enough for the 108-byte ``sun_path`` limit,
+    which pytest's ``tmp_path`` blows through on a long test name."""
+    import atexit
+    import shutil
+    import tempfile
+
+    root = tempfile.mkdtemp(prefix="aes-", dir="/tmp")
+    atexit.register(shutil.rmtree, root, True)
+    return os.path.join(root, "run", name)
