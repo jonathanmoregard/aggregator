@@ -49,6 +49,18 @@
             done
           '';
 
+          # Stand-in for `services.aggregator.embed.server.package`. Not
+          # `pkgs.llama-cpp-vulkan`: the check is about the unit and its
+          # launcher, and pulling a GPU build of llama.cpp into the check's
+          # closure would make it slow for nothing it asserts. The stub prints
+          # its argv, so step 10 can EXECUTE the real launcher and read back
+          # the exact command line the server would be started with.
+          fixtureLlama = pkgs.runCommand "llama-server-unit-fixture" { } ''
+            mkdir -p "$out/bin"
+            printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$out/bin/llama-server"
+            chmod +x "$out/bin/llama-server"
+          '';
+
           # A throwaway home-manager evaluation of ./nix/aggregator.nix, used
           # only to render the unit files the module generates.
           #
@@ -66,6 +78,7 @@
                 services.aggregator = {
                   enable = true;
                   package = fixturePackage;
+                  embed.server.package = fixtureLlama;
                 };
               }
             ];
@@ -94,6 +107,7 @@
                     services.aggregator = {
                       enable = true;
                       package = fixturePackage;
+                      embed.server.package = fixtureLlama;
                       embed.timeoutStartSec = value;
                     };
                   }
@@ -126,15 +140,18 @@
           # value asserted on is now the one that decides the download, and the
           # check's inputs include the file that decides it, so editing that
           # file re-runs this.
+          #
+          # Tolerates a type annotation (`NAME: str | None = "..."`), which is
+          # how the GGUF revision pin is declared; the value is the last group.
           pythonDefaultModel = { file, const }:
             let
               lines = pkgs.lib.splitString "\n" (builtins.readFile file);
               hits = builtins.filter (m: m != null) (
-                map (l: builtins.match "${const} = \"([^\"]+)\".*" l) lines
+                map (l: builtins.match "${const}(:[^=]*)? = \"([^\"]+)\".*" l) lines
               );
             in
               if builtins.length hits == 1
-              then builtins.elemAt (builtins.head hits) 0
+              then builtins.elemAt (builtins.head hits) 1
               else throw (
                 "flake check: expected exactly one `${const} = \"...\"` in "
                 + "${toString file}, found ${toString (builtins.length hits)}. "
@@ -149,10 +166,39 @@
           # for weights nobody will ever write there.
           hfCacheDirOf = repo: "models--" + builtins.replaceStrings ["/"] ["--"] repo;
 
+          # THE SERVER BACKEND'S MODEL, because it is the source default
+          # (`DEFAULT_BACKEND = "server"`): the repo, the pinned revision and
+          # the one file, which together are the path the server unit opens.
           pyEmbedModel = pythonDefaultModel {
             file = ./aggregator/core/embed.py;
-            const = "_DEFAULT_MODEL_ST";
+            const = "_DEFAULT_MODEL_GGUF";
           };
+          pyEmbedRevision = pythonDefaultModel {
+            file = ./aggregator/core/embed.py;
+            const = "QWEN3_EMBEDDING_GGUF_REVISION";
+          };
+          pyEmbedFile = pythonDefaultModel {
+            file = ./aggregator/core/embed.py;
+            const = "QWEN3_EMBEDDING_GGUF_FILENAME";
+          };
+          pyEmbedBackend = pythonDefaultModel {
+            file = ./aggregator/core/embed.py;
+            const = "DEFAULT_BACKEND";
+          };
+          # The port every process that does not export AGGREGATOR_EMBED_URL
+          # dials — the MCP server is registered bare, so this IS where its
+          # queries go. The unit must bind exactly this.
+          pyEmbedPort =
+            let
+              url = pythonDefaultModel {
+                file = ./aggregator/core/embed.py;
+                const = "DEFAULT_EMBED_URL";
+              };
+              m = builtins.match "http://127\\.0\\.0\\.1:([0-9]+)/?" url;
+            in
+              if m == null
+              then throw "flake check: DEFAULT_EMBED_URL (${url}) is not a 127.0.0.1:<port> URL; the server unit binds loopback only"
+              else builtins.head m;
           pyRerankModel = pythonDefaultModel {
             file = ./aggregator/core/rerank.py;
             const = "_DEFAULT_MODEL";
@@ -184,6 +230,7 @@
               # uv run, their own notifier with their own debounce stamp.
               all_units="aggregator-embed.service aggregator-embed.timer \
                          aggregator-embed-seed.service \
+                         aggregator-embed-server.service \
                          aggregator-embed-failure-notify.service \
                          aggregator-embed-seed-failure-notify.service \
                          aggregator-tag.service aggregator-tag.timer \
@@ -573,6 +620,12 @@
               py_rerank_model=${pkgs.lib.escapeShellArg pyRerankModel}
               py_embed_dir=${pkgs.lib.escapeShellArg (hfCacheDirOf pyEmbedModel)}
               py_rerank_dir=${pkgs.lib.escapeShellArg (hfCacheDirOf pyRerankModel)}
+              # The exact file the server opens, relative to HF_HOME: repo
+              # directory, PINNED revision, pinned filename. A unit gating on
+              # "some snapshot exists" would wave through a cache holding the
+              # wrong revision; one gating on a stale sha would refuse forever
+              # on a correctly seeded machine.
+              py_embed_path=${pkgs.lib.escapeShellArg "hub/${hfCacheDirOf pyEmbedModel}/snapshots/${pyEmbedRevision}/${pyEmbedFile}"}
 
               for repo in "$py_embed_model" "$py_rerank_model"; do
                 grep -qF "$repo" "$seed_script" \
@@ -586,12 +639,16 @@
               # forever on a correctly seeded machine, or waves through a
               # machine holding the wrong weights.
               worker_script=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$svc")
-              grep -qF "$py_embed_dir" "$worker_script" \
-                || fail "aggregator-embed.service's preflight does not check for $py_embed_dir — the HF cache directory of $py_embed_model, which is the model the worker will actually load. It is gating on some other directory, so 'weights present' is a claim about the wrong model"
-              for dir in "$py_embed_dir" "$py_rerank_dir"; do
-                grep -qF "$dir" "$seed_script" \
-                  || fail "the seed unit's presence check never looks at $dir — it would report 'already present' or 'downloading' about a directory the loaders do not use"
+              server_script=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' \
+                                "$units/aggregator-embed-server.service")
+              for pair in "aggregator-embed.service:$worker_script" \
+                          "aggregator-embed-server.service:$server_script" \
+                          "aggregator-embed-seed.service:$seed_script"; do
+                grep -qF "$py_embed_path" "''${pair#*:}" \
+                  || fail "''${pair%%:*} does not look for $py_embed_path — the pinned file of $py_embed_model that embed.py fetches and the server serves. It is gating on some other path, so 'weights present' is a claim about the wrong bytes"
               done
+              grep -qF "$py_rerank_dir" "$seed_script" \
+                || fail "the seed unit's presence check never looks at $py_rerank_dir — it would report 'already present' or 'downloading' about a directory the loaders do not use"
 
               # The seeder is a DOWNLOAD, not a workload. It used to embed a
               # real corpus row to warm the cache, which ran untrusted text
@@ -676,13 +733,16 @@
                   || fail "aggregator-embed-seed.service is missing '$directive' — it downloads 2.4 GB off the internet and loads it into torch, and it must not be less sandboxed than the offline worker on anything except the network"
               done
 
-              # The worker's two network directives, which the seeder is the
-              # one unit allowed to relax.
+              # The worker's network directives. It dials exactly one socket,
+              # the embed server on 127.0.0.1, so it gets AF_INET and loopback
+              # and nothing else; the seeder is the one unit allowed the
+              # internet.
               for directive in \
-                'RestrictAddressFamilies=AF_UNIX AF_NETLINK' \
-                'IPAddressDeny=any'; do
+                'RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET' \
+                'IPAddressDeny=any' \
+                'IPAddressAllow=localhost'; do
                 grep -qxF "$directive" "$svc" \
-                  || fail "aggregator-embed.service is missing '$directive'"
+                  || fail "aggregator-embed.service is missing '$directive' — it must reach the loopback embed server and nothing else"
               done
 
               # The seeder MUST still restrict address families — dropping the
@@ -785,6 +845,97 @@
               if grep -q '^IPAddressDeny=any$' "$tag_svc"; then
                 fail "aggregator-tag.service sets IPAddressDeny=any — that blocks the API call this unit exists to make"
               fi
+
+              # ---- 10. The embed server ------------------------------------
+              # EXECUTED, not grepped: the real launcher is run against a
+              # scratch HF_HOME with the stub llama-server from the fixture,
+              # which prints its argv. So what is asserted is the command line
+              # the server would actually get.
+              server_svc="$units/aggregator-embed-server.service"
+              work="$TMPDIR/embed-server"
+              rm -rf "$work"; mkdir -p "$work/hf"
+
+              # (a) Unseeded: refuse with EX_CONFIG and name the seed unit, so
+              # Restart=on-failure does not loop on something a restart
+              # cannot fix.
+              rc=0
+              HF_HOME="$work/hf" "$server_script" > "$work/unseeded.log" 2>&1 || rc=$?
+              [ "$rc" = 78 ] \
+                || { cat "$work/unseeded.log" >&2; fail "the server launcher exited $rc on an unseeded cache, not 78 — RestartPreventExitStatus=78 is what stops a restart loop there"; }
+              grep -qF 'aggregator-embed-seed.service' "$work/unseeded.log" \
+                || fail "the server launcher's refusal does not name aggregator-embed-seed.service, the only unit that can fix it"
+              grep -qxF 'RestartPreventExitStatus=78' "$server_svc" \
+                || fail "aggregator-embed-server.service does not stop restarting on 78 — an unseeded cache becomes a restart loop"
+
+              # (b) Seeded: the exact pinned file, and the flags the stamp
+              # depends on.
+              mkdir -p "$(dirname "$work/hf/$py_embed_path")"
+              : > "$work/hf/$py_embed_path"
+              HF_HOME="$work/hf" "$server_script" > "$work/argv" 2>&1 \
+                || { cat "$work/argv" >&2; fail "the server launcher failed on a seeded cache"; }
+              argv_has() { grep -qxF -- "$1" "$work/argv"; }
+              argv_pair() {
+                # $1 flag, $2 value: the value must follow the flag.
+                grep -A1 -xF -- "$1" "$work/argv" | tail -n 1 | grep -qxF -- "$2"
+              }
+              argv_pair -m "$work/hf/$py_embed_path" \
+                || fail "the server is not started on $py_embed_path — it would serve bytes the stamp does not describe"
+              argv_has --embedding || fail "the server is not started with --embedding"
+              # Qwen3-Embedding is last-token pooled, and no endpoint reports
+              # pooling, so embed.py cannot check it on connect. This is the
+              # only place it is pinned.
+              argv_pair --pooling last \
+                || fail "the server is not started with --pooling last — any other pooling yields well-formed vectors in a different space, and nothing downstream can tell"
+              argv_pair --host 127.0.0.1 \
+                || fail "the server does not bind 127.0.0.1 only"
+              argv_pair --port ${pyEmbedPort} \
+                || fail "the server does not bind port ${pyEmbedPort}, the port embed.py's DEFAULT_EMBED_URL dials — the bare-registered MCP server would find nothing and every query would silently lose its vector arm"
+
+              # (c) Always on, restarted on failure, loopback-only sandbox, and
+              # the GPU still visible.
+              grep -qxF 'WantedBy=default.target' "$server_svc" \
+                || fail "aggregator-embed-server.service is not wanted by default.target — queries would embed against a server nobody started"
+              grep -qxF 'Restart=on-failure' "$server_svc" \
+                || fail "aggregator-embed-server.service does not restart on failure"
+              for directive in \
+                'NoNewPrivileges=true' \
+                'PrivateTmp=true' \
+                'RestrictNamespaces=true' \
+                'RestrictSUIDSGID=true' \
+                'LockPersonality=true' \
+                'ProtectSystem=full' \
+                'ProtectHome=read-only' \
+                'RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET' \
+                'IPAddressDeny=any' \
+                'IPAddressAllow=localhost'; do
+                grep -qxF "$directive" "$server_svc" \
+                  || fail "aggregator-embed-server.service is missing '$directive' — it tokenizes the whole untrusted corpus in C++"
+              done
+              if grep -q '^PrivateDevices=' "$server_svc"; then
+                fail "aggregator-embed-server.service sets PrivateDevices — that hides /dev/dri, and llama.cpp then runs on the CPU at a sixtieth of the speed without failing"
+              fi
+
+              # (d) The worker is ordered after it and pulls it in.
+              grep -qxF 'Wants=aggregator-embed-server.service' "$svc" \
+                || fail "aggregator-embed.service does not Want the embed server"
+              grep -qxF 'After=aggregator-embed-server.service' "$svc" \
+                || fail "aggregator-embed.service is not ordered After the embed server"
+
+              # (e) The backend is the SOURCE default, not a unit override.
+              # `cli._would_start_a_second_index_by_accident` refuses a
+              # backfill whose only author is AGGREGATOR_EMBED_BACKEND, and
+              # the MCP server (registered bare) cannot see a unit's
+              # environment — so an override here would split the worker and
+              # the queries across two indexes.
+              [ ${pkgs.lib.escapeShellArg pyEmbedBackend} = server ] \
+                || fail "embed.py's DEFAULT_BACKEND is ${pyEmbedBackend}, but this module deploys the server backend"
+              for u in aggregator-embed.service aggregator-embed-seed.service; do
+                if grep -qE 'AGGREGATOR_EMBED_(BACKEND|URL)=' "$units/$u"; then
+                  grep -nE 'AGGREGATOR_EMBED_(BACKEND|URL)=' "$units/$u" >&2
+                  fail "$u exports the embed backend or URL — the deployed choice must be the source default, which is the only thing every process agrees on"
+                fi
+              done
+              rm -rf "$work"
 
               # ---- 9. The score behind step 8, and why it is not asserted -
               # `systemd-analyze security --offline=true --user <unit>` rates

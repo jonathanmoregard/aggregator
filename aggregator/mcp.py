@@ -1199,8 +1199,11 @@ def _apply_hybrid(
                 raise _VectorModeUnavailableError(
                     "search_mode='vector' cannot run: the query could not be "
                     "embedded, so there is no vector to search with",
-                    "Run `aggregator embed --seed-models` if the embedding "
-                    "model's weights are missing, then retry. Re-run with the "
+                    "Check `systemctl --user status "
+                    "aggregator-embed-server.service` (offline-AI mode stops "
+                    "it) and run `aggregator embed --seed-models` if the "
+                    "embedding model's weights are missing, then retry. "
+                    "Re-run with the "
                     "default search_mode='hybrid' to answer from the keyword "
                     "arm meanwhile.",
                 )

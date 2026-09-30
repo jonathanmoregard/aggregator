@@ -41,6 +41,22 @@ def _isolated_state_home(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
 
 
+@pytest.fixture(autouse=True)
+def _no_real_embed_server(monkeypatch):
+    """No test may reach a real ``aggregator-embed-server`` on this machine.
+
+    The source default URL is a fixed loopback port, and on a deployed host
+    something IS listening there — a real Q8_0 model on the GPU. A test that
+    built a default ``Embedder()`` by accident would then pass or fail
+    depending on whose machine ran it, and in CI it would fail for a reason
+    unrelated to what it asserts. Port 9 (discard) has no listener, so an
+    accidental real construction fails fast and names itself. Tests that want
+    a server run ``tests/embed_server_stub.py`` and set their own URL, which
+    wins over this.
+    """
+    monkeypatch.setenv("AGGREGATOR_EMBED_URL", "http://127.0.0.1:9")
+
+
 @pytest.fixture
 def repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

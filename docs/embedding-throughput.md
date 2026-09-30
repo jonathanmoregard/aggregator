@@ -18,6 +18,45 @@ from `scripts/embedding_token_bill.py`, which exists so that every figure in
 this file is a command a reader can re-run rather than a number they have to
 trust. The int8 lever is closed by measurement in the same pass.
 
+## Superseded 2026-10-01: the encoder moved to the GPU
+
+Everything below this section measures the **CPU** backend (`st`, fp32) on
+the i7-1365U, and it is still true of that backend. It is no longer the
+deployed one. The source default is now the `server` backend
+(`aggregator/core/embed.py::DEFAULT_BACKEND`): the same Qwen3-Embedding-0.6B
+as a **Q8_0 GGUF**, served by `llama-server` (nixpkgs `llama-cpp-vulkan`,
+build 10273) on the Radeon 890M iGPU of tuxedo, as the
+`aggregator-embed-server` user unit.
+
+| | CPU `st` fp32 (below) | GPU `server` Q8_0 |
+|---|---|---|
+| tokens/s at 4000-char chunks | ~40 | **2495** (16 × 4000-char chunks in one request) |
+| one chunk | ~20 s | ~0.3 s |
+| index stamp | `Qwen/Qwen3-Embedding-0.6B-fp32@768/…` | `Qwen/Qwen3-Embedding-0.6B-GGUF-q8_0@768/chunk-4000-400/norm-l2` |
+
+Command line (`nix/aggregator.nix::embedServerRunner`):
+`llama-server -m <snapshots/370f27d…/Qwen3-Embedding-0.6B-Q8_0.gguf>
+--embedding --pooling last -ngl 99 -c 8192 -b 8192 -ub 8192 --host 127.0.0.1
+--port 8719 --no-webui`.
+
+**Parity with the vectors it replaces**, not assumed: 45 real chunks from the
+live cache, embedded by the server with exactly that command line, truncated to
+768 and L2-normalised, against the fp32 `st` vectors already stored for the
+same chunks — cosine **mean 0.9994, min 0.9990**. The quantization is not what
+the speed is bought with. The same file under the unit's sandbox measured 2448
+tokens/s (unsandboxed 2500), i.e. still on the GPU.
+
+**Why the stamp moves anyway.** 0.999 is close, not equal, and the stamp's job
+is to keep two builds' vectors from being compared silently; so the Q8_0 index
+is a new backfill beside the old one (vectors are keyed `(chunk_id, model)`,
+nothing is deleted). At this rate the corpus that was a 25-30 day CPU job is a
+matter of hours.
+
+The worker's batch constants (`cli._SECONDS_PER_CHUNK`, `_MAX_BATCH_CHUNKS`,
+`_MAX_CHUNKS_PER_ENCODE`) are still derived from the CPU rate. They were left
+alone: on the GPU they only make checkpoints and stop-checks more frequent than
+they need to be, which is the safe direction.
+
 ## Hardware
 
 | | |
@@ -247,6 +286,10 @@ lever on the 40 tok/s.
 
 ## gguf Q4_K_M — pending bench
 
+(2026-10-01: superseded by the GPU `server` backend at the top of this file,
+and `QWEN3_EMBEDDING_GGUF_REVISION` is now pinned. What follows is the
+2026-09-04 state, kept for the harness description.)
+
 The Q4_K_M backend in `aggregator/core/embed.py` has never produced a number
 in this file, and as of 2026-09-04 it cannot: `QWEN3_EMBEDDING_GGUF_REVISION`
 is `None` — no sha of the separate `-GGUF` repository has been verified — the
@@ -290,8 +333,10 @@ sometimes quoted for Q4 is a claim the bench must earn.
   100-140M parameters, i.e. ~4-5x, not 20x. Any swap is a full re-embed and
   requires re-deriving the abstention floor, since `_QUANTIZATION` and the model
   id are both in the version string.
-* **The `gguf` Q4_K_M backend already in the tree** — still needs its repository
-  revision pinned (`QWEN3_EMBEDDING_GGUF_REVISION is None`) and verified. Its
+* **The `gguf` Q4_K_M backend already in the tree** — its repository revision
+  is now pinned (`QWEN3_EMBEDDING_GGUF_REVISION`, verified for the Q8_0 file
+  the `server` backend uses; whether that revision carries a Q4_K_M file is
+  unverified). Superseded as a speed lever by the GPU server above. Its
   plausible 3-5x overlaps with what int8 was supposed to deliver, and int8
   measured 1.06x, so the same compute-bound argument applies and this should be
   weighed accordingly rather than assumed. The bench harness and the

@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -200,22 +201,25 @@ def test_pin_line_refuses_anything_but_a_40_hex_sha(harness):
 def test_pin_line_is_a_drop_in_replacement_for_the_line_embed_py_holds(harness):
     """Guard the two files against drifting apart.
 
-    The printed line is only useful if it replaces the unpinned line verbatim.
-    This reads ``embed.py`` off disk and asserts (a) the constant is still the
-    named hole — ``None``, nothing invented — and (b) the harness's output is
-    that same line with only the value changed.
+    The printed line is only useful if it replaces the constant's line
+    verbatim. The hole this harness was written to close is closed now — the
+    constant holds a verified sha — so the guard reads the line ``embed.py``
+    actually holds and asserts the harness formats exactly that line for
+    exactly that sha. A future re-pin is then a paste, not an edit.
     """
     source = Path(embed_mod.__file__).read_text()
-    unpinned = "QWEN3_EMBEDDING_GGUF_REVISION: str | None = None"
-    assert unpinned in source, (
-        "embed.py no longer holds the unpinned constant line this harness "
-        "formats a replacement for — update pin_line() to match, or the "
-        "printed instruction is wrong"
+    pinned = re.search(
+        r'^QWEN3_EMBEDDING_GGUF_REVISION: str \| None = "([0-9a-f]{40})"$',
+        source,
+        re.MULTILINE,
     )
-    sha = "f" * 40
-    expected = unpinned[: -len("None")] + f'"{sha}"'
-    assert harness.pin_line(sha) == expected
-    assert embed_mod.QWEN3_EMBEDDING_GGUF_REVISION is None
+    assert pinned, (
+        "embed.py no longer holds the constant line this harness formats a "
+        "replacement for — update pin_line() to match, or the printed "
+        "instruction is wrong"
+    )
+    assert harness.pin_line(pinned.group(1)) == pinned.group(0)
+    assert pinned.group(1) == embed_mod.QWEN3_EMBEDDING_GGUF_REVISION
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +303,9 @@ def test_the_candidate_sha_reaches_the_gguf_load_and_the_constant_is_restored(
 ):
     """The override must exercise the SAME path the hardcoded pin will take —
     ``embed.py``'s own constant, injected for the load — and must leave no
-    trace afterwards: the source constant stays None (criterion 6)."""
+    trace afterwards: the source constant is what it was (criterion 6)."""
+    committed = embed_mod.QWEN3_EMBEDDING_GGUF_REVISION
+    assert committed != _SHA
     rc = harness.main(["--backend", "gguf", "--gguf-revision", _SHA])
     assert rc == 0
 
@@ -311,10 +317,10 @@ def test_the_candidate_sha_reaches_the_gguf_load_and_the_constant_is_restored(
     )
     st_loads = [rec for rec in fake_loaders if rec["backend"] == "st"]
     assert len(st_loads) == 1
-    assert st_loads[0]["pin_at_load"] is None, (
+    assert st_loads[0]["pin_at_load"] == committed, (
         "the injected pin leaked past the gguf load"
     )
-    assert embed_mod.QWEN3_EMBEDDING_GGUF_REVISION is None
+    assert committed == embed_mod.QWEN3_EMBEDDING_GGUF_REVISION
 
 
 def test_backend_st_benches_st_alone_with_no_pin_talk(harness, fake_loaders, capsys):
@@ -562,6 +568,9 @@ def _real_unpinned_download_error() -> RuntimeError:
     """
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv(embed_mod.MODEL_DOWNLOAD_ENV, "1")
+        # The refusal only exists on a build whose pin is unset; this one has
+        # a verified sha, so the unpinned build is simulated.
+        mp.setattr(embed_mod, "QWEN3_EMBEDDING_GGUF_REVISION", None)
         with pytest.raises(RuntimeError) as excinfo:
             embed_mod.Embedder._gguf_revision(embed_mod._DEFAULT_MODEL_GGUF)
     return excinfo.value

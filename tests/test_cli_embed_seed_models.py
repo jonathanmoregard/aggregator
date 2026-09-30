@@ -46,7 +46,7 @@ def built(monkeypatch):
 
     import aggregator.core.rerank as rerank_mod
 
-    monkeypatch.setattr(cli, "Embedder", FakeEmbedder)
+    monkeypatch.setattr(cli, "seed_embedder", FakeEmbedder)
     monkeypatch.setattr(rerank_mod, "Reranker", FakeReranker)
     return built
 
@@ -96,7 +96,7 @@ def test_absent_weights_are_loud_and_name_the_fix(tmp_data_home, monkeypatch, ca
 
     import aggregator.core.rerank as rerank_mod
 
-    monkeypatch.setattr(cli, "Embedder", Missing)
+    monkeypatch.setattr(cli, "seed_embedder", Missing)
     monkeypatch.setattr(rerank_mod, "Reranker", Missing)
     monkeypatch.delenv(embed_mod.MODEL_DOWNLOAD_ENV, raising=False)
 
@@ -121,7 +121,7 @@ def test_both_models_are_reported_not_just_the_first(
 
     import aggregator.core.rerank as rerank_mod
 
-    monkeypatch.setattr(cli, "Embedder", Missing)
+    monkeypatch.setattr(cli, "seed_embedder", Missing)
     monkeypatch.setattr(rerank_mod, "Reranker", Missing)
 
     cli.main(["embed", "--seed-models"])
@@ -144,3 +144,54 @@ def test_seed_models_cannot_be_combined_with_a_batch_mode(capsys):
     """It is a mode, not a modifier: --once/--catchup mean something else."""
     with pytest.raises(SystemExit):
         cli.main(["embed", "--seed-models", "--once"])
+
+
+# -- the server backend: the file the unit serves, fetched without the unit ---
+
+
+@pytest.fixture
+def hub(monkeypatch):
+    """Record the hub call; stub the reranker. Nothing may be downloaded."""
+    import huggingface_hub
+
+    import aggregator.core.rerank as rerank_mod
+
+    seen: dict = {}
+
+    def _recorder(**kwargs):
+        seen.update(kwargs)
+        return f"/nonexistent/{kwargs.get('filename')}"
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _recorder)
+    monkeypatch.setattr(rerank_mod, "Reranker", lambda *a, **k: None)
+    monkeypatch.delenv("AGGREGATOR_EMBED_BACKEND", raising=False)
+    return seen
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_seeding_the_server_backend_fetches_the_pinned_file_without_the_server(
+    tmp_data_home, hub, monkeypatch, capsys, allowed
+):
+    """The seed unit runs with the server STOPPED on a fresh machine — the
+    server cannot start until this has run — so seeding must not need it.
+
+    And what it fetches must be exactly the bytes the server unit will look
+    for: the pinned revision of the pinned file, not whatever ``main`` holds.
+    """
+    from tests.embed_server_stub import closed_port_url
+
+    monkeypatch.setenv(embed_mod.EMBED_URL_ENV, closed_port_url())
+    if allowed:
+        monkeypatch.setenv(embed_mod.MODEL_DOWNLOAD_ENV, "1")
+    else:
+        monkeypatch.delenv(embed_mod.MODEL_DOWNLOAD_ENV, raising=False)
+
+    rc = cli.main(["embed", "--seed-models"])
+
+    assert rc == 0, capsys.readouterr().err
+    assert hub["repo_id"] == embed_mod._DEFAULT_MODEL_GGUF
+    assert hub["filename"] == embed_mod.QWEN3_EMBEDDING_GGUF_FILENAME
+    rev = embed_mod.QWEN3_EMBEDDING_GGUF_REVISION
+    assert isinstance(rev, str) and len(rev) == 40 and int(rev, 16) >= 0
+    assert hub["revision"] == rev
+    assert hub["local_files_only"] is (not allowed)

@@ -101,7 +101,7 @@ def test_the_real_model_hands_over_its_own_prompt():
     """The end-to-end version of the two tests above, against the weights on
     this machine rather than against a double."""
     try:
-        embedder = Embedder()
+        embedder = Embedder(backend="st")
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"embedder unavailable: {e}")
 
@@ -119,7 +119,7 @@ def test_the_prompt_reaches_the_encoder_verbatim(monkeypatch):
     monkeypatch.setattr(
         embedder,
         "_encode",
-        lambda texts: (
+        lambda texts, **_kw: (
             seen.extend(texts),
             np.zeros((len(texts), 768), dtype=np.float32),
         )[1],
@@ -147,7 +147,7 @@ def test_a_model_with_no_prompt_registry_gets_no_instruction(monkeypatch):
     monkeypatch.setattr(
         embedder,
         "_encode",
-        lambda texts: (
+        lambda texts, **_kw: (
             seen.extend(texts),
             np.zeros((len(texts), 768), dtype=np.float32),
         )[1],
@@ -189,7 +189,7 @@ def test_documents_are_encoded_exactly_as_given(monkeypatch):
     monkeypatch.setattr(
         embedder,
         "_encode",
-        lambda texts: (
+        lambda texts, **_kw: (
             seen.append(list(texts)),
             np.zeros((len(texts), 768), dtype=np.float32),
         )[1],

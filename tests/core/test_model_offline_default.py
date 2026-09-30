@@ -34,6 +34,13 @@ import aggregator.core.rerank as rerank_mod
 _OPT_IN = "AGGREGATOR_ALLOW_MODEL_DOWNLOAD"
 
 
+def _st_embedder():
+    """The in-process loader these tests are about. The source default is the
+    ``server`` backend, whose weights never load in this process — its offline
+    gate is on the seed path, see ``test_cli_embed_seed_models.py``."""
+    return embed_mod.Embedder(backend="st")
+
+
 def _kwargs_from(monkeypatch, target, factory):
     seen = {}
 
@@ -49,7 +56,7 @@ def _kwargs_from(monkeypatch, target, factory):
 def test_the_embedder_is_offline_by_default(monkeypatch):
     monkeypatch.delenv(_OPT_IN, raising=False)
     kwargs = _kwargs_from(
-        monkeypatch, "sentence_transformers.SentenceTransformer", embed_mod.Embedder
+        monkeypatch, "sentence_transformers.SentenceTransformer", _st_embedder
     )
     assert kwargs["local_files_only"] is True
 
@@ -65,7 +72,7 @@ def test_the_reranker_is_offline_by_default(monkeypatch):
 def test_the_embedder_downloads_only_when_explicitly_allowed(monkeypatch):
     monkeypatch.setenv(_OPT_IN, "1")
     kwargs = _kwargs_from(
-        monkeypatch, "sentence_transformers.SentenceTransformer", embed_mod.Embedder
+        monkeypatch, "sentence_transformers.SentenceTransformer", _st_embedder
     )
     assert kwargs["local_files_only"] is False
 
@@ -83,7 +90,7 @@ def test_only_an_affirmative_opt_in_counts(monkeypatch, value):
     """A variable that exists but says no must not be read as yes."""
     monkeypatch.setenv(_OPT_IN, value)
     kwargs = _kwargs_from(
-        monkeypatch, "sentence_transformers.SentenceTransformer", embed_mod.Embedder
+        monkeypatch, "sentence_transformers.SentenceTransformer", _st_embedder
     )
     assert kwargs["local_files_only"] is True
 
@@ -106,7 +113,8 @@ def test_an_uncached_model_is_refused_rather_than_fetched(monkeypatch):
     monkeypatch.delenv(_OPT_IN, raising=False)
     with pytest.raises(OSError):
         embed_mod.Embedder(
-            model_name="aggregator-test/nonexistent-model-do-not-create"
+            backend="st",
+            model_name="aggregator-test/nonexistent-model-do-not-create",
         )
 
 

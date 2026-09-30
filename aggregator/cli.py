@@ -58,7 +58,13 @@ from pathlib import Path
 from typing import Any
 
 from aggregator.core.chunk import chunk_body
-from aggregator.core.embed import MODEL_DOWNLOAD_ENV, Embedder, downloads_allowed
+from aggregator.core.embed import (
+    MODEL_DOWNLOAD_ENV,
+    Embedder,
+    EmbedServerError,
+    downloads_allowed,
+    seed_embedder,
+)
 from aggregator.core.provenance import classify
 from aggregator.core.store import (
     EMBED_BACKLOG_ORDER,
@@ -2008,7 +2014,25 @@ def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
     # right about them — while the load itself is seconds against a backfill
     # measured in weeks, and the cheap refusal above has already caught the
     # common case.
-    embedder = Embedder()
+    #
+    # THE ENCODER MAY SIMPLY NOT BE THERE, and on the ``server`` backend that
+    # is routine rather than exceptional: offline-AI mode stops
+    # ``aggregator-embed-server.service`` for hours at a time, and this timer
+    # keeps firing through it. Caught here, BEFORE ``migrate()``, so a tick
+    # that finds the unit stopped changes nothing at all — no stamp, no claim,
+    # no ledger entry, no row — and says which unit to look at instead of
+    # printing a socket traceback. Non-zero, because a run that embedded
+    # nothing must not read as one that finished.
+    try:
+        embedder = Embedder()
+    except EmbedServerError as e:
+        print(
+            f"ERROR: aggregator embed cannot run — {e}\n"
+            f"No row was embedded and the backlog is untouched; the next tick "
+            f"resumes once the embed server is back.",
+            file=sys.stderr,
+        )
+        return 1
     # ``embed`` MIGRATES ITSELF (see ``main``), so it needs its own copy of the
     # guard rather than inheriting one. It runs on its own thirty-minute timer
     # with its own OnFailure= notifier, so an unhandled refusal here would be a
@@ -2943,7 +2967,7 @@ def _cmd_seed_models() -> int:
 
     allowed = downloads_allowed()
     failures: list[tuple[str, BaseException]] = []
-    for label, build in (("embedder", Embedder), ("reranker", Reranker)):
+    for label, build in (("embedder", seed_embedder), ("reranker", Reranker)):
         try:
             build()
         except Exception as e:  # noqa: BLE001 - reported per model, not handled
@@ -3886,7 +3910,8 @@ def _embed_batch(
                     f"({type(e).__name__}: {e}) and the embedder then could not "
                     f"embed a known-good probe string either. That is an "
                     f"environment fault — a model that has not loaded, an OOM, "
-                    f"an I/O blip — and not bad data, so that row was NOT "
+                    f"an I/O blip, an embed server that stopped answering — "
+                    f"and not bad data, so that row was NOT "
                     f"blamed for it and every row still unembedded stays in "
                     f"the backlog. Fix the model and re-run "
                     f"`aggregator embed --catchup`."
