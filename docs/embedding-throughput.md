@@ -36,8 +36,10 @@ build 10273) on the Radeon 890M iGPU of tuxedo, as the
 
 Command line (`nix/aggregator.nix::embedServerRunner`):
 `llama-server -m <snapshots/370f27d…/Qwen3-Embedding-0.6B-Q8_0.gguf>
---embedding --pooling last -ngl 99 -c 8192 -b 8192 -ub 8192 --host 127.0.0.1
---port 8719 --no-webui`.
+--embedding --pooling last -ngl 99 -c 8192 -b 8192 -ub 8192
+--host $XDG_RUNTIME_DIR/aggregator-embed-server/embed.sock --no-webui` (the
+2495 figure was measured over loopback TCP; over the unix socket, under the
+unit's sandbox, the same batch measured 2270).
 
 **Parity with the vectors it replaces**, not assumed: 45 real chunks from the
 live cache, embedded by the server with exactly that command line, truncated to
