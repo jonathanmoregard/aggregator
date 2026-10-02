@@ -651,3 +651,58 @@ def test_iter_records_omits_updated_filter_when_since_is_none(monkeypatch):
     assert len(called_paths) == 4
     for path in called_paths:
         assert "+updated:" not in path
+
+
+# --- transient gh failures are retried, permanent ones are not -------------
+
+
+def _gh_err(stderr: str) -> subprocess.CalledProcessError:
+    return subprocess.CalledProcessError(returncode=1, cmd=["gh"], stderr=stderr)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _gh_err("gh: Server Error (HTTP 502)"),
+        _gh_err("HTTP 500: Internal Server Error (https://api.github.com/search/issues)"),
+        _gh_err("HTTP 429: Too Many Requests"),
+        _gh_err('Get "https://api.github.com/x": dial tcp: lookup api.github.com: no such host'),
+        _gh_err("read tcp 10.0.0.2:5555->140.82.121.6:443: read: connection reset by peer"),
+        _gh_err("net/http: TLS handshake timeout"),
+        subprocess.TimeoutExpired(cmd=["gh"], timeout=1),
+    ],
+    ids=["502", "500", "429", "dns", "reset", "tls-timeout", "timeout"],
+)
+def test_default_api_fetcher_retries_a_transient_failure(exc):
+    ok = subprocess.CompletedProcess(args=["gh"], returncode=0, stdout='{"id": 1}\n', stderr="")
+    with patch("aggregator.sources.github.subprocess.run", side_effect=[exc, ok]) as run:
+        items = _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+    assert items == [{"id": 1}]
+    assert run.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _gh_err("HTTP 401: Bad credentials"),
+        _gh_err("HTTP 422: Validation Failed"),
+        subprocess.CalledProcessError(returncode=1, cmd=["gh"]),
+        FileNotFoundError("gh not installed"),
+    ],
+    ids=["401", "422", "no-stderr", "gh-missing"],
+)
+def test_default_api_fetcher_does_not_retry_a_permanent_failure(exc):
+    with patch("aggregator.sources.github.subprocess.run", side_effect=exc) as run, \
+         pytest.raises(GhApiError):
+        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+    assert run.call_count == 1
+
+
+def test_default_scope_fetcher_retries_a_transient_failure():
+    ok = _fake_completed_process("HTTP/2 200\nX-Oauth-Scopes: public_repo\n\n{}")
+    with patch(
+        "aggregator.sources.github.subprocess.run",
+        side_effect=[_gh_err("HTTP 503: Service Unavailable"), ok],
+    ) as run:
+        assert _default_scope_fetcher() == ["public_repo"]
+    assert run.call_count == 2
