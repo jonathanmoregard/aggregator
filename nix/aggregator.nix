@@ -334,9 +334,55 @@ let
   #   -ngl 99           every layer on the GPU.
   #   -c 8192           context; a 4000-character chunk is ~1k tokens, and
   #                     the chunker's worst case (dense non-English text,
-  #                     base64) stays well inside it.
-  #   -b/-ub 8192       an embedding input must fit ONE micro-batch in
-  #                     llama.cpp, so the physical batch is the context.
+  #                     base64) stays well inside it. The ONLY size ceiling
+  #                     on an input — see -ub.
+  #   -b/-ub 1024       the micro-batch is a MEMORY/THROUGHPUT knob, not an
+  #                     input limit. This block used to say "an embedding
+  #                     input must fit ONE micro-batch, so the physical
+  #                     batch is the context" and set both to 8192. That is
+  #                     true of non-causal (BERT-style) embedders; Qwen3-
+  #                     Embedding is a causal decoder with last-token
+  #                     pooling, and llama-server carries an input across
+  #                     micro-batches in the KV cache. Measured 2026-10-02
+  #                     on tuxedo (build 10273, Vulkan, Radeon 890M): a
+  #                     5997-token input embeds at every -ub from 512 to
+  #                     8192, cosine ≥ 0.9999 between sizes. What -ub 8192
+  #                     without flash attention DID do was pin ~20 GiB for a
+  #                     640 MB model — the KQ compute buffer scales with
+  #                     ubatch × context — and the unit sat at RSS 11.0 GiB
+  #                     + GPU-pinned RAM (GTT) 8.7 GiB, cgroup peak 17.9
+  #                     GiB, 6.4 GiB of it swapped. Sweep, with -fa on and
+  #                     --cache-ram 0: 64 chunks of 828-1062 tokens, four
+  #                     per request as the worker sends them, then one
+  #                     5997-token input; resident = RSS + GTT after that;
+  #                     tokens/s on the chunks, old and new under the same
+  #                     background load (the worker was running):
+  #                       -ub  512   2.3 GiB    638 tok/s
+  #                       -ub 1024   3.0 GiB   2302 tok/s   <- this
+  #                       -ub 2048   4.3 GiB   2269 tok/s
+  #                       -ub 4096   6.7 GiB   2058 tok/s
+  #                       -ub 8192   9.3 GiB   1250 tok/s   (fa on)
+  #                       old flags 19.7 GiB   2033 tok/s   (fa off, cache 8 GiB)
+  #                     1024 is the knee: the old throughput at a sixth of
+  #                     the memory. -b is set EQUAL to -ub because
+  #                     llama-server forces n_batch = n_ubatch for
+  #                     embeddings ("setting n_batch = n_ubatch ... to avoid
+  #                     assertion failure"); a larger -b in argv would be a
+  #                     number that never runs. The flake's hygiene check
+  #                     executes this launcher and asserts -ub, -fa and
+  #                     --cache-ram, so an edit cannot bring the hog back
+  #                     quietly.
+  #   -fa on            flash attention: the KQ matrix is never materialised
+  #                     (compute buffer 612 MiB at -ub 1024 instead of
+  #                     gigabytes). Vectors agree with the non-FA ones at
+  #                     cosine min 0.99978 / mean 0.99996 over the 64
+  #                     chunks and 0.99992 on the 5997-token input — the
+  #                     stamp stays valid.
+  #   --cache-ram 0     llama-server's prompt cache (default 8192 MiB of
+  #                     host RAM) keeps the KV state of past prompts to
+  #                     reuse on a shared prefix. An embedding corpus has
+  #                     no prefixes to reuse; the cache only grew RSS by
+  #                     ~100 MiB per ~1k-token input until it hit the cap.
   #   --host <x>.sock   llama-server binds a unix socket when the host ends in
   #                     .sock (verified on build 10273, /v1/models and
   #                     /v1/embeddings both answer over it). The same path
@@ -368,7 +414,7 @@ let
     exec ${cfg.embed.server.package}/bin/llama-server \
       -m "$embed_model" \
       --embedding --pooling last \
-      -ngl 99 -c 8192 -b 8192 -ub 8192 \
+      -ngl 99 -c 8192 -b 1024 -ub 1024 -fa on --cache-ram 0 \
       --host "$sock" \
       --no-webui
   '';

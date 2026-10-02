@@ -36,10 +36,51 @@ build 10273) on the Radeon 890M iGPU of tuxedo, as the
 
 Command line (`nix/aggregator.nix::embedServerRunner`):
 `llama-server -m <snapshots/370f27d…/Qwen3-Embedding-0.6B-Q8_0.gguf>
---embedding --pooling last -ngl 99 -c 8192 -b 8192 -ub 8192
---host $XDG_RUNTIME_DIR/aggregator-embed-server/embed.sock --no-webui` (the
-2495 figure was measured over loopback TCP; over the unix socket, under the
-unit's sandbox, the same batch measured 2270).
+--embedding --pooling last -ngl 99 -c 8192 -b 1024 -ub 1024 -fa on
+--cache-ram 0 --host $XDG_RUNTIME_DIR/aggregator-embed-server/embed.sock
+--no-webui` (the 2495 figure was measured over loopback TCP with the
+2026-10-01 flags `-b 8192 -ub 8192`, no `-fa`, default prompt cache; over the
+unix socket, under the unit's sandbox, the same batch measured 2270).
+
+### Memory, 2026-10-02: the same throughput at a sixth of the RAM
+
+The 2026-10-01 flags sized the micro-batch at the context (`-ub 8192`) on the
+claim that an embedding input must fit one micro-batch. That is true of
+non-causal (BERT-style) embedders and **false for this model**: Qwen3-Embedding
+is a causal decoder with last-token pooling, and llama-server carries an input
+across micro-batches in the KV cache — a 5997-token input embedded at every
+`-ub` from 512 to 8192, cosine ≥ 0.9999 between sizes. What `-ub 8192` did do,
+without flash attention, was allocate a KQ compute buffer of ubatch × context,
+and the default 8 GiB prompt cache grew host RSS by ~100 MiB per input on top:
+the unit sat at **RSS 11.0 GiB + GPU-pinned RAM (GTT) 8.7 GiB**, cgroup peak
+17.9 GiB, 6.4 GiB of it swapped — for a 640 MB model.
+
+Sweep on tuxedo, same build 10273: 64 real chunks of 828-1062 tokens (60,844
+tokens), four per request as the worker sends them, then one 5997-token
+input. Resident = RSS (`smaps_rollup`) + GTT (`fdinfo drm-resident-gtt`)
+after that; tokens/s on the chunks. Old and new were measured minutes apart
+under the same background load (the embed worker was running, feeding the
+production server), so the absolute rates are depressed and the comparison
+is what holds. Commands and raw output:
+`~/.local/state/claude-tasks/offline-ai/embed-server-measurement.md`.
+
+| flags | resident after batch | chunks tok/s | 5997-token input | cos vs old, min / mean (64 chunks) | cos vs old, long |
+|---|---|---|---|---|---|
+| old: `-b 8192 -ub 8192`, no fa, cache 8 GiB | **19.7 GiB** (+6.4 swapped) | 2033 | 495 tok/s | — | — |
+| `-ub 512 -fa on --cache-ram 0` | 2.3 GiB | 638 | 1384 tok/s | 0.99978 / 0.99996 | 0.99993 |
+| **`-ub 1024 -fa on --cache-ram 0`** | **3.0 GiB** | **2302** | 890 tok/s | 0.99984 / 0.99997 | 0.99992 |
+| `-ub 2048 -fa on --cache-ram 0` | 4.3 GiB | 2269 | 748 tok/s | 0.99971 / 0.99997 | 0.99991 |
+| `-ub 4096 -fa on --cache-ram 0` | 6.7 GiB | 2058 | 609 tok/s | 0.99984 / 0.99998 | 0.99991 |
+| `-ub 8192 -fa on --cache-ram 0` | 9.3 GiB | 1250 | 312 tok/s | 0.99984 / 0.99998 | 0.99990 |
+
+`-ub 1024` is the knee: the old throughput at a sixth of the memory, and
+inside the 3 GiB the fix was sized for. 512 loses 3.6× on the chunk batch —
+llama-server forces `n_batch = n_ubatch` for embeddings, so at 512 a ~950-token
+chunk never fits one decode call. Flash attention alone (the 8192 row) is not
+the fix; the micro-batch is. Every row's vectors agree with the old server's
+at cosine ≥ 0.9997 (768-dim, L2-normalised, the stored form), so **the stamp
+does not move** — the flags change what the server allocates, not what it
+computes.
 
 **Parity with the vectors it replaces**, not assumed: 45 real chunks from the
 live cache, embedded by the server with exactly that command line, truncated to

@@ -893,6 +893,16 @@
               # only place it is pinned.
               argv_pair --pooling last \
                 || fail "the server is not started with --pooling last — any other pooling yields well-formed vectors in a different space, and nothing downstream can tell"
+              # The memory flags. With -ub 8192 and no flash attention the
+              # unit pinned ~20 GiB of RAM for a 640 MB model (2026-10-02,
+              # sweep in embedServerRunner's comment). Asserted so a flag
+              # edit cannot bring that back without failing here.
+              argv_pair -fa on \
+                || fail "the server is not started with -fa on — without flash attention the KQ compute buffer scales with ubatch x context, and at -ub 8192 the unit pinned ~20 GiB for a 640 MB model"
+              argv_pair -ub 1024 \
+                || fail "the server is not started with -ub 1024 — the measured knee: -ub 512 runs at a third of the throughput, every larger size only adds memory (2.3 GiB at 512, 3.0 at 1024, 4.3 at 2048, 6.7 at 4096, 9.3 at 8192)"
+              argv_pair --cache-ram 0 \
+                || fail "the server is not started with --cache-ram 0 — llama-server's prompt cache (8 GiB default) keeps the KV state of past inputs in host RAM, and an embedding corpus has no shared prefixes to reuse"
               argv_pair --host "$work/rt/$py_embed_socket" \
                 || fail "the server does not bind \$XDG_RUNTIME_DIR/$py_embed_socket, the socket embed.py's EMBED_SOCKET_NAME dials — the bare-registered MCP server would find nothing and every query would silently lose its vector arm"
               # The socket's directory is the unit's own RuntimeDirectory:

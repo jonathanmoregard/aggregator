@@ -834,9 +834,12 @@ class Embedder:
     def _server_encode(self, texts: list[str], timeout: float) -> np.ndarray:
         """All of ``texts`` in ONE request, rows put back by ``index``.
 
-        One request per call, not per text: the GPU's advantage is the batch,
-        and ``-b``/``-ub`` on the unit are sized so a full
-        ``cli._MAX_CHUNKS_PER_ENCODE`` slice fits one micro-batch.
+        One request per call, not per text: the GPU's advantage is the batch.
+        The unit's ``-ub`` is NOT a size limit on an input: Qwen3-Embedding is
+        a causal decoder with last-token pooling, so llama-server carries an
+        input across micro-batches in the KV cache (measured 2026-10-02: a
+        5997-token input embeds at ``-ub 512``, cosine 0.9999 against the
+        one-micro-batch vector). ``-c`` is the only ceiling.
         """
         reply = self._server_request(
             "/v1/embeddings",
