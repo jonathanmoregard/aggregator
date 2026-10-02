@@ -1,14 +1,19 @@
 """Qwen3-Embedding-0.6B wrapper.
 
-Two loader paths, one interface:
+Three loader paths, one interface:
 
-* ``AGGREGATOR_EMBED_BACKEND=st`` (default) — sentence-transformers +
-  safetensors. ~1.2 GB RAM, no extra runtime.
-* ``AGGREGATOR_EMBED_BACKEND=gguf`` — llama-cpp-python + Q4_K_M GGUF.
-  ~400 MB RAM, tiny bit slower per query. Requires the optional
-  ``embed-gguf`` extra installed.
+* ``AGGREGATOR_EMBED_BACKEND=server`` (the SOURCE default, see
+  ``DEFAULT_BACKEND``) — a local ``llama-server --embedding`` serving the
+  pinned Q8_0 GGUF on the GPU, spoken to over loopback HTTP. The worker and
+  the MCP server compute nothing themselves; the ``aggregator-embed-server``
+  user unit does. Measured ~60x the CPU backends on this machine
+  (``docs/embedding-throughput.md``).
+* ``AGGREGATOR_EMBED_BACKEND=st`` — sentence-transformers + safetensors on
+  CPU. ~1.2 GB RAM, no extra runtime.
+* ``AGGREGATOR_EMBED_BACKEND=gguf`` — llama-cpp-python + Q4_K_M GGUF,
+  in-process on CPU. Requires the optional ``embed-gguf`` extra.
 
-Both paths return float32, L2-normalized, MRL-truncated to 768 dims.
+All paths return float32, L2-normalized, MRL-truncated to 768 dims.
 The Qwen3 query instruction ("Instruct: ...\\nQuery:...") is applied by
 ``embed_query``; documents go through ``embed_documents`` unprefixed
 (load-bearing per the Qwen3 model card — omitting the instruction loses
@@ -22,8 +27,13 @@ the fallback for a load that cannot expose one.
 
 from __future__ import annotations
 
+import http.client
+import json
 import logging
 import os
+import socket
+import time
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 
@@ -79,29 +89,155 @@ _DEFAULT_MODEL_GGUF = "Qwen/Qwen3-Embedding-0.6B-GGUF"
 #: nothing about a model name a caller passed in.
 QWEN3_EMBEDDING_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
 
-#: The same pin for the ``-GGUF`` repository — **not yet established**.
+#: The same pin for the ``-GGUF`` repository — a DIFFERENT repository.
 #:
 #: ``QWEN3_EMBEDDING_REVISION`` above was read off the safetensors repo and is
 #: not a valid ref in the ``-GGUF`` one; they are separate repositories with
-#: separate histories. Reusing it would not pin the download, it would break
-#: it, and inventing a plausible-looking sha would be worse than either.
+#: separate histories. This sha was read off the hub download metadata of
+#: ``QWEN3_EMBEDDING_GGUF_FILENAME`` on the deploying machine (2026-09-30), and
+#: the file it resolved to hashed to
+#: ``06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439``. It
+#: closes the hole this constant used to name as ``None``: the ``gguf``
+#: backend's download refusal (``_gguf_revision``) no longer has anything to
+#: refuse, and the ``server`` backend's weights are fetched at this revision
+#: and nowhere else.
 #:
-#: So the hole is left open and NAMED rather than papered over. It is not a
-#: silent one: ``Embedder`` refuses to construct the default gguf backend on
-#: the download path while this is ``None`` (see ``_gguf_revision``), because
-#: that path — and only that path — is where unpinned bytes would actually
-#: move. An already-seeded machine loading from cache is unaffected.
+#: VERIFIED FOR THE Q8_0 FILE ONLY. Whether this revision carries the
+#: ``gguf`` backend's ``Q4_K_M`` default was not established — the repo may
+#: not publish one at all, in which case that backend fails with a
+#: not-found at this revision rather than resolving ``main``, which is the
+#: honest failure.
 #:
-#: TO CLOSE IT: resolve the sha of ``Qwen/Qwen3-Embedding-0.6B-GGUF`` on a
-#: machine with network access — ``huggingface_hub.HfApi().model_info(
-#: "Qwen/Qwen3-Embedding-0.6B-GGUF").sha`` — verify the Q4_K_M file loads at
-#: that revision, and put the 40-hex-character sha here. A sha, never a tag:
-#: a tag is repointable by the repo owner, which is the thing being defended
-#: against. Deliberately a source constant and NOT an environment variable —
-#: an env-var pin is an in-place mutable knob, i.e. the exact thing
-#: "pinned artifact, no in-place update" forbids. New sha → new commit → new
-#: store path.
-QWEN3_EMBEDDING_GGUF_REVISION: str | None = None
+#: A sha, never a tag: a tag is repointable by the repo owner, which is the
+#: thing being defended against. Deliberately a source constant and NOT an
+#: environment variable — an env-var pin is an in-place mutable knob, i.e. the
+#: exact thing "pinned artifact, no in-place update" forbids. New sha → new
+#: commit → new store path. ``nix/aggregator.nix`` builds the server unit's
+#: model path from this same value, and the flake's hygiene check reads it out
+#: of this file so the two cannot disagree.
+QWEN3_EMBEDDING_GGUF_REVISION: str | None = "370f27d7550e0def9b39c1f16d3fbaa13aa67728"
+
+#: The one file the ``server`` backend accepts the server serving, and the one
+#: the seed step fetches. Q8_0 rather than the ``gguf`` backend's Q4_K_M:
+#: measured against 45 real chunks from the live cache, Q8_0 on the Vulkan
+#: backend agrees with the fp32 safetensors vectors at cosine mean 0.9994,
+#: min 0.9990 — the quantization is not what anyone would be trading for the
+#: speed.
+QWEN3_EMBEDDING_GGUF_FILENAME = "Qwen3-Embedding-0.6B-Q8_0.gguf"
+
+
+#: The backend a process gets when nothing is exported. A SOURCE constant,
+#: because a model change is made in source and deployed as a new store path —
+#: ``cli._would_start_a_second_index_by_accident`` refuses a backfill whose
+#: only author is an exported variable.
+DEFAULT_BACKEND = "server"
+
+#: Override for where the ``server`` backend finds llama-server:
+#: ``unix:///abs/path.sock`` or ``http://host:port``. An environment value
+#: because WHERE is deployment plumbing — the test suite points it at a stub,
+#: a developer at a scratch instance — while WHAT is served is not: the
+#: backend refuses a server that is not serving
+#: ``QWEN3_EMBEDDING_GGUF_FILENAME``, so this can move the socket and never
+#: the stamp. Unset in every deployed unit; see :func:`default_embed_url`.
+EMBED_URL_ENV = "AGGREGATOR_EMBED_URL"
+
+#: The server's socket, relative to ``$XDG_RUNTIME_DIR``. A UNIX SOCKET, NOT A
+#: TCP PORT, because of the worker's sandbox: it reads the whole untrusted
+#: corpus, and "offline by design" there means ``RestrictAddressFamilies=
+#: AF_UNIX AF_NETLINK`` — no IP at all. The loopback-only alternative,
+#: ``AF_INET`` plus ``IPAddressDeny=any``/``IPAddressAllow=localhost``, was
+#: measured to confine NOTHING in the deploying host's user manager (no cgroup
+#: BPF there: a connect to the host's LAN address went through), so TCP would
+#: have widened the worker from no network to the whole network.
+#:
+#: The directory is the server unit's ``RuntimeDirectory=`` — mode 0700, so
+#: only this user can reach the socket, and removed by systemd when the unit
+#: stops, so a stale socket cannot outlive it. ``nix/aggregator.nix`` binds
+#: exactly this path; the flake check reads it out of this line, so the unit
+#: and every process that does not export ``AGGREGATOR_EMBED_URL`` — the MCP
+#: server is registered bare — agree without anybody configuring them to.
+EMBED_SOCKET_NAME = "aggregator-embed-server/embed.sock"
+
+
+def default_embed_url() -> str:
+    """``unix://$XDG_RUNTIME_DIR/<EMBED_SOCKET_NAME>`` for this process.
+
+    Falls back to ``/run/user/<uid>`` — which is what systemd-logind makes
+    ``XDG_RUNTIME_DIR`` anyway — for a process started with a scrubbed
+    environment, so an MCP server launched without it still finds the unit.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip() or f"/run/user/{os.getuid()}"
+    return f"unix://{runtime.rstrip('/')}/{EMBED_SOCKET_NAME}"
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """``http.client`` over ``AF_UNIX``. Stdlib only, no new dependency."""
+
+    def __init__(self, path: str, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(self._socket_path)
+        except BaseException:
+            sock.close()
+            raise
+        self.sock = sock
+
+
+class _HTTPStatusError(Exception):
+    """A non-2xx reply, carried to the one place that classifies it."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+        self.detail = detail
+
+#: The unit a "server is unreachable" message sends the operator to.
+EMBED_SERVER_UNIT = "aggregator-embed-server.service"
+
+#: How long construction waits out llama-server's 503 "Loading model". The
+#: worker is ordered After= the server unit, and a Type=simple unit counts as
+#: started the moment it forks — before the ~600 MB model is on the GPU. A
+#: refused CONNECTION is not waited on at all: that is a stopped unit, and the
+#: MCP path must fall back to FTS5 at once rather than hang a query.
+_SERVER_LOADING_GRACE_S = 30.0
+
+#: Per-request ceiling. A batch here is ``cli._MAX_CHUNKS_PER_ENCODE`` chunks,
+#: about a second of GPU time; two minutes only ever expires on a wedged
+#: server, and then the worker's health probe turns it into an environment
+#: fault rather than a blamed row.
+_SERVER_TIMEOUT_S = 120.0
+#: A query has a human waiting on it; past this the MCP path answers from
+#: FTS5 instead.
+_SERVER_QUERY_TIMEOUT_S = 15.0
+
+
+def configured_backend() -> str:
+    """The backend ``Embedder()`` builds in this process.
+
+    An exported-but-empty variable means unset, the same reading
+    ``cli._would_start_a_second_index_by_accident`` gives it, so the two can
+    never disagree about whether a variable is "doing something".
+    """
+    return os.environ.get("AGGREGATOR_EMBED_BACKEND", "").strip() or DEFAULT_BACKEND
+
+
+class EmbedServerError(RuntimeError):
+    """The ``server`` backend cannot be used. Never a property of a row."""
+
+
+class EmbedServerUnavailableError(EmbedServerError):
+    """Nothing usable is answering at the embed URL — the unit is stopped,
+    still loading past the grace period, or died mid-request."""
+
+
+class EmbedServerMismatchError(EmbedServerError):
+    """Something answers, but it is not serving the pinned model, so vectors
+    from it would be stamped with an identity they do not have."""
 
 
 #: The ONE opt-in that lets a model load reach the network.
@@ -148,7 +284,7 @@ def _resolve_model_id(backend: str, model_name: str | None) -> str:
     """
     if model_name is not None:
         return model_name
-    if backend == "gguf":
+    if backend in ("gguf", "server"):
         return _DEFAULT_MODEL_GGUF
     return _DEFAULT_MODEL_ST
 
@@ -158,7 +294,12 @@ def _resolve_model_id(backend: str, model_name: str | None) -> str:
 #: Two vectors from the same checkpoint at different precisions are close but
 #: not equal, and a KNN compares them against each other with no way to tell —
 #: so this belongs in the version string as surely as the repo id does.
-_QUANTIZATION = {"st": "fp32", "gguf": "q4_k_m"}
+#:
+#: ``server`` and ``gguf`` are both GGUF files from the same repository but
+#: different quantizations run by different runtimes, so they are different
+#: entries — and ``tests/core/test_embed_server_backend.py`` fails if any two
+#: backends ever collapse onto one stamp.
+_QUANTIZATION = {"st": "fp32", "gguf": "q4_k_m", "server": "q8_0"}
 
 
 def configured_quantization(embedder: Embedder | None = None) -> str:
@@ -172,7 +313,7 @@ def configured_quantization(embedder: Embedder | None = None) -> str:
         backend = getattr(embedder, "backend", None)
         if isinstance(backend, str):
             return _QUANTIZATION.get(backend, backend)
-    backend = os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
+    backend = configured_backend()
     return _QUANTIZATION.get(backend, backend)
 
 
@@ -270,8 +411,7 @@ def configured_model_id(embedder: Embedder | None = None) -> str:
             "instead. A real Embedder always carries one.",
             type(embedder).__name__,
         )
-    backend = os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
-    return _resolve_model_id(backend, None)
+    return _resolve_model_id(configured_backend(), None)
 
 
 def _pin_thread_pools(setter: Callable[[int], None] | None = None) -> int | None:
@@ -361,7 +501,7 @@ class Embedder:
         gguf_filename: str = "Qwen3-Embedding-0.6B-Q4_K_M.gguf",
         cache_dir: str | Path | None = None,
     ):
-        self.backend = backend or os.environ.get("AGGREGATOR_EMBED_BACKEND", "st")
+        self.backend = backend or configured_backend()
         self.model_name = model_name
         #: The repo id THIS instance actually loaded, whatever the environment
         #: says. Vectors this embedder produces must be stamped with this and
@@ -370,7 +510,29 @@ class Embedder:
         self.model_id = _resolve_model_id(self.backend, model_name)
         self._st_model = None
         self._gguf_model = None
-        if self.backend == "st":
+        self._server_url: str | None = None
+        self._server_model: str | None = None
+        if self.backend == "server":
+            if model_name is not None:
+                # The server serves ONE file and this backend verifies it is
+                # the pinned one; there is no second model it could vouch for.
+                raise ValueError(
+                    "the server embed backend serves only the pinned "
+                    f"{_DEFAULT_MODEL_GGUF} ({QWEN3_EMBEDDING_GGUF_FILENAME}); "
+                    f"model_name={model_name!r} cannot be honoured"
+                )
+            url = os.environ.get(EMBED_URL_ENV, "").strip() or default_embed_url()
+            self._server_url = url.rstrip("/")
+            parsed = urllib.parse.urlsplit(self._server_url)
+            if parsed.scheme not in ("unix", "http") or not (
+                parsed.path if parsed.scheme == "unix" else parsed.netloc
+            ):
+                raise ValueError(
+                    f"{EMBED_URL_ENV}={url!r} is neither unix:///path.sock nor "
+                    f"http://host:port"
+                )
+            self._server_model = self._verify_server()
+        elif self.backend == "st":
             from sentence_transformers import SentenceTransformer
 
             # AFTER the import, which is what makes it worth doing at all.
@@ -424,12 +586,12 @@ class Embedder:
             # the gap is not the same as closing it — nothing enforced it, and
             # nothing would have noticed it widening.
             #
-            # ``QWEN3_EMBEDDING_GGUF_REVISION`` is currently ``None`` because no
-            # sha for the ``-GGUF`` repo has been verified (see its docstring).
-            # ``revision=None`` resolves exactly as omitting the argument did,
-            # so this line alone changes no behaviour — what changes behaviour
-            # is ``_gguf_revision`` refusing the unpinned DOWNLOAD below. The
-            # argument is spelled out regardless, so the pin is a wired,
+            # ``QWEN3_EMBEDDING_GGUF_REVISION`` holds a verified sha since the
+            # ``server`` backend needed one (see its docstring). Were it ever
+            # ``None`` again, ``revision=None`` would resolve exactly as
+            # omitting the argument did, and what stops that moving the bytes
+            # is ``_gguf_revision`` refusing the unpinned DOWNLOAD. The
+            # argument is spelled out either way, so the pin is a wired,
             # greppable, testable thing rather than a missing keyword nobody
             # can assert on.
             repo_id = self.model_id
@@ -520,9 +682,9 @@ class Embedder:
         this can only be reached by a human who opted into ``gguf`` AND into
         ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD`` in the same breath — someone
         watching a terminal right now, who can act on a message that names the
-        file, the constant and the command. The deployed units pin
-        ``AGGREGATOR_EMBED_BACKEND=st`` and the ``embed-gguf`` extra is not in
-        the closure, so no unit can reach this at all.
+        file, the constant and the command. The deployed units run the
+        ``server`` backend and the ``embed-gguf`` extra is not in the closure,
+        so no unit can reach this at all.
         """
         if repo_id != _DEFAULT_MODEL_GGUF:
             return None
@@ -545,9 +707,167 @@ class Embedder:
             f"HfApi().model_info({_DEFAULT_MODEL_GGUF!r}).sha — and rebuild."
         )
 
-    def _encode(self, texts: list[str]) -> np.ndarray:
+    # -- the server backend ---------------------------------------------------
+
+    def _server_request(
+        self,
+        path: str,
+        payload: dict | None = None,
+        timeout: float = _SERVER_TIMEOUT_S,
+    ) -> dict:
+        """One JSON round-trip to llama-server. Stdlib only, on purpose.
+
+        EVERY WAY THE SOCKET CAN BE MISSING RAISES ONE TYPE. A refused
+        connection (unit stopped), a dropped one (unit stopped mid-request), a
+        timeout (wedged) and a 503 (still loading) are all "the encoder is not
+        there", and callers decide on that one fact: the worker's health probe
+        refuses to blame a row for it, and the MCP path answers from FTS5. Any
+        OTHER HTTP status is a real answer about THIS input — a body the server
+        rejects — and is raised as a plain ``RuntimeError`` so the worker's
+        probe can find out whether it discriminates between rows.
+        """
+        assert self._server_url is not None
+        where = f"{self._server_url}{path}"
+        parsed = urllib.parse.urlsplit(self._server_url)
+        if parsed.scheme == "unix":
+            conn: http.client.HTTPConnection = _UnixHTTPConnection(parsed.path, timeout)
+        else:
+            conn = http.client.HTTPConnection(parsed.netloc, timeout=timeout)
+        body = None if payload is None else json.dumps(payload).encode()
+        try:
+            try:
+                conn.request(
+                    "GET" if body is None else "POST",
+                    path,
+                    body=body,
+                    headers={"Content-Type": "application/json"} if body else {},
+                )
+                resp = conn.getresponse()
+                raw = resp.read()
+            finally:
+                conn.close()
+            if resp.status >= 300:
+                raise _HTTPStatusError(resp.status, raw[:500].decode("utf-8", "replace"))
+            return json.loads(raw)
+        except _HTTPStatusError as e:
+            if e.status == 503:
+                raise EmbedServerUnavailableError(
+                    f"{where} answered 503 ({e.detail}); llama-server says this "
+                    f"while its model is still loading"
+                ) from e
+            raise RuntimeError(f"{where} answered HTTP {e.status}: {e.detail}") from e
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            # A missing socket file (unit stopped: systemd removed its runtime
+            # directory), a refused or reset connection, a timeout, and a reply
+            # cut off mid-body are all OSError or HTTPException; ValueError is
+            # a body that is not JSON — a half-written reply from a process
+            # that died.
+            raise EmbedServerUnavailableError(
+                f"the embed server at {where} is not answering "
+                f"({type(e).__name__}: {e}). It is the {EMBED_SERVER_UNIT} "
+                f"user unit — check `systemctl --user status "
+                f"{EMBED_SERVER_UNIT}`; offline-AI mode stops it on purpose. "
+                f"Set {EMBED_URL_ENV} only to point at a different instance "
+                f"of the same model."
+            ) from e
+
+    def _verify_server(self) -> str:
+        """Confirm the server serves the pinned file. Returns its model id.
+
+        THE STAMP IS A SOURCE CONSTANT AND THE URL IS NOT. Without this, a
+        variable pointed at any llama-server — the chat model on 8717, an f16
+        export, some other embedder entirely — would produce vectors that get
+        stamped ``…-GGUF-q8_0`` and mixed into the index as if they were.
+        ``(chunk_id, model)`` keying cannot catch that: the key is exactly what
+        would be wrong. So the identity is checked here, before anything is
+        embedded, against what the server itself reports.
+
+        WHAT IS CHECKED is what ``/v1/models`` exposes on llama.cpp build 10273:
+        the served file's name (``data[].id`` is the ``-m`` path) and, when
+        ``meta`` is present, its native width and its quantization. Pooling is
+        NOT exposed by any endpoint, so ``--pooling last`` is enforced where it
+        is decided — the unit's command line in ``nix/aggregator.nix`` — and
+        the measured parity of that exact command line is recorded in
+        ``docs/embedding-throughput.md``.
+        """
+        deadline = time.monotonic() + _SERVER_LOADING_GRACE_S
+        while True:
+            try:
+                listing = self._server_request("/v1/models")
+                break
+            except EmbedServerUnavailableError as e:
+                loading = isinstance(e.__cause__, _HTTPStatusError)
+                if not loading or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
+
+        served = listing.get("data") or []
+        for entry in served:
+            name = str(entry.get("id") or "")
+            if os.path.basename(name) != QWEN3_EMBEDDING_GGUF_FILENAME:
+                continue
+            meta = entry.get("meta") or {}
+            n_embd = meta.get("n_embd")
+            ftype = meta.get("ftype")
+            if n_embd is not None and n_embd != _NATIVE_DIM:
+                raise EmbedServerMismatchError(
+                    f"{self._server_url} serves {name} with n_embd={n_embd}, "
+                    f"but {_DEFAULT_MODEL_GGUF} is {_NATIVE_DIM} wide — this "
+                    f"is not the model the index is stamped for"
+                )
+            if ftype is not None and str(ftype).upper() != "Q8_0":
+                raise EmbedServerMismatchError(
+                    f"{self._server_url} serves {name} as {ftype}, not Q8_0 — "
+                    f"the stamp names q8_0 and these vectors would not be"
+                )
+            return name
+        names = [str(e.get("id")) for e in served] or ["nothing"]
+        raise EmbedServerMismatchError(
+            f"refusing the embed server at {self._server_url}: it serves "
+            f"{', '.join(names)}, not {QWEN3_EMBEDDING_GGUF_FILENAME} from "
+            f"{_DEFAULT_MODEL_GGUF}@{QWEN3_EMBEDDING_GGUF_REVISION}. Vectors "
+            f"from it would be stamped as that model and mixed into its index. "
+            f"Point {EMBED_URL_ENV} at a server running the pinned file (the "
+            f"{EMBED_SERVER_UNIT} unit does), or unset it."
+        )
+
+    def _server_encode(self, texts: list[str], timeout: float) -> np.ndarray:
+        """All of ``texts`` in ONE request, rows put back by ``index``.
+
+        One request per call, not per text: the GPU's advantage is the batch,
+        and ``-b``/``-ub`` on the unit are sized so a full
+        ``cli._MAX_CHUNKS_PER_ENCODE`` slice fits one micro-batch.
+        """
+        reply = self._server_request(
+            "/v1/embeddings",
+            {"input": list(texts), "model": self._server_model},
+            timeout=timeout,
+        )
+        rows = reply.get("data") or []
+        if len(rows) != len(texts):
+            raise RuntimeError(
+                f"the embed server returned {len(rows)} embedding(s) for "
+                f"{len(texts)} input(s)"
+            )
+        out = np.empty((len(texts), _NATIVE_DIM), dtype=np.float32)
+        seen: set[int] = set()
+        for row in rows:
+            i = int(row["index"])
+            vec = np.asarray(row["embedding"], dtype=np.float32)
+            if vec.shape != (_NATIVE_DIM,) or i in seen or not 0 <= i < len(texts):
+                raise RuntimeError(
+                    f"the embed server returned a malformed embedding "
+                    f"(index {i}, shape {vec.shape})"
+                )
+            seen.add(i)
+            out[i] = vec
+        return out
+
+    def _encode(self, texts: list[str], *, timeout: float = _SERVER_TIMEOUT_S) -> np.ndarray:
         """Backend-specific encode. Returns raw native-dim vectors."""
-        if self._st_model is not None:
+        if self._server_url is not None:
+            arr = self._server_encode(texts, timeout)
+        elif self._st_model is not None:
             arr = self._st_model.encode(
                 texts,
                 convert_to_numpy=True,
@@ -602,5 +922,43 @@ class Embedder:
         One code path then serves both backends — the gguf loader has no prompt
         registry to call through — instead of two that are quietly different.
         """
-        raw = self._encode([f"{self.query_prompt}{query}"])
+        raw = self._encode(
+            [f"{self.query_prompt}{query}"], timeout=_SERVER_QUERY_TIMEOUT_S
+        )
         return self._truncate_and_normalize(raw)[0]
+
+
+def fetch_server_weights() -> str:
+    """Resolve the pinned Q8_0 file into the hub cache. Returns its path.
+
+    What the ``aggregator-embed-server`` unit serves, fetched at the pinned
+    revision into the standard hub layout —
+    ``$HF_HOME/hub/models--Qwen--Qwen3-Embedding-0.6B-GGUF/snapshots/<sha>/<file>``
+    — which is the exact path the unit's launcher resolves. Offline unless
+    ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD`` is set, like every other load, so run
+    without the opt-in it is a presence check that names the fix.
+    """
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(
+        repo_id=_DEFAULT_MODEL_GGUF,
+        filename=QWEN3_EMBEDDING_GGUF_FILENAME,
+        revision=QWEN3_EMBEDDING_GGUF_REVISION,
+        local_files_only=not downloads_allowed(),
+    )
+
+
+def seed_embedder() -> object:
+    """Make the configured embedder's weights present. ``embed --seed-models``.
+
+    FOR THE SERVER BACKEND THIS MUST NOT CONSTRUCT AN ``Embedder``. That would
+    ask the server whether it is serving the right file — and on a fresh
+    machine the server cannot be running yet, because the file it serves is
+    the thing being seeded. So the weights are fetched directly, and the
+    server is never contacted. The other backends load in-process, and
+    constructing them is still the honest proof their weights load.
+    """
+    backend = configured_backend()
+    if backend == "server":
+        return fetch_server_weights()
+    return Embedder(backend=backend)

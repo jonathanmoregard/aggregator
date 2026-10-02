@@ -51,11 +51,45 @@ let
   # the "cache is empty" case loud rather than silent.
   hfHome = "%C/huggingface";
 
-  # The sentence-transformers repo id the Embedder loads by default
-  # (aggregator/core/embed.py::_DEFAULT_MODEL_ST) and the on-disk directory
-  # name the huggingface_hub cache gives it.
-  embedModelRepo = "Qwen/Qwen3-Embedding-0.6B";
-  embedModelDir = "models--Qwen--Qwen3-Embedding-0.6B";
+  # The embedding model this deployment runs: the Q8_0 GGUF that
+  # `aggregator-embed-server` serves on the GPU (aggregator/core/embed.py::
+  # _DEFAULT_MODEL_GGUF, QWEN3_EMBEDDING_GGUF_REVISION and
+  # QWEN3_EMBEDDING_GGUF_FILENAME), and where the huggingface_hub cache puts
+  # that exact file at that exact revision.
+  #
+  # THE REVISION IS IN THE PATH, not just in the download. The server unit
+  # opens `snapshots/<sha>/<file>` and nothing else, so a cache that also
+  # holds some other revision of the repo — or a later `main` pulled by some
+  # other tool — cannot change what is served. These four strings are copies
+  # of the Python constants; `checks.<system>.aggregator-embed-unit-hygiene`
+  # reads the constants OUT of embed.py and fails when they disagree, so a
+  # re-pin in Python cannot leave the unit serving the old file.
+  embedModelRepo = "Qwen/Qwen3-Embedding-0.6B-GGUF";
+  embedModelDir = "models--Qwen--Qwen3-Embedding-0.6B-GGUF";
+  embedModelRevision = "370f27d7550e0def9b39c1f16d3fbaa13aa67728";
+  embedModelFile = "Qwen3-Embedding-0.6B-Q8_0.gguf";
+  # Relative to HF_HOME. The worker's preflight, the server's launcher and the
+  # seeder's report all test this one path.
+  embedModelRelPath = "hub/${embedModelDir}/snapshots/${embedModelRevision}/${embedModelFile}";
+
+  # The server's unix socket, relative to $XDG_RUNTIME_DIR. Its first
+  # component is the unit's RuntimeDirectory (mode 0700, removed on stop).
+  #
+  # A SOCKET, NOT A TCP PORT, so the worker can keep `RestrictAddressFamilies=
+  # AF_UNIX AF_NETLINK` — no IP at all — while it reads the untrusted corpus.
+  # TCP was tried first and measured: the loopback-only fence for AF_INET
+  # (`IPAddressDeny=any` + `IPAddressAllow=localhost`) is cgroup BPF, which
+  # this host's user manager does not get, so a connect to the host's own LAN
+  # address went straight through. TCP would have widened the worker from no
+  # network to all of it.
+  #
+  # NOT an option, deliberately: the MCP server is registered bare and finds
+  # the embedder at the source default (aggregator/core/embed.py::
+  # EMBED_SOCKET_NAME), so a configurable path would silently split the
+  # worker from every query. One value, asserted equal to the Python default
+  # by the hygiene check.
+  embedSocketName = "aggregator-embed-server/embed.sock";
+  embedRuntimeDir = builtins.head (lib.splitString "/" embedSocketName);
 
   # The cross-encoder the MCP server loads on `rerank=True`
   # (aggregator/core/rerank.py::_DEFAULT_MODEL).
@@ -75,7 +109,7 @@ let
   rerankModelRepo = "Qwen/Qwen3-Reranker-0.6B";
   rerankModelDir = "models--Qwen--Qwen3-Reranker-0.6B";
 
-  # HOW MANY CORES BACKGROUND EMBEDDING MAY TAKE.
+  # HOW MANY CORES THE BACKGROUND EMBED WORKER MAY TAKE.
   #
   # ONE binding, used for BOTH the thread pools and the cgroup quota below, so
   # the two cannot drift. That pairing is the whole point: a pool sized larger
@@ -84,27 +118,36 @@ let
   # context-switching and cache-thrash for a fraction of the throughput. Sized
   # together they are just fewer, faster threads.
   #
-  # FOUR, on a 12-core machine, because this is an interactive laptop and the
-  # operator can hear it. Measured from the unit's own accounting on
-  # 2026-08-27: `1d 7h 51min` of CPU over `4h 3s` of wall clock — ~8x
-  # parallelism, sustained, which is a fan that never spins down. The
-  # instruction already in place was `Nice=19`, and nice is the wrong
-  # instrument for this: it orders who runs FIRST, not how many run AT ONCE,
-  # so twelve threads at nice 19 still saturate twelve cores and still make
-  # the same heat. It stays, because it is the right instrument for the
-  # different question of who yields when the operator starts typing.
+  # ONE, since the worker stopped computing embeddings. The encoder runs in
+  # `aggregator-embed-server` on the GPU; what is left in this process is
+  # chunking, sha256 of each chunk, JSON over a unix socket and SQLite writes —
+  # single-threaded Python that never loads torch at all on the `server`
+  # backend. It was FOUR while the worker ran sentence-transformers on the
+  # CPU, and that number was measured, not chosen: `1d 7h 51min` of CPU over
+  # `4h 3s` of wall clock on 2026-08-27, i.e. a fan that never spun down, and
+  # the operator's directive was to spend wall clock rather than heat. With
+  # the arithmetic gone a one-core cap costs no throughput (the GPU is the
+  # bottleneck, measured in docs/embedding-throughput.md) and bounds whatever
+  # a regression back to CPU encoding would cost to one core rather than four.
   #
-  # The backfill is measured in weeks either way; the operator's directive on
-  # 2026-08-27 was explicit that wall clock is the currency to spend here
-  # ("limit it a bit more, even if it takes a bit longer"). Not exposed as a
-  # module option: this is the behaviour of a background indexer on a personal
+  # `Nice=19` stays for the reason it always had — who yields when the
+  # operator starts typing — and so does `CPUWeight`. Not exposed as a module
+  # option: this is the behaviour of a background indexer on a personal
   # machine, not a dial anyone should have to find.
-  embedThreads = 4;
+  embedThreads = 1;
 
   # Environment shared by the embed worker and its one-shot seeding sibling.
-  # `AGGREGATOR_EMBED_BACKEND=st` pins the safetensors loader; the `gguf`
-  # backend needs an optional extra that is not in the deployed closure, and a
-  # backend that silently changes under a unit is a debugging trap.
+  #
+  # NO `AGGREGATOR_EMBED_BACKEND`, deliberately. It used to pin `st` here. The
+  # backend is a SOURCE default now (aggregator/core/embed.py::
+  # DEFAULT_BACKEND), for the rule `cli._would_start_a_second_index_by_accident`
+  # enforces: a model change is made in source and deployed as a new store
+  # path, and a backfill whose only author is an exported variable is refused.
+  # Exporting it from the unit would make every deploy look like exactly that
+  # accident — and would let the unit and the bare-registered MCP server
+  # disagree about which index they are reading. No `AGGREGATOR_EMBED_URL`
+  # either, for the same reason: the socket is the source default, see
+  # `embedSocketName`.
   #
   # THE THREE THREAD VARIABLES ARE THREE DIFFERENT POOLS, not belt-and-braces
   # spellings of one. torch's kernels run on OpenMP (`OMP_NUM_THREADS`), its
@@ -121,7 +164,6 @@ let
     "SSL_CERT_FILE=${caBundle}"
     "NIX_SSL_CERT_FILE=${caBundle}"
     "HF_HOME=${hfHome}"
-    "AGGREGATOR_EMBED_BACKEND=st"
     "OMP_NUM_THREADS=${toString embedThreads}"
     "MKL_NUM_THREADS=${toString embedThreads}"
     "RAYON_NUM_THREADS=${toString embedThreads}"
@@ -147,6 +189,11 @@ let
       done
       return 1
     }
+    # The embedding model is checked by EXACT FILE at the pinned revision,
+    # not by "some snapshot exists": that file is the only thing the server
+    # will open, so any weaker test can wave through a cache that holds the
+    # wrong revision and then fail one unit later with a worse message.
+    embed_model="$hf_home/${embedModelRelPath}"
   '';
 
   # ExecStart for the timer-driven worker.
@@ -183,11 +230,17 @@ let
     # Only the EMBEDDING weights gate this unit. It never reranks — the
     # cross-encoder is loaded lazily by the MCP server — so a missing
     # reranker must not stop the index from filling.
-    if ! have_model "${embedModelDir}"; then
-      snapshots="$hf_home/hub/${embedModelDir}/snapshots"
-      echo "aggregator-embed: ${embedModelRepo} weights are not in the Hugging Face cache (looked in $snapshots)." >&2
-      echo "aggregator-embed: this unit runs OFFLINE by design (HF_HUB_OFFLINE=1) and will NOT pull ~1.2 GB unattended." >&2
-      echo "aggregator-embed: seed the cache once, then this timer takes over:" >&2
+    #
+    # This process no longer opens the file itself — aggregator-embed-server
+    # does — but it is still the unit that fires every 30 minutes and has a
+    # notifier, so it is where "the weights were never seeded" has to be
+    # diagnosed by name. Without this the same fact would arrive as "the
+    # embed server is not answering", which sends the operator to a unit
+    # that is only failing for the reason below.
+    if [ ! -e "$embed_model" ]; then
+      echo "aggregator-embed: ${embedModelRepo} is not in the Hugging Face cache (looked for $embed_model)." >&2
+      echo "aggregator-embed: this unit runs OFFLINE by design (HF_HUB_OFFLINE=1) and will NOT pull ~640 MB unattended." >&2
+      echo "aggregator-embed: seed the cache once, then this timer and aggregator-embed-server take over:" >&2
       echo "aggregator-embed:     systemctl --user start aggregator-embed-seed.service" >&2
       echo "aggregator-embed: refusing to run rather than no-op silently; the embedding backlog is untouched." >&2
       exit 1
@@ -236,18 +289,16 @@ let
     fi
 
     ${modelPresenceCheck}
-    for spec in "${embedModelRepo}|${embedModelDir}|the embed worker's vector index" \
-                "${rerankModelRepo}|${rerankModelDir}|the MCP server's rerank=True path"; do
-      repo="''${spec%%|*}"
-      rest="''${spec#*|}"
-      dir="''${rest%%|*}"
-      what="''${rest#*|}"
-      if have_model "$dir"; then
-        echo "aggregator-embed-seed: $repo already present under $hf_home/hub/$dir/snapshots — nothing to download."
-      else
-        echo "aggregator-embed-seed: downloading $repo (~1.2 GB) into $hf_home — feeds $what. One-time cost."
-      fi
-    done
+    if [ -e "$embed_model" ]; then
+      echo "aggregator-embed-seed: ${embedModelRepo}@${embedModelRevision} already present at $embed_model — nothing to download."
+    else
+      echo "aggregator-embed-seed: downloading ${embedModelFile} from ${embedModelRepo}@${embedModelRevision} (~640 MB) into $hf_home — served by aggregator-embed-server to fill the vector index. One-time cost."
+    fi
+    if have_model "${rerankModelDir}"; then
+      echo "aggregator-embed-seed: ${rerankModelRepo} already present under $hf_home/hub/${rerankModelDir}/snapshots — nothing to download."
+    else
+      echo "aggregator-embed-seed: downloading ${rerankModelRepo} (~1.2 GB) into $hf_home — feeds the MCP server's rerank=True path. One-time cost."
+    fi
 
     # THE ONLY OPT-IN IN THIS MODULE. The Python loaders pass
     # `local_files_only=True` unless this is set, so every other caller — the
@@ -260,6 +311,66 @@ let
     # exactly the property that makes the download consented to.
     export AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1
     exec ${aggregatorBin} embed --seed-models
+  '';
+
+  # The embedding model server. Always on; the worker and every MCP query
+  # talk to it over a unix socket in the user's runtime directory.
+  #
+  # WHY A SERVER AT ALL. The worker used to run sentence-transformers on the
+  # CPU at ~40 tokens/second — a 25-30 day backfill for this corpus. The same
+  # model as a Q8_0 GGUF under llama.cpp's Vulkan backend on the Radeon 890M
+  # iGPU measured 2495 tokens/second on this machine, with vectors agreeing
+  # with the fp32 ones at cosine 0.9994 mean / 0.9990 min over 45 real chunks
+  # (docs/embedding-throughput.md). Out of process, because the GPU runtime
+  # is a C++ stack that has no business inside the editor's MCP process, and
+  # one resident copy serves both the worker and queries.
+  #
+  # EVERY FLAG IS PART OF WHAT THE STAMP VOUCHES FOR, and the one that most
+  # needs saying is `--pooling last`: Qwen3-Embedding is last-token pooled,
+  # llama-server exposes the pooling mode on no endpoint, and mean pooling
+  # would produce well-formed vectors in a different space with nothing
+  # anywhere noticing. The Python side verifies the served FILE (name,
+  # width, quantization) on connect; pooling can only be pinned here.
+  #   -ngl 99           every layer on the GPU.
+  #   -c 8192           context; a 4000-character chunk is ~1k tokens, and
+  #                     the chunker's worst case (dense non-English text,
+  #                     base64) stays well inside it.
+  #   -b/-ub 8192       an embedding input must fit ONE micro-batch in
+  #                     llama.cpp, so the physical batch is the context.
+  #   --host <x>.sock   llama-server binds a unix socket when the host ends in
+  #                     .sock (verified on build 10273, /v1/models and
+  #                     /v1/embeddings both answer over it). The same path
+  #                     rule as embed.py::default_embed_url, fallback included.
+  #   --no-webui        nothing here wants a chat UI.
+  #
+  # Refuses, with the fix named, when the pinned file is absent — and exits
+  # 78 (EX_CONFIG) so `RestartPreventExitStatus` stops Restart=on-failure
+  # from turning an unseeded cache into a restart loop.
+  embedServerRunner = pkgs.writeShellScript "aggregator-embed-server" ''
+    set -uo pipefail
+
+    ${modelPresenceCheck}
+    if [ ! -e "$embed_model" ]; then
+      echo "aggregator-embed-server: ${embedModelFile} (${embedModelRepo}@${embedModelRevision}) is not in the Hugging Face cache (looked for $embed_model)." >&2
+      echo "aggregator-embed-server: seed it once — the only unit allowed to download weights:" >&2
+      echo "aggregator-embed-server:     systemctl --user start aggregator-embed-seed.service" >&2
+      echo "aggregator-embed-server: then: systemctl --user restart aggregator-embed-server.service" >&2
+      exit 78
+    fi
+
+    runtime_dir="''${XDG_RUNTIME_DIR:-/run/user/$(${pkgs.coreutils}/bin/id -u)}"
+    sock="$runtime_dir/${embedSocketName}"
+    # llama-server will not bind over a socket file left by a SIGKILLed
+    # predecessor ("couldn't bind HTTP server socket"). RuntimeDirectory= is
+    # normally removed on stop, so this only matters for an unclean exit.
+    ${pkgs.coreutils}/bin/rm -f "$sock"
+
+    exec ${cfg.embed.server.package}/bin/llama-server \
+      -m "$embed_model" \
+      --embedding --pooling last \
+      -ngl 99 -c 8192 -b 8192 -ub 8192 \
+      --host "$sock" \
+      --no-webui
   '';
 
   # ---- LLM record tagging -----------------------------------------------
@@ -407,9 +518,12 @@ let
     summary = "aggregator embed FAILED";
     body =
       "The background embed worker exited non-zero, so the vector index is"
-      + " not being filled. Likely: Qwen3 weights missing from the HF cache"
-      + " (fix: systemctl --user start aggregator-embed-seed.service), or the"
-      + " sqlite-vec extension did not load. Keyword search is unaffected.";
+      + " not being filled. Likely: aggregator-embed-server is stopped"
+      + " (offline-AI mode stops it; systemctl --user status"
+      + " aggregator-embed-server.service), the Qwen3 GGUF is missing from the"
+      + " HF cache (fix: systemctl --user start aggregator-embed-seed.service),"
+      + " or the sqlite-vec extension did not load. Keyword search is"
+      + " unaffected.";
   };
 
   tagFailureNotify = mkFailureNotify {
@@ -738,6 +852,21 @@ in {
           the wall time than keep the notifier truthful.
         '';
       };
+
+      server.package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.llama-cpp-vulkan;
+        defaultText = lib.literalExpression "pkgs.llama-cpp-vulkan";
+        description = ''
+          The llama.cpp build whose `bin/llama-server` runs
+          `aggregator-embed-server`. The Vulkan build is the one measured
+          (2495 tokens/s on a Radeon 890M, see
+          `docs/embedding-throughput.md`); any build with `llama-server`
+          works, at its own speed. The model, the port and every flag are
+          fixed by this module (see `embedServerRunner`) because they are
+          part of what the index's embedding stamp vouches for.
+        '';
+      };
     };
 
     tag = {
@@ -878,6 +1007,14 @@ in {
         Unit = {
           Description = "Aggregator: background embed worker (vector index)";
           OnFailure = "aggregator-embed-failure-notify.service";
+          # The encoder. Wants, not Requires: a stopped server must make THIS
+          # run fail with its own message (the worker exits non-zero, names
+          # the server unit and leaves the backlog untouched), not have
+          # systemd refuse to start it with a dependency error that no
+          # notifier describes. After, so a tick that starts both lets the
+          # server fork first; the worker then waits out the model load.
+          Wants = [ "aggregator-embed-server.service" ];
+          After = [ "aggregator-embed-server.service" ];
         };
         Service = {
           # The catch-up worker is expected to stay alive for weeks while the
@@ -999,16 +1136,20 @@ in {
           # RestrictAddressFamilies is the load-bearing line here. seccomp,
           # supported in a USER manager, and it makes an AF_INET socket()
           # fail outright — so "does not talk to the network" stops resting
-          # on every library agreeing to read HF_HUB_OFFLINE. AF_UNIX stays
-          # for journal and dbus; AF_NETLINK because glibc probes interfaces
-          # during resolver setup even when nothing ever connects.
+          # on every library agreeing to read HF_HUB_OFFLINE. AF_UNIX is also
+          # the transport to the encoder (`aggregator-embed-server`'s socket
+          # in $XDG_RUNTIME_DIR), plus journal and dbus; AF_NETLINK because
+          # glibc probes interfaces during resolver setup even when nothing
+          # ever connects.
+          #
+          # NO IPAddressDeny/IPAddressAllow. They are cgroup BPF, and this
+          # host's user manager does not get it: measured 2026-10-01 under
+          # `systemd-run --user`, `IPAddressDeny=any` let a TCP connect to the
+          # host's own LAN address through. With no IP family at all there is
+          # nothing for them to add, and a directive that reads as a fence
+          # but is not one is worse than none. The hygiene check asserts this
+          # unit has no AF_INET/AF_INET6, which is the property that matters.
           RestrictAddressFamilies = "AF_UNIX AF_NETLINK";
-          # Belt to that brace, and deliberately second: IP filtering is BPF
-          # and a user manager only gets it with cgroup delegation, so this
-          # may be a no-op here. It costs nothing when unsupported and covers
-          # the case where a future revision has to re-widen the address
-          # families above.
-          IPAddressDeny = "any";
         };
       };
 
@@ -1025,6 +1166,79 @@ in {
           Persistent = true;
         };
         Install.WantedBy = [ "timers.target" ];
+      };
+
+      # ---- embed server --------------------------------------------------
+      # The encoder, resident. See `embedServerRunner` for what it runs and
+      # why every flag is fixed.
+      systemd.user.services.aggregator-embed-server = lib.mkIf cfg.embed.enable {
+        Unit = {
+          Description = "Aggregator: Qwen3 embedding server (llama.cpp, unix socket %t/${embedSocketName})";
+          # A crash loop must end somewhere a human can see it; the defaults
+          # (5 starts in 10s) are too tight for a GPU driver that needs a
+          # moment after resume.
+          StartLimitIntervalSec = 300;
+          StartLimitBurst = 5;
+        };
+        # ALWAYS ON. Queries embed through it, and a query must not wait for
+        # a model load. The worker's `Wants=` also brings it back on the next
+        # tick if it was stopped by hand and forgotten.
+        Install.WantedBy = [ "default.target" ];
+        Service = {
+          Type = "simple";
+          ExecStart = "${embedServerRunner}";
+          Environment = [ "HF_HOME=${hfHome}" ];
+          # $XDG_RUNTIME_DIR/aggregator-embed-server: where the socket lives.
+          # 0700 so only this user can reach the encoder; removed by systemd
+          # on stop, so "unit stopped" means "socket absent" to every client.
+          # Also the one writable spot under /run/user: ProtectHome=read-only
+          # below covers /run/user too, and llama-server could not bind there
+          # without it (observed: "couldn't bind HTTP server socket").
+          RuntimeDirectory = embedRuntimeDir;
+          RuntimeDirectoryMode = "0700";
+          Restart = "on-failure";
+          RestartSec = "10s";
+          # 78 is the launcher's "weights not seeded": restarting cannot fix
+          # that, and the message already names the unit that does.
+          RestartPreventExitStatus = "78";
+          StandardOutput = "journal";
+          StandardError = "journal";
+
+          # ---- sandbox ------------------------------------------------------
+          # It parses attacker-influenced text (every chunk of the corpus) in
+          # a C++ tokenizer and hands it to a GPU driver, so it gets the same
+          # "shrink the ambient surface" treatment as the worker. Verified by
+          # running llama-server under exactly this set with
+          # `systemd-run --user` on the deploying host (2026-10-01), unix
+          # socket and all (RuntimeDirectory, no AF_INET): /v1/models and
+          # /v1/embeddings answered over the socket at 2270 tokens/s, against
+          # ~2500 for an unsandboxed TCP instance, i.e. still on the GPU.
+          #
+          # DELIBERATELY ABSENT:
+          #   PrivateDevices: hides /dev/dri, so the model silently runs on
+          #     the CPU at a sixtieth of the speed. The one directive a
+          #     hardening pass would reach for first; the hygiene check
+          #     asserts it stays off.
+          #   MemoryDenyWriteExecute: not verified against the Vulkan
+          #     driver's shader compilation, and the failure mode there is a
+          #     quiet fallback to CPU, not an error.
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          SystemCallArchitectures = "native";
+          ProtectSystem = "full";
+          # Read-only, not hidden: the model lives in the HF cache under
+          # $HOME, and nothing else in $HOME is this process's business.
+          ProtectHome = "read-only";
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectControlGroups = true;
+          # Listens on a unix socket and dials nothing: no IP family at all.
+          RestrictAddressFamilies = "AF_UNIX AF_NETLINK";
+        };
       };
 
       # One-time weight seeding. Deliberately has no [Install] section and

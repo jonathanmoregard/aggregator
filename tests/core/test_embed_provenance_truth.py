@@ -69,12 +69,16 @@ def test_a_non_default_backend_is_not_stamped_as_the_default(
     assert embed_mod.configured_model_id(embedder) == embed_mod._DEFAULT_MODEL_GGUF
     # ...and the environment-derived answer really does differ, so this is a
     # live divergence rather than a pair of assertions that agree by accident.
-    assert embed_mod.configured_model_id() != embedder.model_id
+    # The REPO is shared with the source-default ``server`` backend (both are
+    # GGUFs of one repository), so the divergence is asserted on the full
+    # stamp, where the quantization tells them apart.
+    assert embed_mod.embedding_version() != embed_mod.embedding_version(embedder)
+    assert embed_mod.configured_quantization(embedder) == "q4_k_m"
 
 
 def test_a_caller_supplied_model_is_stamped_as_itself(monkeypatch, stub_loaders):
     monkeypatch.delenv(_BACKEND, raising=False)
-    embedder = embed_mod.Embedder(model_name=_FAKE_MODEL)
+    embedder = embed_mod.Embedder(backend="st", model_name=_FAKE_MODEL)
 
     assert embedder.model_id == _FAKE_MODEL
     assert embed_mod.configured_model_id(embedder) == _FAKE_MODEL
@@ -106,7 +110,7 @@ def test_the_stamp_is_readable_even_when_the_weights_fail_to_load(monkeypatch):
 
     monkeypatch.setattr("sentence_transformers.SentenceTransformer", _boom)
     with pytest.raises(OSError):
-        embed_mod.Embedder(model_name=_FAKE_MODEL)
+        embed_mod.Embedder(backend="st", model_name=_FAKE_MODEL)
 
     # The resolution itself is pure and independent of the load.
     assert embed_mod._resolve_model_id("st", _FAKE_MODEL) == _FAKE_MODEL

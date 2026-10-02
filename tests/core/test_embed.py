@@ -8,11 +8,13 @@ from aggregator.core.embed import QWEN3_QUERY_PREFIX, Embedder
 
 @pytest.fixture(scope="module")
 def embedder():
-    # Uses the default model configured in Embedder (safetensors path).
-    # Tests mark themselves skip if the model isn't available locally,
-    # so the test can run in CI environments that don't cache the weight.
+    # The in-process safetensors path, named explicitly now that the source
+    # default is the ``server`` backend (covered against a stub server in
+    # test_embed_server_backend.py). Tests mark themselves skip if the model
+    # isn't available locally, so the test can run in CI environments that
+    # don't cache the weight.
     try:
-        return Embedder()
+        return Embedder(backend="st")
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"embedder unavailable: {e}")
 
@@ -22,7 +24,7 @@ def test_query_gets_prefix(monkeypatch, embedder):
     monkeypatch.setattr(
         embedder,
         "_encode",
-        lambda texts: (
+        lambda texts, **_kw: (
             calls.extend(texts),
             np.zeros((len(texts), 768), dtype=np.float32),
         )[1],
@@ -42,7 +44,7 @@ def test_document_no_prefix(monkeypatch, embedder):
     monkeypatch.setattr(
         embedder,
         "_encode",
-        lambda texts: (
+        lambda texts, **_kw: (
             calls.append(list(texts)),
             np.zeros((len(texts), 768), dtype=np.float32),
         )[1],
@@ -92,7 +94,7 @@ def test_the_embedder_pins_a_revision():
     monkey = pytest.MonkeyPatch()
     monkey.setattr("sentence_transformers.SentenceTransformer", _FakeST)
     try:
-        embed_mod.Embedder()
+        embed_mod.Embedder(backend="st")
     finally:
         monkey.undo()
 
@@ -115,7 +117,7 @@ def test_a_caller_supplied_model_is_not_given_someone_elses_revision():
     monkey = pytest.MonkeyPatch()
     monkey.setattr("sentence_transformers.SentenceTransformer", _FakeST)
     try:
-        embed_mod.Embedder(model_name="some/other-model")
+        embed_mod.Embedder(backend="st", model_name="some/other-model")
     finally:
         monkey.undo()
 

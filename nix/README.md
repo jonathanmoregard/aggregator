@@ -114,101 +114,73 @@ services.aggregator.embed = {
 
 ### Model weights: pre-seeded, never fetched by the timer
 
-Two models, about 1.2 GB of safetensors each:
+Two models are deployed — the embedding GGUF (~640 MB) and the reranker
+(~1.2 GB of safetensors):
 
 | Model | Loaded by | Used for | Pinned |
 |---|---|---|---|
-| `Qwen/Qwen3-Embedding-0.6B` | `aggregator-embed.service` | filling the vector index | sha, `embed.QWEN3_EMBEDDING_REVISION` |
+| `Qwen/Qwen3-Embedding-0.6B-GGUF`, file `Qwen3-Embedding-0.6B-Q8_0.gguf` | `aggregator-embed-server.service` (llama.cpp, Vulkan) | every embedding — the worker's backfill and every query | sha, `embed.QWEN3_EMBEDDING_GGUF_REVISION`, **in the path the unit opens** |
 | `Qwen/Qwen3-Reranker-0.6B` | the MCP server, lazily | `rerank=True` on a search | sha, `rerank.QWEN3_RERANKER_REVISION` |
-| `Qwen/Qwen3-Embedding-0.6B-GGUF` | nothing deployed — opt-in `AGGREGATOR_EMBED_BACKEND=gguf` only | the low-RAM embed backend | **no sha yet** — downloads refuse, see below |
+| `Qwen/Qwen3-Embedding-0.6B` | nothing deployed — opt-in `AGGREGATOR_EMBED_BACKEND=st` only | the in-process CPU backend | sha, `embed.QWEN3_EMBEDDING_REVISION` |
 
-"Pinned artifact, no in-place update" has to cover the weights: without a
-`revision=`, every load resolves `main` on the hub, so the bytes a rev-pinned
-unit executes can change with no commit anywhere in the repo. A sha, never a
-tag — a tag is repointable by the repo owner, which is the thing being
-defended against.
+### The embed server
 
-The `gguf` backend's `hf_hub_download` used to pass no `revision=` at all
-while the safetensors path passed one, so the two backends were not equally
-safe on the single path that can reach the network. `QWEN3_EMBEDDING_REVISION`
-cannot be reused: it was read off the safetensors repo and is not a valid ref
-in the separate `-GGUF` one. No sha for that repo has been verified yet, so
-`embed.QWEN3_EMBEDDING_GGUF_REVISION` is `None` and the **download** path
-refuses rather than silently resolving `main`; loading an already-seeded cache
-is unaffected. Nothing deployed can reach it — the units pin
-`AGGREGATOR_EMBED_BACKEND=st` and the `embed-gguf` extra is not in the closure.
-To close it: resolve `HfApi().model_info("Qwen/Qwen3-Embedding-0.6B-GGUF").sha`
-on a networked machine, verify the Q4_K_M file loads at that revision, and put
-the sha in `aggregator/core/embed.py`. A source constant, deliberately not an
-environment variable — an env-var pin is exactly the in-place mutable knob the
-deployment rule forbids.
+The worker and the MCP server no longer compute embeddings. They talk HTTP,
+over a **unix socket**, to `aggregator-embed-server.service`: an always-on
+user unit running `llama-server --embedding --pooling last` on the pinned
+Q8_0 file, bound to `$XDG_RUNTIME_DIR/aggregator-embed-server/embed.sock`,
+fully offloaded to the GPU. Measured on tuxedo (Radeon 890M): 2495 tokens/s
+against ~40 for the CPU backend it replaces, with vectors agreeing with the
+fp32 ones at cosine 0.9994 mean / 0.9990 min — see
+`docs/embedding-throughput.md`. The index is stamped
+`Qwen/Qwen3-Embedding-0.6B-GGUF-q8_0@768/chunk-4000-400/norm-l2`; switching to
+it starts a new backfill beside the old index rather than deleting it.
 
-**Both** are seeded by `aggregator-embed-seed.service`. That is not a detail:
-the seed unit used to run `embed --once`, which constructs only the `Embedder`.
-`Reranker()` is built in exactly one place — the MCP server — and it passes
-`local_files_only=not downloads_allowed()`, while that server is registered
-bare so downloads are never permitted there. So nothing anywhere fetched the
-reranker weights, every `rerank=True` raised inside the constructor, and
-`_maybe_rerank` caught it and returned the page in its original order. The
-feature was dead on arrival and the response said nothing about it.
-
-Three ways to get weights to an unattended unit, and they fail differently:
-
-| Approach | Upkeep | Manual work | Failure mode |
-|---|---|---|---|
-| Bake into a store path | new hash on every model bump; 1.2 GB in every closure | none | none at runtime, but every CI build pulls 1.2 GB |
-| Fetch at runtime | none | none | an outage, a rate limit or a renamed repo turns a background indexer into a fetcher retrying a 1.2 GB download every 30 min |
-| **Pre-seed a cache (chosen)** | **none** | **one command, once per machine** | **loud, specific, and names its own fix** |
-
-So the timer-driven unit runs with `HF_HUB_OFFLINE=1` and opens no sockets.
-`HF_HOME` is `%C/huggingface` — the systemd cache-directory specifier, which
-for a user manager is `$XDG_CACHE_HOME`, i.e. the same `~/.cache/huggingface`
-the interactive tooling already populates. No second copy, and no home path
-baked into the unit.
-
-If the weights are absent the worker refuses the run, non-zero, and prints
-the one command that fixes it:
-
-```bash
-systemctl --user start aggregator-embed-seed.service
-```
-
-That unit is the only thing here allowed to touch the network. It has no
-`[Install]` section and no timer — it runs when a human starts it, exports
-`AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1` (the opt-in the Python loaders gate on),
-and runs:
-
-```
-aggregator embed --seed-models
-```
-
-which constructs **both** the `Embedder` and the `Reranker`, touches no
-database rows, and exits non-zero naming the remedy if weights are absent and
-downloads are disallowed. Constructing both models is still a live proof that
-the weights are complete and loadable by torch.
-
-It deliberately does **not** embed a corpus row any more. The old
-`embed --once --batch-size 1` warmed the cache by running a real, untrusted
-corpus row through torch, opened the database — contending with a concurrent
-ingest — and advanced `embedding_state` as a side effect of a download.
-Fetching weights has no business touching the corpus.
-
-`checks.<system>.aggregator-embed-unit-hygiene` fails the build if the seed
-unit stops naming either model repo, stops running `--seed-models`, drops the
-download opt-in, or starts embedding rows again.
-
-The repo ids it compares against are **read out of the Python source** —
-`embed.py::_DEFAULT_MODEL_ST` and `rerank.py::_DEFAULT_MODEL` — because those
-are what `--seed-models` actually resolves. They used to be two string literals
-typed into `flake.nix`, matching strings that appear in the seed script only
-inside an informational `echo`, so changing the real model left the check green
-and `nix build` returned a byte-identical store path. That is fake coverage,
-which is worse than none: it reads as protection. The check now also derives
-each model's `models--Org--Name` cache directory and asserts the worker's
-`have_model` preflight gates on it, since a stale directory makes "weights
-present" a claim about the wrong model.
+* **A socket, not a TCP port, because of the worker's sandbox.** The worker
+  reads the whole untrusted corpus and stays at
+  `RestrictAddressFamilies=AF_UNIX AF_NETLINK` — no IP at all. TCP would have
+  needed `AF_INET`, and the loopback fence for it
+  (`IPAddressDeny=any` + `IPAddressAllow=localhost`) is cgroup BPF, which
+  tuxedo's user manager does not get: measured under those directives, a TCP
+  connect to the host's own LAN address succeeded. The server has no IP
+  family either. The hygiene check asserts neither unit permits `AF_INET`.
+* **The path is not an option.** The MCP server is registered bare and dials
+  `unix://$XDG_RUNTIME_DIR/` + `embed.EMBED_SOCKET_NAME` (falling back to
+  `/run/user/<uid>`); the unit binds the same path, and the hygiene check
+  asserts the two agree. The directory is the unit's `RuntimeDirectory`, mode
+  0700 (only this user reaches the encoder), removed by systemd on stop — so
+  "stopped" is "no socket file" to every client; the launcher also clears a
+  stale socket after an unclean exit. `AGGREGATOR_EMBED_URL`
+  (`unix:///path.sock` or `http://host:port`) can point a process at another
+  instance, but the backend checks what that instance serves (file name,
+  width, quantization via `/v1/models`) and refuses anything but the pinned
+  file, so a URL can never change what the stamp vouches for. Pooling is not
+  visible on any endpoint, so `--pooling last` is pinned by the unit's command
+  line and asserted by executing its launcher in the check.
+* **Stopped server = FTS5, not an error.** Offline-AI mode stops the unit for
+  hours. A query then answers from the keyword arm (the construction failure
+  is not cached, so the vector arm returns with the server); the worker's
+  next tick exits non-zero naming the unit, embeds nothing, blames no row and
+  leaves the backlog where it was. A server stopped mid-run is caught by the
+  worker's health probe the same way.
+* **Sandbox, verified by execution.** The server runs under
+  `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`,
+  `ProtectHome=read-only` (which also makes `/run/user` read-only — hence the
+  `RuntimeDirectory`, the one writable spot), `RestrictAddressFamilies=AF_UNIX
+  AF_NETLINK` and the rest of the worker's set, and **not** `PrivateDevices`,
+  which would hide `/dev/dri` and silently put the model on the CPU. Run under
+  exactly that set with `systemd-run --user` on tuxedo, `/v1/models` and
+  `/v1/embeddings` answered over the socket at 2270 tokens/s.
 
 ### Sandboxing the two units that run torch
+
+**Since the embed server (2026-10-01) the worker no longer loads torch** on
+the deployed backend — the encoding moved to `aggregator-embed-server`, whose
+sandbox is described and verified in "The embed server" above — and it
+now also uses `AF_UNIX` to reach that server's socket; it still has no IP
+family.
+The rest of this section still holds for the seeder, which loads the
+reranker, and for the worker on the opt-in `st` backend.
 
 Both `aggregator-embed.service` and `aggregator-embed-seed.service` load
 third-party weights into torch and a native tokenizer — a large C++ attack
@@ -296,6 +268,8 @@ What is **not** verified, and what would settle it:
 
 | Claim | Status | How to settle it |
 |---|---|---|
+| llama-server keeps the GPU under the embed server's directive set | **verified 2026-10-01** on tuxedo via `systemd-run --user` (2448 vs 2500 tokens/s unsandboxed) | — |
+| `IPAddressDeny=any` + `IPAddressAllow=localhost` would confine an `AF_INET` unit to loopback | **measured FALSE on tuxedo** — no cgroup BPF in the user manager; a connect to the host's LAN address succeeded | settled by design: the embed units use a unix socket and permit no IP family |
 | torch imports and runs under this directive set | **UNPROVEN** | run `aggregator-embed.service` on a host whose closure has torch, and read the journal |
 | the seeder can actually reach huggingface.co through `RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6` | **UNPROVEN** | `systemctl --user start aggregator-embed-seed.service` on such a host |
 | `MemoryDenyWriteExecute` would break torch | **asserted from documented behaviour, not measured here** | as above, plus one run with the directive added |

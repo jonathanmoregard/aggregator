@@ -942,8 +942,18 @@ def _query_embedding(text: str) -> object | None:
     """
     try:
         return _get_embedder().embed_query(text)
-    except Exception:  # noqa: BLE001 — the vector arm degrades, never fails
-        log.exception("query embedding failed; answering from FTS5 alone")
+    except Exception as e:  # noqa: BLE001 — the vector arm degrades, never fails
+        # Free by the time anything raised: the embedder module is imported by
+        # the construction attempt that got us here.
+        from aggregator.core.embed import EmbedServerError
+
+        if isinstance(e, EmbedServerError):
+            # A stopped embed server is a STATE, not a bug — offline-AI mode
+            # holds it stopped for hours — so one line per query, not a
+            # traceback per query burying whatever else the log says.
+            log.warning("query embedding unavailable, answering from FTS5 alone: %s", e)
+        else:
+            log.exception("query embedding failed; answering from FTS5 alone")
         return None
 
 
@@ -1199,8 +1209,11 @@ def _apply_hybrid(
                 raise _VectorModeUnavailableError(
                     "search_mode='vector' cannot run: the query could not be "
                     "embedded, so there is no vector to search with",
-                    "Run `aggregator embed --seed-models` if the embedding "
-                    "model's weights are missing, then retry. Re-run with the "
+                    "Check `systemctl --user status "
+                    "aggregator-embed-server.service` (offline-AI mode stops "
+                    "it) and run `aggregator embed --seed-models` if the "
+                    "embedding model's weights are missing, then retry. "
+                    "Re-run with the "
                     "default search_mode='hybrid' to answer from the keyword "
                     "arm meanwhile.",
                 )
