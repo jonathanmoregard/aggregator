@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 # equivalent; github.py still carried the dead import). When enrichment
 # lands, wire the runner at the call site, not as an unused module-level
 # import.
+from aggregator.core.retry import call_with_retry
 from aggregator.sources.base import IngestResult, QueryAST, Record, stable_id_for
 
 log = logging.getLogger(__name__)
@@ -97,6 +98,42 @@ def _has_write_scope(scopes: list[str]) -> bool:
     return any(s in WRITE_SCOPES for s in scopes)
 
 
+# What ``gh`` prints on stderr when the failure is the network or GitHub's
+# side rather than the request: a 5xx or 429 status, or a Go net/http
+# transport error (DNS, refused/reset connection, timeouts, truncated reads).
+_TRANSIENT_GH_STDERR = re.compile(
+    r"HTTP (5\d\d|429)\b"
+    r"|no such host|connection (refused|reset)|i/o timeout|TLS handshake timeout"
+    r"|context deadline exceeded|unexpected EOF|network is unreachable",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_gh_failure(exc: BaseException) -> bool:
+    """Whether a failed ``gh`` call might succeed if simply run again.
+
+    A timeout is a hang on the wire. A non-zero exit is transient only when
+    stderr names a server or transport fault; a 4xx, a missing ``gh``, or a
+    failure with no stderr to read is not retried.
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return True
+    if isinstance(exc, subprocess.CalledProcessError):
+        return bool(exc.stderr and _TRANSIENT_GH_STDERR.search(exc.stderr))
+    return False
+
+
+def _run_gh(argv: list[str], *, timeout: int) -> subprocess.CompletedProcess:
+    """Run one read-only ``gh`` call, retrying through transient failures."""
+    return call_with_retry(
+        lambda: subprocess.run(
+            argv, check=True, capture_output=True, text=True, timeout=timeout
+        ),
+        is_transient=_is_transient_gh_failure,
+        what=" ".join(argv),
+    )
+
+
 def _default_scope_fetcher() -> list[str]:
     """Call `gh api -i /rate_limit` and parse X-Oauth-Scopes from headers.
 
@@ -109,13 +146,7 @@ def _default_scope_fetcher() -> list[str]:
     failure.
     """
     try:
-        result = subprocess.run(
-            ["gh", "api", "--method", "GET", "-i", "/rate_limit"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        result = _run_gh(["gh", "api", "--method", "GET", "-i", "/rate_limit"], timeout=30)
         out = result.stdout
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
         log.warning("gh api -i /rate_limit failed: %s", e)
@@ -297,20 +328,8 @@ def _default_api_fetcher(path: str) -> list[dict]:
     """
     _validate_search_path(path)
     try:
-        result = subprocess.run(
-            [
-                "gh",
-                "api",
-                "--method",
-                "GET",
-                "--paginate",
-                "--jq",
-                ".items[]",
-                path,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+        result = _run_gh(
+            ["gh", "api", "--method", "GET", "--paginate", "--jq", ".items[]", path],
             timeout=120,
         )
         out = result.stdout

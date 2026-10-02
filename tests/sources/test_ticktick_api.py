@@ -2527,3 +2527,62 @@ def test_reconcile_matches_ids_the_way_the_baseline_keys_them(tmp_path):
     )
     assert ticktick_api.reconcile_open_tasks(state, poll, first) == []
     assert ticktick_api.reconcile_open_tasks(state, poll, second) == []
+
+
+# --- transient upstream failures are retried, permanent ones are not -------
+
+
+def _open_failing_then(monkeypatch, failures):
+    calls = {"n": 0}
+
+    def fake_open(req, timeout=None):
+        calls["n"] += 1
+        if failures:
+            raise failures.pop(0)
+        return _FakeResponse({"ok": True})
+
+    monkeypatch.setattr(ticktick_api, "_open", fake_open)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        HTTPError("https://x/y", 500, "boom", {}, None),
+        HTTPError("https://x/y", 503, "unavailable", {}, None),
+        HTTPError("https://x/y", 429, "slow down", {}, None),
+        URLError(OSError(-2, "Name or service not known")),
+        TimeoutError("timed out"),
+        ConnectionResetError("reset"),
+    ],
+    ids=["500", "503", "429", "dns", "timeout", "reset"],
+)
+def test_request_retries_a_transient_failure(monkeypatch, exc):
+    """2026-10-02: one project's HTTP 500 failed two whole ingest runs."""
+    calls = _open_failing_then(monkeypatch, [exc])
+    assert ticktick_api._request("GET", "https://x/y", token="tok") == {"ok": True}
+    assert calls["n"] == 2
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        HTTPError("https://x/y", 401, "unauthorized", {}, None),
+        HTTPError("https://x/y", 404, "missing", {}, None),
+        URLError("refusing a 302 redirect to a non-https url: http://evil"),
+    ],
+    ids=["401", "404", "redirect-refusal"],
+)
+def test_request_does_not_retry_a_permanent_failure(monkeypatch, exc):
+    calls = _open_failing_then(monkeypatch, [exc])
+    with pytest.raises(URLError):
+        ticktick_api._request("GET", "https://x/y", token="tok")
+    assert calls["n"] == 1
+
+
+def test_request_gives_up_on_a_persistent_500(monkeypatch):
+    failures = [HTTPError("https://x/y", 500, "boom", {}, None) for _ in range(10)]
+    calls = _open_failing_then(monkeypatch, failures)
+    with pytest.raises(HTTPError):
+        ticktick_api._request("GET", "https://x/y", token="tok")
+    assert 1 < calls["n"] < 10

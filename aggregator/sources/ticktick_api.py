@@ -63,13 +63,15 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from http.client import HTTPException
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 from urllib import request
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
 from aggregator.core.durable import flush_to_disk, replace_durably
+from aggregator.core.retry import call_with_retry
 from aggregator.sources.base import Record, stable_id_for
 
 # One vocabulary, defined once, in the module whose file format documents it.
@@ -256,8 +258,29 @@ def _request(method: str, url: str, token: str, timeout: int = DEFAULT_TIMEOUT) 
     # this write-scoped bearer token to another host.
     req.add_unredirected_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/json")
-    with _open(req, timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+
+    def attempt() -> bytes:
+        with _open(req, timeout) as response:
+            return response.read()
+
+    body = call_with_retry(attempt, is_transient=_is_transient, what=f"ticktick GET {url}")
+    return json.loads(body.decode("utf-8"))
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Whether a failed GET might succeed if simply sent again.
+
+    5xx and 429 are the server saying "not now". A non-HTTP ``URLError``
+    wrapping an ``OSError`` is DNS, a refused or reset connection, or a
+    timeout. A ``URLError`` with a string reason is this module's own refusal
+    (a redirect to plaintext) and a 4xx is a request the server rejected;
+    sending either again changes nothing.
+    """
+    if isinstance(exc, HTTPError):
+        return exc.code >= 500 or exc.code == 429
+    if isinstance(exc, URLError):
+        return isinstance(exc.reason, OSError)
+    return isinstance(exc, (OSError, HTTPException))
 
 
 def _note(errors: list[str] | None, message: str) -> None:

@@ -60,3 +60,11 @@ def _no_real_embed_server(monkeypatch):
 @pytest.fixture
 def repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """Transient-retry backoff is real seconds; no test should wait on it."""
+    from aggregator.core import retry
+
+    monkeypatch.setattr(retry, "_sleep", lambda _seconds: None)
