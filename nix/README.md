@@ -136,6 +136,17 @@ fp32 ones at cosine 0.9994 mean / 0.9990 min — see
 `Qwen/Qwen3-Embedding-0.6B-GGUF-q8_0@768/chunk-4000-400/norm-l2`; switching to
 it starts a new backfill beside the old index rather than deleting it.
 
+* **It is resident at ~3 GiB, not ~20.** The 2026-10-01 flags (`-ub 8192`,
+  no flash attention, llama-server's default 8 GiB prompt cache) pinned
+  RSS 11 GiB + 8.7 GiB of GPU-pinned RAM for a 640 MB model, on the belief
+  that an embedding input must fit one micro-batch. It need not: the model
+  is a causal decoder, the KV cache carries an input across micro-batches,
+  and a 5997-token input embeds at `-ub 512`. The unit now runs
+  `-b 1024 -ub 1024 -fa on --cache-ram 0` — measured 2026-10-02 at 3.0 GiB
+  resident after a 64-chunk batch, the old throughput, vectors at cosine
+  ≥ 0.9997 against the old flags (sweep in `docs/embedding-throughput.md`
+  and `embedServerRunner`'s comment). The hygiene check executes the
+  launcher and asserts those three flags.
 * **A socket, not a TCP port, because of the worker's sandbox.** The worker
   reads the whole untrusted corpus and stays at
   `RestrictAddressFamilies=AF_UNIX AF_NETLINK` — no IP at all. TCP would have
