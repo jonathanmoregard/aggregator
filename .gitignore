@@ -51,6 +51,23 @@ tasks/arftl-run.json
 /result
 /result-*
 
+# The dev shell's isolated XDG_DATA_HOME (flake.nix devShells.default
+# shellHook). Everything a `uv run aggregator …` inside `nix develop` would
+# otherwise have written to the LIVE cache lands here instead: cache.db and
+# its -wal/-shm, the retrieval eval DB, the TickTick backup archive.
+#
+# Three reasons this must be ignored, not merely untracked:
+#   1. cache.db is multi-GB in normal use. `nix develop` snapshots a dirty git
+#      tree into the Nix store, and untracked-but-unignored files are part of
+#      that snapshot — so without this line, entering the shell would copy the
+#      developer's whole database into /nix/store, every time it changed.
+#   2. The daily sync-agent.sh cron auto-commits untracked files. This repo is
+#      public, and the cache contains scrubbed-but-personal history.
+#   3. `*.db` above already covers the database itself, but not the directory,
+#      the archive tree, or anything a future call site puts under
+#      $XDG_DATA_HOME. Anchored at the root so the whole subtree is covered.
+/.devshell-data/
+
 # Working notes live in userspace, NOT in this repo (2026-08-16).
 #
 # These are agent/operator notes — mission state, durable user directives,
