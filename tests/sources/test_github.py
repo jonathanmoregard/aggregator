@@ -32,14 +32,6 @@ from aggregator.sources.github import (
 FIX = Path(__file__).parent.parent / "fixtures" / "github"
 
 
-@pytest.fixture(autouse=True)
-def _no_real_repo_enumeration(monkeypatch):
-    """Hermetic: never let a default-constructed source probe the real API."""
-    monkeypatch.setattr(
-        "aggregator.sources.github._default_private_repo_lister", lambda: None
-    )
-
-
 # -- pure helpers -----------------------------------------------------------
 
 
