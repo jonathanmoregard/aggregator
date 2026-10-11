@@ -177,17 +177,20 @@ become `[REDACTED:<rule-id>]`.
 
 **gitleaks is a hard runtime dependency and the scrubber fails closed.** The
 binary comes from `AGGREGATOR_GITLEAKS` (set it to a store path in any Nix
-wrapper — systemd units have a minimal PATH) or else `PATH`. When it is
+wrapper — systemd units have a minimal PATH), else `PATH`, else the Nix
+profile directories. When it is
 missing or errors, ingest writes nothing for the affected source and exits 3
 (the runner treats it as a broken sink, never as poison records), and
 `aggregator_search_memory` returns `ok: false` with the reason instead of
 results. Ingest batches each write group into one gitleaks call
 (`scrub_many`): a gitleaks process costs ~100 ms before it reads a byte.
-Each text is scanned as its own file (`gitleaks dir` over a tmpfs dir, empty
-cwd), under one gitleaks read and behind a `BM` header line — gitleaks
+How gitleaks is run lives in `aggregator/core/gitleaks_driver.py`, a
+byte-identical copy of `hooks/gitleaks_driver.py` in the `~/.claude` repo
+(sha256-pinned like the rules file): each text is its own scanned file under
+one gitleaks read, behind a `BM` header, in a fresh tmpfs dir — gitleaks
 otherwise cuts long inputs mid-token, skips input that sniffs as binary, and
-lets one text's keywords switch rules on for another. A scan that read fewer
-bytes than it was given fails closed.
+lets one text's keywords switch rules on for another — and a scan that read
+fewer bytes than it was given fails closed.
 
 Rows stored before a format was detectable are fixed in place with
 
