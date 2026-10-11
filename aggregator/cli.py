@@ -66,6 +66,10 @@ from aggregator.core.embed import (
     seed_embedder,
 )
 from aggregator.core.provenance import classify
+from aggregator.core.rescrub import DEFAULT_CHUNK as _RESCRUB_CHUNK
+from aggregator.core.rescrub import DEFAULT_JOBS as _RESCRUB_JOBS
+from aggregator.core.rescrub import rescrub
+from aggregator.core.scrub import ScrubUnavailableError
 from aggregator.core.store import (
     EMBED_BACKLOG_ORDER,
     EmptyRebuildRefusedError,
@@ -2303,6 +2307,53 @@ def _cmd_provenance(
     return 0
 
 
+def _cmd_rescrub(args: argparse.Namespace, store: Store) -> int:
+    """Re-apply the secret layers of ``scrub`` to stored rows (see core/rescrub).
+
+    Prints COUNTS ONLY — rows scanned and changed per table, redactions per
+    rule — never any of the text. ``--dry-run`` writes nothing. Hand-run;
+    no timer starts it.
+    """
+    mode = "dry-run" if args.dry_run else "write"
+
+    def _progress(rep) -> None:
+        if args.progress:
+            print(
+                f"rescrub[{mode}]: scanned={dict(rep.scanned)} "
+                f"changed={dict(rep.changed)}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    try:
+        with graceful_shutdown() as stop:
+            report = rescrub(
+                store,
+                dry_run=args.dry_run,
+                chunk_size=args.chunk_size,
+                jobs=args.jobs,
+                stop=stop,
+                progress=_progress,
+            )
+    except ScrubUnavailableError as e:
+        print(f"rescrub: secret scanner unavailable, stopped: {e}", file=sys.stderr)
+        return EXIT_COMPLETED_WITH_ERRORS
+    for table in ("observations", "records"):
+        print(
+            f"rescrub[{mode}]: {table}: scanned={report.scanned[table]} "
+            f"{'would_change' if args.dry_run else 'changed'}={report.changed[table]}"
+        )
+    for rule, n in sorted(report.by_rule.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"rescrub[{mode}]: rule {rule}: {n}")
+    if report.interrupted:
+        print(
+            f"rescrub[{mode}]: INTERRUPTED — re-run to finish (rows already "
+            f"rescrubbed come back unchanged and are not rewritten)"
+        )
+        return EXIT_COMPLETED_WITH_ERRORS
+    return 0
+
+
 def _owed_archive_paths(store: Store) -> set[str]:
     """JSONL paths that still own at least one unclassified observation.
 
@@ -4358,6 +4409,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_rescrub = sub.add_parser(
+        "rescrub",
+        help=(
+            "re-apply the secret scanner (regex floor + gitleaks) to rows "
+            "already stored; prints counts by rule, never values"
+        ),
+    )
+    p_rescrub.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="scan and count only; write nothing",
+    )
+    p_rescrub.add_argument(
+        "--chunk-size",
+        type=_positive_int,
+        default=_RESCRUB_CHUNK,
+        dest="chunk_size",
+        help=f"rows per scanned/committed chunk (default: {_RESCRUB_CHUNK})",
+    )
+    p_rescrub.add_argument(
+        "--jobs",
+        type=_positive_int,
+        default=_RESCRUB_JOBS,
+        help=(
+            f"chunks scanned concurrently, one gitleaks process each "
+            f"(default: {_RESCRUB_JOBS}); writes stay serial"
+        ),
+    )
+    p_rescrub.add_argument(
+        "--progress",
+        action="store_true",
+        help="print running counts to stderr after every chunk",
+    )
+
     p_tag = sub.add_parser(
         "tag",
         help=(
@@ -4524,6 +4610,8 @@ def main(
         return _cmd_provenance(args, store, sources())
     if args.cmd == "tag":
         return _cmd_tag(args, store)
+    if args.cmd == "rescrub":
+        return _cmd_rescrub(args, store)
     if args.cmd == "github-token-status":
         return _cmd_github_token_status(args, store, sources())
     return 2

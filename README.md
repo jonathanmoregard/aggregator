@@ -163,11 +163,45 @@ some session and `scope:session` will show them. The index does **not** stem:
 
 **There is deliberately no fourth code for "finished, known poison present".** Input that can never be parsed — two malformed lines in a JSONL file — is reported loudly the first time its exact identity is seen (exit 3, notification) and is a *note* on every run after that, so a run whose only faults are already-known ones exits `0`. A distinct code would still be non-zero, and `aggregator-ingest.service` treats every non-zero exit as a failure and fires `OnFailure=`, so introducing one would keep notifying every 30 minutes about a file that has been broken since March — the exact alarm fatigue the ledger exists to end. What a non-zero code would have signalled is signalled instead by things a stale unit file cannot suppress: `poison=N` on the run summary, a `note:` line naming each fault under its source, and the full listing in `aggregator status` (file, record count, first-seen date). The ledger itself is `PoisonLedger` in `aggregator/imports/ingest_state.py`.
 
+## Secret scrubbing
+
+`aggregator/core/scrub.py` redacts secrets in two passes before anything is
+stored and again before anything is returned: a regex floor for the formats
+most likely in this history (OpenAI, Anthropic incl. OAuth/admin, GitHub
+classic + fine-grained, Slack, Tavily, Cloudflare v2, Google OAuth client
+secret, JWT, AWS, PEM blocks), then `gitleaks stdin` with the vendored
+`aggregator/core/secret-rules.toml` (gitleaks' ~220 default rules plus custom
+ones; byte-identical to `hooks/secret-rules.toml` in the `~/.claude` config
+repo, pinned by checksum in `tests/core/test_scrub_gitleaks.py`). Findings
+become `[REDACTED:<rule-id>]`.
+
+**gitleaks is a hard runtime dependency and the scrubber fails closed.** The
+binary comes from `AGGREGATOR_GITLEAKS` (set it to a store path in any Nix
+wrapper — systemd units have a minimal PATH) or else `PATH`. When it is
+missing or errors, ingest writes nothing for the affected source and exits 3
+(the runner treats it as a broken sink, never as poison records), and
+`aggregator_search_memory` returns `ok: false` with the reason instead of
+results. Ingest batches each write group into one gitleaks call
+(`scrub_many`): a gitleaks process costs ~100 ms before it reads a byte.
+
+Rows stored before a format was detectable are fixed in place with
+
+```
+aggregator rescrub --dry-run   # counts by rule, writes nothing
+aggregator rescrub             # rewrites only the rows that change
+```
+
+It applies the secret layers to the stored text (no Presidio re-run), keeps
+`obs_fts`/`records_fts` in step, resets `embedding_state` and drops vectors
+for changed rows only, and leaves `src_hash` alone. Output is counts, never
+values. See `aggregator/core/rescrub.py` for why this replaces a
+`SCRUB_FINGERPRINT` bump for detection-only changes.
+
 ## Non-negotiables (from spec)
 
 - GitHub authority is constrained at the operation boundary: only explicit GET requests to the source's fixed `/search/issues` paths are accepted. OAuth scopes are reported by `aggregator github-token-status`, not used as the safety boundary.
 - MCP has NO write tools in v1.
-- Scrub (Presidio + gitleaks) pre-store AND pre-return.
+- Scrub (Presidio + gitleaks) pre-store AND pre-return. See **Secret scrubbing** above.
 - All returned content wrapped in `<ExternalContent source="…">` delimiters.
 - Stable local IDs persist across `--rebuild`.
 
