@@ -5105,16 +5105,11 @@ class Store:
         digest: str,
         existed: bool = False,
         *,
-        vec_usable: bool = False,
-        scrubbed: tuple[str, str] | None = None,
+        vec_usable: bool,
+        scrubbed: tuple[str, str],
     ) -> None:
         # ``scrubbed`` = (subject, body) already scrubbed by the caller's batch.
-        if scrubbed is None:
-            scrubbed_subject, scrubbed_body = (
-                res.text for res in scrub_many([r.subject, r.body])
-            )
-        else:
-            scrubbed_subject, scrubbed_body = scrubbed
+        scrubbed_subject, scrubbed_body = scrubbed
         c.execute(
             """
             INSERT INTO records(

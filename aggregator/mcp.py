@@ -155,7 +155,6 @@ from aggregator.core.hybrid import (
 from aggregator.core.provenance import MACHINE_VALUES
 from aggregator.core.scrub import (
     ScrubUnavailableError,
-    scrub,
     scrub_many,
     start_background_init,
 )
@@ -3567,8 +3566,8 @@ def _session_to_item(
 def _observation_to_item(
     o: ObservationRow,
     fields: str,
-    terms: tuple[str, ...] = (),
-    scrubbed_body: str | None = None,
+    terms: tuple[str, ...],
+    scrubbed_body: str,
 ) -> dict[str, Any]:
     """One observation row. ``terms`` are the query's terms, for the snippet.
 
@@ -3579,12 +3578,10 @@ def _observation_to_item(
     between a summary and a full fetch.
 
     ``scrubbed_body`` is the body already scrubbed by the caller's batch
-    (``scrub_many`` over the page); omitted, it is scrubbed here. The SUBJECT
-    is cut from the scrubbed body: it used to be cut from the raw one, so a
-    secret in a row's first 120 characters went back unscrubbed even though
-    the body beside it was clean.
+    (``scrub_many`` over the page). The SUBJECT is cut from it too, never from
+    the raw body.
     """
-    body = scrubbed_body if scrubbed_body is not None else scrub(o.body or "").text
+    body = scrubbed_body
     subject = (body[:120] if body else o.type)
     if fields == "full":
         content = wrap_record(
