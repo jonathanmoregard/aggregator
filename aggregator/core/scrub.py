@@ -56,7 +56,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -413,19 +413,50 @@ def _gitleaks_redact_many(texts: list[str], counts: list[dict[str, int]]) -> lis
 def _redact_targets(text: str, targets: dict[str, str], counts: dict[str, int]) -> str:
     """Replace every target string with ``[REDACTED:<rule>]`` in ONE pass.
 
-    Longest first in the alternation, so a shorter target never cuts into a
-    longer one and leaves part of it behind.
+    At each position the LONGEST target wins, so a shorter target never cuts
+    into a longer one and leaves part of it behind.
     """
     if not targets:
         return text
-    pattern = re.compile("|".join(map(re.escape, sorted(targets, key=len, reverse=True))))
 
     def _repl(m: re.Match) -> str:
         rule = targets[m.group(0)]
         counts[rule] = counts.get(rule, 0) + 1
         return f"[REDACTED:{rule}]"
 
-    return pattern.sub(_repl, text)
+    return _union_pattern(targets).sub(_repl, text)
+
+
+def _union_pattern(strings: Iterable[str]) -> re.Pattern:
+    """One regex matching any of ``strings``, longest first, built as a trie.
+
+    A flat ``a|b|c`` alternation is tried branch by branch at every position:
+    12,000 distinct targets over 3.7 MB took 49 s. Nested by shared prefix
+    (runs without a branch collapsed to one literal), each position costs one
+    pass down the trie instead: 0.9 s for the same input.
+    """
+    trie: dict = {}
+    for s in strings:
+        node = trie
+        for ch in s:
+            node = node.setdefault(ch, {})
+        node[""] = {}  # a string ends here
+
+    def build(node: dict) -> str:
+        branches = []
+        for ch in sorted(k for k in node if k):
+            literal, child = ch, node[ch]
+            while len(child) == 1 and "" not in child:
+                ((nxt, child),) = child.items()
+                literal += nxt
+            branches.append(re.escape(literal) + build(child))
+        if not branches:
+            return ""
+        body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
+        # A string ends here AND longer ones continue: try longer first.
+        return f"(?:{body})?" if "" in node else body
+
+    return re.compile(build(trie))
 
 
 # Presidio entity allowlist: real PII we want scrubbed at the boundary.

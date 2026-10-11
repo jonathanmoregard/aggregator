@@ -17,6 +17,7 @@ import hashlib
 import secrets
 import stat
 import string
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,6 +32,7 @@ from aggregator.core.scrub import (
     SECRET_PATTERNS,
     ScrubUnavailableError,
     _gitleaks_redact_many,
+    _redact_targets,
     _run_patterns,
     scrub,
     scrub_many,
@@ -411,3 +413,32 @@ def test_a_scan_that_reads_nothing_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setenv(GITLEAKS_ENV, str(fake))
     with pytest.raises(ScrubUnavailableError, match="read 0 of"):
         scrub("some text")
+
+
+# --- applying targets ----------------------------------------------------------
+
+
+def test_the_longest_target_wins_where_targets_overlap():
+    counts: dict[str, int] = {}
+    targets = {"abc": "short", "abcdef": "long", "bcd": "mid"}
+    out = _redact_targets("abcdef abc bcd", targets, counts)
+    assert out == "[REDACTED:long] [REDACTED:short] [REDACTED:mid]"
+    assert counts == {"long": 1, "short": 1, "mid": 1}
+
+
+def test_many_distinct_targets_over_megabytes_apply_quickly():
+    """A flat alternation of 12,000 distinct targets over ~3.7 MB took 49 s;
+    the trie-shaped pattern takes about 1 s. Bound generous for slow CI."""
+    tokens = [_r(25) + "7" for _ in range(12000)]
+    words = ("the", "rate", "limit", "server", "request", "value", "file")
+    parts = [words[i % len(words)] for i in range(600_000)]
+    for i, t in enumerate(tokens):
+        parts[i * 50] = t
+    text = " ".join(parts)
+    counts: dict[str, int] = {}
+    t0 = time.monotonic()
+    out = _redact_targets(text, dict.fromkeys(tokens, "generic-api-key"), counts)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 15, f"{elapsed:.1f}s"
+    assert counts == {"generic-api-key": 12000}
+    assert not any(t in out for t in tokens)
