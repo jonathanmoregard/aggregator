@@ -24,6 +24,8 @@ must say so, and the parser whitelists tag shape rather than trusting output.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -74,6 +76,10 @@ class FakeClaude:
         self.calls: list[dict] = []
 
     def __call__(self, argv, **kwargs):
+        # The scrubber's gitleaks, run on every store write, is real; every
+        # other command is the scripted tagger.
+        if os.path.basename(str(argv[0])) == "gitleaks":
+            return _REAL_RUN(argv, **kwargs)
         prompt = kwargs.get("input", "")
         self.calls.append({"argv": list(argv), "prompt": prompt})
         step = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
@@ -115,6 +121,10 @@ def no_sleep(monkeypatch):
     return naps
 
 
+_REAL_RUN = subprocess.run
+_REAL_WHICH = shutil.which
+
+
 def _install(monkeypatch, fake: FakeClaude, which=None) -> None:
     """Stub the subprocess seam AND the PATH probe.
 
@@ -124,8 +134,12 @@ def _install(monkeypatch, fake: FakeClaude, which=None) -> None:
     the probe to find nothing.
     """
     monkeypatch.setattr(subprocess, "run", fake)
+    probe = which or (lambda prog: f"/stub/{prog}")
+    # Stubbed for everything but gitleaks, which the scrubber resolves for real.
     monkeypatch.setattr(
-        cli.shutil, "which", which or (lambda prog: f"/stub/{prog}")
+        cli.shutil,
+        "which",
+        lambda prog, *a, **k: _REAL_WHICH(prog, *a, **k) if prog == "gitleaks" else probe(prog),
     )
 
 

@@ -228,6 +228,7 @@ def test_missing_binary_raises(monkeypatch, tmp_path):
 def test_no_binary_on_path_raises(monkeypatch, tmp_path):
     monkeypatch.delenv(GITLEAKS_ENV, raising=False)
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(gitleaks_driver, "FALLBACK_DIRS", ())
     with pytest.raises(ScrubUnavailableError):
         scrub_many(["one", "two"])
 
@@ -407,5 +408,5 @@ def test_a_scan_that_reads_nothing_fails_closed(monkeypatch, tmp_path):
     )
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv(GITLEAKS_ENV, str(fake))
-    with pytest.raises(ScrubUnavailableError, match="scanned 0 of"):
+    with pytest.raises(ScrubUnavailableError, match="read 0 of"):
         scrub("some text")
