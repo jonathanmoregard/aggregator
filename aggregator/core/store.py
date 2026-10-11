@@ -321,15 +321,8 @@ def _try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
 # next ingest — no rebuild, no migration, no flag. Leaving it alone is the
 # statement that the scrubber's output for a given input is unchanged.
 #
-# THE ONE DELIBERATE EXCEPTION: A CHANGE THAT ONLY ADDS SECRET DETECTION. The
-# gitleaks layer and the wider regex floor (2026-10) left this at v1 on
-# purpose. A bump re-runs Presidio over every row (~11 h) and, through the
-# UPSERT's ``embedding_state = NULL``, throws away the vector of every row —
-# to change a few hundred of them. Such a change ships with
-# ``aggregator rescrub`` instead (core/rescrub.py), which applies the secret
-# layers to the STORED text in place and touches only rows that change. That
-# is equivalent because ``scrub`` is idempotent. A change to the PII layers,
-# or one that REMOVES a redaction, still needs the bump.
+# Exception: a change that only ADDS secret detection ships with
+# ``aggregator rescrub`` instead of a bump — see core/rescrub.py for why.
 SCRUB_FINGERPRINT = "presidio+gitleaks/v1"
 
 # v3 chat-export origins. ``sessions.origin`` values are these plus the
