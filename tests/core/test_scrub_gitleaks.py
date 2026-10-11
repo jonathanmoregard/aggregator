@@ -41,9 +41,9 @@ from aggregator.core.scrub import (
 #: constant together.
 #: sha256 of ``hooks/gitleaks_driver.py`` in the same repo, vendored here
 #: byte-identical as ``aggregator/core/gitleaks_driver.py``.
-SHARED_DRIVER_SHA256 = "d9b4f5637f702e4d26e59b85eb06910774a2552418682274bf273153712794f7"
+SHARED_DRIVER_SHA256 = "6ea329d7f008d2c6a4f2edd4dca76f7661307e8b2494d1e21f0651245e774e93"
 
-SHARED_RULES_SHA256 = "b70f0f5848709aef1d720e3b48f5360cd02d0f3b465af3a91bedad92e638c77a"
+SHARED_RULES_SHA256 = "0a703ac9b96343940f15c8c3ab634e8b699416892664700566459b2edb253294"
 
 _ALNUM = string.ascii_letters + string.digits
 

@@ -129,7 +129,7 @@ def redact(text: str, targets: dict[str, str], marker: Callable[[str, int], str]
     # Hand-rolled on purpose: the hooks run stdlib-only `python3 -S -E`, where pyahocorasick
     # (in nixpkgs) is not importable, and an `re` alternation took 19 s for 1,000 targets
     # over 8 MB. One str.find pass per target took 0.7 s.
-    spans = sorted(((i, i + len(t), rule) for t, rule in targets.items() if t for i in _find_all(text, t)),
+    spans = sorted(((start, end, rule) for t, rule in targets.items() if t for start, end in _spans(text, t)),
                    key=lambda span: (span[0], -span[1]))
     merged: list[list] = []
     for start, end, rule in spans:
@@ -144,8 +144,15 @@ def redact(text: str, targets: dict[str, str], marker: Callable[[str, int], str]
     return "".join(out) + text[pos:]
 
 
-def _find_all(text: str, target: str):
-    i = text.find(target)
-    while i != -1:
-        yield i
-        i = text.find(target, i + 1)
+def _spans(text: str, target: str):
+    """(start, end) of each run of overlapping occurrences of ``target``: one span per run,
+    so a target repeated through a long run of one character costs no memory."""
+    start = text.find(target)
+    while start != -1:
+        end = start + len(target)
+        nxt = text.find(target, start + 1)
+        while nxt != -1 and nxt < end:
+            end = nxt + len(target)
+            nxt = text.find(target, nxt + 1)
+        yield start, end
+        start = nxt
