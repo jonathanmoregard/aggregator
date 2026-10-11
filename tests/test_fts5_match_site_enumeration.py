@@ -92,8 +92,10 @@ _VEC_SITE = re.compile(r"\bembedding\s+MATCH\b", re.IGNORECASE)
 #: shape it would miss is ``f"... {table} match '{q}'"``, i.e. precisely the
 #: interpolated-user-text injection this file exists to catch.
 _NOT_SQL = {
-    # gitleaks' JSON report field name, read by the secret scrubber.
+    # gitleaks' JSON report field name, read by the secret scrubber and the
+    # vendored gitleaks driver.
     ("aggregator/core/scrub.py", "", "Match"),
+    ("aggregator/core/gitleaks_driver.py", "_targets", "Match"),
     (
         "aggregator/core/store.py",
         "Store._fts_rows",

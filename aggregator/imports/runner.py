@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from aggregator.core.scrub_errors import ScrubUnavailableError
+from aggregator.core.scrub import ScrubUnavailableError
 from aggregator.imports.ingest_state import (
     STALE_INPUTS,
     FaultVerdict,

@@ -66,9 +66,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-# Lives in its own module so its identity survives ``importlib.reload`` of
-# this one (tests reload it); re-exported here as the public name.
-from aggregator.core.scrub_errors import ScrubUnavailableError
+from aggregator.core.gitleaks_driver import GitleaksError
+
+#: The scrubber's fail-closed error: the scan did not complete, so the text
+#: must be neither stored nor returned. An alias, not a subclass, so it is the
+#: same class after ``importlib.reload`` of this module (tests reload it).
+ScrubUnavailableError = GitleaksError
 
 #: Bound at import, not looked up per call: a test that stubs the global
 #: ``subprocess.run``/``shutil.which`` seam for ANOTHER tool (the ``claude``

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from aggregator.core import gitleaks_driver
 from aggregator.core import scrub as scrub_mod
 from aggregator.core.scrub import (
     GITLEAKS_ENV,
@@ -38,6 +39,10 @@ from aggregator.core.scrub import (
 #: sha256 of ``hooks/secret-rules.toml`` in the ~/.claude config repo, which
 #: redacts agent tool output with the same rules. Update BOTH copies and this
 #: constant together.
+#: sha256 of ``hooks/gitleaks_driver.py`` in the same repo, vendored here
+#: byte-identical as ``aggregator/core/gitleaks_driver.py``.
+SHARED_DRIVER_SHA256 = "019133e174e15d462f0d0143a8946f694cd8bf350051c0843354e884a3023c27"
+
 SHARED_RULES_SHA256 = "b4db7a807ab4b709ba08d66e2cbec56d1f084650fc26eddfd3c525836a8e0a18"
 
 _ALNUM = string.ascii_letters + string.digits
@@ -71,19 +76,22 @@ def _mask(s: str) -> str:
 # --- the vendored rules ------------------------------------------------------
 
 
-def test_vendored_rules_file_is_the_shared_copy():
-    digest = hashlib.sha256(GITLEAKS_RULES.read_bytes()).hexdigest()
-    assert digest == SHARED_RULES_SHA256, (
-        "aggregator/core/secret-rules.toml drifted from the ~/.claude copy "
-        "(hooks/secret-rules.toml); update both and SHARED_RULES_SHA256"
+@pytest.mark.parametrize(
+    ("vendored", "digest", "claude_copy"),
+    [
+        (GITLEAKS_RULES, SHARED_RULES_SHA256, "secret-rules.toml"),
+        (Path(gitleaks_driver.__file__), SHARED_DRIVER_SHA256, "gitleaks_driver.py"),
+    ],
+    ids=["rules", "driver"],
+)
+def test_vendored_files_are_the_shared_copies(vendored, digest, claude_copy):
+    assert hashlib.sha256(vendored.read_bytes()).hexdigest() == digest, (
+        f"{vendored.name} drifted from the ~/.claude copy (hooks/{claude_copy}); "
+        "update both and the pinned digest"
     )
-
-
-def test_vendored_rules_match_the_local_claude_copy_when_present():
-    other = Path.home() / ".claude" / "hooks" / "secret-rules.toml"
-    if not other.exists():
-        pytest.skip("no ~/.claude/hooks/secret-rules.toml on this machine")
-    assert other.read_bytes() == GITLEAKS_RULES.read_bytes()
+    other = Path.home() / ".claude" / "hooks" / claude_copy
+    if other.exists():
+        assert other.read_bytes() == vendored.read_bytes()
 
 
 def test_rules_file_ships_inside_the_package():
@@ -332,7 +340,7 @@ def test_runner_does_not_quarantine_rows_when_the_scanner_is_down(monkeypatch, t
     assert not adapter.ok
     assert adapter.quarantined == 0
     assert ledger.held("dropbox") == {}
-    assert any("ScrubUnavailableError" in e for e in adapter.errors)
+    assert any(ScrubUnavailableError.__name__ in e for e in adapter.errors)
     bodies = {r[0] for r in store._c().execute("SELECT body FROM records")}
     assert bodies == {"b0", "b1", "b2", "b3"}
     store.close()
