@@ -10,6 +10,7 @@ import string
 
 import pytest
 
+from aggregator.core.scrub import GITLEAKS_ENV
 from aggregator.core.store import Store
 from aggregator.mcp import aggregator_query
 
@@ -77,7 +78,7 @@ def test_observation_drilldown_subject_and_body_are_scrubbed(leaky, fields):
 
 def test_results_are_withheld_when_the_scanner_is_missing(leaky, monkeypatch, tmp_path):
     store, secret = leaky
-    monkeypatch.setenv("AGGREGATOR_GITLEAKS", str(tmp_path / "absent"))
+    monkeypatch.setenv(GITLEAKS_ENV, str(tmp_path / "absent"))
     result = aggregator_query(dsl="source:sessions", fields="full", _store=store)
     assert result["ok"] is False
     assert "secret scanner unavailable" in result["reason"]

@@ -112,13 +112,12 @@ def test_each_format_is_redacted(name):
     assert "trailing words" in out.text
 
 
-def test_regex_floor_alone_covers_the_listed_formats():
+@pytest.mark.parametrize("name", sorted(set(_tokens()) - {"gitlab_pat"}))
+def test_regex_floor_alone_covers_the_listed_formats(name):
     """The floor must stand without gitleaks for everything but gitlab."""
-    for name, token in _tokens().items():
-        if name == "gitlab_pat":
-            continue
-        out = _run_patterns(f"x {token} y", SECRET_PATTERNS, {})
-        assert token not in out, f"floor missed {name}: {_mask(token)}"
+    token = _tokens()[name]
+    out = _run_patterns(f"x {token} y", SECRET_PATTERNS, {})
+    assert token not in out, f"floor missed {name}: {_mask(token)}"
 
 
 def test_base64_encoded_secret_is_redacted():
@@ -161,10 +160,10 @@ def _mixed_corpus() -> list[str]:
     ]
 
 
-def test_scrub_is_idempotent_over_new_formats():
-    for text in _mixed_corpus():
-        once = scrub(text).text
-        assert scrub(once).text == once
+@pytest.mark.parametrize("i", range(len(_mixed_corpus())))
+def test_scrub_is_idempotent_over_new_formats(i):
+    once = scrub(_mixed_corpus()[i]).text
+    assert scrub(once).text == once
 
 
 def test_batch_gives_exactly_the_single_results():
@@ -202,18 +201,20 @@ def test_a_multiline_secret_next_to_a_dangling_header_is_still_found():
     assert body.splitlines()[5] not in batched[1]
 
 
-def test_non_secret_text_is_unchanged():
-    benign = [
+@pytest.mark.parametrize(
+    "text",
+    [
         "The rate limit is 5000 requests per hour.",
         "Use the api_key parameter; the token is read from the keyring.",
         "def get_token():\n    return os.environ['API_TOKEN']\n",
         "commit 3f2a9c1 fixed the key rotation script",
         "see https://github.com/owner/repo/pull/42 for the token refactor",
-    ]
-    for text in benign:
-        out = scrub(text)
-        assert out.text == text, out.counts
-        assert out.counts == {}
+    ],
+)
+def test_non_secret_text_is_unchanged(text):
+    out = scrub(text)
+    assert out.text == text, out.counts
+    assert out.counts == {}
 
 
 # --- fail closed -------------------------------------------------------------
@@ -350,12 +351,8 @@ def test_runner_does_not_quarantine_rows_when_the_scanner_is_down(monkeypatch, t
 # --- gitleaks input-handling holes (close-out review) ------------------------
 #
 # Each of these was a real leak against gitleaks 8.30.1 driven naively; the
-# tests pin that the wrapper closes them. The token format (GitLab PAT) is one
+# tests pin, end to end through ``scrub``, that the driver closes them. The token format (GitLab PAT) is one
 # only gitleaks knows, so the regex floor cannot mask a regression.
-
-
-def _glpat() -> str:
-    return "gl" + "pat-" + _r(20)
 
 
 @pytest.mark.parametrize(
@@ -365,14 +362,14 @@ def _glpat() -> str:
 def test_text_that_sniffs_as_a_binary_type_is_still_scanned(prefix):
     """gitleaks skips input whose first bytes look like application/* and
     reports it clean with zero bytes scanned."""
-    token = _glpat()
+    token = _tokens()["gitlab_pat"]
     assert token not in scrub(f"{prefix}\n{token}").text
 
 
 def test_no_token_is_lost_to_a_fragment_cut():
     """gitleaks cuts long blank-line-free input at arbitrary bytes; tokens on
     the cut were missed (8 of 12,000 here, timing-dependent)."""
-    tokens = [_glpat() for _ in range(12000)]
+    tokens = [_tokens()["gitlab_pat"] for _ in range(12000)]
     out = scrub(" ".join(tokens)).text
     # About 1 random token in 240,000 is rejected by gitleaks' own rule and
     # allowlists wherever it stands (measured: missed when scanned alone too).
@@ -381,9 +378,9 @@ def test_no_token_is_lost_to_a_fragment_cut():
     assert [t for t in survivors if t not in scrub(t).text] == []
 
 
-def test_long_text_is_windowed_and_positions_map_back():
-    """A text far larger than one call: a base64-encoded secret deep inside,
-    on a line that starts mid-window, is redacted at the right place."""
+def test_long_text_is_windowed_and_redacted_in_place():
+    """A text far larger than one piece: a base64-encoded secret deep inside,
+    on a line that starts mid-piece, is redacted and nothing else moves."""
     token = "gh" + "p_" + _r(36)
     encoded = base64.b64encode(f"user:{token}".encode()).decode()
     filler = "\n".join("plain words " * 8 for _ in range(3000))
@@ -397,7 +394,7 @@ def test_long_text_is_windowed_and_positions_map_back():
 
 
 def test_a_gitleaksignore_in_the_working_directory_cannot_suppress(monkeypatch, tmp_path):
-    token = _glpat()
+    token = _tokens()["gitlab_pat"]
     (tmp_path / ".gitleaksignore").write_text(":gitlab-pat:1\n:gitlab-pat:3\n")
     monkeypatch.chdir(tmp_path)
     assert token not in scrub(token).text

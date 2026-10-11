@@ -13,6 +13,7 @@ import pytest
 
 from aggregator.cli import main
 from aggregator.core.rescrub import rescrub
+from aggregator.core.scrub import GITLEAKS_ENV
 from aggregator.core.store import _RECORDS_FTS_REFRESH_SQL, Store
 
 _ALNUM = string.ascii_letters + string.digits
@@ -117,7 +118,7 @@ def test_cli_prints_counts_never_values(seeded, capsys):
 
 def test_cli_fails_closed_without_the_scanner(seeded, monkeypatch, tmp_path, capsys):
     store, obs_secret, _ = seeded
-    monkeypatch.setenv("AGGREGATOR_GITLEAKS", str(tmp_path / "absent"))
+    monkeypatch.setenv(GITLEAKS_ENV, str(tmp_path / "absent"))
     assert main(["rescrub"]) == 3
     body = _row(store, "SELECT body FROM observations WHERE obs_id='o-leak'")[0]
     assert obs_secret in body
