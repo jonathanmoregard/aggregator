@@ -374,7 +374,11 @@ def test_no_token_is_lost_to_a_fragment_cut():
     the cut were missed (8 of 12,000 here, timing-dependent)."""
     tokens = [_glpat() for _ in range(12000)]
     out = scrub(" ".join(tokens)).text
-    assert [t for t in tokens if t in out] == []
+    # About 1 random token in 240,000 is rejected by gitleaks' own rule and
+    # allowlists wherever it stands (measured: missed when scanned alone too).
+    # Those are not cut losses; anything else surviving is.
+    survivors = [t for t in tokens if t in out]
+    assert [t for t in survivors if t not in scrub(t).text] == []
 
 
 def test_long_text_is_windowed_and_positions_map_back():
