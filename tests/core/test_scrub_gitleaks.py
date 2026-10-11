@@ -43,7 +43,7 @@ from aggregator.core.scrub import (
 #: byte-identical as ``aggregator/core/gitleaks_driver.py``.
 SHARED_DRIVER_SHA256 = "d9b4f5637f702e4d26e59b85eb06910774a2552418682274bf273153712794f7"
 
-SHARED_RULES_SHA256 = "30fa7a45343da88a6107481e48cc8bf241f67687d23fe9c8738396e98733b5a7"
+SHARED_RULES_SHA256 = "b70f0f5848709aef1d720e3b48f5360cd02d0f3b465af3a91bedad92e638c77a"
 
 _ALNUM = string.ascii_letters + string.digits
 
