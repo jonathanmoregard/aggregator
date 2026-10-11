@@ -29,11 +29,9 @@ from aggregator.core import scrub as scrub_mod
 from aggregator.core.scrub import (
     GITLEAKS_ENV,
     GITLEAKS_RULES,
-    SECRET_PATTERNS,
     ScrubUnavailableError,
+    _counting_marker,
     _gitleaks_redact_many,
-    _redact_targets,
-    _run_patterns,
     scrub,
     scrub_many,
 )
@@ -43,9 +41,9 @@ from aggregator.core.scrub import (
 #: constant together.
 #: sha256 of ``hooks/gitleaks_driver.py`` in the same repo, vendored here
 #: byte-identical as ``aggregator/core/gitleaks_driver.py``.
-SHARED_DRIVER_SHA256 = "019133e174e15d462f0d0143a8946f694cd8bf350051c0843354e884a3023c27"
+SHARED_DRIVER_SHA256 = "d9b4f5637f702e4d26e59b85eb06910774a2552418682274bf273153712794f7"
 
-SHARED_RULES_SHA256 = "763782827890d286f4f0b9a34b1b38e95a4da33ecd0fef0fa53f57e39ff9b540"
+SHARED_RULES_SHA256 = "30fa7a45343da88a6107481e48cc8bf241f67687d23fe9c8738396e98733b5a7"
 
 _ALNUM = string.ascii_letters + string.digits
 
@@ -66,7 +64,7 @@ def _tokens() -> dict[str, str]:
         "anthropic_oauth": "sk-" + "ant-oat01-" + _r(80),
         "anthropic_admin": "sk-" + "ant-admin01-" + _r(80),
         "anthropic_api03": "sk-" + "ant-api03-" + _r(93) + "AA",
-        # Not in the regex floor at all: only gitleaks' default rules know it.
+        # A format only gitleaks' default rules know.
         "gitlab_pat": "gl" + "pat-" + _r(20),
     }
 
@@ -114,12 +112,21 @@ def test_each_format_is_redacted(name):
     assert "trailing words" in out.text
 
 
-@pytest.mark.parametrize("name", sorted(set(_tokens()) - {"gitlab_pat"}))
-def test_regex_floor_alone_covers_the_listed_formats(name):
-    """The floor must stand without gitleaks for everything but gitlab."""
-    token = _tokens()[name]
-    out = _run_patterns(f"x {token} y", SECRET_PATTERNS, {})
-    assert token not in out, f"floor missed {name}: {_mask(token)}"
+@pytest.mark.parametrize(
+    "token",
+    [
+        "github" + "_pat_11" + _r(41),  # truncated fine-grained PATs, as found in the store
+        "gh" + "p_" + _r(20),
+        "sk-" + "ant-" + _r(30),
+        "sk-" + _r(48),
+        "tvly" + "-" + _r(20),
+        "ey" + "J" + _r(10) + ".ey" + "J" + _r(10) + "." + _r(10),
+    ],
+    ids=["fine-grained-43", "classic-20", "anthropic-loose", "openai-legacy", "tavily-20", "short-jwt"],
+)
+def test_known_prefixes_are_redacted_at_any_body_length(token):
+    """gitleaks pins exact lengths; truncated and hand-made tokens still go."""
+    assert token not in scrub(f"x {token} y").text, _mask(token)
 
 
 def test_base64_encoded_secret_is_redacted():
@@ -189,8 +196,7 @@ def test_batched_texts_do_not_switch_rules_on_for_each_other():
 
 def test_a_multiline_secret_next_to_a_dangling_header_is_still_found():
     """A PEM block whose header is in one text and whose END is in the next
-    must not swallow the next text's own complete key. The regex floor is
-    bypassed here on purpose — it would remove the headers first."""
+    must not swallow the next text's own complete key."""
     body = "\n".join(_r(64) for _ in range(12))
     head = "-----BEGIN RSA " + "PRIVATE KEY-----"
     tail = "-----END RSA " + "PRIVATE KEY-----"
@@ -231,7 +237,6 @@ def test_missing_binary_raises(monkeypatch, tmp_path):
 def test_no_binary_on_path_raises(monkeypatch, tmp_path):
     monkeypatch.delenv(GITLEAKS_ENV, raising=False)
     monkeypatch.setenv("PATH", str(tmp_path))
-    monkeypatch.setattr(gitleaks_driver, "FALLBACK_DIRS", ())
     with pytest.raises(ScrubUnavailableError):
         scrub_many(["one", "two"])
 
@@ -353,8 +358,7 @@ def test_runner_does_not_quarantine_rows_when_the_scanner_is_down(monkeypatch, t
 # --- gitleaks input-handling holes (close-out review) ------------------------
 #
 # Each of these was a real leak against gitleaks 8.30.1 driven naively; the
-# tests pin, end to end through ``scrub``, that the driver closes them. The token format (GitLab PAT) is one
-# only gitleaks knows, so the regex floor cannot mask a regression.
+# tests pin, end to end through ``scrub``, that the driver closes them.
 
 
 @pytest.mark.parametrize(
@@ -421,14 +425,14 @@ def test_a_scan_that_reads_nothing_fails_closed(monkeypatch, tmp_path):
 def test_the_longest_target_wins_where_targets_overlap():
     counts: dict[str, int] = {}
     targets = {"abc": "short", "abcdef": "long", "bcd": "mid"}
-    out = _redact_targets("abcdef abc bcd", targets, counts)
+    out = gitleaks_driver.redact("abcdef abc bcd", targets, _counting_marker(counts))
     assert out == "[REDACTED:long] [REDACTED:short] [REDACTED:mid]"
     assert counts == {"long": 1, "short": 1, "mid": 1}
 
 
 def test_many_distinct_targets_over_megabytes_apply_quickly():
     """A flat alternation of 12,000 distinct targets over ~3.7 MB took 49 s;
-    the trie-shaped pattern takes about 1 s. Bound generous for slow CI."""
+    one str.find pass per target takes a few seconds. Bound generous for slow CI."""
     tokens = [_r(25) + "7" for _ in range(12000)]
     words = ("the", "rate", "limit", "server", "request", "value", "file")
     parts = [words[i % len(words)] for i in range(600_000)]
@@ -437,7 +441,7 @@ def test_many_distinct_targets_over_megabytes_apply_quickly():
     text = " ".join(parts)
     counts: dict[str, int] = {}
     t0 = time.monotonic()
-    out = _redact_targets(text, dict.fromkeys(tokens, "generic-api-key"), counts)
+    out = gitleaks_driver.redact(text, dict.fromkeys(tokens, "generic-api-key"), _counting_marker(counts))
     elapsed = time.monotonic() - t0
     assert elapsed < 15, f"{elapsed:.1f}s"
     assert counts == {"generic-api-key": 12000}

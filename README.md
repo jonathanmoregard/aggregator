@@ -165,20 +165,17 @@ some session and `scope:session` will show them. The index does **not** stem:
 
 ## Secret scrubbing
 
-`aggregator/core/scrub.py` redacts secrets in two passes before anything is
-stored and again before anything is returned: a regex floor for the formats
-most likely in this history (OpenAI, Anthropic incl. OAuth/admin, GitHub
-classic + fine-grained, Slack, Tavily, Cloudflare v2, Google OAuth client
-secret, JWT, AWS, PEM blocks), then `gitleaks stdin` with the vendored
+`aggregator/core/scrub.py` redacts secrets with gitleaks before anything is
+stored and again before anything is returned, using the vendored
 `aggregator/core/secret-rules.toml` (gitleaks' ~220 default rules plus custom
-ones; byte-identical to `hooks/secret-rules.toml` in the `~/.claude` config
+ones for what they miss: known token prefixes at any body length, and private
+keys cut by truncation; byte-identical to `hooks/secret-rules.toml` in the `~/.claude` config
 repo, pinned by checksum in `tests/core/test_scrub_gitleaks.py`). Findings
 become `[REDACTED:<rule-id>]`.
 
 **gitleaks is a hard runtime dependency and the scrubber fails closed.** The
 binary comes from `AGGREGATOR_GITLEAKS` (set it to a store path in any Nix
-wrapper — systemd units have a minimal PATH), else `PATH`, else the Nix
-profile directories. When it is
+wrapper — systemd units have a minimal PATH), else `PATH`. When it is
 missing or errors, ingest writes nothing for the affected source and exits 3
 (the runner treats it as a broken sink, never as poison records), and
 `aggregator_search_memory` returns `ok: false` with the reason instead of

@@ -2,11 +2,12 @@
 
 Invariants:
 - Each text is judged alone: one scanned file per piece, so a rule's keywords never cross texts.
-- gitleaks reads every byte or the call fails: no piece is skipped as binary or cut mid-token,
-  and the "scanned ~N bytes" count is checked against what was written.
+- gitleaks reads every byte or the call fails: no file is skipped as binary or cut mid-token,
+  and gitleaks' own read count is checked against what was written.
 - Nothing in or around the input can silence a finding (no ignore files, gitleaks:allow ignored).
 - Any scanner fault raises GitleaksError; an empty result means "read it all, found nothing".
 - Results are plain target strings (never containing a redaction marker); no coordinates leave.
+- ``redact`` replaces every occurrence of every target; overlapping ones become one marker.
 Stdlib only: vendored byte-identical into the aggregator repo.
 """
 from __future__ import annotations
@@ -14,129 +15,137 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
-import time
+from collections.abc import Callable
 
 # BMP magic: gitleaks sniffs each file and silently skips application/* types (%PDF, MZ, ...).
-HEADER = "BM gitleaks-driver\n\n"
-# Under gitleaks' 100,000-byte read, so a file is one fragment and never cut mid-token.
+HEADER = b"BM gitleaks-driver\n\n"
+# HEADER + piece stays under gitleaks' 100,000-byte read, so gitleaks never cuts a file itself.
 PIECE_BYTES = 96_000
-# A secret straddling a piece edge lies whole inside the neighbouring piece.
-OVERLAP_CHARS = 16_000
+# Neighbouring pieces share this many bytes, so a secret cut by one piece's edge is whole in
+# the other (an armored private key is well under 16 KB).
+OVERLAP_BYTES = 16_000
 # A Secret capture shorter than this is too generic to redact everywhere; use the full Match.
 MIN_SECRET_CHARS = 8
-# Decoded findings report the DECODED secret; the encoded run on that line is what to redact.
+# Decoded findings report the DECODED secret; the encoded runs on that line are what to redact.
 ENCODED_RUN = re.compile(r"[A-Za-z0-9+/=_%\-]{16,}")
 # A target containing a marker is a match on an earlier redaction: dropping it keeps reruns stable.
 MARKER = "[REDACTED:"
-# gitleaks' own read count; fewer bytes than written means something was skipped.
+# An existing marker on a decoded line is not an encoded run (its rule id could look like one).
+MARKER_SPAN = re.compile(r"\[REDACTED:[^\]\n]*\]")
+# gitleaks' log line with its own read count.
 SCANNED = re.compile(r"scanned ~(\d+) bytes")
-# gitleaks colours its log lines even under --no-color.
+# gitleaks colours its fatal log lines even under --no-color.
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# Used when the caller gives no deadline; only a hung scanner reaches it.
-DEFAULT_TIMEOUT_S = 300.0
 # tmpfs where available, so unredacted text is not written to disk.
 RAM_DIR = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
-# Where Nix puts gitleaks when PATH is minimal (systemd units, hooks).
-FALLBACK_DIRS = ("/etc/profiles/per-user/{user}/bin", "{home}/.nix-profile/bin",
-                 "/run/current-system/sw/bin")
 
 
 class GitleaksError(Exception):
     """The scan did not complete; the texts are NOT known to be clean. Never carries text."""
 
 
-def gitleaks_binary(env_var: str | None = None) -> str | None:
-    """The gitleaks to run: ``$env_var`` if set (and nothing else), else PATH, else Nix dirs."""
-    if env_var and os.environ.get(env_var):
-        path = os.environ[env_var]
-        return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
-    found = shutil.which("gitleaks")
-    if found:
-        return found
-    user, home = os.environ.get("USER", ""), os.path.expanduser("~")
-    for d in FALLBACK_DIRS:
-        path = os.path.join(d.format(user=user, home=home), "gitleaks")
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
+def pieces(data: bytes) -> list[bytes]:
+    """``data`` as PIECE_BYTES windows, each overlapping the next by OVERLAP_BYTES."""
+    step = PIECE_BYTES - OVERLAP_BYTES
+    return [data[i : i + PIECE_BYTES] for i in range(0, max(len(data) - OVERLAP_BYTES, 1), step)]
 
 
-def pieces(text: str) -> list[str]:
-    """``text`` cut into overlapping pieces that each fit one file, preferring newline cuts."""
-    budget = PIECE_BYTES - len(HEADER.encode())
-    out, start = [], 0
-    while True:
-        end = min(len(text), start + budget)
-        while len(text[start:end].encode("utf-8", "replace")) > budget:
-            end = start + (end - start) * 9 // 10
-        if end < len(text):
-            nl = text.rfind("\n", start + OVERLAP_CHARS + 1, end)
-            end = nl + 1 if nl != -1 else end
-        out.append(text[start:end])
-        if end >= len(text):
-            return out
-        start = max(end - OVERLAP_CHARS, start + 1)
-
-
-def find_secrets(texts: list[str], *, rules: str, binary: str, deadline: float | None = None,
-                 env: dict | None = None) -> list[dict[str, str]]:
-    """Per text, ``{target string: rule id}``. ``deadline`` is a time.monotonic() instant."""
-    owner = [(i, p) for i, t in enumerate(texts) if t for p in pieces(t)]
+def find_secrets(texts: list[str], *, gitleaks: str, rules: str, timeout: float,
+                 env: dict[str, str] | None = None) -> list[dict[str, str]]:
+    """Per text, ``{target string: rule id}``, from one gitleaks run of at most ``timeout`` s."""
+    files = [(i, HEADER + p) for i, t in enumerate(texts) if t
+             for p in pieces(t.encode("utf-8", "replace"))]
     result: list[dict[str, str]] = [{} for _ in texts]
-    if not owner:
+    if not files:
         return result
-    timeout = DEFAULT_TIMEOUT_S if deadline is None else deadline - time.monotonic()
-    if timeout <= 0:
-        raise GitleaksError("deadline passed before the scan")
-    cmd = [binary, "dir", "in", "--config", os.path.abspath(rules),
-           "--report-format", "json", "--report-path", "-", "--exit-code", "0",
-           "--no-banner", "--no-color", "--log-level", "info",
-           "--ignore-gitleaks-allow", "--gitleaks-ignore-path", os.devnull]
-    written = 0
+    report = _run(gitleaks, rules, [data for _, data in files], timeout, env)
     try:
-        # Fresh 0700 dir as cwd AND scan root: no .gitleaksignore can be found in either.
-        with tempfile.TemporaryDirectory(prefix="gitleaks-driver-", dir=RAM_DIR) as work:
-            os.mkdir(os.path.join(work, "in"), 0o700)
-            for n, (_, piece) in enumerate(owner):
-                data = (HEADER + piece).encode("utf-8", "replace")
-                with open(os.path.join(work, "in", f"{n}.txt"), "wb") as fh:
-                    fh.write(data)
-                written += len(data)
-            proc = subprocess.run(cmd, cwd=work, capture_output=True, timeout=timeout, check=False,
-                                  stdin=subprocess.DEVNULL, env={**os.environ, **(env or {})})
-    except subprocess.TimeoutExpired as e:
-        raise GitleaksError(f"gitleaks timed out after {timeout:.1f}s") from e
-    except OSError as e:
-        raise GitleaksError(f"gitleaks could not run ({type(e).__name__})") from e
-    stderr = ANSI.sub("", proc.stderr.decode("utf-8", "replace"))
-    if proc.returncode != 0:
-        fatal = next((ln for ln in stderr.splitlines() if "FTL" in ln), "")
-        raise GitleaksError(f"gitleaks exited {proc.returncode} {fatal[:200]}".rstrip())
-    scanned = SCANNED.search(stderr)
-    if scanned is None or int(scanned.group(1)) < written:
-        raise GitleaksError(f"gitleaks read {scanned.group(1) if scanned else '?'} of {written} bytes")
-    try:
-        report = json.loads(proc.stdout)
-        for f in report:
-            n = int(os.path.basename(f["File"]).removesuffix(".txt"))
-            i, piece = owner[n]
-            for target in _targets(f, piece):
-                if MARKER not in target:
-                    result[i].setdefault(target, f["RuleID"])
+        for finding in report:
+            i, data = files[int(os.path.basename(finding["File"]).removesuffix(".txt"))]
+            for target in _targets(finding, data):
+                if MARKER not in target:  # several rules on one target: the same one every run
+                    result[i][target] = min(finding["RuleID"], result[i].get(target, finding["RuleID"]))
     except (ValueError, KeyError, TypeError, IndexError) as e:
         raise GitleaksError("gitleaks report was unreadable") from e
     return result
 
 
-def _targets(finding: dict, piece: str) -> list[str]:
-    """The strings in ``piece`` that redact this finding."""
+def _run(gitleaks: str, rules: str, files: list[bytes], timeout: float,
+         env: dict[str, str] | None) -> list:
+    """gitleaks' JSON report over ``files`` (written as in/<n>.txt), checked to be complete."""
+    cmd = [gitleaks, "dir", "in", "--config", os.path.abspath(rules),
+           "--report-format", "json", "--report-path", "-", "--exit-code", "0",
+           "--no-banner", "--no-color", "--log-level", "info",
+           "--ignore-gitleaks-allow", "--gitleaks-ignore-path", os.devnull]
+    try:
+        # A fresh 0700 dir as cwd AND scan root: no .gitleaksignore can be found in either.
+        with tempfile.TemporaryDirectory(prefix="gitleaks-driver-", dir=RAM_DIR) as work:
+            os.mkdir(os.path.join(work, "in"), 0o700)
+            for n, data in enumerate(files):
+                with open(os.path.join(work, "in", f"{n}.txt"), "wb") as fh:
+                    fh.write(data)
+            proc = subprocess.run(cmd, cwd=work, capture_output=True, timeout=timeout, check=False,
+                                  stdin=subprocess.DEVNULL, env={**os.environ, **(env or {})})
+    except subprocess.TimeoutExpired as e:
+        raise GitleaksError(f"gitleaks timed out after {timeout:.1f}s") from e
+    except OSError as e:
+        raise GitleaksError(f"gitleaks could not run: {e.strerror or type(e).__name__} ({gitleaks})") from e
+    stderr = ANSI.sub("", proc.stderr.decode("utf-8", "replace"))
+    if proc.returncode != 0:
+        fatal = next((ln for ln in stderr.splitlines() if "FTL" in ln), "")
+        raise GitleaksError(f"gitleaks exited {proc.returncode} {fatal[:200]}".rstrip())
+    scanned = SCANNED.search(stderr)
+    written = sum(map(len, files))
+    if scanned is None or int(scanned[1]) < written:
+        raise GitleaksError(f"gitleaks read {scanned[1] if scanned else '?'} of {written} bytes")
+    try:
+        report = json.loads(proc.stdout)
+    except ValueError as e:
+        raise GitleaksError("gitleaks report was unreadable") from e
+    if not isinstance(report, list):
+        raise GitleaksError("gitleaks report was unreadable")
+    return report
+
+
+def _targets(finding: dict, data: bytes) -> list[str]:
+    """The strings in the scanned file ``data`` that redact this finding."""
     if any(str(tag).startswith("decoded:") for tag in finding.get("Tags") or ()):
-        lines = piece.split("\n")
-        n = finding["StartLine"] - HEADER.count("\n") - 1
-        return ENCODED_RUN.findall(lines[n]) if 0 <= n < len(lines) else []
+        lines = data.decode("utf-8", "replace").split("\n")
+        n = finding["StartLine"] - 1
+        if not 0 <= n < len(lines):
+            raise GitleaksError("gitleaks placed a decoded finding outside its file")
+        return ENCODED_RUN.findall(MARKER_SPAN.sub(" ", lines[n]))
     secret = finding.get("Secret") or ""
     target = secret if len(secret) >= MIN_SECRET_CHARS else finding.get("Match") or secret
     return [target] if target else []
+
+
+def redact(text: str, targets: dict[str, str], marker: Callable[[str, int], str]) -> str:
+    """``text`` with each occurrence of each target (``{target: rule id}``) replaced by
+    ``marker(rule, length)``. Occurrences that share characters become one marker, named
+    by the longest target at its start, so no fragment of either survives between them."""
+    # Hand-rolled on purpose: the hooks run stdlib-only `python3 -S -E`, where pyahocorasick
+    # (in nixpkgs) is not importable, and an `re` alternation took 19 s for 1,000 targets
+    # over 8 MB. One str.find pass per target took 0.7 s.
+    spans = sorted(((i, i + len(t), rule) for t, rule in targets.items() if t for i in _find_all(text, t)),
+                   key=lambda span: (span[0], -span[1]))
+    merged: list[list] = []
+    for start, end, rule in spans:
+        if merged and start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end, rule])
+    out, pos = [], 0
+    for start, end, rule in merged:
+        out += [text[pos:start], marker(rule, end - start)]
+        pos = end
+    return "".join(out) + text[pos:]
+
+
+def _find_all(text: str, target: str):
+    i = text.find(target)
+    while i != -1:
+        yield i
+        i = text.find(target, i + 1)

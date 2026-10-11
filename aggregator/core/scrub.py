@@ -2,20 +2,13 @@
 
 Two layers:
 
-1. **Secrets**, in two passes, both mandatory:
-
-   a. **Regex floor** (``SECRET_PATTERNS``) — the token formats most likely
-      to appear in this user's history (OpenAI, Anthropic incl. OAuth/admin,
-      GitHub classic + fine-grained PATs, Slack, Tavily, Cloudflare v2, Google
-      OAuth client secret, JWT, AWS access key, PEM headers). Pure Python,
-      always on.
-   b. **gitleaks**, through the vendored ``gitleaks_driver`` with
-      ``secret-rules.toml`` (every default rule — ~220 providers — plus the
-      custom formats gitleaks lacks). Each target string the driver returns
-      is replaced by ``[REDACTED:<rule-id>]``. FAIL CLOSED: if the scan does
-      not complete, ``scrub``/``scrub_many`` raise
-      :class:`ScrubUnavailableError` and the caller must neither store nor
-      return the text.
+1. **Secrets**: **gitleaks**, through the vendored ``gitleaks_driver`` with
+   ``secret-rules.toml`` (every default rule — ~220 providers — plus the
+   formats gitleaks lacks, including known prefixes at any body length and
+   truncated private keys). Each target string the driver returns is
+   replaced by ``[REDACTED:<rule-id>]``. FAIL CLOSED: if the scan does not
+   complete, ``scrub``/``scrub_many`` raise :class:`ScrubUnavailableError`
+   and the caller must neither store nor return the text.
 
    A gitleaks call costs ~100 ms of process start, so callers with many
    texts use :func:`scrub_many`: one call, and the same per-text result as
@@ -54,9 +47,10 @@ metadata only — the redacted content of individual findings is never surfaced
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -225,51 +219,6 @@ def start_background_init() -> threading.Thread | None:
         return _warm_thread
 
 
-# --- Secret patterns
-# ORDER MATTERS: patterns run in sequence over the same text, so a more
-# specific prefix must come before a more general one — every Anthropic
-# variant (OAuth login, admin, exact api03 console key) before the generic
-# `sk-ant-` pattern, and all of them before OpenAI's `sk-` — or a key is
-# counted under the wrong label.
-SECRET_PATTERNS: dict[str, re.Pattern] = {
-    "anthropic_oauth": re.compile(r"sk-ant-oat\d{2}-[A-Za-z0-9_-]{20,}"),
-    "anthropic_admin": re.compile(r"sk-ant-admin\d{2}-[A-Za-z0-9_-]{20,}"),
-    "anthropic_api03": re.compile(r"sk-ant-api03-[A-Za-z0-9_-]{93}AA"),
-    "anthropic_key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
-    "openai_key": re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
-    # GitHub fine-grained PAT: github_pat_<22>_<59> = 82 word chars. `{30,}`
-    # rather than `{82}`, measured against the live store (2026-10-11): all
-    # 14 `github_pat_11…` strings in it had 43 or 75 chars after the prefix —
-    # truncated or hand-made, which gitleaks' exact-length rule never
-    # flags — while every identifier that merely contains the prefix
-    # (`test_github_pat_redacted`) has under 30.
-    "github_fine_grained_pat": re.compile(r"github_pat_[A-Za-z0-9_]{30,}"),
-    # GitHub PAT / OAuth / server token / user token / refresh token.
-    "github_pat": re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    # Slack bot / app / user / refresh / legacy tokens.
-    "slack_token": re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
-    # Tavily: tvly-[dev-|prod-]<body>.
-    "tavily_key": re.compile(r"tvly-[A-Za-z0-9_-]{20,}"),
-    # Cloudflare scannable tokens: user/account API token, global API key.
-    "cloudflare_token": re.compile(r"cf(?:ut|at|k)_[A-Za-z0-9]{40,}"),
-    # Google OAuth client secret.
-    "google_oauth_secret": re.compile(r"GOCSPX-[A-Za-z0-9_-]{20,}"),
-    # JWT: header.payload.signature — three base64url segments, first starts
-    # with "eyJ" (base64 of `{"`).
-    "jwt": re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-    # AWS access key ID.
-    "aws_access_key": re.compile(r"AKIA[0-9A-Z]{16}"),
-    # PEM private key. When the matching END line follows, the WHOLE block goes: redacting
-    # only the header would leave the key material in place AND hide it from
-    # the gitleaks pass, whose private-key rule needs the header to fire.
-    # Without an END (a header quoted in code, a truncated paste) only the
-    # header goes, rather than everything after it.
-    "generic_pem_start": re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
-        r"(?:[\s\S]{0,20000}?-----END [A-Z ]*PRIVATE KEY-----)?"
-    ),
-}
-
 # --- PII regex patterns (always run; Presidio is additive)
 #
 # Advisor round-1 MEDIUM: added credit_card (Luhn-shape via a custom check
@@ -378,8 +327,11 @@ GITLEAKS_RULES = Path(__file__).with_name("secret-rules.toml")
 
 #: Names the gitleaks binary. Set by the Nix wrapper to a store path, because
 #: a systemd unit's PATH is minimal and must not decide whether text is
-#: scanned. Unset: PATH, then the Nix profile dirs (see gitleaks_driver).
+#: scanned. Unset: ``gitleaks`` on PATH.
 GITLEAKS_ENV = "AGGREGATOR_GITLEAKS"
+
+#: One gitleaks call may take this long; only a hung scanner reaches it.
+GITLEAKS_TIMEOUT_S = 300.0
 
 #: Go threads per gitleaks call. Unbounded it takes every core and burns ~3x
 #: the CPU for the same scan (8.6 MB of real rows: 17.6 s CPU on 24 threads,
@@ -390,73 +342,30 @@ _GITLEAKS_CHILD_ENV = {"GOMAXPROCS": "2"}
 def _gitleaks_redact_many(texts: list[str], counts: list[dict[str, int]]) -> list[str]:
     """Redact every gitleaks finding in the text it was found in. Fails closed.
 
-    All gitleaks handling (one scanned file per text, header, piece bounds,
-    hermetic run, read-everything check) lives in ``gitleaks_driver``; this
-    only applies the target strings it returns.
+    All gitleaks handling lives in the vendored ``gitleaks_driver``; this
+    names the binary and counts what was redacted.
     """
-    if not any(texts):
-        return list(texts)
-    binary = gitleaks_driver.gitleaks_binary(GITLEAKS_ENV)
-    if binary is None:
-        raise ScrubUnavailableError(
-            f"gitleaks not found: set {GITLEAKS_ENV} or put gitleaks on PATH"
-        )
     found = gitleaks_driver.find_secrets(
-        list(texts), rules=str(GITLEAKS_RULES), binary=binary, env=_GITLEAKS_CHILD_ENV
+        list(texts),
+        gitleaks=os.environ.get(GITLEAKS_ENV) or "gitleaks",
+        rules=str(GITLEAKS_RULES),
+        timeout=GITLEAKS_TIMEOUT_S,
+        env=_GITLEAKS_CHILD_ENV,
     )
     return [
-        _redact_targets(t, targets, c)
+        gitleaks_driver.redact(t, targets, _counting_marker(c))
         for t, targets, c in zip(texts, found, counts, strict=True)
     ]
 
 
-def _redact_targets(text: str, targets: dict[str, str], counts: dict[str, int]) -> str:
-    """Replace every target string with ``[REDACTED:<rule>]`` in ONE pass.
+def _counting_marker(counts: dict[str, int]) -> Callable[[str, int], str]:
+    """``[REDACTED:<rule>]``, counting each one under its rule."""
 
-    At each position the LONGEST target wins, so a shorter target never cuts
-    into a longer one and leaves part of it behind.
-    """
-    if not targets:
-        return text
-
-    def _repl(m: re.Match) -> str:
-        rule = targets[m.group(0)]
+    def marker(rule: str, _length: int) -> str:
         counts[rule] = counts.get(rule, 0) + 1
         return f"[REDACTED:{rule}]"
 
-    return _union_pattern(targets).sub(_repl, text)
-
-
-def _union_pattern(strings: Iterable[str]) -> re.Pattern:
-    """One regex matching any of ``strings``, longest first, built as a trie.
-
-    A flat ``a|b|c`` alternation is tried branch by branch at every position:
-    12,000 distinct targets over 3.7 MB took 49 s. Nested by shared prefix
-    (runs without a branch collapsed to one literal), each position costs one
-    pass down the trie instead: 0.9 s for the same input.
-    """
-    trie: dict = {}
-    for s in strings:
-        node = trie
-        for ch in s:
-            node = node.setdefault(ch, {})
-        node[""] = {}  # a string ends here
-
-    def build(node: dict) -> str:
-        branches = []
-        for ch in sorted(k for k in node if k):
-            literal, child = ch, node[ch]
-            while len(child) == 1 and "" not in child:
-                ((nxt, child),) = child.items()
-                literal += nxt
-            branches.append(re.escape(literal) + build(child))
-        if not branches:
-            return ""
-        body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
-        # A string ends here AND longer ones continue: try longer first.
-        return f"(?:{body})?" if "" in node else body
-
-    return re.compile(build(trie))
+    return marker
 
 
 # Presidio entity allowlist: real PII we want scrubbed at the boundary.
@@ -546,7 +455,7 @@ def scrub(text: str) -> ScrubResult:
 
 
 def scrub_secrets_many(texts: Sequence[str]) -> list[ScrubResult]:
-    """The SECRET layers only — regex floor, then gitleaks — over every text.
+    """The SECRET layer only (gitleaks) over every text.
 
     For re-scrubbing text that already went through the full ``scrub`` once
     (``aggregator rescrub``): its PII pass is already applied, and Presidio is
@@ -554,10 +463,7 @@ def scrub_secrets_many(texts: Sequence[str]) -> list[ScrubResult]:
     for nothing. Fails closed exactly like :func:`scrub`.
     """
     counts: list[dict[str, int]] = [{} for _ in texts]
-    floor = [
-        _run_patterns(t, SECRET_PATTERNS, c) for t, c in zip(texts, counts, strict=True)
-    ]
-    cleaned = _gitleaks_redact_many(floor, counts)
+    cleaned = _gitleaks_redact_many(list(texts), counts)
     return [ScrubResult(text=t, counts=c) for t, c in zip(cleaned, counts, strict=True)]
 
 
