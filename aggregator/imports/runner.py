@@ -38,6 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from aggregator.core.scrub_errors import ScrubUnavailableError
 from aggregator.imports.ingest_state import (
     STALE_INPUTS,
     FaultVerdict,
@@ -463,6 +464,14 @@ async def _write_chunk(
       is broken, so the original error is re-raised and the adapter reports it.
       That distinction is the whole reason the isolation pass counts successes.
 
+    A SECRET SCANNER THAT CANNOT RUN IS A BROKEN SINK, ALWAYS. ``scrub`` fails
+    closed with ``ScrubUnavailableError`` when gitleaks is missing or errors,
+    and every changed row in the chunk hits it — but rows that need no scrub
+    (session rows, unchanged rows) still "survive" the isolation pass, which
+    would make the scrubbed ones look like poison and park them in the
+    quarantine. They are not bad records; the scanner is down. So that error
+    is re-raised and the source fails loudly, with nothing written unscrubbed.
+
     THE MARK IS NOT ADVANCED BY AN ISOLATED CHUNK. If anything was set aside,
     the checkpoint is dropped and this pass ends with the old mark — the next
     run re-reads the window, and a record that was merely unlucky gets another
@@ -474,6 +483,8 @@ async def _write_chunk(
             return _sink_write(sink, items, checkpoint)
         except Exception as e:  # noqa: BLE001 -- classified below, never swallowed
             last_error = e
+            if isinstance(e, ScrubUnavailableError):
+                raise
             if attempt < CHUNK_RETRY_ATTEMPTS - 1:
                 delay = full_jitter(
                     attempt,
@@ -497,6 +508,8 @@ async def _write_chunk(
             # move the mark.
             counts = counts + _sink_write(sink, [item], None)
         except Exception as e:  # noqa: BLE001 -- per-record isolation boundary
+            if isinstance(e, ScrubUnavailableError):
+                raise
             failures.append((item, e))
         else:
             survived += 1

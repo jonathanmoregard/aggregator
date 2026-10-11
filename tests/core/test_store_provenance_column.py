@@ -226,7 +226,7 @@ def test_no_filter_returns_every_row(tmp_path):
     """DEFAULT ABSENT MEANS NO FILTER, exactly like ``type:`` today.
 
     A default human-only filter would silently drop the machine-authored
-    majority from ``_first_user_prompt``, from the eval baseline and from
+    majority from ``_first_user_row``, from the eval baseline and from
     ``matching_observations`` — a narrowing the caller never asked for and
     cannot see.
     """

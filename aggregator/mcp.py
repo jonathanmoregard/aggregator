@@ -153,7 +153,12 @@ from aggregator.core.hybrid import (
     vector_floor,
 )
 from aggregator.core.provenance import MACHINE_VALUES
-from aggregator.core.scrub import scrub, start_background_init
+from aggregator.core.scrub import (
+    ScrubUnavailableError,
+    scrub,
+    scrub_many,
+    start_background_init,
+)
 from aggregator.core.store import (
     CHAT_ORIGINS,
     LEXICAL_RELAX_OR,
@@ -222,7 +227,7 @@ _VECTOR_ARM_K = FUSION_ARM_DEPTH
 # but ABSENT. ``rerank.MAX_PAIR_TOKENS`` bounds it, and every page now
 # completes. The median moved the other way because the documents are real:
 # session cards used to be scored against their own subject (see
-# ``_session_body_preview``), so the old median was cheap and meaningless.
+# ``_render_session_preview``), so the old median was cheap and meaningless.
 #
 # THE STAGE CANNOT BE MADE INTERACTIVE BY TUNING THIS NUMBER. ~13.7 s per
 # (query, document) pair means even a window of 1 misses a 500 ms budget by
@@ -2361,8 +2366,14 @@ def _attach_next_page_token(
     result["notice"] = f"{notice} {prior}" if prior else notice
 
 
-def _scrub_record(r: Record) -> Record:
-    return replace(r, subject=scrub(r.subject).text, body=scrub(r.body).text)
+def _scrub_records(records: Sequence[Record]) -> list[Record]:
+    """Scrub a page of records with ONE secret-scanner call (``scrub_many``)."""
+    n = len(records)
+    out = scrub_many([r.subject for r in records] + [r.body for r in records])
+    return [
+        replace(r, subject=out[i].text, body=out[n + i].text)
+        for i, r in enumerate(records)
+    ]
 
 
 # --- summary-mode snippets (D1) ---------------------------------------------
@@ -2435,10 +2446,10 @@ def _summary_snippet_notice(what: str, where: str) -> str:
 #
 # THE RECALL PATH IS NOT NARROWED, AND THIS IS WHAT REPLACES THE NARROWING.
 # Filtering to human-authored rows by default was measured as breaking for
-# three in-repo callers — ``_first_user_prompt`` (29% of sampled user turns are
+# three in-repo callers — ``_first_user_row`` (29% of sampled user turns are
 # hook-class, and headless sessions OPEN with one, so cards would lose their
 # labels), the frozen eval baseline, and ``_count_scope_for`` /
-# ``_session_body_preview``, which would under-count in silence. A result set
+# ``_render_session_preview``, which would under-count in silence. A result set
 # narrowed behind the caller's back is the "plausible but wrong" failure this
 # module already refuses for page tokens at ``_PageTokenError``.
 #
@@ -3502,7 +3513,7 @@ def _session_to_item(
     ``matching_observations`` = how many observations match the query.
 
     ``content`` is the wrapped ``body_preview`` the caller supplies — see
-    ``_session_body_preview``, which builds it from the observations that
+    ``_render_session_preview``, which builds it from the observations that
     matched: the whole 1 500-character preview in full mode, a
     ``_SNIPPET_CHARS`` snippet of the first matching observation in summary
     mode. It used to be handed the SUBJECT, which made the card a copy of its
@@ -3554,7 +3565,10 @@ def _session_to_item(
 
 
 def _observation_to_item(
-    o: ObservationRow, fields: str, terms: tuple[str, ...] = ()
+    o: ObservationRow,
+    fields: str,
+    terms: tuple[str, ...] = (),
+    scrubbed_body: str | None = None,
 ) -> dict[str, Any]:
     """One observation row. ``terms`` are the query's terms, for the snippet.
 
@@ -3563,9 +3577,15 @@ def _observation_to_item(
     back as five opaque UUIDs. Both branches now scrub and wrap the body; they
     differ only in HOW MUCH of it goes back, which is the whole difference
     between a summary and a full fetch.
+
+    ``scrubbed_body`` is the body already scrubbed by the caller's batch
+    (``scrub_many`` over the page); omitted, it is scrubbed here. The SUBJECT
+    is cut from the scrubbed body: it used to be cut from the raw one, so a
+    secret in a row's first 120 characters went back unscrubbed even though
+    the body beside it was clean.
     """
-    body = scrub(o.body or "").text
-    subject = (o.body[:120] if o.body else o.type)
+    body = scrubbed_body if scrubbed_body is not None else scrub(o.body or "").text
+    subject = (body[:120] if body else o.type)
     if fields == "full":
         content = wrap_record(
             Record(
@@ -4237,6 +4257,45 @@ def _dispatch(
     fingerprint: str,
     search_mode: str = "hybrid",
 ) -> dict[str, Any]:
+    """Route a parsed, validated query; refuse it if results cannot be scrubbed.
+
+    FAIL CLOSED. Every route scrubs what it returns, and the secret layer of
+    that scrub is a gitleaks process. When it cannot run, nothing may go back
+    unscanned, so the whole page is refused with a structured error instead
+    of being served partly scrubbed. The reason names the failure only.
+    """
+    try:
+        return _route(
+            store, ast, mode, fields, page_size, cursor, drilldown, rerank,
+            fingerprint, search_mode,
+        )
+    except ScrubUnavailableError as e:
+        log.error("refusing to return results: %s", e)
+        return {
+            "ok": False,
+            "reason": f"secret scanner unavailable: {e}",
+            "remediation": (
+                "Results are withheld because they could not be scanned for "
+                "secrets. This is a deployment fault (gitleaks missing or "
+                "failing in the MCP backend's environment), not a query "
+                "problem; retrying the same query will not help until it is "
+                "fixed."
+            ),
+        }
+
+
+def _route(
+    store: Store,
+    ast: QueryAST,
+    mode: str,
+    fields: str,
+    page_size: int,
+    cursor: _PageCursor,
+    drilldown: bool,
+    rerank: bool,
+    fingerprint: str,
+    search_mode: str = "hybrid",
+) -> dict[str, Any]:
     """Route a parsed, validated query to the path that answers it."""
     if mode == "sessions":
         return _query_sessions_path(
@@ -4325,7 +4384,7 @@ def _query_records_path(
         }
     has_more = len(page_plus_one) > page_size
     page_records = page_plus_one[:page_size]
-    items = [_record_to_item(_scrub_record(r), fields) for r in page_records]
+    items = [_record_to_item(r, fields) for r in _scrub_records(page_records)]
     items, rr_count, rr_notice, rr_standout = _maybe_rerank(
         items, query_text, rerank
     )
@@ -4412,7 +4471,11 @@ def _query_sessions_path(
         has_more = len(page_plus_one) > page_size
         page_obs = page_plus_one[:page_size]
         terms = _snippet_terms(query_text)
-        items = [_observation_to_item(o, fields, terms) for o in page_obs]
+        bodies = scrub_many([o.body or "" for o in page_obs])
+        items = [
+            _observation_to_item(o, fields, terms, b.text)
+            for o, b in zip(page_obs, bodies, strict=True)
+        ]
         items, rr_count, rr_notice, rr_standout = _maybe_rerank(
             items, query_text, rerank
         )
@@ -4470,9 +4533,9 @@ def _query_sessions_path(
     page_sessions = page_plus_one[:page_size]
     items: list[dict[str, Any]] = []
     terms = _snippet_terms(query_text)
+    scopes: list[QueryAST] = []
+    counts: list[int] = []
     for s in page_sessions:
-        # Per-session subject: first user observation's body (up to 280 chars).
-        subject = _first_user_prompt(store, s)
         # Match count within THIS session card, kind-aware:
         # * kind='session' (top-level): count the whole root group, i.e.
         #   ``root_session_id = s.root_session_id`` (== s.session_id for a
@@ -4483,10 +4546,16 @@ def _query_sessions_path(
         # * kind='subagent': count only that subagent's own obs by exact
         #   session_id match (top_session_id in the AST).
         session_scoped = _count_scope_for(ast, s)
-        match_count = store.count_observations(session_scoped)
-        preview = _session_body_preview(
-            store, session_scoped, fields, subject, terms
-        )
+        scopes.append(session_scoped)
+        counts.append(store.count_observations(session_scoped))
+    # Per-session subject (first user observation's body, up to 280 chars) and
+    # preview, every body on the page scrubbed in one batch.
+    cards = _session_cards(
+        store, list(zip(page_sessions, scopes, strict=True)), fields, terms
+    )
+    for s, match_count, (subject, preview) in zip(
+        page_sessions, counts, cards, strict=True
+    ):
         items.append(_session_to_item(s, fields, subject, match_count, preview))
     items, rr_count, rr_notice, rr_standout = _maybe_rerank(
         items, query_text, rerank
@@ -4700,19 +4769,25 @@ def _query_union_path(
 
     items: list[dict[str, Any]] = []
     terms = _snippet_terms(query_text)
-    for _ts, kind, obj in window:
+    # Scrubbed in two batches — the page's records, then its session cards —
+    # rather than per item: each scrub is a secret-scanner process.
+    page_records = _scrub_records([obj for _ts, kind, obj in window if kind == "record"])
+    page_sess = [obj for _ts, kind, obj in window if kind != "record"]
+    # Session-shaped cards reuse the sessions-path helpers for parity (subject =
+    # first user prompt, matching_observations count). Kind-aware scope (see
+    # round-1 BLOCKER fix in the sessions path).
+    sess_scopes = [_count_scope_for(sess_ast, obj) for obj in page_sess]
+    sess_counts = [store.count_observations(sc) for sc in sess_scopes]
+    sess_cards = _session_cards(
+        store, list(zip(page_sess, sess_scopes, strict=True)), fields, terms
+    )
+    rec_iter = iter(page_records)
+    sess_iter = iter(zip(page_sess, sess_counts, sess_cards, strict=True))
+    for _ts, kind, _obj in window:
         if kind == "record":
-            items.append(_record_to_item(_scrub_record(obj), fields))
+            items.append(_record_to_item(next(rec_iter), fields))
         else:
-            # Session-shaped card. Reuse the sessions-path helper for parity
-            # (subject = first user prompt, matching_observations count).
-            # Kind-aware scope (see round-1 BLOCKER fix in the sessions path).
-            subject = _first_user_prompt(store, obj)
-            session_scoped = _count_scope_for(sess_ast, obj)
-            match_count = store.count_observations(session_scoped)
-            preview = _session_body_preview(
-                store, session_scoped, fields, subject, terms
-            )
+            obj, match_count, (subject, preview) = next(sess_iter)
             items.append(
                 _session_to_item(obj, fields, subject, match_count, preview)
             )
@@ -4837,18 +4912,57 @@ def _count_scope_for(ast: QueryAST, s: SessionRow) -> QueryAST:
     return replace(ast, session_id=s.root_session_id, top_session_id=None)
 
 
-def _first_user_prompt(store: Store, s: SessionRow) -> str:
-    """Return the session's first user observation body (truncated).
+def _session_cards(
+    store: Store,
+    cards: Sequence[tuple[SessionRow, QueryAST]],
+    fields: str,
+    terms: tuple[str, ...] = (),
+) -> list[tuple[str, str]]:
+    """``(subject, preview)`` for each ``(session, scoped AST)`` on a page.
+
+    TWO PHASES, SO THE PAGE COSTS ONE SECRET SCAN. Every body a card shows is
+    scrubbed on return, and the secret layer of that scrub is a gitleaks
+    process with ~100 ms of start-up. Scrubbing card by card put two to six of
+    those on every card; here every raw body on the page is fetched first and
+    scrubbed in one ``scrub_many`` call, then the cards are rendered from the
+    scrubbed text — the same text, row for row, that per-call ``scrub`` gave.
+    """
+    fetched = [
+        (_first_user_row(store, s), _preview_rows(store, scoped, fields))
+        for s, scoped in cards
+    ]
+    texts: list[str] = []
+    for first, rows in fetched:
+        texts.append((first.body or "") if first is not None else "")
+        texts.extend(o.body or "" for o in rows)
+    cleaned = iter([r.text for r in scrub_many(texts)])
+    out: list[tuple[str, str]] = []
+    for (s, _scoped), (first, rows) in zip(cards, fetched, strict=True):
+        first_body = next(cleaned)
+        subject = _render_subject(s, first_body if first is not None else None)
+        row_bodies = [(o, next(cleaned)) for o in rows]
+        out.append(
+            (subject, _render_session_preview(row_bodies, fields, subject, terms))
+        )
+    return out
+
+
+def _first_user_row(store: Store, s: SessionRow) -> ObservationRow | None:
+    """The session's first user observation, unscrubbed — or None.
 
     Cached lookup would be nicer; on typical volumes (thousands of sessions,
     tens of observations each) this is fine for the hit-list surface.
     """
     obs_ast = QueryAST(top_session_id=s.session_id, obs_type="user")
     rows = store.query_observations(obs_ast, limit=1, offset=0)
-    if not rows:
-        return f"session {s.session_id}"
-    body = scrub(rows[0].body or "").text
-    return body[:280] if body else f"session {s.session_id}"
+    return rows[0] if rows else None
+
+
+def _render_subject(s: SessionRow, scrubbed_first_body: str | None) -> str:
+    """The card subject: the first user turn's SCRUBBED body, truncated."""
+    if scrubbed_first_body:
+        return scrubbed_first_body[:280]
+    return f"session {s.session_id}"
 
 
 # How much of a session's matching text goes into its ``content`` preview.
@@ -4860,14 +4974,24 @@ _SESSION_PREVIEW_OBSERVATIONS = 5
 _SESSION_PREVIEW_CHARS = 1500
 
 
-def _session_body_preview(
-    store: Store,
-    scoped: QueryAST,
+def _preview_rows(
+    store: Store, scoped: QueryAST, fields: str
+) -> list[ObservationRow]:
+    """The unscrubbed rows a card preview is built from; see the renderer."""
+    limit = _SESSION_PREVIEW_OBSERVATIONS if fields == "full" else 1
+    return store.query_observations(scoped, limit=limit)
+
+
+def _render_session_preview(
+    rows: Sequence[tuple[ObservationRow, str]],
     fields: str,
     subject: str,
     terms: tuple[str, ...] = (),
 ) -> str:
     """The body of a session card: the observations that actually matched.
+
+    ``rows`` pairs each row from :func:`_preview_rows` with its SCRUBBED body
+    (see :func:`_session_cards` for why scrubbing happens outside).
 
     THE DEFECT THIS REPLACES. Both session-shaped routes called
     ``_session_to_item(s, fields, subject, match_count, subject)`` — the last
@@ -4899,7 +5023,7 @@ def _session_body_preview(
     the output limit. So the cost is now paid, at the smallest size that
     answers the question: ONE row, ``limit=1``, snippetted to
     ``_SNIPPET_CHARS``. That is one more indexed lookup per card on a surface
-    that already runs two (``_first_user_prompt`` and ``count_observations``).
+    that already runs two (``_first_user_row`` and ``count_observations``).
 
     Falls back to the subject when the session yields no usable body — an
     honest degenerate case (there is nothing else in it) rather than an empty
@@ -4910,14 +5034,12 @@ def _session_body_preview(
     returns ``[]`` while the session itself still matched on metadata.
     """
     if fields != "full":
-        rows = store.query_observations(scoped, limit=1)
-        body = scrub(rows[0].body or "").text.strip() if rows else ""
+        body = rows[0][1].strip() if rows else ""
         return _snippet(body or subject, terms)
-    rows = store.query_observations(scoped, limit=_SESSION_PREVIEW_OBSERVATIONS)
     parts: list[str] = []
     used = 0
-    for o in rows:
-        body = scrub(o.body or "").text.strip()
+    for o, scrubbed in rows:
+        body = scrubbed.strip()
         if not body:
             continue
         body = body[: _SESSION_PREVIEW_CHARS - used]

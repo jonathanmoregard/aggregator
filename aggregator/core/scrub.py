@@ -2,10 +2,25 @@
 
 Two layers:
 
-1. **Secret regex patterns** — gitleaks-style, covering API-key shapes
-   (OpenAI, Anthropic, GitHub PAT, JWT, AWS access key, PEM private key
-   headers). Runs unconditionally; the fastest layer and the strictest
-   security gate (secrets must never round-trip through the store).
+1. **Secrets**, in two passes, both mandatory:
+
+   a. **Regex floor** (``SECRET_PATTERNS``) — the token formats most likely
+      to appear in this user's history (OpenAI, Anthropic incl. OAuth/admin,
+      GitHub classic + fine-grained PATs, Slack, Tavily, Cloudflare v2, Google
+      OAuth client secret, JWT, AWS access key, PEM headers). Pure Python,
+      always on.
+   b. **gitleaks** (``gitleaks stdin`` with the vendored
+      ``secret-rules.toml``: every default rule — ~220 providers — plus the
+      custom formats gitleaks lacks). Each finding's secret string is
+      replaced by ``[REDACTED:<rule-id>]``. FAIL CLOSED: if the binary is
+      missing or errors, ``scrub``/``scrub_many`` raise
+      :class:`ScrubUnavailableError` and the caller must neither store nor
+      return the text. ``AGGREGATOR_GITLEAKS`` names the binary explicitly
+      (the Nix wrapper sets it to a store path); otherwise ``PATH`` is used.
+
+   A gitleaks call costs ~100 ms of process start before it reads a byte, so
+   callers with many texts use :func:`scrub_many`, which scans them in ONE
+   call and gives the same per-text result as ``scrub`` on each.
 
 2. **PII detection**:
    - If `presidio_analyzer` + `presidio_anonymizer` are importable, use them
@@ -39,10 +54,26 @@ metadata only — the redacted content of individual findings is never surfaced
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import shutil
+import subprocess
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# Lives in its own module so its identity survives ``importlib.reload`` of
+# this one (tests reload it); re-exported here as the public name.
+from aggregator.core.scrub_errors import ScrubUnavailableError
+
+#: Bound at import, not looked up per call: a test that stubs the global
+#: ``subprocess.run``/``shutil.which`` seam for ANOTHER tool (the ``claude``
+#: CLI in test_cli_tag.py) must not silently stub the secret scanner too.
+_subprocess_run = subprocess.run
+_which = shutil.which
 
 log = logging.getLogger(__name__)
 
@@ -207,22 +238,50 @@ def start_background_init() -> threading.Thread | None:
 # would otherwise match the generic openai `sk-…` pattern first and be
 # mis-classified.
 SECRET_PATTERNS: dict[str, re.Pattern] = {
+    # Anthropic variants first, most specific first, all BEFORE the generic
+    # anthropic and openai `sk-` patterns so each is counted under its own
+    # label. OAuth (Claude subscription login) and admin keys are separate
+    # credential types; api03 is the exact console-key shape.
+    "anthropic_oauth": re.compile(r"sk-ant-oat\d{2}-[A-Za-z0-9_-]{20,}"),
+    "anthropic_admin": re.compile(r"sk-ant-admin\d{2}-[A-Za-z0-9_-]{20,}"),
+    "anthropic_api03": re.compile(r"sk-ant-api03-[A-Za-z0-9_-]{93}AA"),
     # Anthropic: sk-ant-… . Match this BEFORE the generic openai `sk-` pattern
     # so anthropic keys are counted under the correct label.
     "anthropic_key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
     # OpenAI: sk-… (optionally sk-proj-…). Now safe to run — anthropic already
     # consumed its variant above.
     "openai_key": re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    # GitHub fine-grained PAT: github_pat_<22>_<59> = 82 word chars. `{30,}`
+    # rather than `{82}`, measured against the live store (2026-10-11): all
+    # 14 `github_pat_11…` strings in it had 43 or 75 chars after the prefix —
+    # truncated or hand-made, which gitleaks' exact-length rule never
+    # flags — while every identifier that merely contains the prefix
+    # (`test_github_pat_redacted`) has under 30.
+    "github_fine_grained_pat": re.compile(r"github_pat_[A-Za-z0-9_]{30,}"),
     # GitHub PAT / OAuth / server token / user token / refresh token.
     "github_pat": re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    # Slack bot / app / user / refresh / legacy tokens.
+    "slack_token": re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    # Tavily: tvly-[dev-|prod-]<body>.
+    "tavily_key": re.compile(r"tvly-[A-Za-z0-9_-]{20,}"),
+    # Cloudflare scannable tokens: user/account API token, global API key.
+    "cloudflare_token": re.compile(r"cf(?:ut|at|k)_[A-Za-z0-9]{40,}"),
+    # Google OAuth client secret.
+    "google_oauth_secret": re.compile(r"GOCSPX-[A-Za-z0-9_-]{20,}"),
     # JWT: header.payload.signature — three base64url segments, first starts
     # with "eyJ" (base64 of `{"`).
     "jwt": re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
     # AWS access key ID.
     "aws_access_key": re.compile(r"AKIA[0-9A-Z]{16}"),
-    # PEM private-key header (redact just the header; body will collapse in
-    # downstream FTS since the delimiter is gone).
-    "generic_pem_start": re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
+    # PEM private key. When the matching END line follows, the WHOLE block goes: redacting
+    # only the header would leave the key material in place AND hide it from
+    # the gitleaks pass, whose private-key rule needs the header to fire.
+    # Without an END (a header quoted in code, a truncated paste) only the
+    # header goes, rather than everything after it.
+    "generic_pem_start": re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+        r"(?:[\s\S]{0,20000}?-----END [A-Z ]*PRIVATE KEY-----)?"
+    ),
 }
 
 # --- PII regex patterns (always run; Presidio is additive)
@@ -323,6 +382,272 @@ def _run_patterns(
     return text
 
 
+# --- gitleaks layer ----------------------------------------------------------
+
+#: The vendored rules: gitleaks' defaults plus the formats it lacks. A
+#: byte-identical copy of ``hooks/secret-rules.toml`` in the ``~/.claude``
+#: config repo, which redacts tool output with the same rules; the copies are
+#: pinned to one checksum by ``tests/core/test_scrub_gitleaks.py``.
+GITLEAKS_RULES = Path(__file__).with_name("secret-rules.toml")
+
+#: Names the gitleaks binary. Set by the Nix wrapper to a store path, because
+#: a systemd unit's PATH is minimal and must not decide whether text is
+#: scanned. Unset: ``PATH`` lookup (dev shells, CI).
+GITLEAKS_ENV = "AGGREGATOR_GITLEAKS"
+
+#: Input bound for ONE gitleaks call. Measured ~1.1 s per MB on this host, and
+#: memory grows with the input, so a 1000-row ingest group of large tool
+#: outputs is split rather than fed as one blob.
+_GITLEAKS_BATCH_CHARS = 4 * 1024 * 1024
+
+#: Wall-clock bound for one call. ~5 s is typical for a full batch; this is
+#: far enough above it that only a hung scanner reaches it.
+_GITLEAKS_TIMEOUT_S = 300
+
+#: Separates batch members. Blank lines plus a line of characters that no rule
+#: accepts as a key, an assignment operator or a secret, so keyword-proximity
+#: rules (``generic-api-key``) cannot bind one member's key to the next
+#: member's value. Rules that span lines freely (PEM private keys) CAN still
+#: straddle it; :func:`_gitleaks_redact_many` detects that and rescans the
+#: members involved one at a time.
+_BOUNDARY = "\n\n#~#~#~#~#~#~#~#~\n\n"
+_BOUNDARY_NEWLINES = _BOUNDARY.count("\n")
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+#: gitleaks' JSON report key for the full matched text. A JSON key, not SQL —
+#: declared in tests/test_fts5_match_site_enumeration.py's ``_NOT_SQL``.
+_REPORT_MATCH_KEY = "Match"
+_NON_SPACE_RUN = re.compile(r"\S+")
+
+
+def gitleaks_binary() -> str:
+    """The gitleaks executable to run, or :class:`ScrubUnavailableError`."""
+    explicit = os.environ.get(GITLEAKS_ENV, "").strip()
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return explicit
+        raise ScrubUnavailableError(
+            f"{GITLEAKS_ENV}={explicit} is not an executable file"
+        )
+    found = _which("gitleaks")
+    if found is None:
+        raise ScrubUnavailableError(
+            f"gitleaks not found: set {GITLEAKS_ENV} or put gitleaks on PATH"
+        )
+    return found
+
+
+@dataclass(frozen=True)
+class _Finding:
+    """One gitleaks finding. Lines are 1-based; columns are 1-based BYTE
+    offsets into their line, end inclusive (normalised in ``_run_gitleaks``)."""
+
+    rule: str
+    secret: str
+    start_line: int
+    end_line: int
+    start_col: int
+    end_col: int
+    decoded: bool
+
+
+def _run_gitleaks(text: str) -> list[_Finding]:
+    """Scan ``text`` with one gitleaks call. Raises ScrubUnavailableError."""
+    cmd = [
+        gitleaks_binary(),
+        "stdin",
+        "--no-banner",
+        "--no-color",
+        "--config", str(GITLEAKS_RULES),
+        "--report-path", "-",
+        "--report-format", "json",
+        "--log-level", "error",
+        # Findings are the expected outcome, not an error. With the default
+        # (1) a finding and a crash share an exit code; with 0, any non-zero
+        # status is a failure.
+        "--exit-code", "0",
+        # Scanned text must not be able to opt itself out: a transcript line
+        # containing `gitleaks:allow` would otherwise be skipped...
+        "--ignore-gitleaks-allow",
+        # ...and nor may a .gitleaksignore in whatever directory we run from.
+        "--gitleaks-ignore-path", os.devnull,
+    ]
+    try:
+        proc = _subprocess_run(  # noqa: S603 - fixed argv, no shell
+            cmd,
+            input=text.encode("utf-8", "replace"),
+            capture_output=True,
+            timeout=_GITLEAKS_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ScrubUnavailableError(
+            f"gitleaks timed out after {_GITLEAKS_TIMEOUT_S}s"
+        ) from e
+    except OSError as e:
+        raise ScrubUnavailableError(
+            f"gitleaks could not be started ({type(e).__name__})"
+        ) from e
+    if proc.returncode != 0:
+        # gitleaks' own diagnostic (config/IO errors), never scanned text —
+        # and passed through the regex floor anyway, so even a scanner that
+        # one day echoes input cannot put a secret in a log line.
+        detail = _ANSI.sub("", proc.stderr.decode("utf-8", "replace")).strip()
+        detail = _run_patterns(detail.splitlines()[0][:200] if detail else "", SECRET_PATTERNS, {})
+        raise ScrubUnavailableError(
+            f"gitleaks exited {proc.returncode}: {detail or '(no diagnostic)'}"
+        )
+    try:
+        report = json.loads(proc.stdout or b"[]")
+    except ValueError as e:
+        raise ScrubUnavailableError("gitleaks report was not valid JSON") from e
+    findings = []
+    for f in report or ():
+        match = str(f.get(_REPORT_MATCH_KEY) or "")
+        secret = f.get("Secret") or match
+        start_line = int(f.get("StartLine") or 1)
+        # EndLine is NOT trustworthy for a multi-line match: 8.30 reports a
+        # whole PEM block as StartLine == EndLine (measured). The match text
+        # itself says how many lines it spans, and a finding mapped to the
+        # wrong lines is attributed to the wrong batch member.
+        spanned = max(
+            match.count("\n"), secret.count("\n")
+        )
+        end_line = max(int(f.get("EndLine") or start_line), start_line + spanned)
+        # gitleaks 8.30 counts the preceding newline into the column on every
+        # line but the first (measured: the same token at the start of line 1
+        # and of line 3 reports column 1 and column 2), so take it back out.
+        start_col = int(f.get("StartColumn") or 1) - (start_line > 1)
+        end_col = int(f.get("EndColumn") or start_col) - (end_line > 1)
+        findings.append(
+            _Finding(
+                rule=str(f.get("RuleID") or "gitleaks"),
+                secret=secret,
+                start_line=start_line,
+                end_line=end_line,
+                start_col=start_col,
+                end_col=end_col,
+                decoded=any(
+                    str(t).startswith("decoded:") for t in (f.get("Tags") or ())
+                ),
+            )
+        )
+    return findings
+
+
+def _redact_at(lines: list[str], f: _Finding, marker: str) -> None:
+    """Redact a finding by POSITION, in place on ``lines`` (0-based list).
+
+    For the findings a string replace cannot reach: DECODED ones (gitleaks
+    reports the decoded secret, which does not occur in the text — the
+    encoded run does) and any whose secret is not in the text verbatim. One
+    line: every whitespace-delimited run touching the reported columns.
+    Several lines: the whole span, which is coarse and certain.
+    """
+    first, last = f.start_line - 1, f.end_line - 1
+    if not (0 <= first <= last < len(lines)):
+        return
+    if first != last:
+        lines[first : last + 1] = [marker]
+        return
+    line = lines[first]
+    raw = line.encode("utf-8", "replace")
+    # Byte columns -> character offsets on this line.
+    lo = len(raw[: max(f.start_col - 1, 0)].decode("utf-8", "ignore"))
+    hi = len(raw[: max(f.end_col, f.start_col)].decode("utf-8", "ignore"))
+    runs = [m for m in _NON_SPACE_RUN.finditer(line) if m.start() < hi and m.end() > lo]
+    if not runs:
+        lines[first] = marker
+        return
+    lines[first] = line[: runs[0].start()] + marker + line[runs[-1].end() :]
+
+
+def _apply_findings(text: str, findings: Sequence[_Finding], counts: dict[str, int]) -> str:
+    """Redact ``findings`` (line numbers local to ``text``) from ``text``."""
+    if not findings:
+        return text
+    by_string = [f for f in findings if not f.decoded and f.secret and f.secret in text]
+    by_position = [f for f in findings if f not in by_string]
+    if by_position:
+        lines = text.split("\n")
+        # Bottom-up, right-to-left, so an edit never moves a later target.
+        for f in sorted(by_position, key=lambda f: (f.start_line, f.start_col), reverse=True):
+            _redact_at(lines, f, f"[REDACTED:{f.rule}]")
+            counts[f.rule] = counts.get(f.rule, 0) + 1
+        text = "\n".join(lines)
+    # Longest first, so a shorter secret never cuts into a longer one and
+    # leaves part of it behind. A secret already consumed by a longer one
+    # counts zero — it is gone either way.
+    for f in sorted(by_string, key=lambda f: len(f.secret), reverse=True):
+        n = text.count(f.secret)
+        if n:
+            text = text.replace(f.secret, f"[REDACTED:{f.rule}]")
+            counts[f.rule] = counts.get(f.rule, 0) + n
+    return text
+
+
+def _gitleaks_redact_many(texts: list[str], counts: list[dict[str, int]]) -> list[str]:
+    """Run the gitleaks layer over every text, in as few calls as possible.
+
+    Members are joined with ``_BOUNDARY`` and each finding is mapped back to
+    its member by line number, so a secret found in one member is redacted in
+    THAT member only — each text's result is what scanning it alone gives,
+    whatever it was batched with. A finding that straddles a boundary (a
+    multi-line rule spanning two members) is not trusted: each member it
+    touches is rescanned on its own.
+    """
+    out = list(texts)
+    batch: list[int] = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal size
+        if batch:
+            _scan_members(batch, out, counts)
+        batch.clear()
+        size = 0
+
+    for i, t in enumerate(texts):
+        if not t:
+            continue
+        if batch and size + len(t) > _GITLEAKS_BATCH_CHARS:
+            flush()
+        batch.append(i)
+        size += len(t) + len(_BOUNDARY)
+    flush()
+    return out
+
+
+def _scan_members(idx: list[int], out: list[str], counts: list[dict[str, int]]) -> None:
+    members = [out[i] for i in idx]
+    spans: list[tuple[int, int]] = []  # (first line, last line), 1-based
+    line = 1
+    for t in members:
+        n = t.count("\n")
+        spans.append((line, line + n))
+        line += n + _BOUNDARY_NEWLINES
+    local: dict[int, list[_Finding]] = {}
+    rescan: set[int] = set()
+    for f in _run_gitleaks(_BOUNDARY.join(members)):
+        hit = [k for k, (a, b) in enumerate(spans) if a <= f.end_line and f.start_line <= b]
+        if len(hit) == 1:
+            k = hit[0]
+            off = spans[k][0] - 1
+            local.setdefault(k, []).append(
+                _Finding(
+                    f.rule, f.secret, f.start_line - off, f.end_line - off,
+                    f.start_col, f.end_col, f.decoded,
+                )
+            )
+        else:
+            rescan.update(hit)
+    for k in rescan:
+        local[k] = _run_gitleaks(members[k]) if len(idx) > 1 else local.get(k, [])
+    for k, fs in local.items():
+        out[idx[k]] = _apply_findings(members[k], fs, counts[idx[k]])
+
+
 # Presidio entity allowlist: real PII we want scrubbed at the boundary.
 # Explicitly excluded are the noisy recognizers that flag ordinary prose:
 # PERSON, DATE_TIME, LOCATION, NRP, URL, ORGANIZATION. Those are useful in
@@ -402,9 +727,46 @@ def scrub(text: str) -> ScrubResult:
       propagate straight out of this function. Deliberate: a ctrl-c during a
       50-second model load has to keep killing the process. It simply is not
       "never raises".
+    * A non-empty text needs gitleaks. When it cannot run this raises
+      :class:`ScrubUnavailableError` — fail closed, by design: the caller
+      must not store or return the text.
     """
-    counts: dict[str, int] = {}
-    text = _run_patterns(text, SECRET_PATTERNS, counts)
+    return scrub_many([text])[0]
+
+
+def scrub_secrets_many(texts: Sequence[str]) -> list[ScrubResult]:
+    """The SECRET layers only — regex floor, then gitleaks — over every text.
+
+    For re-scrubbing text that already went through the full ``scrub`` once
+    (``aggregator rescrub``): its PII pass is already applied, and Presidio is
+    ~70 ms a row, so running it again over the whole store would cost hours
+    for nothing. Fails closed exactly like :func:`scrub`.
+    """
+    counts: list[dict[str, int]] = [{} for _ in texts]
+    floor = [
+        _run_patterns(t, SECRET_PATTERNS, c) if t else (t or "")
+        for t, c in zip(texts, counts, strict=True)
+    ]
+    cleaned = _gitleaks_redact_many(floor, counts)
+    return [ScrubResult(text=t, counts=c) for t, c in zip(cleaned, counts, strict=True)]
+
+
+def scrub_many(texts: Sequence[str]) -> list[ScrubResult]:
+    """:func:`scrub` over many texts, with ONE gitleaks call per ~4 MB.
+
+    ``scrub_many(xs)[i] == scrub(xs[i])`` for every i — batching changes the
+    cost, never the result (see :func:`_gitleaks_redact_many`). Raises
+    :class:`ScrubUnavailableError` when the secret scanner cannot run, and
+    then NO text in the batch may be stored or returned.
+    """
+    results = scrub_secrets_many(texts)
+    return [ScrubResult(text=_scrub_pii(r.text, r.counts), counts=r.counts) for r in results]
+
+
+def _scrub_pii(text: str, counts: dict[str, int]) -> str:
+    """The PII layers, after the secret layers have run."""
+    if not text:
+        return text
     # Credit-card Luhn-gated pass runs BEFORE the generic PII loop so a
     # Luhn-valid 16-digit sequence isn't fragmented by another pattern first
     # (e.g. the phone regex).
@@ -420,4 +782,4 @@ def scrub(text: str) -> ScrubResult:
     # one. After that it is one atomic Event read.
     if ensure_presidio_ready():
         text = _scrub_pii_presidio(text, counts)
-    return ScrubResult(text=text, counts=counts)
+    return text

@@ -108,7 +108,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 from aggregator.core.provenance import MACHINE, MACHINE_VALUES
-from aggregator.core.scrub import scrub
+from aggregator.core.scrub import scrub_many
 from aggregator.sources.base import (
     SCOPE_SESSION,
     ObservationRow,
@@ -320,6 +320,16 @@ def _try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
 # that changes what ``scrub`` detects, and every scrubbed row re-scrubs on the
 # next ingest — no rebuild, no migration, no flag. Leaving it alone is the
 # statement that the scrubber's output for a given input is unchanged.
+#
+# THE ONE DELIBERATE EXCEPTION: A CHANGE THAT ONLY ADDS SECRET DETECTION. The
+# gitleaks layer and the wider regex floor (2026-10) left this at v1 on
+# purpose. A bump re-runs Presidio over every row (~11 h) and, through the
+# UPSERT's ``embedding_state = NULL``, throws away the vector of every row —
+# to change a few hundred of them. Such a change ships with
+# ``aggregator rescrub`` instead (core/rescrub.py), which applies the secret
+# layers to the STORED text in place and touches only rows that change. That
+# is equivalent because ``scrub`` is idempotent. A change to the PII layers,
+# or one that REMOVES a redaction, still needs the bump.
 SCRUB_FINGERPRINT = "presidio+gitleaks/v1"
 
 # v3 chat-export origins. ``sessions.origin`` values are these plus the
@@ -2901,8 +2911,45 @@ class Store:
         # ``_vec_table_usable``.
         vec_present = _vec_table_usable(c, "vec_observations")
 
+        # DIGESTS FIRST, THEN ONE SCRUB FOR THE WHOLE GROUP. The secret scanner
+        # is a gitleaks process whose start-up alone is ~100 ms, so scrubbing
+        # row by row would put a process spawn on every changed row; batched it
+        # is one spawn per group. ``scrub_many`` gives each body exactly what
+        # ``scrub`` would, and raises ``ScrubUnavailableError`` when the scanner
+        # cannot run — nothing in the group is written then (fail closed).
+        obs_digest: dict[int, str] = {}
+        to_scrub: list[int] = []
+        for pos, e in enumerate(group):
+            if not isinstance(e, ObservationRow):
+                continue
+            digest = _src_hash(
+                SCRUB_FINGERPRINT,
+                e.obs_id,
+                e.session_id,
+                e.root_session_id,
+                e.parent_obs_id,
+                e.type,
+                _iso(e.ts),
+                e.model,
+                e.input_tokens,
+                e.output_tokens,
+                e.tool_name,
+                e.tool_use_id,
+                e.body,
+            )
+            obs_digest[pos] = digest
+            if stored_obs.get(e.obs_id) != digest and e.body:
+                to_scrub.append(pos)
+        scrubbed_by_pos = dict(
+            zip(
+                to_scrub,
+                (r.text for r in scrub_many([group[p].body for p in to_scrub])),
+                strict=True,
+            )
+        )
+
         unchanged = 0
-        for e in group:
+        for pos, e in enumerate(group):
             if isinstance(e, SessionRow):
                 # NO ``SCRUB_FINGERPRINT`` here: session rows carry no
                 # user-authored text (cwd and git_branch are structural) and are
@@ -2987,26 +3034,13 @@ class Store:
                 # INSERT and on the ``DO UPDATE`` branch (which is rewriting the
                 # row anyway), and is otherwise owned by
                 # ``aggregator provenance --backfill``, whose cursor is
-                # ``provenance IS NULL``.
-                digest = _src_hash(
-                    SCRUB_FINGERPRINT,
-                    e.obs_id,
-                    e.session_id,
-                    e.root_session_id,
-                    e.parent_obs_id,
-                    e.type,
-                    _iso(e.ts),
-                    e.model,
-                    e.input_tokens,
-                    e.output_tokens,
-                    e.tool_name,
-                    e.tool_use_id,
-                    e.body,
-                )
+                # ``provenance IS NULL``. (The digest is computed above, before
+                # the group's one batched scrub.)
+                digest = obs_digest[pos]
                 if stored_obs.get(e.obs_id) == digest:
                     unchanged += 1
                     continue
-                scrubbed_body = scrub(e.body).text if e.body else ""
+                scrubbed_body = scrubbed_by_pos.get(pos, "")
                 # UPSERT, NOT DELETE-THEN-INSERT. The old shape allocated a
                 # fresh rowid and a fresh page for a row whose content had not
                 # moved, and SQLite's default ``auto_vacuum=NONE`` never hands
@@ -5024,6 +5058,7 @@ class Store:
         vec_usable = _vec_table_usable(c, "vec_records")
 
         unchanged = 0
+        to_write: list[tuple[Record, str]] = []
         for r in records:
             held_hash, held_created, held_updated = stored.get(
                 r.stable_id, (None, None, None)
@@ -5044,8 +5079,22 @@ class Store:
             if held_hash == digest:
                 unchanged += 1
                 continue
+            to_write.append((r, digest))
+        # One batched scrub for every changed row's subject and body — see the
+        # observations path for why (one scanner process per group, and fail
+        # closed: a ScrubUnavailableError here writes nothing).
+        scrubbed = scrub_many(
+            [r.subject for r, _ in to_write] + [r.body for r, _ in to_write]
+        )
+        n = len(to_write)
+        for i, (r, digest) in enumerate(to_write):
             Store._write_one_record(
-                c, r, digest, r.stable_id in stored, vec_usable=vec_usable
+                c,
+                r,
+                digest,
+                r.stable_id in stored,
+                vec_usable=vec_usable,
+                scrubbed=(scrubbed[i].text, scrubbed[n + i].text),
             )
         return unchanged
 
@@ -5057,9 +5106,15 @@ class Store:
         existed: bool = False,
         *,
         vec_usable: bool = False,
+        scrubbed: tuple[str, str] | None = None,
     ) -> None:
-        scrubbed_body = scrub(r.body).text
-        scrubbed_subject = scrub(r.subject).text
+        # ``scrubbed`` = (subject, body) already scrubbed by the caller's batch.
+        if scrubbed is None:
+            scrubbed_subject, scrubbed_body = (
+                res.text for res in scrub_many([r.subject, r.body])
+            )
+        else:
+            scrubbed_subject, scrubbed_body = scrubbed
         c.execute(
             """
             INSERT INTO records(
@@ -5786,9 +5841,9 @@ class Store:
         """Append the ``by:`` predicate, or nothing at all.
 
         NOTHING AT ALL IS THE DEFAULT AND STAYS THE DEFAULT. A human-only
-        default here would narrow ``_first_user_prompt`` (which labels every
+        default here would narrow ``_first_user_row`` (which labels every
         session card), ``count_observations`` (which is
-        ``matching_observations``), ``_session_body_preview`` and the frozen
+        ``matching_observations``), ``_render_session_preview`` and the frozen
         eval baseline — four callers that never asked for a filter, in one
         edit, invisibly.
         """

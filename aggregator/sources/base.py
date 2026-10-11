@@ -261,7 +261,7 @@ class QueryAST:
       shorthand ``'machine'`` for any non-human member. ``None`` means NO
       FILTER, exactly like ``obs_type``: nothing in this codebase applies a
       default here, because a default would silently narrow
-      ``_first_user_prompt``, the frozen eval baseline and every
+      ``_first_user_row``, the frozen eval baseline and every
       ``matching_observations`` count at once.
     * ``active_from``/``active_to`` — activity-window overlap:
       ``first_ts <= active_to AND last_ts >= active_from``. Different from
