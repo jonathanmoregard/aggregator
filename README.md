@@ -183,6 +183,11 @@ missing or errors, ingest writes nothing for the affected source and exits 3
 `aggregator_search_memory` returns `ok: false` with the reason instead of
 results. Ingest batches each write group into one gitleaks call
 (`scrub_many`): a gitleaks process costs ~100 ms before it reads a byte.
+Each text is scanned as its own file (`gitleaks dir` over a tmpfs dir, empty
+cwd), under one gitleaks read and behind a `BM` header line — gitleaks
+otherwise cuts long inputs mid-token, skips input that sniffs as binary, and
+lets one text's keywords switch rules on for another. A scan that read fewer
+bytes than it was given fails closed.
 
 Rows stored before a format was detectable are fixed in place with
 

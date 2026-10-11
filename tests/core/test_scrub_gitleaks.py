@@ -168,9 +168,19 @@ def test_batch_gives_exactly_the_single_results():
         assert batched.counts == single.counts
 
 
-def test_a_multiline_finding_straddling_members_is_rescanned():
-    """A PEM block whose header is in one member and whose END is in the next
-    must not swallow the next member's own complete key. The regex floor is
+def test_batched_texts_do_not_switch_rules_on_for_each_other():
+    """gitleaks applies a rule only when one of its keywords is in the same
+    fragment. Streamed together, a text mentioning sourcegraph made a git SHA
+    in ANOTHER text a "sourcegraph-access-token" (seen on real rows)."""
+    sha = _r(40, "0123456789abcdef")
+    alone = scrub(f"commit {sha} merged").text
+    batched = scrub_many(["notes about sourcegraph search", f"commit {sha} merged"])[1].text
+    assert batched == alone
+
+
+def test_a_multiline_secret_next_to_a_dangling_header_is_still_found():
+    """A PEM block whose header is in one text and whose END is in the next
+    must not swallow the next text's own complete key. The regex floor is
     bypassed here on purpose — it would remove the headers first."""
     body = "\n".join(_r(64) for _ in range(12))
     head = "-----BEGIN RSA " + "PRIVATE KEY-----"
@@ -326,3 +336,68 @@ def test_runner_does_not_quarantine_rows_when_the_scanner_is_down(monkeypatch, t
     bodies = {r[0] for r in store._c().execute("SELECT body FROM records")}
     assert bodies == {"b0", "b1", "b2", "b3"}
     store.close()
+
+
+# --- gitleaks input-handling holes (close-out review) ------------------------
+#
+# Each of these was a real leak against gitleaks 8.30.1 driven naively; the
+# tests pin that the wrapper closes them. The token format (GitLab PAT) is one
+# only gitleaks knows, so the regex floor cannot mask a regression.
+
+
+def _glpat() -> str:
+    return "gl" + "pat-" + _r(20)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["%PDF-1.4", "%!PS-Adobe", "{\\rtf1", "MZ", "SQLite format 3", "y" * 257 + "ustar"],
+)
+def test_text_that_sniffs_as_a_binary_type_is_still_scanned(prefix):
+    """gitleaks skips input whose first bytes look like application/* and
+    reports it clean with zero bytes scanned."""
+    token = _glpat()
+    assert token not in scrub(f"{prefix}\n{token}").text
+
+
+def test_no_token_is_lost_to_a_fragment_cut():
+    """gitleaks cuts long blank-line-free input at arbitrary bytes; tokens on
+    the cut were missed (8 of 12,000 here, timing-dependent)."""
+    tokens = [_glpat() for _ in range(12000)]
+    out = scrub(" ".join(tokens)).text
+    assert [t for t in tokens if t in out] == []
+
+
+def test_long_text_is_windowed_and_positions_map_back():
+    """A text far larger than one call: a base64-encoded secret deep inside,
+    on a line that starts mid-window, is redacted at the right place."""
+    token = "gh" + "p_" + _r(36)
+    encoded = base64.b64encode(f"user:{token}".encode()).decode()
+    filler = "\n".join("plain words " * 8 for _ in range(3000))
+    text = f"{filler}\nAuthorization: Basic {encoded} tail\n{filler}"
+    out = scrub(text).text
+    assert encoded not in out
+    assert "Authorization: Basic [REDACTED:" in out and "] tail\n" in out
+    assert out.count("plain words") == text.count("plain words")
+    batched = scrub_many(["x", text, "y"])[1].text
+    assert batched == out
+
+
+def test_a_gitleaksignore_in_the_working_directory_cannot_suppress(monkeypatch, tmp_path):
+    token = _glpat()
+    (tmp_path / ".gitleaksignore").write_text(":gitlab-pat:1\n:gitlab-pat:3\n")
+    monkeypatch.chdir(tmp_path)
+    assert token not in scrub(token).text
+
+
+def test_a_scan_that_reads_nothing_fails_closed(monkeypatch, tmp_path):
+    """An empty report only counts as clean if gitleaks read the input."""
+    fake = tmp_path / "gitleaks"
+    fake.write_text(
+        "#!/bin/sh\ncat >/dev/null\necho '[]'\n"
+        "echo 'INF scanned ~0 bytes (0 bytes) in 1ms' >&2\nexit 0\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv(GITLEAKS_ENV, str(fake))
+    with pytest.raises(ScrubUnavailableError, match="scanned 0 of"):
+        scrub("some text")
