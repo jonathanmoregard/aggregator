@@ -38,7 +38,7 @@ from aggregator.core.scrub import (
 #: sha256 of ``hooks/secret-rules.toml`` in the ~/.claude config repo, which
 #: redacts agent tool output with the same rules. Update BOTH copies and this
 #: constant together.
-SHARED_RULES_SHA256 = "5eeb852b8109a33d63ebd748f4577082248be76b284b2e7f3b9d9628598d9206"
+SHARED_RULES_SHA256 = "b4db7a807ab4b709ba08d66e2cbec56d1f084650fc26eddfd3c525836a8e0a18"
 
 _ALNUM = string.ascii_letters + string.digits
 
