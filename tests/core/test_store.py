@@ -134,7 +134,7 @@ def test_store_scrubs_on_upsert(tmp_data_home):
     results = s.query(QueryAST(source="github", text="key"))
     assert len(results) == 1
     assert "sk-" + "ant-api03" not in results[0].body
-    assert "[REDACTED:anthropic_key]" in results[0].body
+    assert "[REDACTED:" in results[0].body
 
 
 def test_store_fts5_metacharacters_are_answered_not_rejected(tmp_data_home):
@@ -647,7 +647,7 @@ def test_obs_scrub_on_write(tmp_data_home):
     )
     obs = s.query_observations(QueryAST(top_session_id="sess-leak"))
     assert "sk-" + "ant-api03" not in obs[0].body
-    assert "[REDACTED:anthropic_key]" in obs[0].body
+    assert "[REDACTED:" in obs[0].body
 
 
 def test_rebuild_all_wipes_and_recreates(tmp_data_home):

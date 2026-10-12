@@ -1,6 +1,28 @@
 import os
+import shutil
+import sys
+from pathlib import Path
 
 import pytest
+
+#: The real ``secret-redact`` if this machine has one, found BEFORE the stub
+#: below shadows it on PATH. Tests that need the real scanner skip without it.
+REAL_SECRET_REDACT = shutil.which("secret-redact")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _stub_secret_redact(tmp_path_factory):
+    """Every test scrubs through the stub ``secret-redact`` (tests/secret_redact_stub.py),
+    so the suite needs no real scanner and no test depends on whose machine ran it.
+    Session-wide, because module-scoped fixtures seed stores before any test runs."""
+    bindir = tmp_path_factory.mktemp("secret-redact-stub")
+    stub = bindir / "secret-redact"
+    source = (Path(__file__).parent / "secret_redact_stub.py").read_text()
+    stub.write_text(f"#!{sys.executable}\n{source}")
+    stub.chmod(0o755)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+        yield
 
 
 @pytest.fixture

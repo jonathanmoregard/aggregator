@@ -2,7 +2,7 @@
 
 Security note (spec §Security): sources MUST use read-only credentials only. The
 github source enforces this via `gh auth` scope inspection (see spec constraint 1).
-Every source's `ingest()` scrubs pre-store (Presidio + gitleaks) via core/scrub.py.
+Every source's `ingest()` scrubs pre-store (Presidio + secret-redact) via core/scrub.py.
 
 Schema v2 (Langfuse-derived, Schema B from
 ``research-agent/reports/0212132731c649a99d54eaf72c6e220c.md``): sessions now

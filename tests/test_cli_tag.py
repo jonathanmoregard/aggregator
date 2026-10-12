@@ -24,6 +24,7 @@ must say so, and the parser whitelists tag shape rather than trusting output.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -74,6 +75,10 @@ class FakeClaude:
         self.calls: list[dict] = []
 
     def __call__(self, argv, **kwargs):
+        # The scrubber's secret-redact, run on every store write, is the
+        # suite's stub; every other command is the scripted tagger.
+        if os.path.basename(str(argv[0])) == "secret-redact":
+            return _REAL_RUN(argv, **kwargs)
         prompt = kwargs.get("input", "")
         self.calls.append({"argv": list(argv), "prompt": prompt})
         step = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
@@ -113,6 +118,9 @@ def no_sleep(monkeypatch):
     naps: list[float] = []
     monkeypatch.setattr(cli.time, "sleep", naps.append)
     return naps
+
+
+_REAL_RUN = subprocess.run
 
 
 def _install(monkeypatch, fake: FakeClaude, which=None) -> None:

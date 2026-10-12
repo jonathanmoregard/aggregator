@@ -19,7 +19,9 @@ Security invariants (spec §Security):
 
 1. **No write tools.** Enforced by ``tests/test_mcp_no_write_tools.py``.
 2. **Every record leaves via ``wrap_record``.** No raw bodies escape.
-3. **Scrub on return.** Records + observations re-scrubbed pre-return.
+3. **Scrubbed at ingest.** Every stored row went through ``core.scrub`` on its way in
+   (and ``aggregator rescrub`` brings older rows up to date), so results are
+   returned as stored.
 4. **Structured errors only.** DSL parse errors, an unreadable cache, and any
    unexpected exception become ``{ok: false, reason, remediation}``. FTS5
    syntax errors are NOT in that list any more and the branch that reported
@@ -71,10 +73,8 @@ not import ``torch``, ``spacy``, ``thinc``, ``transformers``,
 either. Claude Code allows an MCP server 30 s to answer ``initialize``; this
 process used to spend 57.6 s of that on imports it did not need yet — 49.0 s of
 it inside ``core.scrub``, which built Presidio's engines at module scope — and
-from 2026-09-04 every session's connect timed out. ``main()`` now calls
-``start_background_init()`` between building the server and serving stdio, so the
-handshake is answered while the PII engines load on a daemon thread; the first
-result that needs them blocks on that build rather than racing it.
+from 2026-09-04 every session's connect timed out. This module no longer
+imports ``core.scrub`` at all (scrubbing happens at ingest).
 ``tests/test_mcp_cold_start.py`` fails if any of those six modules reappears on
 the import path.
 
@@ -139,13 +139,6 @@ from aggregator.core.dsl import DSLError, format_help, parse
 # the ones that never run a vector query. They are imported inside
 # ``_get_embedder`` / ``_get_reranker``; ``tests/test_mcp_cold_start.py``
 # fails if that ever regresses. ``hybrid`` is pure Python and free.
-#
-# ``aggregator.core.scrub`` IS imported here, and is free for the same reason
-# by a different mechanism: it builds its Presidio engines lazily. It used not
-# to, and that cost 49.0 s of a 57.6 s import — the whole reason this server
-# stopped answering Claude Code's 30 s connect handshake. ``main()`` starts the
-# engine build on a daemon thread, so it runs while stdio is already being
-# served. Same test file guards it.
 from aggregator.core.hybrid import (
     FUSION_ARM_DEPTH,
     has_standout,
@@ -153,7 +146,6 @@ from aggregator.core.hybrid import (
     vector_floor,
 )
 from aggregator.core.provenance import MACHINE_VALUES
-from aggregator.core.scrub import scrub, start_background_init
 from aggregator.core.store import (
     CHAT_ORIGINS,
     LEXICAL_RELAX_OR,
@@ -2361,10 +2353,6 @@ def _attach_next_page_token(
     result["notice"] = f"{notice} {prior}" if prior else notice
 
 
-def _scrub_record(r: Record) -> Record:
-    return replace(r, subject=scrub(r.subject).text, body=scrub(r.body).text)
-
-
 # --- summary-mode snippets (D1) ---------------------------------------------
 #
 # WHAT SUMMARY MODE USED TO MEAN. ``_observation_to_item`` and
@@ -3560,11 +3548,11 @@ def _observation_to_item(
 
     D1 — THE BLOCKER THIS FIXES. Summary mode used to set ``content = ""``
     here, which is how a five-row result set carrying the exact answer came
-    back as five opaque UUIDs. Both branches now scrub and wrap the body; they
+    back as five opaque UUIDs. Both branches now wrap the body; they
     differ only in HOW MUCH of it goes back, which is the whole difference
     between a summary and a full fetch.
     """
-    body = scrub(o.body or "").text
+    body = o.body or ""
     subject = (o.body[:120] if o.body else o.type)
     if fields == "full":
         content = wrap_record(
@@ -4325,7 +4313,7 @@ def _query_records_path(
         }
     has_more = len(page_plus_one) > page_size
     page_records = page_plus_one[:page_size]
-    items = [_record_to_item(_scrub_record(r), fields) for r in page_records]
+    items = [_record_to_item(r, fields) for r in page_records]
     items, rr_count, rr_notice, rr_standout = _maybe_rerank(
         items, query_text, rerank
     )
@@ -4702,7 +4690,7 @@ def _query_union_path(
     terms = _snippet_terms(query_text)
     for _ts, kind, obj in window:
         if kind == "record":
-            items.append(_record_to_item(_scrub_record(obj), fields))
+            items.append(_record_to_item(obj, fields))
         else:
             # Session-shaped card. Reuse the sessions-path helper for parity
             # (subject = first user prompt, matching_observations count).
@@ -4847,7 +4835,7 @@ def _first_user_prompt(store: Store, s: SessionRow) -> str:
     rows = store.query_observations(obs_ast, limit=1, offset=0)
     if not rows:
         return f"session {s.session_id}"
-    body = scrub(rows[0].body or "").text
+    body = rows[0].body or ""
     return body[:280] if body else f"session {s.session_id}"
 
 
@@ -4911,13 +4899,13 @@ def _session_body_preview(
     """
     if fields != "full":
         rows = store.query_observations(scoped, limit=1)
-        body = scrub(rows[0].body or "").text.strip() if rows else ""
+        body = (rows[0].body or "").strip() if rows else ""
         return _snippet(body or subject, terms)
     rows = store.query_observations(scoped, limit=_SESSION_PREVIEW_OBSERVATIONS)
     parts: list[str] = []
     used = 0
     for o in rows:
-        body = scrub(o.body or "").text.strip()
+        body = (o.body or "").strip()
         if not body:
             continue
         body = body[: _SESSION_PREVIEW_CHARS - used]
@@ -5260,22 +5248,6 @@ def main() -> None:
             }
         )
         server = build_server(_auth=auth)
-    # BETWEEN build and run, on a daemon thread, and not joined. Presidio is
-    # ~50 s of model loading on this host and every result path needs it
-    # (scrub-on-return), but the `initialize` handshake needs none of it and
-    # Claude Code gives it 30 s. Before `build_server()` this would contend with
-    # the cache read that builds the tool descriptions; after `server.run()` it
-    # would never happen, because `run()` serves stdio and does not return.
-    #
-    # HONEST ABOUT WHAT THIS DOES NOT FIX: `scrub()` is synchronous and the tool
-    # handlers are `async def`, so a query landing in the first ~10-50 s waits
-    # for the engine build on the event loop — that one query is slow, and
-    # anything queued behind it waits too. That is the spec'd trade (a result
-    # must not return unscrubbed, and must not race a half-built engine) and it
-    # is bounded by the build. Before this branch the same window was worse in
-    # kind, not just degree: the server never answered `initialize` at all, so
-    # it was absent from the session rather than briefly slow.
-    start_background_init()
     server.run(show_banner=False)
 
 

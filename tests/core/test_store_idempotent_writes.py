@@ -152,13 +152,15 @@ def test_an_unchanged_row_is_not_scrubbed_again(store, monkeypatch):
     import aggregator.core.store as store_mod
 
     calls: list[str] = []
-    real = store_mod.scrub
+    real = store_mod.scrub_many
 
-    def counting_scrub(text):
-        calls.append(text)
-        return real(text)
+    # The write path scrubs a whole group in one batched call; count the
+    # TEXTS it is handed, which is the per-row scrub cost.
+    def counting_scrub_many(texts):
+        calls.extend(texts)
+        return real(texts)
 
-    monkeypatch.setattr(store_mod, "scrub", counting_scrub)
+    monkeypatch.setattr(store_mod, "scrub_many", counting_scrub_many)
     store.upsert_entities([session(), observation()])
     first = len(calls)
     assert first >= 1

@@ -44,8 +44,8 @@ one virtual table per base table with ``content=base_table content_rowid=rowid``
 plus AFTER INSERT/DELETE/UPDATE triggers to keep the index in sync without
 duplicating body text.
 
-Scrub-on-write (spec constraint 3, defense in depth: also runs pre-return at
-MCP/CLI boundary). WAL + busy_timeout=5000 (Codex Phase 2 MEDIUM #2 —
+Scrub-on-write (spec constraint 3; ``aggregator rescrub`` brings older rows up
+to date, and results are returned as stored). WAL + busy_timeout=5000 (Codex Phase 2 MEDIUM #2 —
 concurrent-writer safety).
 
 v3→v4 is additive and migrates IN PLACE. It adds:
@@ -108,7 +108,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 from aggregator.core.provenance import MACHINE, MACHINE_VALUES
-from aggregator.core.scrub import scrub
+from aggregator.core.scrub import scrub_many
 from aggregator.sources.base import (
     SCOPE_SESSION,
     ObservationRow,
@@ -320,6 +320,9 @@ def _try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:
 # that changes what ``scrub`` detects, and every scrubbed row re-scrubs on the
 # next ingest — no rebuild, no migration, no flag. Leaving it alone is the
 # statement that the scrubber's output for a given input is unchanged.
+#
+# Exception: a change that only ADDS secret detection ships with
+# ``aggregator rescrub`` instead of a bump — see core/rescrub.py for why.
 SCRUB_FINGERPRINT = "presidio+gitleaks/v1"
 
 # v3 chat-export origins. ``sessions.origin`` values are these plus the
@@ -2901,8 +2904,45 @@ class Store:
         # ``_vec_table_usable``.
         vec_present = _vec_table_usable(c, "vec_observations")
 
+        # DIGESTS FIRST, THEN ONE SCRUB FOR THE WHOLE GROUP. The secret scanner
+        # is a ``secret-redact`` process whose start-up alone is ~100 ms, so
+        # scrubbing row by row would put a process spawn on every changed row;
+        # batched it is one spawn per group. ``scrub_many`` raises
+        # ``ScrubUnavailableError`` when the scanner cannot run — nothing in the
+        # group is written then (fail closed).
+        obs_digest: dict[int, str] = {}
+        to_scrub: list[int] = []
+        for pos, e in enumerate(group):
+            if not isinstance(e, ObservationRow):
+                continue
+            digest = _src_hash(
+                SCRUB_FINGERPRINT,
+                e.obs_id,
+                e.session_id,
+                e.root_session_id,
+                e.parent_obs_id,
+                e.type,
+                _iso(e.ts),
+                e.model,
+                e.input_tokens,
+                e.output_tokens,
+                e.tool_name,
+                e.tool_use_id,
+                e.body,
+            )
+            obs_digest[pos] = digest
+            if stored_obs.get(e.obs_id) != digest and e.body:
+                to_scrub.append(pos)
+        scrubbed_by_pos = dict(
+            zip(
+                to_scrub,
+                (r.text for r in scrub_many([group[p].body for p in to_scrub])),
+                strict=True,
+            )
+        )
+
         unchanged = 0
-        for e in group:
+        for pos, e in enumerate(group):
             if isinstance(e, SessionRow):
                 # NO ``SCRUB_FINGERPRINT`` here: session rows carry no
                 # user-authored text (cwd and git_branch are structural) and are
@@ -2987,26 +3027,13 @@ class Store:
                 # INSERT and on the ``DO UPDATE`` branch (which is rewriting the
                 # row anyway), and is otherwise owned by
                 # ``aggregator provenance --backfill``, whose cursor is
-                # ``provenance IS NULL``.
-                digest = _src_hash(
-                    SCRUB_FINGERPRINT,
-                    e.obs_id,
-                    e.session_id,
-                    e.root_session_id,
-                    e.parent_obs_id,
-                    e.type,
-                    _iso(e.ts),
-                    e.model,
-                    e.input_tokens,
-                    e.output_tokens,
-                    e.tool_name,
-                    e.tool_use_id,
-                    e.body,
-                )
+                # ``provenance IS NULL``. (The digest is computed above, before
+                # the group's one batched scrub.)
+                digest = obs_digest[pos]
                 if stored_obs.get(e.obs_id) == digest:
                     unchanged += 1
                     continue
-                scrubbed_body = scrub(e.body).text if e.body else ""
+                scrubbed_body = scrubbed_by_pos.get(pos, "")
                 # UPSERT, NOT DELETE-THEN-INSERT. The old shape allocated a
                 # fresh rowid and a fresh page for a row whose content had not
                 # moved, and SQLite's default ``auto_vacuum=NONE`` never hands
@@ -5024,6 +5051,7 @@ class Store:
         vec_usable = _vec_table_usable(c, "vec_records")
 
         unchanged = 0
+        to_write: list[tuple[Record, str]] = []
         for r in records:
             held_hash, held_created, held_updated = stored.get(
                 r.stable_id, (None, None, None)
@@ -5044,8 +5072,22 @@ class Store:
             if held_hash == digest:
                 unchanged += 1
                 continue
+            to_write.append((r, digest))
+        # One batched scrub for every changed row's subject and body — see the
+        # observations path for why (one scanner process per group, and fail
+        # closed: a ScrubUnavailableError here writes nothing).
+        scrubbed = scrub_many(
+            [r.subject for r, _ in to_write] + [r.body for r, _ in to_write]
+        )
+        n = len(to_write)
+        for i, (r, digest) in enumerate(to_write):
             Store._write_one_record(
-                c, r, digest, r.stable_id in stored, vec_usable=vec_usable
+                c,
+                r,
+                digest,
+                r.stable_id in stored,
+                vec_usable=vec_usable,
+                scrubbed=(scrubbed[i].text, scrubbed[n + i].text),
             )
         return unchanged
 
@@ -5056,10 +5098,11 @@ class Store:
         digest: str,
         existed: bool = False,
         *,
-        vec_usable: bool = False,
+        vec_usable: bool,
+        scrubbed: tuple[str, str],
     ) -> None:
-        scrubbed_body = scrub(r.body).text
-        scrubbed_subject = scrub(r.subject).text
+        # ``scrubbed`` = (subject, body) already scrubbed by the caller's batch.
+        scrubbed_subject, scrubbed_body = scrubbed
         c.execute(
             """
             INSERT INTO records(

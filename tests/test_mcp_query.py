@@ -420,31 +420,6 @@ def test_query_sessions_observations_wrapped_content(tmp_data_home):
         assert "</ExternalContent>" in item["content"]
 
 
-def test_query_sessions_scrubs_observation_bodies_on_return(tmp_data_home):
-    """Pre-return scrub catches secrets even if they slipped past pre-write."""
-    store = Store()
-    store.migrate()
-    # Bypass upsert_entities scrub by writing raw into the observations table.
-    session = _sess("sess-leak")
-    store.upsert_entities([session])
-    secret = "sk-" + "ant-" + "api03-" + "z" * 44
-    conn = store._c()
-    conn.execute(
-        "INSERT INTO observations(obs_id, session_id, root_session_id, "
-        "parent_obs_id, type, ts, model, input_tokens, output_tokens, "
-        "tool_name, tool_use_id, body) VALUES "
-        "('o-leak', 'sess-leak', 'sess-leak', NULL, 'user', "
-        "'2026-07-25T10:00:00+00:00', NULL, NULL, NULL, NULL, NULL, ?)",
-        (secret,),
-    )
-    conn.commit()
-    result = aggregator_query(
-        dsl="source:sessions", fields="full", drilldown=True, _store=store
-    )
-    for item in result["records"]:
-        assert "sk-ant-api03" not in item["content"]
-
-
 def test_query_sessions_notice_when_summary(tmp_data_home):
     store = Store()
     _seed_sessions(store)
@@ -504,27 +479,3 @@ def test_records_summary_omits_external_content_wrap(tmp_data_home):
         assert "<ExternalContent" not in rec["content"], (
             f"summary mode should not wrap; got: {rec['content']!r}"
         )
-
-
-def test_query_scrubs_records_secrets_on_return(tmp_data_home):
-    """Pre-return scrub of Record path (parity with pre-v2 behaviour)."""
-    store = Store()
-    store.migrate()
-    secret = "sk-" + "ant-" + "api03-" + "x" * 44
-    conn = store._c()
-    conn.execute(
-        "INSERT INTO records(stable_id, source, subject, body, tags, "
-        "created_at, updated_at, extra) VALUES "
-        "('github:leak', 'github', 's', ?, '[]', NULL, NULL, '{}')",
-        (secret,),
-    )
-    conn.execute(
-        "INSERT INTO records_fts(stable_id, source, subject, body, tags) "
-        "VALUES ('github:leak', 'github', 's', ?, '')",
-        (secret,),
-    )
-    conn.commit()
-    result = aggregator_query(dsl="source:github", fields="full", _store=store)
-    assert result["ok"] is True
-    for rec in result["records"]:
-        assert "sk-ant-api03" not in rec["content"]

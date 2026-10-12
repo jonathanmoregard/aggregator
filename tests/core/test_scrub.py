@@ -10,48 +10,40 @@ under BOTH regimes (the regex fallback covers every fixture case), so this test
 file is Presidio-agnostic.
 """
 import importlib
+import secrets
+import string
 from pathlib import Path
+
+import pytest
 
 from aggregator.core.scrub import ScrubResult, scrub
 
 FIX = Path(__file__).parent.parent / "fixtures" / "scrub"
 
 
-def test_openai_key_redacted():
-    txt = (FIX / "api_keys.txt").read_text()
-    result = scrub(txt)
-    # Split literals so this file itself is not gitleaks-flaggable.
-    assert "sk-" + "proj-" not in result.text
-    assert result.counts.get("openai_key", 0) >= 1
+def _rand(n: int) -> str:
+    alnum = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alnum) for _ in range(n - 1)) + secrets.choice(string.digits)
 
 
-def test_anthropic_key_redacted():
-    txt = (FIX / "api_keys.txt").read_text()
-    result = scrub(txt)
-    assert "sk-" + "ant-api03-" not in result.text
-    assert result.counts.get("anthropic_key", 0) >= 1
-
-
-def test_github_pat_redacted():
-    txt = (FIX / "api_keys.txt").read_text()
-    result = scrub(txt)
-    assert "gh" + "p_" not in result.text
-    assert result.counts.get("github_pat", 0) >= 1
-
-
-def test_jwt_redacted():
-    txt = (FIX / "api_keys.txt").read_text()
-    result = scrub(txt)
-    # JWTs begin with "ey" + "J" (base64 of `{"`); assert none survive.
-    assert "ey" + "J" not in result.text
-    assert result.counts.get("jwt", 0) >= 1
-
-
-def test_aws_key_redacted():
-    txt = (FIX / "api_keys.txt").read_text()
-    result = scrub(txt)
-    assert "AKIA" + "IOSFODNN7EXAMPLE" not in result.text
-    assert result.counts.get("aws_access_key", 0) >= 1
+# Generated per run: gitleaks rightly ignores placeholder values such as a
+# sequential alphabet, and a literal real-looking key cannot be committed.
+@pytest.mark.parametrize(
+    "token",
+    [
+        "sk-" + "proj-" + _rand(48),
+        "sk-" + "ant-api03-" + _rand(93) + "AA",
+        "gh" + "p_" + _rand(36),
+        "ey" + "J" + _rand(20) + ".ey" + "J" + _rand(30) + "." + _rand(43),
+        "AKIA" + "".join(secrets.choice(string.ascii_uppercase + "234567") for _ in range(16)),
+    ],
+    ids=["openai", "anthropic", "github", "jwt", "aws"],
+)
+def test_api_key_redacted(token):
+    result = scrub(f"key example: {token}\nnext line")
+    assert token not in result.text
+    assert result.counts
+    assert result.text.endswith("\nnext line")
 
 
 def test_ssn_redacted():
