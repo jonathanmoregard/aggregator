@@ -1569,8 +1569,10 @@ class Store:
         The artifacts are the ``vec_observations`` / ``vec_records`` virtual
         tables (and their shadow tables), ``chunk_embeddings``,
         ``embedding_versions``, the ``embedding_state`` column on
-        ``observations`` and ``records`` with its two indexes, and the
-        ``vector_provenance`` / ``embed_inflight`` rows in ``meta``.
+        ``observations`` and ``records`` with its two indexes, the
+        ``vector_provenance`` / ``embed_inflight`` rows in ``meta``, and the
+        embed worker's held rows in ``quarantine`` (sources
+        ``embed:observations`` / ``embed:records``).
 
         PROBES THE ARTIFACTS, NOT ``user_version``, like every ``_ensure_*``
         helper: each step runs only when its artifact is present, so a fresh
@@ -1617,16 +1619,15 @@ class Store:
                 "AND name IN ('chunk_embeddings', 'embedding_versions')"
             )
         ]
-        if not (vtabs or shadows or columns or plain):
-            return
-        log.warning(
-            "Removing the retired vector index (schema v8): dropping %s. "
-            "One-time migration; the freed space stays inside cache.db until "
-            "a VACUUM.",
-            ", ".join(
-                [*vtabs, *plain, *(f"{t}.embedding_state" for t in columns)]
-            ),
-        )
+        if vtabs or shadows or columns or plain:
+            log.warning(
+                "Removing the retired vector index (schema v8): dropping %s. "
+                "One-time migration; the freed space stays inside cache.db "
+                "until a VACUUM.",
+                ", ".join(
+                    [*vtabs, *plain, *(f"{t}.embedding_state" for t in columns)]
+                ),
+            )
         if vtabs:
             c.execute("PRAGMA writable_schema = ON")
             try:
@@ -1644,6 +1645,10 @@ class Store:
             c.execute(f"ALTER TABLE {table} DROP COLUMN embedding_state")
         c.execute(
             "DELETE FROM meta WHERE key IN ('vector_provenance', 'embed_inflight')"
+        )
+        c.execute(
+            "DELETE FROM quarantine WHERE source IN "
+            "('embed:observations', 'embed:records')"
         )
 
     def schema_version(self) -> int:

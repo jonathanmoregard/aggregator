@@ -97,6 +97,10 @@ def _make_v7(path) -> None:
         "INSERT INTO meta(key, value) VALUES ('vector_provenance', '{}'), "
         "('embed_inflight', 'observations:o1')"
     )
+    c.execute(
+        "INSERT INTO quarantine(source, record_key, error_type, first_seen_at, "
+        "last_seen_at) VALUES ('embed:observations', 'o1', 'RuntimeError', 't', 't')"
+    )
     c.execute("PRAGMA user_version = 7")
     c.commit()
     c.close()
@@ -135,6 +139,10 @@ def test_migrate_drops_every_vector_artifact(v7_cache):
         assert "embedding_state" not in columns, (table, columns)
     keys = {row[0] for row in c.execute("SELECT key FROM meta")}
     assert not keys & {"vector_provenance", "embed_inflight"}, keys
+    held = c.execute(
+        "SELECT count(*) FROM quarantine WHERE source LIKE 'embed:%'"
+    ).fetchone()[0]
+    assert held == 0, "the embed worker's held rows outlived the worker"
     assert store.schema_version() == SCHEMA_VERSION == 8
     store.close()
 
