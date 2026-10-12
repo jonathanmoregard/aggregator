@@ -35,9 +35,9 @@ precision, 23.3% recall on its own. It is a backstop for old lines, not the
 mechanism.
 
 ``NULL`` IS NOT A MEMBER. It means "not classified yet" and is the backfill's
-cursor. Never store ``'unknown'``: a value that means "we looked and could not tell" and a
-value that means "nobody has looked" are different facts, and collapsing them
-loses the only thing that makes the backfill resumable.
+cursor. Never store ``'unknown'``: a value that means "we looked and could not
+tell" and a value that means "nobody has looked" are different facts, and
+collapsing them loses the only thing that makes the backfill resumable.
 """
 from __future__ import annotations
 

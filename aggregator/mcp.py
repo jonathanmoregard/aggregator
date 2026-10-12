@@ -1865,8 +1865,9 @@ def _snippet(body: str | None, terms: tuple[str, ...]) -> str:
     NO HIT IS NOT AN ERROR. A pure-filter query has no terms at all, and a
     stemmed or relaxed match need not contain a term verbatim. Both fall back
     to the head of the body, which is still strictly more legible than the
-    empty string the caller used to get. The leading ellipsis is what tells the two apart on sight: a
-    snippet that starts mid-body was centred on something.
+    empty string the caller used to get. The leading ellipsis is what tells the
+    two apart on sight: a snippet that starts mid-body was centred on
+    something.
     """
     text = _SNIPPET_WS_RE.sub(" ", body or "").strip()
     if not text:
@@ -1924,10 +1925,10 @@ def _wrap_snippet(stable_id: str, source: str, subject: str, snippet: str) -> st
 # session — which is how ``page_size=8`` returned 282,110 characters, overran
 # the tool output limit, and got spilled to a file the caller then had to jq.
 #
-# TRUNCATION HERE, AND IT IS SAFE ONLY BECAUSE IT IS DECLARED. A truncated
-# body is still the right body, and the caller can act on a short one — but
-# only while the cut is DECLARED. That is why ``truncated`` and ``content_length`` are
-# emitted on every item rather than only the cut ones, and why neither is
+# TRUNCATION HERE, AND IT IS SAFE ONLY BECAUSE IT IS DECLARED. A truncated body
+# is still the right body, and the caller can act on a short one — but only
+# while the cut is DECLARED. That is why ``truncated`` and ``content_length``
+# are emitted on every item rather than only the cut ones, and why neither is
 # optional.
 
 #: The response ceiling, in characters of serialized JSON.
@@ -3341,8 +3342,9 @@ def _session_body_preview(
 
     ``scoped`` is the card's own AST from ``_count_scope_for``, so this returns
     the same rows ``matching_observations`` counted: with free text, the
-    observations that matched it; without, the session's opening turns. That is the evidence a
-    cross-encoder needs to judge the card, and what a reader wants to see.
+    observations that matched it; without, the session's opening turns. That is
+    the evidence a cross-encoder needs to judge the card, and what a reader
+    wants to see.
 
     SUMMARY MODE READS ONE OBSERVATION AND SNIPPETS IT (D1). It used to return
     "" without querying at all, on the reasoning that the preview is a

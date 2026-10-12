@@ -273,16 +273,17 @@ class SubstackSource:
         in drops dir + Downloads.
 
         DUPLICATE EXPORTS YIELD ONE RECORD, from the newest zip. Discovery
-        hands the zips over newest-file-first, and ``claimed`` makes the
-        first sighting of a stable_id the only one — so an old export left
-        beside the fresh one can no longer make each tick rewrite every post
-        once per zip (measured live 2026-09-03: updated=522 for 261 posts,
-        ``extra.zip_path`` flip-flopping every 30 minutes). The claim happens BEFORE the ``since`` filter on purpose:
-        the newest zip owns an id for the whole run even when the window
-        already excludes its (unchanged) copy, otherwise an older zip whose
-        member carries a fresher stamp would slip through the window and
-        overwrite the settled row. A set of stable_ids is the entire memory
-        cost — the records themselves still stream.
+        hands the zips over newest-file-first, and ``claimed`` makes the first
+        sighting of a stable_id the only one — so an old export left beside the
+        fresh one can no longer make each tick rewrite every post once per zip
+        (measured live 2026-09-03: updated=522 for 261 posts,
+        ``extra.zip_path`` flip-flopping every 30 minutes). The claim happens
+        BEFORE the ``since`` filter on purpose: the newest zip owns an id for
+        the whole run even when the window already excludes its (unchanged)
+        copy, otherwise an older zip whose member carries a fresher stamp would
+        slip through the window and overwrite the settled row. A set of
+        stable_ids is the entire memory cost — the records themselves still
+        stream.
 
         ``since``: skip members whose zip-recorded mtime is <= since
         (exclusive boundary, matching the sibling records sources). Naive

@@ -147,8 +147,9 @@ class SchemaAheadError(RuntimeError):
     WHY REFUSING IS THE ONLY SAFE MOVE, and not merely the tidy one. A cache
     stamped above this build's ``SCHEMA_VERSION`` was written by code this
     process has never seen. It does not know which columns the newer schema
-    added, which of them are ``NOT NULL``, which triggers now fire on write,
-    or whether the FTS shadows still mean what they used to. Every alternative to stopping is worse:
+    added, which of them are ``NOT NULL``, which triggers now fire on write, or
+    whether the FTS shadows still mean what they used to. Every alternative to
+    stopping is worse:
 
     * stamp anyway (the bug) — silently breaks every newer reader;
     * skip the stamp and keep writing — writes rows against a schema this
@@ -3001,14 +3002,14 @@ class Store:
     def llm_tag_progress_by_source(self) -> list[dict]:
         """How far the tag backfill has got, PER SOURCE — the truth surface.
 
-        A partially-tagged corpus must never look fully tagged, and one global percentage cannot
-        say which sources a ``tag:`` filter can be trusted for. One row per
-        source actually present in ``records`` (the population the tagger
-        walks), each with ``total``, ``tagged``, ``pending`` and a ``state``
-        of ``not_started`` /
-        ``in_progress`` / ``complete``. No ``degraded`` here — a failed
-        record keeps its NULL watermark and stays honestly in ``pending``;
-        the failure itself is reported loudly by the run that hit it.
+        A partially-tagged corpus must never look fully tagged, and one global
+        percentage cannot say which sources a ``tag:`` filter can be trusted
+        for. One row per source actually present in ``records`` (the population
+        the tagger walks), each with ``total``, ``tagged``, ``pending`` and a
+        ``state`` of ``not_started`` / ``in_progress`` / ``complete``. No
+        ``degraded`` here — a failed record keeps its NULL watermark and stays
+        honestly in ``pending``; the failure itself is reported loudly by the
+        run that hit it.
 
         Cheap by construction (one grouped count over a ~4.4k-row table), so
         it rides along on ``capabilities()``.
