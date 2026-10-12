@@ -63,6 +63,24 @@ def repo_root():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_repo_enumeration(monkeypatch):
+    """No test may let a default-constructed ``GitHubSource`` probe GitHub.
+
+    ``iter_records``/``ingest`` first ask the ``_repo_lister`` seam which
+    private repositories an App installation token can reach, and the default
+    seam shells out to ``gh api /installation/repositories``. Left real, the
+    outcome depends on whose ``gh`` runs the suite: a personal token answers
+    403 and the probe silently returns ``None``, while CI's unauthenticated
+    ``gh`` exits 4 and the failure lands in the ingest errors. Tests that
+    exercise the real lister call ``monkeypatch.undo()`` and patch
+    ``subprocess.run`` themselves.
+    """
+    monkeypatch.setattr(
+        "aggregator.sources.github._default_private_repo_lister", lambda: None
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_retry_sleep(monkeypatch):
     """Transient-retry backoff is real seconds; no test should wait on it."""
     from aggregator.core import retry
