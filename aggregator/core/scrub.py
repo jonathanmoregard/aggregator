@@ -9,8 +9,8 @@ Two layers:
    caller must not store the text.
 
    One CLI call costs ~100 ms, so callers with many texts use
-   :func:`scrub_many`: one call for all of them. A secret found in any text
-   of a call is redacted in all of them.
+   :func:`scrub_many`: one call for all of them, with the same result per
+   text as ``scrub`` on each.
 
 2. **PII detection**:
    - If `presidio_analyzer` + `presidio_anonymizer` are importable, use them
@@ -459,8 +459,8 @@ def scrub_secrets_many(texts: Sequence[str]) -> list[ScrubResult]:
 def scrub_many(texts: Sequence[str]) -> list[ScrubResult]:
     """:func:`scrub` over many texts, with ONE ``secret-redact`` call.
 
-    Same as ``scrub`` on each text, except that a secret found in any text is
-    redacted in all of them. Raises :class:`ScrubUnavailableError` when the
+    ``scrub_many(xs)[i] == scrub(xs[i])`` for every i: batching changes the
+    cost, never the result. Raises :class:`ScrubUnavailableError` when the
     secret scanner cannot run, and then NO text in the batch may be stored.
     """
     results = scrub_secrets_many(texts)
