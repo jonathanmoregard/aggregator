@@ -28,54 +28,16 @@ Security invariants (spec §Security):
    them is gone: ``fts5_match_query`` whitelists every string before it
    reaches MATCH, so malformed query text can no longer be constructed.
 
-KNOWN EXPOSURE — ``rerank=True`` RUNS TORCH IN THE SERVER PROCESS.
-
-``_get_reranker().score`` runs a native tokenizer and torch, in-process, over
-corpus text. Production deploys one loopback HTTP backend inside a hardened,
-memory-bounded systemd user service; each editor's stdio child is only a
-FastMCP proxy selected by ``AGGREGATOR_MCP_BACKEND_URL``. Direct stdio mode is
-still supported when that variable is absent, so callers using it outside the
-managed deployment own the server process and its resource boundary.
-
-What bounds the model path itself:
-
-* The input is the user's OWN already-ingested corpus, at the same trust level
-  as the text the FTS5 path already handles. Nothing reaches the tokenizer
-  that did not already reach SQLite.
-* It is opt-in twice over — ``rerank=True`` AND ``fields='full'`` — so the
-  default query never constructs the model or imports torch at all. That is
-  also why the import sits inside ``_get_reranker``.
-* The model loads ``local_files_only``, so a query cannot fetch code or
-  weights from the network into this process. ENFORCED, NOT ASSUMED — this
-  used to say only that the MCP path "never sets"
-  ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD``, which was true of this file and
-  irrelevant: the server is a stdio child of the editor and INHERITS the
-  environment of the shell that launched it, and ``downloads_allowed()``
-  reads nothing else. One leftover export — from following our own
-  ``aggregator seed-reranker`` remediation, say — and the claim was false.
-  ``_downloads_denied`` removes the variable across the model construction.
-
-Availability, not code execution, is the realistic failure here — the same
-shape as the page-token decompression bomb fixed above, arrived at
-legitimately. IT WAS NOT A HYPOTHETICAL. The model is ~2 GB RSS at rest, but
-the pass over it was unbounded in sequence length: measuring one real page
-that held a 25941-token record OOM-killed the process at 20.2 GB RSS and
-9.4 GB of swap. On this surface that is the user's editor dying because they
-asked a question. ``rerank.MAX_PAIR_TOKENS`` now caps each pair at 512 tokens,
-so the peak is a function of ``_RERANK_WINDOW`` and that cap rather than of
-the longest document the corpus happens to contain. There is still no
-in-process hard limit in direct stdio mode; the managed backend supplies one.
-
 STARTUP CONTRACT: NO MODEL STACK ON THE IMPORT PATH. Importing this module must
-not import ``torch``, ``spacy``, ``thinc``, ``transformers``,
-``presidio_analyzer`` or ``presidio_anonymizer``, and ``build_server()`` must not
-either. Claude Code allows an MCP server 30 s to answer ``initialize``; this
-process used to spend 57.6 s of that on imports it did not need yet — 49.0 s of
-it inside ``core.scrub``, which built Presidio's engines at module scope — and
-from 2026-09-04 every session's connect timed out. This module no longer
-imports ``core.scrub`` at all (scrubbing happens at ingest).
-``tests/test_mcp_cold_start.py`` fails if any of those six modules reappears on
-the import path.
+not import ``spacy``, ``thinc``, ``presidio_analyzer`` or
+``presidio_anonymizer``, and ``build_server()`` must not either. Claude Code
+allows an MCP server 30 s to answer ``initialize``; this process used to spend
+57.6 s of that on imports it did not need yet — 49.0 s of it inside
+``core.scrub``, which built Presidio's engines at module scope — and from
+2026-09-04 every session's connect timed out. This module no longer imports
+``core.scrub`` at all (scrubbing happens at ingest).
+``tests/test_mcp_cold_start.py`` fails if any of those modules reappears on the
+import path.
 
 Routing: two ontologies, one DSL surface.
 
@@ -122,7 +84,7 @@ import os
 import re
 import shutil
 import sqlite3
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -130,14 +92,6 @@ from fastmcp import FastMCP
 
 from aggregator.core.dsl import DSLError, format_help, parse
 from aggregator.core.provenance import MACHINE_VALUES
-
-# NOT imported here: ``aggregator.core.rerank``. It pulls
-# sentence-transformers, and this module is imported by an MCP server the
-# editor starts on demand, so a module-scope import would put a multi-second
-# model-stack load on the cold start of every session. It is imported inside
-# ``_get_reranker``; ``tests/test_mcp_cold_start.py`` fails if that ever
-# regresses. ``standout`` is pure Python and free.
-from aggregator.core.standout import has_standout
 from aggregator.core.store import (
     CHAT_ORIGINS,
     LEXICAL_RELAX_OR,
@@ -164,39 +118,6 @@ _BACKEND_TOKEN_FILE_ENV = "AGGREGATOR_MCP_BACKEND_TOKEN_FILE"
 
 _DEFAULT_PAGE_SIZE_SUMMARY = 200
 _DEFAULT_PAGE_SIZE_FULL = 40
-
-# How many hits of a page the cross-encoder reorders when ``rerank=True``.
-# A latency budget, not a quality knob.
-#
-# RE-MEASURED 2026-08-21 ON A READ-ONLY SNAPSHOT OF THE REAL 505k-OBSERVATION
-# CACHE, and the previously recorded figure did not reproduce. 12 real pages
-# from the golden query set, 20 pairs each, ``fields='full'``,
-# Qwen3-Reranker-0.6B on this CPU (i7-1365U, no GPU), each page scored in its
-# own process under a 10 GB cgroup cap:
-#
-#                        pages done   wall P50   wall P95   median doc
-#   before this wave        9 / 12      128 s      190 s      189 tok
-#   as it ships now        12 / 12      273 s      304 s      546 tok
-#
-# READ BOTH COLUMNS TOGETHER OR THE COMPARISON INVERTS. The three pages the
-# old configuration did not finish are the EXPENSIVE ones — each held a
-# 25941-token record, the batch padded to it, and the process was OOM-killed
-# (20.2 GB RSS, 9.4 GB swap, uncapped). So "128 s" is the median of the pages
-# that happened not to contain a long document, and the old tail was not slow
-# but ABSENT. ``rerank.MAX_PAIR_TOKENS`` bounds it, and every page now
-# completes. The median moved the other way because the documents are real:
-# session cards used to be scored against their own subject (see
-# ``_session_body_preview``), so the old median was cheap and meaningless.
-#
-# THE STAGE CANNOT BE MADE INTERACTIVE BY TUNING THIS NUMBER. ~13.7 s per
-# (query, document) pair means even a window of 1 misses a 500 ms budget by
-# 27x. Closing that needs a ~25x smaller cross-encoder (a MiniLM-class or
-# int8-ONNX reranker); none is in the local model cache and this codebase does
-# not download weights on the recall path. 20 is kept because it is already
-# inside the "at most 50 candidates into the reranker" band the retrieval
-# literature gives, and cutting it further would trade ranking quality for a
-# target that stays out of reach either way.
-_RERANK_WINDOW = 20
 
 # Bytes of query fingerprint carried in every page token. See
 # ``_query_fingerprint`` for what goes into it and why.
@@ -569,13 +490,11 @@ def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
     return None
 
 
-# --- reranker + miss log ---------------------------------------------------
-
-_reranker: object | None = None
+# --- the zero-result log ----------------------------------------------------
 
 #: The zero-result log's open connection, and the cache it belongs to.
 #:
-#: A SINGLETON FOR THE SAME REASON THE MODELS ARE ONE. A miss opens a second
+#: A SINGLETON. A miss opens a second
 #: SQLite file and runs its schema script; doing that per query would put a
 #: connect + ``executescript`` on the recall path of every unanswered question,
 #: and the unanswered ones are exactly the queries an agent retries.
@@ -585,66 +504,6 @@ _reranker: object | None = None
 #: one cache's misses into the other's log.
 _miss_log: object | None = None
 _miss_log_path: object | None = None
-
-
-@contextlib.contextmanager
-def _downloads_denied() -> Iterator[None]:
-    """Make "the MCP path never downloads weights" true, rather than claimed.
-
-    THIS PROCESS INHERITS THE USER'S SHELL. ``downloads_allowed()`` reads
-    ``os.environ`` and nothing else, so the offline property depends on
-    ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD`` not being exported in whichever shell
-    launched the server — while this project's own remediation text tells the
-    operator to export exactly that to seed the reranker. One leftover export
-    and a single ``rerank=True`` query fetches ~1.2 GB from the hub, in the
-    server's process, from a tool that advertises ``openWorldHint=False``.
-
-    REMOVED, NOT MATCHED. Deleting the variable defers to
-    ``downloads_allowed``'s own parsing of it instead of re-implementing the
-    accepted spellings here, so the two cannot drift apart.
-
-    SCOPED TO THE CONSTRUCTION, AND RESTORED AFTER. The loader resolves its
-    weights eagerly in ``__init__``, so that window is the only moment it
-    consults the flag. Clearing it process-wide would be simpler and wrong:
-    ``aggregator seed-reranker`` is the one sanctioned downloader, it runs in
-    an interpreter that has imported this module (the CLI borrows
-    ``_get_reranker``), and disarming it would leave no supported way to
-    obtain the weights at all.
-
-    The import is deferred for the same reason as in ``_get_reranker``.
-    """
-    from aggregator.core.rerank import MODEL_DOWNLOAD_ENV
-
-    prior = os.environ.pop(MODEL_DOWNLOAD_ENV, None)
-    try:
-        yield
-    finally:
-        if prior is not None:
-            os.environ[MODEL_DOWNLOAD_ENV] = prior
-
-
-def _get_reranker() -> object:
-    """Lazy singleton for the cross-encoder — only ever built on ``rerank=True``.
-
-    Costs roughly 2 GB RSS, so a caller who never opts in must not pay even
-    the import. The import is INSIDE the function on purpose: ``aggregator.mcp``
-    is imported by an MCP server the editor starts on demand, so anything at
-    module scope is paid by every session. Guarded by
-    ``tests/test_mcp_cold_start.py``.
-
-    THIS IS THE ONE PLACE THAT PUTS TORCH IN AN UNSANDBOXED PROCESS. See
-    "KNOWN, ACCEPTED EXPOSURE" in the module docstring for what that means and
-    why it is not closeable from inside an in-process MCP server. Keeping the
-    construction to this single function is what makes the exposure one
-    documented point rather than a property of the file.
-    """
-    global _reranker
-    if _reranker is None:
-        with _downloads_denied():
-            from aggregator.core.rerank import Reranker
-
-            _reranker = Reranker()
-    return _reranker
 
 
 def _log_search_miss(store: Store, query_text: str) -> str | None:
@@ -725,13 +584,12 @@ def _log_search_miss(store: Store, query_text: str) -> str | None:
     return None
 
 
-# --- rerank -----------------------------------------------------------------
+# --- confidence -------------------------------------------------------------
 
 
 def _note_confidence(
     result: dict[str, Any],
     query_text: str | None,
-    rerank_standout: bool | None,
     lexical_matched: int | None,
 ) -> dict[str, Any]:
     """Say whether the answer to a free-text query is trusted.
@@ -746,22 +604,15 @@ def _note_confidence(
     ``low_confidence`` IS ALWAYS PRESENT WHEN IT APPLIES, INCLUDING WHEN IT IS
     ``False``. An absent key is unfalsifiable from the caller's side — it reads
     exactly like a server that predates the feature — and this is a claim about
-    the answer, so it has to be stated even when the claim is "fine". That is
-    the opposite discipline from ``_note_rerank``, whose keys answer a question
-    only the rerank caller asked; every free-text caller has this one.
+    the answer, so it has to be stated even when the claim is "fine".
 
-    TWO SIGNALS:
-
-    1. **Nothing came back.** The query abstained. Reported as low confidence
-       rather than as a bare empty page. WHY the page is empty comes from
-       ``lexical_matched`` (``Store.lexical_matches``), three-valued exactly as
-       the store reports it — ``None`` the ladder never ran, ``0`` it ran and
-       matched nothing, ``> 0`` the words are in the corpus and a filter
-       removed their rows. Only ``> 0`` changes the sentence, and it matches
-       what ``_empty_page_notice`` prints on the same page.
-    2. **The reranker ran and found nothing that stands out.** ``None`` means
-       it did not run or produced no scores, which is not the same as "nothing
-       was relevant" and must not be read as it.
+    THE SIGNAL IS "NOTHING CAME BACK": the query abstained, and that is
+    reported as low confidence rather than as a bare empty page. WHY the page
+    is empty comes from ``lexical_matched`` (``Store.lexical_matches``),
+    three-valued exactly as the store reports it — ``None`` the ladder never
+    ran, ``0`` it ran and matched nothing, ``> 0`` the words are in the corpus
+    and a filter removed their rows. Only ``> 0`` changes the sentence, and it
+    matches what ``_empty_page_notice`` prints on the same page.
 
     NOTHING IS TRUNCATED. The page comes back whole with a flag on it. An agent
     handed a shorter page cannot distinguish a confident short answer from a
@@ -785,11 +636,6 @@ def _note_confidence(
                 "nothing matched this query, so this is an abstention rather "
                 "than a short answer"
             )
-    elif rerank_standout is False:
-        reasons.append(
-            "the reranker scored this page and found nothing that stands out "
-            "from the rest of it"
-        )
     result["low_confidence"] = bool(reasons)
     if not reasons:
         return result
@@ -801,138 +647,6 @@ def _note_confidence(
     )
     prior = result.get("notice")
     result["notice"] = f"{notice} {prior}" if prior else notice
-    return result
-
-
-def _rerank_doc(item: dict[str, Any]) -> str:
-    """The text the cross-encoder scores for one result item.
-
-    Ontology-agnostic on purpose: records carry ``subject``, session cards
-    carry ``subject``, observation rows carry ``type``. Whatever is present
-    gets concatenated with the body, so one reranking helper serves all four
-    result shapes instead of three near-identical ones.
-    """
-    head = item.get("subject") or item.get("type") or ""
-    return f"{head}\n\n{item.get('content') or ''}"
-
-
-def _maybe_rerank(
-    items: list[dict[str, Any]], query: str | None, rerank: bool
-) -> tuple[list[dict[str, Any]], int, str | None, bool | None]:
-    """Reorder the head of a page by cross-encoder relevance.
-
-    Returns ``(items, reranked, notice, standout)``. ``standout`` is criterion
-    D's reranker-score signal: ``True`` when some document on the page scored
-    clearly above the rest, ``False`` when none did, and ``None`` when the
-    question could not be asked — the reranker did not run, it failed, or the
-    page was too short to compare scores across. ``None`` is NOT ``False``:
-    "the model died" and "nothing was relevant" are opposite facts, and
-    collapsing them would invent an answer out of a failure.
-
-    ``reranked`` is HOW MANY leading
-    items were scored and reordered — 0 whenever the caller asked for
-    reranking and the ordering they got is not reranked, and ``notice`` then
-    says why, in the caller's own response.
-
-    A COUNT AND NOT A BOOLEAN, because the boolean could not answer the
-    question the caller actually has. This reorders at most ``_RERANK_WINDOW``
-    items — a latency budget, 273 s median per pass — while a page holds up to
-    200, and the reordered rows are byte-for-byte indistinguishable from the
-    untouched ones below them. So ``rerank_applied: true`` on a 40-hit page
-    described 20 ranked rows and 20 recency-ordered ones with a single word,
-    and no caller could tell where one became the other. Round 3 found the
-    same defect in the CLI's printed note; ``cli.py`` now marks the seam for a
-    human reader, and this is the machine-readable half.
-
-    ``min(len(items), _RERANK_WINDOW)`` and not the window itself: a 5-hit
-    page under a 20-hit window is ranked all the way down, and reporting 20
-    there would invent rows that do not exist.
-
-    Never changes WHICH items are on the page, so pagination is untouched: a
-    page token still addresses the same rows whether or not the caller asked
-    for reranking. Callers who want the whole page ranked should request a
-    page no larger than the window.
-
-    A rerank failure still costs the ordering and never the answer — the
-    caller already has a usable result, and destroying it to report a lost
-    nicety is the wrong trade. WHAT CHANGED IS THAT IT IS NO LONGER SILENT.
-    The failure used to go to the log and nowhere else, and a page in recency
-    order is indistinguishable from a page in reranked order, so the caller
-    waited minutes for an ordering, did not get it, and was not told. That is
-    the same shape as an ingest that stops and looks like an ingest with
-    nothing to do: degrading is fine, degrading invisibly is not.
-    """
-    if not rerank:
-        return items, 0, None, None
-    if not query:
-        # Nothing to score documents against. Reported rather than assumed
-        # obvious: a caller that filtered by source and asked for relevance
-        # ordering got recency, and an ``applied`` flag that said True here
-        # would be worse than no flag at all.
-        return items, 0, (
-            "rerank did NOT apply: this query has no free text, so there is "
-            "nothing to score documents against. Results are in the default "
-            "recency order."
-        ), None
-    if not items:
-        return items, 0, None, None
-    window = items[:_RERANK_WINDOW]
-    try:
-        scores = _get_reranker().score(query, [_rerank_doc(it) for it in window])
-    except Exception as e:  # noqa: BLE001 — rerank degrades to recency order
-        log.exception("rerank failed; returning the page in its original order")
-        return items, 0, (
-            f"rerank did NOT apply: the cross-encoder failed while scoring "
-            f"this page ({type(e).__name__}: {e}). These rows are in the "
-            f"recency order — which is exactly what rerank=True asked to "
-            f"replace — so treat their ORDER as unranked. The rows "
-            f"themselves are unaffected: reranking never changes which "
-            f"results you get. Run `aggregator seed-reranker` if the "
-            f"cross-encoder's weights are missing."
-        ), None
-    order = sorted(
-        range(len(window)), key=lambda i: scores[i], reverse=True
-    )
-    # NO THRESHOLD PASSED, DELIBERATELY. The bar depends on how many documents
-    # were scored, and this line is the one place that knows: it is
-    # ``min(len(items), _RERANK_WINDOW)``, not the window. Handing over a
-    # constant is what made the signal assert the wrong thing on short pages.
-    standout = has_standout(list(scores))
-    return (
-        [window[i] for i in order] + items[_RERANK_WINDOW:],
-        len(window),
-        None,
-        standout,
-    )
-
-
-def _note_rerank(
-    result: dict[str, Any], rerank: bool, reranked: int, notice: str | None
-) -> dict[str, Any]:
-    """Put the rerank outcome in the response, where the caller will see it.
-
-    Both keys appear only when the caller asked for reranking — they answer a
-    question nobody else posed, and ``reranked_count: 0`` on every ordinary
-    response would read as "the cross-encoder ran and ranked nothing".
-
-    ``rerank_applied`` IS DERIVED FROM THE COUNT rather than tracked beside
-    it. Two independently maintained facts about one event drift, and the
-    drift would be invisible: a response asserting ``rerank_applied: false``
-    next to ``reranked_count: 20`` is unfalsifiable from the caller's side,
-    since the rows look identical either way. One value with two views cannot
-    disagree with itself, which is a stronger guarantee than documenting that
-    it must not.
-
-    ``notice`` is the human-readable half and leads, because a degradation the
-    reader has to scroll for is one they will miss.
-    """
-    if not rerank:
-        return result
-    result["reranked_count"] = reranked
-    result["rerank_applied"] = reranked > 0
-    if notice:
-        prior = result.get("notice")
-        result["notice"] = f"{notice} {prior}" if prior else notice
     return result
 
 
@@ -974,9 +688,7 @@ def _query_fingerprint(ast: QueryAST, drilldown: bool) -> str:
     * ``page_size`` — the offset is a row offset, and stays a valid one when
       the window around it changes size. Binding it would refuse a caller that
       legitimately asked for a bigger next page.
-    * ``fields`` and ``rerank`` — presentation. ``rerank`` reorders the head of
-      a page already selected and never changes membership (see
-      ``_maybe_rerank``), and ``fields`` only decides whether bodies come back.
+    * ``fields`` — presentation: it only decides whether bodies come back.
     """
     canonical = json.dumps(
         {
@@ -1919,11 +1631,10 @@ def _wrap_snippet(stable_id: str, source: str, subject: str, snippet: str) -> st
 
 # --- the payload ceiling (D3) -----------------------------------------------
 #
-# THERE WAS NO GOVERNOR. Grepping this module for size caps found only the
-# cross-encoder's 512-token pair budget, which does not bound the response.
-# ``page_size`` bounds ROWS, and a single row can carry a whole compacted
-# session — which is how ``page_size=8`` returned 282,110 characters, overran
-# the tool output limit, and got spilled to a file the caller then had to jq.
+# THERE WAS NO GOVERNOR. ``page_size`` bounds ROWS, and a single row can carry
+# a whole compacted session — which is how ``page_size=8`` returned 282,110
+# characters, overran the tool output limit, and got spilled to a file the
+# caller then had to jq.
 #
 # TRUNCATION HERE, AND IT IS SAFE ONLY BECAUSE IT IS DECLARED. A truncated body
 # is still the right body, and the caller can act on a short one — but only
@@ -2198,7 +1909,7 @@ def _session_to_item(
     matched: the whole 1 500-character preview in full mode, a
     ``_SNIPPET_CHARS`` snippet of the first matching observation in summary
     mode. It used to be handed the SUBJECT, which made the card a copy of its
-    own header and gave the cross-encoder a document to score against itself.
+    own header.
 
     D1: summary mode used to set ``content = ""`` here, and THAT is what made
     ``matching_observations: N`` unactionable — a count of turns the caller
@@ -2480,7 +2191,6 @@ def aggregator_query(
     page_size: int | None = None,
     page_token: str | None = None,
     drilldown: bool = False,
-    rerank: bool = False,
     max_chars: int | None = None,
     _store: Store | None = None,
     _log_misses: bool = False,
@@ -2564,38 +2274,6 @@ def aggregator_query(
       drilldown: for session-shaped queries, ``True`` returns observation
                  rows for the matching sessions; ``False`` (default) returns
                  one card per matching session with ``matching_observations``.
-      rerank: ``True`` re-orders the head of the page by cross-encoder
-              relevance instead of recency. Off by default.
-
-              REQUIRES ``fields='full'``, and is refused without it. The
-              cross-encoder scores the bodies, and summary mode does not
-              return bodies — so under the default it would rank documents
-              that are empty below their subject line, and still charge the
-              full cost for that ordering.
-
-              EXPENSIVE — DO NOT SET THIS IN AN INTERACTIVE TURN. Measured
-              2026-08-21 against real corpus bodies on this machine (CPU, no
-              GPU), over 12 real pages of 20 hits each from a snapshot of the
-              live cache: **273 s median, 304 s at p95 per call** — about
-              4.5 minutes — against 0.65 s for the same query without it, plus
-              a one-off model load on first use. That is ~13.7 s per
-              (query, document) pair, so no smaller ``page_size`` makes it
-              interactive; it is a batch/offline facility here. The figure
-              this docstring carried before was an order of magnitude lower
-              and did not reproduce — see ``_RERANK_WINDOW`` for the table.
-
-              THE BATCH SURFACE IS ``aggregator query --rerank``, run from a
-              terminal, which is where a multi-minute wait belongs and where
-              the operator can see it happening. That flag also refuses out
-              loud when the cross-encoder's weights cannot be loaded, rather
-              than handing back an unranked page. Its weights come from
-              ``aggregator seed-reranker``, the only path that fetches them.
-
-              Leaving it off costs ORDERING ONLY. The same rows come back
-              either way — reranking never changes WHICH results you get,
-              only the order of the first few — so the cheap call is the
-              right default, and this is worth paying only when the ranking
-              itself is the answer you need and you can afford to wait.
       max_chars: ask for a SMALLER response than the default ceiling. It can
               only lower the bound, never raise it: the server caps every
               response regardless, because ``page_size`` bounds rows and one
@@ -2605,7 +2283,7 @@ def aggregator_query(
 
     Returns:
       Success: ``{ok: True, records: [...], total: int, mode: str, notice?,
-      next_page_token?, rerank_applied?}``. ``mode`` tells you which shape the
+      next_page_token?}``. ``mode`` tells you which shape the
       items in ``records`` have, and it is one of four:
 
       * ``union`` — **the default, and what a plain text or date query
@@ -2653,37 +2331,17 @@ def aggregator_query(
       deliberate second step for specific rows rather than as the default next
       move.
 
-      ``rerank_applied`` appears only when ``rerank=True`` was requested, and
-      is ``False`` when the ordering you received is NOT reranked — the model
-      failed, or the query had no free text to score against. ``notice`` then
-      says which. Reranking degrades to the recency ordering rather than
-      failing the call, so this flag is the only way to tell the two apart:
-      the rows are identical either way.
-
       ``search_mode`` (always ``"lexical"``) and ``low_confidence`` appear
       only when the query carried free text; a pure-filter query ran no
       retrieval, and naming one would describe work that did not happen.
       ``low_confidence`` is ALWAYS present there, including when it is
       ``False``: it is a claim about the answer, so it is stated rather than
-      left to be inferred from a missing key. ``True`` means one of two
-      things, and ``low_confidence_reason`` says which — nothing matched at
-      all (or a filter removed every match), or the reranker ran and found
-      nothing on the page that stood out. NOTHING IS TRUNCATED when it is set:
+      left to be inferred from a missing key. ``True`` means nothing came
+      back, and ``low_confidence_reason`` says why — nothing matched at all, or
+      a filter removed every match. NOTHING IS TRUNCATED when it is set:
       the page comes back whole and flagged, because a shorter page cannot be
       told apart from a confident short answer. Treat a flagged page as
       candidates rather than as an answer, and say so when reporting it.
-
-      ``reranked_count`` appears only when ``rerank=True`` was requested and
-      says HOW FAR
-      DOWN THE PAGE THE RANKING GOES. Only the head of a page is scored — a
-      cross-encoder pass is the 4.5 min — so ``records[:reranked_count]`` are in
-      relevance order and ``records[reranked_count:]`` are in the default
-      recency order, and nothing about the rows themselves distinguishes the
-      two. Read the seam from this number rather than assuming a window size;
-      it is a latency budget and it can change. When it equals
-      ``len(records)`` the whole page is ranked, which is what asking for a
-      smaller ``page_size`` buys you. ``rerank_applied`` is exactly
-      ``reranked_count > 0``.
 
       Failure: ``{ok: False, reason: str, remediation: str}``.
     """
@@ -2755,36 +2413,6 @@ def aggregator_query(
             "reason": f"unknown fields mode: {fields!r}",
             "remediation": "Use fields='summary' (default) or fields='full'.",
         }
-    # RERANK NEEDS THE BODIES, AND SUMMARY MODE DOES NOT RETURN THEM.
-    # ``_rerank_doc`` scores the result ITEM, and an item's ``content`` is
-    # empty unless ``fields='full'`` — so under the default this handed the
-    # cross-encoder bodiless documents. Measured per route by spying on
-    # ``score()``: on the drilldown route all 3 documents were the single
-    # literal string ``'user\n\n'``, an ordering over nothing; on the other
-    # routes the documents differed but carried only ``subject``, which the
-    # response already returns to the caller. Either way the multi-minute pass
-    # buys nothing.
-    #
-    # REFUSED RATHER THAN AUTO-UPGRADED TO ``fields='full'``. Auto-upgrading
-    # would change the payload shape behind the caller's back — full items
-    # carry wrapped bodies that summary items do not — and would still spend
-    # the minutes the caller has not been told about. Refusing spends nothing:
-    # this runs before any retrieval.
-    if rerank and fields != "full":
-        return {
-            "ok": False,
-            "reason": (
-                f"rerank=True needs document bodies to score, and "
-                f"fields={fields!r} does not return them — the cross-encoder "
-                f"would rank on an empty body, at ~4.5 min per call"
-            ),
-            "remediation": (
-                "Re-call with fields='full' (CLI: --fields full) to rerank "
-                "the real bodies, or drop rerank=True to keep the default "
-                "recency ordering. Leaving rerank off costs ordering only: "
-                "the same rows come back either way."
-            ),
-        }
     if page_size is None:
         page_size = (
             _DEFAULT_PAGE_SIZE_FULL if fields == "full"
@@ -2804,8 +2432,7 @@ def aggregator_query(
     mode = _route_mode(ast)
     try:
         routed = _dispatch(
-            store, ast, mode, fields, page_size, cursor, drilldown, rerank,
-            fingerprint,
+            store, ast, mode, fields, page_size, cursor, drilldown, fingerprint
         )
         # POPPED BEFORE THE CEILING MEASURES THE PAYLOAD. The route's own facts
         # are for the composer, not for the caller — and ``_apply_payload_ceiling``
@@ -2869,19 +2496,16 @@ def _dispatch(
     page_size: int,
     cursor: _PageCursor,
     drilldown: bool,
-    rerank: bool,
     fingerprint: str,
 ) -> dict[str, Any]:
     """Route a parsed, validated query to the path that answers it."""
     if mode == "sessions":
         return _query_sessions_path(
-            store, ast, fields, page_size, cursor, drilldown, rerank,
-            fingerprint=fingerprint,
+            store, ast, fields, page_size, cursor, drilldown, fingerprint=fingerprint
         )
     if mode == "records":
         return _query_records_path(
-            store, ast, fields, page_size, cursor, rerank,
-            fingerprint=fingerprint,
+            store, ast, fields, page_size, cursor, fingerprint=fingerprint
         )
     if mode == "mismatch_sessions_on_records":
         return _mismatch_response(
@@ -2908,7 +2532,7 @@ def _dispatch(
         )
     # mode == "union"
     return _query_union_path(
-        store, ast, fields, page_size, cursor, rerank, fingerprint=fingerprint
+        store, ast, fields, page_size, cursor, fingerprint=fingerprint
     )
 
 
@@ -2929,7 +2553,6 @@ def _query_records_path(
     fields: str,
     page_size: int,
     cursor: _PageCursor,
-    rerank: bool = False,
     *,
     fingerprint: str,
 ) -> dict[str, Any]:
@@ -2951,9 +2574,6 @@ def _query_records_path(
     has_more = len(page_plus_one) > page_size
     page_records = page_plus_one[:page_size]
     items = [_record_to_item(r, fields) for r in page_records]
-    items, rr_count, rr_notice, rr_standout = _maybe_rerank(
-        items, query_text, rerank
-    )
     result: dict[str, Any] = {
         "ok": True,
         "mode": "records",
@@ -2973,8 +2593,8 @@ def _query_records_path(
         result["next_page_token"] = _mint_page_token(offset + page_size, fingerprint)
     # The ladder's own pre-filter count, so an empty page's hedge says the same
     # thing the empty-page diagnosis does — see _note_confidence.
-    _note_confidence(result, query_text, rr_standout, store.lexical_matches)
-    return _note_rerank(result, rerank, rr_count, rr_notice)
+    _note_confidence(result, query_text, store.lexical_matches)
+    return result
 
 
 def _query_sessions_path(
@@ -2984,7 +2604,6 @@ def _query_sessions_path(
     page_size: int,
     cursor: _PageCursor,
     drilldown: bool,
-    rerank: bool = False,
     *,
     fingerprint: str,
 ) -> dict[str, Any]:
@@ -3010,9 +2629,6 @@ def _query_sessions_path(
         page_obs = page_plus_one[:page_size]
         terms = _snippet_terms(query_text)
         items = [_observation_to_item(o, fields, terms) for o in page_obs]
-        items, rr_count, rr_notice, rr_standout = _maybe_rerank(
-            items, query_text, rerank
-        )
         result: dict[str, Any] = {
             "ok": True,
             "mode": "observations",
@@ -3034,8 +2650,8 @@ def _query_sessions_path(
             result["next_page_token"] = _mint_page_token(
                 offset + page_size, fingerprint
             )
-        _note_confidence(result, query_text, rr_standout, store.lexical_matches)
-        return _note_rerank(result, rerank, rr_count, rr_notice)
+        _note_confidence(result, query_text, store.lexical_matches)
+        return result
 
     try:
         page_plus_one = store.query_sessions(
@@ -3074,9 +2690,6 @@ def _query_sessions_path(
             store, session_scoped, fields, subject, terms
         )
         items.append(_session_to_item(s, fields, subject, match_count, preview))
-    items, rr_count, rr_notice, rr_standout = _maybe_rerank(
-        items, query_text, rerank
-    )
     result = {
         "ok": True,
         "mode": "sessions",
@@ -3096,8 +2709,8 @@ def _query_sessions_path(
     # see ``_compose_notices``.
     if has_more:
         result["next_page_token"] = _mint_page_token(offset + page_size, fingerprint)
-    _note_confidence(result, query_text, rr_standout, store.lexical_matches)
-    return _note_rerank(result, rerank, rr_count, rr_notice)
+    _note_confidence(result, query_text, store.lexical_matches)
+    return result
 
 
 def _query_union_path(
@@ -3106,7 +2719,6 @@ def _query_union_path(
     fields: str,
     page_size: int,
     cursor: _PageCursor,
-    rerank: bool = False,
     *,
     fingerprint: str,
 ) -> dict[str, Any]:
@@ -3208,9 +2820,6 @@ def _query_union_path(
             items.append(
                 _session_to_item(obj, fields, subject, match_count, preview)
             )
-    items, rr_count, rr_notice, rr_standout = _maybe_rerank(
-        items, query_text, rerank
-    )
 
     result: dict[str, Any] = {
         "ok": True,
@@ -3251,8 +2860,8 @@ def _query_union_path(
         result["next_page_token"] = _mint_page_token(offset + page_size, fingerprint)
     # The request-wide probe, which keeps the MAX across both arms — the same
     # value the diagnosis reads at the tool boundary.
-    _note_confidence(result, query_text, rr_standout, store.lexical_matches)
-    return _note_rerank(result, rerank, rr_count, rr_notice)
+    _note_confidence(result, query_text, store.lexical_matches)
+    return result
 
 
 # Type alias for readability in the sort key below.
@@ -3307,11 +2916,8 @@ def _first_user_prompt(store: Store, s: SessionRow) -> str:
     return body[:280] if body else f"session {s.session_id}"
 
 
-# How much of a session's matching text goes into its ``content`` preview.
-# Sized against ``rerank.MAX_PAIR_TOKENS``: ~4 chars per token, so 1500 chars
-# lands just under the 512-token pair budget the cross-encoder truncates to,
-# and a preview materially larger than that would be paid for and then thrown
-# away by the tokenizer.
+# How much of a session's matching text goes into its full-mode ``content``
+# preview.
 _SESSION_PREVIEW_OBSERVATIONS = 5
 _SESSION_PREVIEW_CHARS = 1500
 
@@ -3325,26 +2931,10 @@ def _session_body_preview(
 ) -> str:
     """The body of a session card: the observations that actually matched.
 
-    THE DEFECT THIS REPLACES. Both session-shaped routes called
-    ``_session_to_item(s, fields, subject, match_count, subject)`` — the last
-    slot is ``body_preview``, and it was handed the subject. In
-    ``fields='full'`` the card's ``content`` was therefore the subject wrapped
-    in ``<ExternalContent>``, and ``_rerank_doc`` concatenates head and
-    content, so the string the cross-encoder scored was the subject twice: a
-    document against itself. The union route is the DEFAULT, so this was the
-    common path, and the ``fields='full'`` precondition that exists precisely
-    to guarantee the reranker sees real bodies bought nothing there.
-
-    It cost twice. The ordering ``reranked_count`` reported was derived from
-    near-empty documents that differed only in their first user turn — a field
-    the response already returns, so the caller could have sorted it for free —
-    and the caller paid the full cross-encoder latency for it.
-
     ``scoped`` is the card's own AST from ``_count_scope_for``, so this returns
     the same rows ``matching_observations`` counted: with free text, the
     observations that matched it; without, the session's opening turns. That is
-    the evidence a cross-encoder needs to judge the card, and what a reader
-    wants to see.
+    what a reader needs to judge the card.
 
     SUMMARY MODE READS ONE OBSERVATION AND SNIPPETS IT (D1). It used to return
     "" without querying at all, on the reasoning that the preview is a
@@ -3480,7 +3070,6 @@ async def _tool_aggregator_query(
     page_size: int | None = None,
     page_token: str | None = None,
     drilldown: bool = False,
-    rerank: bool = False,
     max_chars: int | None = None,
 ) -> dict[str, Any]:
     return aggregator_query(
@@ -3489,7 +3078,6 @@ async def _tool_aggregator_query(
         page_size=page_size,
         page_token=page_token,
         drilldown=drilldown,
-        rerank=rerank,
         max_chars=max_chars,
     )
 

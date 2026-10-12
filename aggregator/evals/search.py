@@ -81,8 +81,7 @@ def mcp_search_fn(store) -> SearchFn:
 
     Not an arm and not a reimplementation of one: this drives
     ``aggregator.mcp.aggregator_query`` with default arguments — no
-    ``rerank``, no ``fields`` — so what is measured is the call an agent
-    makes. Everything the store-level mode is blind to is in scope here: the
+    ``fields`` — so what is measured is the call an agent makes. Everything the store-level mode is blind to is in scope here: the
     confidence signal, routing and the response shape.
 
     RESOLVED LAZILY, INSIDE THE CLOSURE'S MODULE IMPORT. ``aggregator.mcp`` is

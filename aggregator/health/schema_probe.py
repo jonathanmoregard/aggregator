@@ -157,7 +157,7 @@ normal shape in a dev checkout with nothing deployed.
 Both routes must stay cheap, so this file is STDLIB ONLY and must stay that way,
 and ``aggregator/__init__.py`` and ``aggregator/health/__init__.py`` must stay
 EMPTY — the console script walks through both on its way here. Pulling the
-package in would drag in torch and sentence-transformers, and a SessionStart
+package in would drag in Presidio and spaCy, and a SessionStart
 hook that blows its budget has its output DISCARDED — which for a health check
 is the same as never noticing.
 """
@@ -867,9 +867,8 @@ def read_reader_version(reader_dir: Path | None) -> int | None:
     Read as text out of whichever directory holds the reader's package — a
     checkout in dev, an env derivation's site-packages once deployed. The same
     reading serves the writer, whose directory is found the same way.
-    Emphatically not an import: ``aggregator.core.store`` pulls
-    sentence-transformers and torch, which is seconds of model-loading
-    machinery, and both consumers here run on budgets measured in single-digit
+    Emphatically not an import: ``aggregator.core.store`` pulls the scrubber
+    and its model stack, which is seconds of loading, and both consumers here run on budgets measured in single-digit
     seconds.
     """
     if reader_dir is None:

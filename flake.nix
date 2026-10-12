@@ -30,8 +30,8 @@
           #
           # NOT `aggregatorPkg`: that derivation is a deliberate stub
           # (`propagatedBuildInputs` is empty, see nix/README.md) and its
-          # build fails at `pythonRuntimeDepsCheckHook` because fastmcp,
-          # presidio and sentence-transformers are not packaged here.
+          # build fails at `pythonRuntimeDepsCheckHook` because fastmcp
+          # and presidio are not packaged here.
           # Depending on it would make this check fail for a reason that has
           # nothing to do with what it asserts. The check is about the SHAPE
           # of the generated units — store-path ExecStart, no home path,
@@ -128,16 +128,7 @@
                   if grep -qE 'uv run|--directory' "$script"; then
                     fail "$u: ExecStart script $script shells out via uv run — that runs a working tree, not a pinned artifact"
                   fi
-                  # No unattended unit may enable model downloads: the opt-in
-                  # is what makes a GB-scale download consented to, and only
-                  # means anything if a human types it.
-                  if grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD' "$script"; then
-                    fail "$u: ExecStart script $script enables AGGREGATOR_ALLOW_MODEL_DOWNLOAD"
-                  fi
                 done
-                if grep -q 'AGGREGATOR_ALLOW_MODEL_DOWNLOAD' "$real"; then
-                  fail "$u sets AGGREGATOR_ALLOW_MODEL_DOWNLOAD"
-                fi
               done
 
               # ---- 2. Fail loudly, about the unit that actually failed ----

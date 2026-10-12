@@ -1,7 +1,7 @@
 """Retrieval evaluation: a frozen golden query set, baselines, and drift.
 
-WHY THIS PACKAGE EXISTS. Every retrieval tuning decision — rerank threshold,
-FTS5 tokenizer, relaxation ladder — is a claim that retrieval got better.
+WHY THIS PACKAGE EXISTS. Every retrieval tuning decision — FTS5 tokenizer,
+relaxation ladder, routing — is a claim that retrieval got better.
 Without a frozen query set and a recorded baseline those claims are
 unfalsifiable, and a change that quietly halves recall ships green because no
 test in the suite can see ranking quality.

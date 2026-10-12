@@ -69,7 +69,7 @@ def store(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _fresh_miss_log(monkeypatch):
-    """The log connection is a module singleton, like the reranker. Tests share
+    """The log connection is a module singleton. Tests share
     a process, so one test's connection would otherwise answer another test's
     cache — and point at a ``tmp_path`` that has already been torn down."""
     monkeypatch.setattr("aggregator.mcp._miss_log", None)

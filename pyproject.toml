@@ -20,15 +20,6 @@ dependencies = [
   # is the one failure mode this index cannot tolerate.
   "pypdf>=5.0",
   "python-docx>=1.1",
-  # The opt-in cross-encoder reranker (`rerank=True` / `query --rerank`).
-  "sentence-transformers>=3.0",
-  # Declared DIRECTLY even though `sentence-transformers` already pulls it.
-  # `[tool.uv.sources]` below binds only direct dependencies, so pinning torch
-  # to the CPU index has no effect while torch is merely transitive — the
-  # resolver keeps taking the CUDA build from PyPI and the NixOS packaging
-  # fails on it. See the comment on that block for the whole story.
-  "torch>=2.0",
-  "numpy>=2.0",
 ]
 
 [project.scripts]
@@ -53,34 +44,6 @@ dev = [
   "pytest-cov>=5",
   "ruff>=0.6",
 ]
-
-# ---------------------------------------------------------------------------
-# torch: CPU WHEELS ONLY, and this is not a size preference.
-#
-# `sentence-transformers` pulls `torch`, and the default PyPI `torch` wheel
-# vendors the entire NVIDIA CUDA stack as hard dependencies — nvidia-cublas,
-# nvidia-cudnn, nvidia-cufile and a dozen more, several hundred MB each. This
-# deployment is CPU-only by design, so none of it can ever execute.
-#
-# It is not merely wasted bytes. Packaging the default wheel for NixOS FAILS
-# OUTRIGHT: `nvidia-cufile` ships `libcufile_rdma.so.1`, which links against
-# libmlx5 / librdmacm / libibverbs — InfiniBand RDMA libraries — and
-# auto-patchelf cannot satisfy them, so the derivation errors and takes the
-# whole aggregator-env with it. The tempting fix at that point is
-# `--ignore-missing` on those three sonames, which would paper over the symptom
-# and still ship a multi-GB GPU stack that nothing runs.
-#
-# Pointing torch at PyTorch's CPU index resolves `torch` with no `nvidia-*`
-# dependencies at all, which is both the smaller closure and the one that
-# builds. `explicit = true` keeps the index scoped to torch — every other
-# package still resolves from PyPI.
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
 
 [build-system]
 requires = ["hatchling"]

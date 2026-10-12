@@ -95,21 +95,6 @@ Both timers set `OnBootSec = "5min"` and `Persistent = true`:
 These are the two knobs `systemd.time(7)` gives us for "run soon after
 the machine wakes up". Verified against systemd v256 timer docs.
 
-## Reranker weights
-
-`rerank=True` (and `aggregator query --rerank`) loads the
-`Qwen/Qwen3-Reranker-0.6B` cross-encoder inside the MCP server, pinned to
-`rerank.QWEN3_RERANKER_REVISION`. Model loads are offline unless
-`AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1` is set, so the weights are fetched once, by
-hand, with network access:
-
-```bash
-AGGREGATOR_ALLOW_MODEL_DOWNLOAD=1 aggregator seed-reranker
-```
-
-Without them `rerank=True` degrades to the recency order and says so in the
-response's `notice`; keyword search is unaffected.
-
 ## Verifying the units without deploying
 
 ```bash
@@ -132,8 +117,6 @@ What it enforces, and why each one is there:
   into the script and greps that too, for `/home/` and for `uv run`.
   Deployment: new revision → new store path → `home-manager switch`. There is
   no in-place update path, by design.
-- **No unit enables `AGGREGATOR_ALLOW_MODEL_DOWNLOAD`**, so nothing unattended
-  can start a GB-scale download.
 - **`OnFailure=` is wired, and the tag unit names its OWN notifier** — which
   cites its own journal.
 - **The failure-notify debounce arms only on a delivered popup** — asserted by
@@ -176,8 +159,8 @@ aggregator status
 
 ## Python deps that may need overlays (follow-up)
 
-`fastmcp`, `presidio-analyzer`, `presidio-anonymizer` and
-`sentence-transformers` are PyPI-only and may not be packaged in nixpkgs.
+`fastmcp`, `presidio-analyzer` and `presidio-anonymizer` are PyPI-only and
+may not be packaged in nixpkgs.
 Consequences:
 
 - `packages.default` from this flake is intentionally thin

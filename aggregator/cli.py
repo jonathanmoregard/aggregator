@@ -54,7 +54,6 @@ from pathlib import Path
 from typing import Any
 
 from aggregator.core.provenance import classify
-from aggregator.core.rerank import MODEL_DOWNLOAD_ENV, downloads_allowed
 from aggregator.core.rescrub import DEFAULT_CHUNK as _RESCRUB_CHUNK
 from aggregator.core.rescrub import DEFAULT_JOBS as _RESCRUB_JOBS
 from aggregator.core.rescrub import rescrub
@@ -92,19 +91,6 @@ from aggregator.imports.runner import (
 )
 from aggregator.imports.store_sink import StoreSink, count_writes
 from aggregator.imports.sync_bridge import accepts_errors_kwarg, unwired_sink_note
-
-# ``_get_reranker`` is the MCP server's LAZY SINGLETON, borrowed rather than
-# re-implemented. The CLI needs the cross-encoder built BEFORE the query runs,
-# so that a load failure is a refusal instead of a silently unranked page —
-# and the query itself asks for the same object a moment later. Constructing a
-# second one here would cost ~2 GB RSS and a second model load to answer one
-# question.
-from aggregator.mcp import (
-    _RERANK_WINDOW,
-)
-from aggregator.mcp import (
-    _get_reranker as _mcp_get_reranker,
-)
 from aggregator.mcp import (
     aggregator_capabilities as _mcp_capabilities,
 )
@@ -323,129 +309,10 @@ def _default_sources() -> dict[str, Any]:
     return {name: _build_source(name, factory) for name, factory in factories}
 
 
-#: The ONE command that is allowed to fetch model weights, spelled exactly as
-#: a human would type it. Every message that needs somebody to go and get
-#: weights names this, so "what do I run?" is never left as an exercise.
-SEED_RERANKER_COMMAND = f"{MODEL_DOWNLOAD_ENV}=1 aggregator seed-reranker"
-
-
-def _reranker_load_failure(error: BaseException) -> str:
-    """What to print when ``--rerank`` cannot have the model it asked for."""
-    return (
-        f"ERROR: --rerank could not load the cross-encoder "
-        f"({type(error).__name__}: {error}).\n"
-        f"No results were printed: without the reranker this command returns "
-        f"the recency order, which is exactly what --rerank was asked to "
-        f"replace, and a page that silently is not ranked is worse than no "
-        f"page.\n"
-        f"If the weights are simply not on this machine yet, fetch them once "
-        f"with `{SEED_RERANKER_COMMAND}` (needs network); otherwise re-run "
-        f"without --rerank."
-    )
-
-
-#: ``--fields`` was not typed. argparse cannot otherwise tell "the operator
-#: left this off" from "the operator typed the default value on purpose", and
-#: the two must diverge under ``--rerank``: one gets the bodies it needs, the
-#: other gets refused.
-_FIELDS_UNSET = None
-
-
-def _rerank_needs_full_fields() -> str:
-    """What to print when ``--rerank`` and ``--fields summary`` are both typed."""
-    return (
-        "ERROR: --rerank and --fields summary ask for incompatible things.\n"
-        "--rerank ranks document BODIES with a cross-encoder, and "
-        "--fields summary does not return any — the ranking would be computed "
-        "over empty documents, at several minutes per query, for an ordering "
-        "over nothing.\n"
-        "Re-run with --fields full, or omit --fields entirely (--rerank "
-        "supplies --fields full for you), or drop --rerank to keep the "
-        "default recency ordering over summaries.\n"
-        "Nothing was spent: no model was loaded and no query was run."
-    )
-
-
 def _cmd_query(args: argparse.Namespace, store: Store) -> int:
-    # WHAT ``--rerank`` ON ITS OWN MEANS. The cross-encoder scores an item's
-    # ``content``, and summary items have none — so under the ``--fields``
-    # default, ``aggregator query "..." --rerank`` refused itself. That is the
-    # batch surface's most obvious invocation, and the one the MCP tool
-    # description sends callers here for. So the flag now supplies the mode it
-    # needs.
-    #
-    # NOT the auto-upgrade the MCP layer deliberately refuses. There, ``fields``
-    # is a function parameter with a real default and no unset state, so
-    # promoting it would change the payload shape behind a caller that had said
-    # nothing — invisible. Here the promotion is attached to a flag the operator
-    # typed, is documented on that flag in ``--help``, and applies ONLY when
-    # ``--fields`` was left off. Typed explicitly, ``--fields summary`` still
-    # reaches the refusal below.
-    fields = args.fields
-    if fields is _FIELDS_UNSET:
-        fields = "full" if args.rerank else "summary"
-    elif args.rerank and fields != "full":
-        # BEFORE THE MODEL LOAD, because this outcome is knowable from argv.
-        # The MCP layer refuses the same pair, but only after the CLI has paid
-        # ~2 GB RSS and a cross-encoder load to reach a query that was already
-        # doomed — spending the thing the refusal exists to save.
-        print(_rerank_needs_full_fields(), file=sys.stderr)
-        return 1
-    if args.rerank:
-        # BEFORE THE QUERY, and loudly. ``_maybe_rerank`` catches a rerank
-        # failure and returns the page in its recency order — right for the
-        # MCP tool, where a lost ordering must not cost the caller their
-        # answer, and wrong here, where the ordering IS what was asked for.
-        #
-        # That degrade is no longer silent: it now sets ``rerank_applied:
-        # False`` and leads the response with a ``notice`` naming the exception
-        # and pointing at ``aggregator seed-reranker``, which this command
-        # prints. What the up-front load still buys is WHEN and WITH
-        # WHAT EXIT CODE. Measured on this path with a reranker that loads and
-        # then raises while scoring: exit 0, the whole page printed, and the
-        # notice on the line after the last row — an operator who waited four
-        # and a half minutes
-        # reads the report only after scrolling past the results it disclaims,
-        # and a script or timer sees a success. Loading first converts that
-        # post-work degradation into a pre-work refusal that names its fix and
-        # exits 1, and the object lands in the singleton the query then reuses.
-        #
-        # It narrows the window rather than closing it — a cross-encoder can
-        # still fail after loading — so the reporting below is the backstop,
-        # not dead weight.
-        try:
-            _mcp_get_reranker()
-        except Exception as e:  # noqa: BLE001 - reported, not handled
-            print(_reranker_load_failure(e), file=sys.stderr)
-            return 1
-        # "SCORES EVERY HIT" WAS FALSE, and round 3's M4. ``_maybe_rerank``
-        # reorders at most ``_RERANK_WINDOW`` items; --page-size defaults to
-        # 50. So the flag's most ordinary invocation returned a 40%-ranked page
-        # while the one line the operator reads during the multi-minute wait
-        # told them the whole thing had been scored.
-        #
-        # AND THE WAIT IT NAMED WAS AN ORDER OF MAGNITUDE SHORT. "47 s median"
-        # was measured while the cross-encoder scored session cards against
-        # their own subjects — near-empty documents — and while the pages
-        # holding a genuinely long document were being OOM-killed instead of
-        # timed. Both are fixed (see ``mcp._RERANK_WINDOW`` for the table), and
-        # the re-measured figure on real bodies is 273 s median / 304 s p95.
-        # The unit is in the sentence on purpose: three digits of seconds reads
-        # as small, and "four and a half minutes" is what an operator actually
-        # decides against.
-        print(
-            f"note: --rerank scores the first {_RERANK_WINDOW} hits of the "
-            f"page with a cross-encoder and reorders those; any hit after them "
-            f"keeps the default recency order. Measured at 273 s median and "
-            f"304 s at p95 per query on this CPU — about four and a half "
-            f"minutes — plus a one-off model load. This is a batch facility. "
-            f"Pass --page-size {_RERANK_WINDOW} or less for a page that is "
-            f"ranked all the way down.",
-            file=sys.stderr,
-        )
     result = _mcp_query(
         dsl=args.dsl,
-        fields=fields,
+        fields=args.fields,
         page_size=args.page_size,
         # THREADED, because this command PRINTS one. Without it the token at
         # the bottom of every long result set addressed a page the CLI then
@@ -453,7 +320,6 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         # here and the only evidence of that was an argparse usage error.
         page_token=args.page_token,
         drilldown=args.drilldown,
-        rerank=args.rerank,
         _store=store,
         # THE ZERO-RESULT LOG IS WRITTEN FROM HERE, AND ONLY FROM HERE.
         # ``aggregator_query`` defaults it off so the MCP surface — annotated
@@ -471,25 +337,7 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         print(f"remediation: {result.get('remediation')}", file=sys.stderr)
         return 1
     mode = result.get("mode", "records")
-    # WHERE THE RANKED PREFIX ENDS. Below this line the rows were never scored
-    # — they are in the ordinary recency order — and they are otherwise
-    # indistinguishable from the ranked ones, so a reader scrolling a 50-row
-    # page reads 30 rows of recency ordering as relevance ordering. Printed
-    # only when there is genuinely a seam: the rerank applied AND the page is
-    # longer than the window.
-    ranked_upto = (
-        _RERANK_WINDOW
-        if result.get("rerank_applied") and len(result["records"]) > _RERANK_WINDOW
-        else None
-    )
-    for i, rec in enumerate(result["records"]):
-        if ranked_upto is not None and i == ranked_upto:
-            print(
-                f"# ---- end of the {ranked_upto} hits ranked by relevance; "
-                f"the {len(result['records']) - ranked_upto} below are in the "
-                f"default recency order and were NOT scored ----"
-            )
-            print()
+    for rec in result["records"]:
         if mode == "sessions":
             print(
                 f"# {rec['source']} :: {rec['subject']}  "
@@ -2605,48 +2453,6 @@ def _cmd_tag(args: argparse.Namespace, store: Store) -> int:
     return 0
 
 
-def _cmd_seed_reranker() -> int:
-    """Fetch/verify the cross-encoder's weights. NO DATABASE, NO ROWS, NO LOCK.
-
-    Every model load is offline unless a human opts in, and the reranker is
-    otherwise only ever built inside a live ``rerank=True`` call — so this is
-    the one path that can put its weights on a machine. Dispatched before
-    ``main`` builds a ``Store`` at all, so warming a model cache cannot write
-    to the index.
-    """
-    from aggregator.core.rerank import Reranker
-
-    try:
-        Reranker()
-    except Exception as error:  # noqa: BLE001 - reported, not handled
-        print(
-            f"ERROR: the reranker weights could not be loaded "
-            f"({type(error).__name__}: {error})",
-            file=sys.stderr,
-        )
-    else:
-        print("seed-reranker: reranker ready")
-        return 0
-    if downloads_allowed():
-        print(
-            f"Downloads were permitted ({MODEL_DOWNLOAD_ENV} is set), so this "
-            f"is not the offline guard — the hub, the network or the disk is "
-            f"the problem. Re-run `{SEED_RERANKER_COMMAND}` once it is fixed.",
-            file=sys.stderr,
-        )
-    else:
-        # NAMED IN FULL: "enable downloads" would leave the operator to work
-        # out how.
-        print(
-            f"Model loads are offline unless a human asks for them, and "
-            f"{MODEL_DOWNLOAD_ENV} is not set, so nothing was fetched. Run "
-            f"this once, with network access:\n"
-            f"    {SEED_RERANKER_COMMAND}",
-            file=sys.stderr,
-        )
-    return 1
-
-
 def _positive_int(raw: str) -> int:
     """An ``argparse`` type that refuses the two values SQLite reinterprets.
 
@@ -2729,14 +2535,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument(
         "--fields",
         choices=["summary", "full"],
-        # Sentinel, not "summary": ``_cmd_query`` has to tell an omitted
-        # --fields from one typed with the default value, because --rerank
-        # supplies the former and refuses the latter.
-        default=_FIELDS_UNSET,
+        default="summary",
         help=(
             "how much of each hit to print: 'summary' (subject and metadata "
-            "only — the default) or 'full' (document bodies too). Left off, "
-            "--rerank raises this to 'full'"
+            "only — the default) or 'full' (document bodies too)"
         ),
     )
     q.add_argument("--page-size", type=int, default=50)
@@ -2758,28 +2560,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "for session-shaped queries, return observation rows for the "
             "matching sessions (default: session-level hit list only)"
-        ),
-    )
-    q.add_argument(
-        "--rerank",
-        action="store_true",
-        help=(
-            f"re-order the head of the page by cross-encoder relevance instead "
-            f"of recency. THE HEAD ONLY: the first {_RERANK_WINDOW} hits are "
-            f"scored and reordered, and anything after them stays in recency "
-            f"order — so at the default --page-size 50 most of the page is NOT "
-            f"ranked, and the output marks where the ranked part ends. Pass "
-            f"--page-size {_RERANK_WINDOW} or less to have the whole page "
-            f"ranked. SLOW — 273 s median and 304 s at p95 per query on this "
-            f"CPU, about four and a half minutes, against 0.65 s without, "
-            f"plus a one-off model load; this command is the "
-            f"batch surface that cost is documented for. Refuses out loud if "
-            "the weights cannot be loaded rather than returning an unranked "
-            "page. IMPLIES --fields full when --fields is not given, because "
-            "the cross-encoder ranks document bodies and summary mode returns "
-            "none — so this also CHANGES THE OUTPUT: full bodies are printed "
-            "under each hit, not subject lines alone. Passing --fields summary "
-            "explicitly is refused rather than silently overridden"
         ),
     )
 
@@ -2903,17 +2683,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="assume 'y' for any --force confirmation (scripted use)",
-    )
-
-    sub.add_parser(
-        "seed-reranker",
-        help=(
-            "load the cross-encoder reranker behind `query --rerank`, then "
-            "exit — no database is opened and no row is read or written. "
-            f"The only path that fetches its weights: set {MODEL_DOWNLOAD_ENV}=1 "
-            "to permit the download; without it this reports what is missing "
-            "and exits non-zero"
-        ),
     )
 
     p_prov = sub.add_parser(
@@ -3074,11 +2843,6 @@ def main(
     _notify: NotifyHook | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
-    # BEFORE ANY STORE IS BUILT. Seeding a model cache must not open, create
-    # or migrate the index — see ``_cmd_seed_reranker``. Every other
-    # subcommand needs the store, so it stays eagerly built for them.
-    if args.cmd == "seed-reranker":
-        return _cmd_seed_reranker()
     store = _store or Store()
     # THE ONE EXCEPTION THAT MUST NOT REACH systemd AS A TRACEBACK. Every other
     # fault here is either transient or specific to one subcommand; a cache

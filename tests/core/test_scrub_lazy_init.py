@@ -2,9 +2,8 @@
 
 WHY THIS IS NOT A CODE COMMENT. ``aggregator/core/scrub.py`` used to build
 ``AnalyzerEngine()`` and ``AnonymizerEngine()`` at module import. Importing the
-module therefore imported ``presidio_analyzer`` (which pulls ``transformers``,
-which pulls ``torch``) and ``spacy`` (which pulls ``thinc``, which pulls
-``torch`` again): 49.0 s of the 57.6 s it took to import ``aggregator.mcp`` on
+module therefore imported ``presidio_analyzer`` and ``spacy`` (which pulls
+``thinc``): 49.0 s of the 57.6 s it took to import ``aggregator.mcp`` on
 the user's laptop, measured with ``PYTHONPROFILEIMPORTTIME``. Claude Code gives
 an MCP server 30 s to answer ``initialize``, so from 2026-09-04 every session
 timed out and the recall server was simply absent.

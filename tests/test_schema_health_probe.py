@@ -80,7 +80,7 @@ def _fake_tree(root: Path, version: int) -> Path:
     Written as a real source file rather than a stub the probe is handed,
     because the probe reads the constant out of that file by text — the one
     way to learn the reader's requirement without importing the package (and
-    dragging torch into a session-start budget).
+    dragging the model stack into a session-start budget).
     """
     core = root / "aggregator" / "core"
     core.mkdir(parents=True, exist_ok=True)
@@ -1556,8 +1556,8 @@ def test_cli_runs_without_the_aggregator_package_importable(tmp_path):
     """The script must be stdlib-only, standalone, and free of package imports.
 
     Both consumers run it outside any venv. If it ever grows
-    ``from aggregator.core.store import SCHEMA_VERSION`` it will import torch
-    on a session-start budget and time out — and a timed-out hook has its
+    ``from aggregator.core.store import SCHEMA_VERSION`` it will import the
+    scrubber's model stack on a session-start budget and time out — and a timed-out hook has its
     output discarded, which for a health check is the same as never noticing.
     """
     proc = _run_cli(tmp_path, cache=6, reader=6, writer=6)

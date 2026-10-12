@@ -23,9 +23,8 @@ Two layers:
 
 PRESIDIO IS INITIALISED LAZILY, AND THAT IS A STARTUP BUDGET, NOT A STYLE
 CHOICE. This module used to build ``AnalyzerEngine()`` and ``AnonymizerEngine()``
-at import. Presidio's predefined recognizers import ``transformers`` (hence
-``torch``), and the spaCy-model probe imports ``spacy`` (hence ``thinc``, hence
-``torch`` again): 49.0 s of the 57.6 s that importing ``aggregator.mcp`` cost on
+at import. Presidio's recognizers and the spaCy-model probe import ``spacy``
+(hence ``thinc``) and load the model: 49.0 s of the 57.6 s that importing ``aggregator.mcp`` cost on
 the user's laptop, measured with ``PYTHONPROFILEIMPORTTIME``. Claude Code gives
 an MCP server 30 s to answer ``initialize``, so the recall server stopped
 connecting at all. ``ensure_presidio_ready`` now does that work on first use —
@@ -120,9 +119,8 @@ def _build_presidio_engines() -> tuple[object, object]:
     """Import Presidio and construct the two engines. SLOW — SECONDS TO A MINUTE.
 
     Every heavy import in this module lives here and nowhere else. Presidio's
-    predefined recognizers import ``transformers`` (hence ``torch``), and
-    ``_spacy_model_present`` imports ``spacy`` (hence ``thinc``, hence
-    ``torch`` again): measured at 49 s of the 57 s it used to take to import
+    recognizers and ``_spacy_model_present`` import ``spacy`` (hence
+    ``thinc``): measured at 49 s of the 57 s it used to take to import
     ``aggregator.mcp``, which is why none of it may happen at module scope.
 
     Raises rather than returning a sentinel — the caller owns the fallback.
