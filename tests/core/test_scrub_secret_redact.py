@@ -68,6 +68,17 @@ def test_empty_texts_make_no_call(monkeypatch, tmp_path):
         ("exits non-zero", "echo 'secret-redact: gitleaks exited 2' >&2; exit 1"),
         ("writes garbage", "echo 'not json'"),
         ("returns too few texts", """echo '{"texts": [], "counts": []}'"""),
+        ("top level is not an object", """echo '["x"]'"""),
+        ("texts is not a list", """echo '{"texts": "x", "counts": [{}]}'"""),
+        ("counts is not a list", """echo '{"texts": ["x"], "counts": {}}'"""),
+        ("a text is not a string", """echo '{"texts": [1], "counts": [{}]}'"""),
+        ("a counts element is a list", """echo '{"texts": ["x"], "counts": [[]]}'"""),
+        ("a counts element is null", """echo '{"texts": ["x"], "counts": [null]}'"""),
+        ("a count is a string", """echo '{"texts": ["x"], "counts": [{"r": "1"}]}'"""),
+        ("a count is a float", """echo '{"texts": ["x"], "counts": [{"r": 1.5}]}'"""),
+        ("a count is a bool", """echo '{"texts": ["x"], "counts": [{"r": true}]}'"""),
+        ("texts key missing", """echo '{"counts": [{}]}'"""),
+        ("counts key missing", """echo '{"texts": ["x"]}'"""),
     ],
 )
 def test_a_failing_scanner_raises_without_echoing_the_text(monkeypatch, tmp_path, label, body):

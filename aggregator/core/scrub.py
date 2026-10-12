@@ -325,6 +325,32 @@ SECRET_REDACT_TIMEOUT_S = 300.0
 _SCANNER_ENV = {"GOMAXPROCS": "2"}
 
 
+def _parse_response(raw: bytes, n: int) -> tuple[list[str], list[dict[str, int]]]:
+    """The CLI's stdout as ``(texts, counts)``; ``ValueError`` on any violation.
+
+    Invariant: the result is a JSON object whose ``texts`` is ``n`` strings and
+    whose ``counts`` is ``n`` objects mapping rule names to integer counts.
+    Nothing else is returned, so callers may use the result without re-checking.
+    """
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        raise ValueError("response is not an object")
+    out, found = result.get("texts"), result.get("counts")
+    if not (isinstance(out, list) and isinstance(found, list)):
+        raise ValueError("texts and counts must be lists")
+    if len(out) != n or len(found) != n:
+        raise ValueError("one result per text")
+    if not all(isinstance(t, str) for t in out):
+        raise ValueError("every text must be a string")
+    for per_text in found:
+        if not isinstance(per_text, dict) or not all(
+            isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)
+            for k, v in per_text.items()
+        ):
+            raise ValueError("every counts entry must map rule names to integers")
+    return out, found
+
+
 def _secret_redact_many(texts: list[str], counts: list[dict[str, int]]) -> list[str]:
     """``texts`` through one ``secret-redact`` call, counting per text. Fails closed."""
     if not any(texts):
@@ -345,11 +371,8 @@ def _secret_redact_many(texts: list[str], counts: list[dict[str, int]]) -> list[
         reason = proc.stderr.decode("utf-8", "replace").strip()[-300:]
         raise ScrubUnavailableError(f"{SECRET_REDACT} exited {proc.returncode}: {reason}")
     try:
-        result = json.loads(proc.stdout)
-        out, found = result["texts"], result["counts"]
-        if len(out) != len(texts) or len(found) != len(texts):
-            raise ValueError("one result per text")
-    except (ValueError, KeyError, TypeError):
+        out, found = _parse_response(proc.stdout, len(texts))
+    except ValueError:
         raise ScrubUnavailableError(f"{SECRET_REDACT} wrote no readable result") from None
     for c, per_text in zip(counts, found, strict=True):
         for rule, n in per_text.items():
