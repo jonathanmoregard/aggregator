@@ -45,10 +45,8 @@ def test_reranker_never_enables_trust_remote_code(monkeypatch):
     """``rerank=True`` must not license the hub to run code in this process.
 
     ``Reranker()`` is constructed lazily INSIDE the MCP server — the process
-    holding the user's entire personal history — and that server is registered
-    bare, with no ``HF_HUB_OFFLINE`` wrapper (only the timer-driven embed unit
-    sets it). With ``trust_remote_code=True`` a single ``rerank=True`` query is
-    therefore enough to fetch and execute repository-controlled Python there.
+    holding the user's entire personal history. With
+    ``trust_remote_code=True`` a single ``rerank=True`` query would be enough to fetch and execute repository-controlled Python there.
 
     Nothing is given up by refusing: the weights carry no custom modeling code,
     and the architecture is native to transformers — see the test below, which
@@ -80,9 +78,7 @@ def test_the_reranker_architecture_is_native_to_transformers(reranker):
 
 
 def test_the_reranker_pins_a_revision():
-    """Same rule as the embedder, and it matters more here.
-
-    This model is loaded inside the long-lived MCP server, so an unpinned
+    """This model is loaded inside the long-lived MCP server, so an unpinned
     ``main`` is a moving artifact executing in the process that holds the
     user's whole history.
     """

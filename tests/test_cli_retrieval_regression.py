@@ -52,7 +52,7 @@ def test_the_action_mode_and_threshold_reach_the_harness(
             "retrieval-regression",
             "freeze",
             "--mode",
-            "hybrid",
+            "mcp",
             "--drift-threshold",
             "0.25",
         ]
@@ -60,7 +60,7 @@ def test_the_action_mode_and_threshold_reach_the_harness(
 
     assert rc == 0
     assert seen["action"] == "freeze"
-    assert seen["mode"] == "hybrid"
+    assert seen["mode"] == "mcp"
     assert seen["drift_threshold"] == 0.25
 
 
@@ -119,25 +119,6 @@ def test_the_mcp_mode_is_offered_on_the_command_line(tmp_data_home, capsys):
     with pytest.raises(SystemExit):
         cli.main(["retrieval-regression", "--help"])
     assert "mcp" in " ".join(capsys.readouterr().out.split())
-
-
-def test_an_mcp_run_against_a_cold_cache_exits_two_and_says_why(
-    tmp_data_home, capsys
-):
-    """EXIT 2, "the harness could not run" — not 0 and not 1.
-
-    A cold vector arm makes the server answer from FTS5, and a run that scored
-    that would file the keyword arm's numbers under ``mcp``. 0 would be a lie
-    about coverage; 1 would call it a retrieval regression.
-    """
-    from aggregator.core.store import Store
-
-    store = Store()
-    store.migrate()
-    rc = cli.main(["retrieval-regression", "run", "--mode", "mcp"], _store=store)
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "embedded" in err, err
 
 
 def test_the_evals_package_does_not_import_the_cli(tmp_data_home):

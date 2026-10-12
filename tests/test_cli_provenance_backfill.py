@@ -20,8 +20,8 @@ THE SHAPE IS THE 2026-08-16 INGEST CONTRACT, in full:
   partial pass as a complete one.
 
 IT IS A PURE UPDATE. No re-ingest, no re-scrub, no ``body`` write, no
-``src_hash`` write, no ``embedding_state`` reset — the classifier's output must
-never be able to cost the corpus a Presidio pass or the vector arm its work.
+``src_hash`` write — the classifier's output must never be able to cost the
+corpus a Presidio pass.
 """
 from __future__ import annotations
 
@@ -207,25 +207,22 @@ def test_a_subagent_stream_is_agent_authored_on_the_db_only_route(tmp_path):
 
 
 def test_the_backfill_rewrites_nothing_but_provenance(tmp_path):
-    """No re-scrub, no body write, no ``embedding_state`` reset.
+    """No re-scrub, no body write.
 
-    Those are what a re-ingest would cost — ~11 hours of Presidio over this
-    corpus, and the observation vector arm discarded. A classification pass
-    must never be able to buy either.
+    That is what a re-ingest would cost — ~11 hours of Presidio over this
+    corpus. A classification pass must never be able to buy it.
     """
     root = _projects_root(tmp_path)
     store = _unclassified_store(tmp_path, root)
     c = store._c()
-    c.execute("UPDATE observations SET embedding_state = 'ok'")
-    c.commit()
     before = {
-        r["obs_id"]: (r["body"], r["src_hash"], r["embedding_state"])
-        for r in c.execute("SELECT obs_id, body, src_hash, embedding_state FROM observations")
+        r["obs_id"]: (r["body"], r["src_hash"])
+        for r in c.execute("SELECT obs_id, body, src_hash FROM observations")
     }
     _run(store, root, "--backfill")
     after = {
-        r["obs_id"]: (r["body"], r["src_hash"], r["embedding_state"])
-        for r in c.execute("SELECT obs_id, body, src_hash, embedding_state FROM observations")
+        r["obs_id"]: (r["body"], r["src_hash"])
+        for r in c.execute("SELECT obs_id, body, src_hash FROM observations")
     }
     assert after == before
 

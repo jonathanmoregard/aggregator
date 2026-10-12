@@ -3,12 +3,10 @@
 WHY THIS EXISTS. 22.4% of `observations` are `type='attachment'` with an empty
 ``body``, which reads like a coverage gap and is not one: they are structural
 nodes in the ``parent_obs_id`` chain, and ~86% of what ingest dropped is harness
-plumbing repeated near-verbatim in every session. Embedding that bulk would
-poison the vector arm with near-duplicates rather than close a gap. See
-``docs/rag-next-steps.md``.
+plumbing repeated near-verbatim in every session. Indexing that bulk would
+flood search with near-duplicates rather than close a gap.
 
-The numbers in that document came from here, so they can be re-derived rather
-than believed. Reads the SOURCE jsonl, not the cache — the cache already threw
+The numbers come from here, so they can be re-derived rather than believed. Reads the SOURCE jsonl, not the cache — the cache already threw
 the payload away, mapping nothing from the top-level ``attachment`` key to
 ``body``.
 
@@ -184,7 +182,7 @@ def main() -> int:
     print(
         f"harness plumbing: {total - carried} rows "
         f"({100 * (total - carried) / total:.1f}%) — near-duplicate across "
-        f"sessions; embedding it would poison the vector arm"
+        f"sessions; indexing it would flood search with near-duplicates"
     )
     unknown = set(rows) - CONTENT_BEARING
     novel = {k for k in unknown if rows[k] and k not in _KNOWN_PLUMBING}

@@ -1,15 +1,6 @@
 """Confidence signal 3: does anything on this page stand out to the reranker?
 
-WHAT WAS WRONG WITH IT. ``has_standout`` refused any sample smaller than
-``VECTOR_FLOOR_MIN_SAMPLE`` — a constant belonging to the *vector floor*, a
-different rule reading a different distribution — and ``mcp._RERANK_WINDOW``, a
-latency budget documented as "not a quality knob", is exactly that same 20. So
-the signal was ``None`` for every page under 20 rows, and lowering the latency
-budget by one would have made it ``None`` forever, silently. Two unrelated
-constants, one accidental equality, and a quality signal whose life depended on
-it.
-
-AND THE BAR WAS THE n=20 SPECIAL CASE OF ITS OWN DERIVATION. The shipped 2.5
+THE BAR WAS THE n=20 SPECIAL CASE OF ITS OWN DERIVATION. The shipped 2.5
 came from "the largest of 20 draws sits about 1.9 sd above its own mean whether
 or not any of them is relevant; 2.5 is the first round bar above that" — a
 statement about 20 draws, applied to whatever number of documents the page
@@ -26,7 +17,7 @@ import math
 
 import pytest
 
-from aggregator.core.hybrid import (
+from aggregator.core.standout import (
     RERANK_STANDOUT_MARGIN,
     RERANK_STANDOUT_MIN_SAMPLE,
     RERANK_STANDOUT_Z,
@@ -98,18 +89,18 @@ def test_the_minimum_sample_is_below_the_rerank_window():
 def test_a_short_page_with_a_clear_winner_answers_true():
     """Ten documents is half the window and used to be ``None``: "the question
     could not be asked", about a page where one document plainly dominates."""
-    assert has_standout(_spiked(10), higher_is_better=True) is True
+    assert has_standout(_spiked(10)) is True
 
 
 def test_a_short_flat_page_answers_false_and_not_none():
     """"Twenty documents scored identically" was already worth reporting; so is
     ten. ``None`` claimed the question was unaskable."""
-    assert has_standout([0.5] * 10, higher_is_better=True) is False
+    assert has_standout([0.5] * 10) is False
 
 
 def test_a_short_page_with_no_winner_answers_false():
     scores = [0.40 + i * 0.01 for i in range(10)]
-    assert has_standout(scores, higher_is_better=True) is False
+    assert has_standout(scores) is False
 
 
 def test_a_page_too_short_to_judge_still_answers_none():
@@ -117,57 +108,38 @@ def test_a_page_too_short_to_judge_still_answers_none():
     minimum the bar is unreachable, so ``False`` would be an artefact of the
     sample size rather than an observation about the documents."""
     n = RERANK_STANDOUT_MIN_SAMPLE - 1
-    assert has_standout(_spiked(n), higher_is_better=True) is None
-
-
-def test_the_signal_flips_for_a_distance_where_lower_is_better():
-    """One primitive, both orientations — the reranker scores up, the vector
-    arm scores down, and two near-identical helpers would drift."""
-    dists = [0.99] * 9 + [0.01]
-    assert has_standout(dists, higher_is_better=False) is True
-    assert has_standout(dists, higher_is_better=True) is False
+    assert has_standout(_spiked(n)) is None
 
 
 def test_an_explicit_threshold_still_overrides_the_derived_one():
     """The escape hatch a caller with its own calibration needs, kept so the
     derivation is a default rather than a wall."""
     scores = _spiked(10)
-    assert has_standout(scores, higher_is_better=True, z_threshold=99.0) is False
+    assert has_standout(scores, z_threshold=99.0) is False
 
 
 # --- the primitive underneath -----------------------------------------------
-#
-# ``relative_z`` used to live under the vector floor as well; the floor is an
-# absolute distance now (see ``test_hybrid_abstention.py``), so ``has_standout``
-# is its only caller and its tests belong here.
 
 
 def test_relative_z_scores_a_clear_outlier_far_above_the_rest():
-    values = [0.05] + [0.60 + i * 0.001 for i in range(40)]
-    zs = relative_z(values, higher_is_better=False, min_sample=20)
+    values = [0.9] + [0.1 + i * 0.001 for i in range(40)]
+    zs = relative_z(values, min_sample=20)
     assert zs is not None
     assert zs[0] > 5.0
     assert all(z < 1.0 for z in zs[1:])
-
-
-def test_relative_z_flips_for_scores_where_higher_is_better():
-    values = [0.9] + [0.1 + i * 0.001 for i in range(40)]
-    zs = relative_z(values, higher_is_better=True, min_sample=20)
-    assert zs is not None
-    assert zs[0] > 5.0
 
 
 def test_relative_z_refuses_a_sample_smaller_than_the_caller_asked_for():
     """``None`` is 'undecidable', which is not the same answer as 'no outlier'
     and must not share a representation with it — a caller that read 0.0 here
     would abstain on a corpus it simply has not measured."""
-    assert relative_z([0.1, 0.9], higher_is_better=False, min_sample=20) is None
+    assert relative_z([0.1, 0.9], min_sample=20) is None
 
 
 def test_relative_z_refuses_a_sample_with_no_spread_at_all():
     """Every value identical: the rule has no discriminating power, and
     reporting a z of 0 for each would read as 'measured, nothing stands out'."""
-    assert relative_z([0.5] * 40, higher_is_better=False, min_sample=20) is None
+    assert relative_z([0.5] * 40, min_sample=20) is None
 
 
 def test_relative_z_has_no_minimum_of_its_own_to_fall_back_on():
@@ -176,4 +148,4 @@ def test_relative_z_has_no_minimum_of_its_own_to_fall_back_on():
     speak. Every caller now states its own minimum, so there is nothing to
     inherit by accident."""
     with pytest.raises(TypeError):
-        relative_z([0.1] * 40, higher_is_better=False)
+        relative_z([0.1] * 40)  # type: ignore[call-arg]

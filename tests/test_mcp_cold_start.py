@@ -1,15 +1,14 @@
-"""Cold start: importing the MCP module must not load the RAG model stack.
+"""Cold start: importing the MCP module must not load the model stack.
 
 WHY THIS IS A TEST AND NOT A CODE COMMENT. ``aggregator.mcp`` is imported by
 an MCP server the user's editor starts on demand, and every import that module
-performs is paid before the first search returns. v5 made
-``sentence-transformers`` (hence torch) a hard runtime dependency, so a single
-convenience import at module scope — ``from aggregator.core.embed import
-Embedder``, the obvious way to write it, and the way the 2026-08-08 draft did
-write it — silently moves a multi-second model-stack import onto the recall
-path of every session, including the ones that never run a vector query at
-all. Nothing about that failure is visible in a unit test of the search
-behaviour; it only shows up as "why is my editor slow to start".
+performs is paid before the first search returns. ``sentence-transformers``
+(hence torch) is a runtime dependency for the opt-in reranker, so a single
+convenience import at module scope — ``from aggregator.core.rerank import
+Reranker``, the obvious way to write it — silently moves a multi-second
+model-stack import onto the recall path of every session, including the ones
+that never rerank. Nothing about that failure is visible in a unit test of the
+search behaviour; it only shows up as "why is my editor slow to start".
 
 Run in a SUBPROCESS on purpose. By the time the rest of the suite has run,
 half these modules are already in the parent's ``sys.modules`` for unrelated
@@ -17,9 +16,9 @@ reasons, so an in-process assertion would be measuring test-ordering rather
 than the import graph.
 
 TWO INDEPENDENT LISTS, BECAUSE THEY FAIL FOR DIFFERENT REASONS.
-``_RAG_ONLY_MODULES`` guards the lazy-import discipline inside ``mcp.py``: the
-vector arm and the reranker are constructed inside ``_get_embedder`` /
-``_get_reranker``, so a convenience import at module scope is the regression.
+``_RERANK_ONLY_MODULES`` guards the lazy-import discipline inside ``mcp.py``:
+the reranker is constructed inside ``_get_reranker``, so a convenience import
+at module scope is the regression.
 ``_ML_STACK_MODULES`` guards ``aggregator.core.scrub``: it used to build
 Presidio's ``AnalyzerEngine`` and ``AnonymizerEngine`` at module import, which
 pulled ``presidio_analyzer`` -> ``transformers`` -> ``torch`` and ``spacy`` ->
@@ -36,13 +35,11 @@ import subprocess
 import sys
 import textwrap
 
-# Modules that only the vector arm has any reason to load. ``sentence_
-# transformers`` is the real cost centre (it is what pulls the model plumbing
-# for both Embedder and Reranker); the two aggregator modules are the direct
-# proof that the lazy-import discipline inside mcp.py is still in place.
-_RAG_ONLY_MODULES = (
+# Modules that only the reranker has any reason to load. ``sentence_
+# transformers`` is the real cost centre; ``aggregator.core.rerank`` is the
+# direct proof that the lazy-import discipline inside mcp.py is still in place.
+_RERANK_ONLY_MODULES = (
     "sentence_transformers",
-    "aggregator.core.embed",
     "aggregator.core.rerank",
 )
 
@@ -61,7 +58,7 @@ _ML_STACK_MODULES = (
 )
 
 
-def _modules_after(statement: str, watched: tuple[str, ...] = _RAG_ONLY_MODULES) -> set[str]:
+def _modules_after(statement: str, watched: tuple[str, ...] = _RERANK_ONLY_MODULES) -> set[str]:
     """Return the subset of ``watched`` loaded by ``statement``."""
     probe = textwrap.dedent(
         f"""
@@ -81,7 +78,7 @@ def _modules_after(statement: str, watched: tuple[str, ...] = _RAG_ONLY_MODULES)
     return {m for m in out.stdout.strip().split(",") if m}
 
 
-def test_importing_mcp_does_not_load_the_rag_model_stack():
+def test_importing_mcp_does_not_load_the_rerank_model_stack():
     assert _modules_after("import aggregator.mcp") == set()
 
 
@@ -96,11 +93,11 @@ def test_importing_mcp_does_not_load_the_reranker():
 def test_the_guard_has_teeth():
     """Confirm the probe actually detects a module-scope import, so a green
     result above means "not imported" rather than "probe is broken"."""
-    loaded = _modules_after("import aggregator.mcp; import aggregator.core.embed")
-    assert "aggregator.core.embed" in loaded
+    loaded = _modules_after("import aggregator.mcp; import aggregator.core.rerank")
+    assert "aggregator.core.rerank" in loaded
 
 
-def test_building_the_server_does_not_load_the_rag_model_stack():
+def test_building_the_server_does_not_load_the_rerank_model_stack():
     """``build_server`` runs at MCP connect time and reads the cache for the
     live inventory. It must not warm the model stack either."""
     loaded = _modules_after(

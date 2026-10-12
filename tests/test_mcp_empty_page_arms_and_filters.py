@@ -1,13 +1,7 @@
 """An empty page's diagnosis must be true of EACH ARM and of EVERY filter.
 
-Three sentences that were each right about a request-wide fact and wrong about
-the page they landed on:
-
-* **"the semantic arm, the only one that ran"** — ``lexical_unavailable`` is
-  ``any`` over the union's arms, and it preempted the filter branch. So a page
-  whose records arm had run, matched, and been emptied by a date filter carried
-  that sentence directly beside the composer's "the keyword arm matched 1
-  row(s)". If the keyword arm ran and matched, it was not unavailable.
+Sentences that were each right about a request-wide fact and wrong about the
+page they landed on:
 
 * **"drop or widen one (start with X) and the matching rows come back"** — a
   promise, and a false one whenever two filters each exclude the matched rows
@@ -23,10 +17,8 @@ the page they landed on:
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import UTC, datetime, timedelta
 
-import numpy as np
 import pytest
 
 from aggregator.core.store import Store
@@ -38,22 +30,6 @@ _TS = datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
 #: The unqualified relaxation suffix. True only when EVERY arm that matched
 #: relaxed; a lie about a page whose record hits matched strictly.
 _ALL_RELAXED = "Those rows matched under the RELAXED"
-
-
-class StubEmbedder:
-    """No real model, ever. One axis, so any text is any other's neighbour."""
-
-    @staticmethod
-    def _vec(_text: str) -> np.ndarray:
-        v = np.zeros(768, dtype=np.float32)
-        v[0] = 1.0
-        return v
-
-    def embed_query(self, query: str) -> np.ndarray:
-        return self._vec(query)
-
-    def embed_documents(self, docs: list[str]) -> np.ndarray:
-        return np.array([self._vec(d) for d in docs], dtype=np.float32)
 
 
 def _rec(sid: str, body: str, tags=()) -> Record:
@@ -109,69 +85,27 @@ def store(tmp_path) -> Store:
     return s
 
 
-@pytest.fixture
-def embedder(monkeypatch) -> StubEmbedder:
-    stub = StubEmbedder()
-    monkeypatch.setattr("aggregator.mcp._get_embedder", lambda: stub)
-    return stub
-
-
-# --- 1. a dropped arm does not make a matching arm "unavailable" -------------
+# --- 1. a filter that emptied the page is named as the reason ---------------
 
 
 @pytest.fixture
-def one_arm_down(store, embedder, monkeypatch) -> Store:
-    """The records arm runs and matches; the observations arm falls over.
-
-    ``from:2030-01-01`` then empties the page, so the request carries both
-    facts at once — an arm that failed, and an arm that matched rows a filter
-    removed — which is the pair the hedge used to report as one.
-    """
+def filtered_out(store) -> Store:
+    """Both arms run and match; ``from:2030-01-01`` then empties the page."""
     store.upsert([_rec("github:hit", "fix bug in the parser")])
     store.upsert_entities([_sess("s1"), _obs("o1", "fix bug in the parser")])
-    vec = StubEmbedder().embed_documents(["fix bug in the parser"])
-    store.upsert_vec_observations([("o1", vec[0])])
-    store.mark_embedded("observations", ["o1"], state="ok")
-
-    def boom(_text):
-        raise sqlite3.OperationalError("simulated FTS5 failure, sessions side")
-
-    monkeypatch.setattr(store, "_fts_obs_ids", boom)
     return store
 
 
-def test_a_matching_keyword_arm_is_never_reported_as_the_arm_that_did_not_run(
-    one_arm_down,
-):
-    """THE CONTRADICTION, on one page: the diagnosis says the keyword arm
-    matched a row, and the hedge beside it said only the semantic arm ran."""
-    result = aggregator_query(dsl="from:2030-01-01 fix bug", _store=one_arm_down)
+def test_the_hedge_reports_the_filter(filtered_out):
+    """The page is empty, and WHY is the whole point of the hedge: the words
+    matched, and a filter removed every matching row."""
+    result = aggregator_query(dsl="from:2030-01-01 fix bug", _store=filtered_out)
     assert result["ok"] is True and result["total"] == 0, result
-    notice = result["notice"]
-    reason = result["low_confidence_reason"]
-    assert "matched 1 row(s)" in notice, notice
-    assert "the only one that ran" not in reason, reason
-    assert "the only one that ran" not in notice, notice
-
-
-def test_and_the_hedge_reports_the_filter_instead(one_arm_down):
-    """Replacing the false sentence with silence would be its own regression:
-    the page is still empty, and WHY is the whole point of the hedge."""
-    result = aggregator_query(dsl="from:2030-01-01 fix bug", _store=one_arm_down)
     reason = result["low_confidence_reason"]
     assert result["low_confidence"] is True
     assert "matched 1 row(s)" in reason, reason
     assert "FILTER" in reason, reason
-
-
-def test_the_dropped_arm_is_still_disclosed(one_arm_down):
-    """And the failure does not get swallowed by the filter sentence — an arm
-    that fell over changes what a re-run may return, so it is still said."""
-    result = aggregator_query(dsl="from:2030-01-01 fix bug", _store=one_arm_down)
-    reason = result["low_confidence_reason"]
-    assert "UNAVAILABLE" in reason, reason
-    # …without the absolute claim, which the records arm's match disproves.
-    assert "has been checked against your words at all" not in reason, reason
+    assert "matched 1 row(s)" in result["notice"], result["notice"]
 
 
 # --- 2. more than one filter gets no single-key promise ----------------------

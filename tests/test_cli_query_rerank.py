@@ -8,11 +8,11 @@ non-interactive entry point, the CLI, had no flag at all. So the measured
 advice named a place to use the feature that did not exist.
 
 AND IT MUST NOT DEGRADE QUIETLY. ``_maybe_rerank`` still catches a rerank
-failure and returns the page in its fused order, which is right for the MCP
+failure and returns the page in its recency order, which is right for the MCP
 tool — a lost ordering should not cost a caller their answer. It no longer
 does so in silence: since ``04acf86`` the response carries ``rerank_applied:
 False`` and leads with a ``notice`` naming the exception and pointing at
-``aggregator embed --seed-models``, and this command prints that notice.
+``aggregator seed-reranker``, and this command prints that notice.
 
 On a command whose ONLY purpose is to rerank, reporting after the fact is
 still the wrong trade — measured here with a reranker that loads and then
@@ -104,7 +104,7 @@ def test_a_reranker_that_cannot_load_is_loud_and_non_zero(
         f"never ran. stderr={err!r}"
     )
     assert "--rerank" in err
-    assert "seed-models" in err, (
+    assert "seed-reranker" in err, (
         f"the refusal does not name the command that fixes it: {err!r}"
     )
 

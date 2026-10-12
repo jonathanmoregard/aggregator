@@ -10,8 +10,8 @@ somebody has to make on purpose.
 WHAT IS IN IT, and why each part earns its place (research report §8):
 
 * **Identifier queries.** The corpus is saturated with symbol names, error
-  codes, PR numbers and package versions. They are also where the FTS5
-  tokenizer and the embedding model disagree most.
+  codes, PR numbers and package versions — exactly what the FTS5
+  tokenizer has to split correctly.
 * **Natural-language queries.** What the agent actually types.
 * **Negative queries** — queries this corpus genuinely cannot answer. The
   report is blunt that almost nobody includes these, and they are the ONLY way

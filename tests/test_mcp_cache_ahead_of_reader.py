@@ -9,9 +9,8 @@ not in ``mcp.py``, not in ``Store``, not at any call site.
 THAT IS THE MIRROR IMAGE OF THE INCIDENT, and it is the quieter half. A cache
 behind the reader produces a refusal on every call, which is at least a fact
 somebody can trip over. A cache ahead of the reader produces ANSWERS —
-computed against tables whose shape this build does not know, columns it will
-not select, and a vector index whose provenance it cannot evaluate. Wrong
-recall that looks like recall is worse than no recall, because nothing about it
+computed against tables whose shape this build does not know, and columns it
+will not select. Wrong recall that looks like recall is worse than no recall, because nothing about it
 prompts anyone to look.
 
 WHY THE TWO REFUSALS MUST NOT SHARE A MESSAGE. They have opposite causes and

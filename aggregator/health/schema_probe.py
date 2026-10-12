@@ -42,7 +42,7 @@ that is all this module is.
 TWO RULES THIS FILE EXISTS TO OBEY
 
 **1. Never probe by running the thing under test.** ``cli.py``'s ``main()``
-calls ``store.migrate()`` for every subcommand except ``embed``, and
+calls ``store.migrate()`` for every subcommand that opens the cache, and
 ``migrate()`` writes ``user_version``. So ``aggregator status`` — the obvious
 probe, and the command the MCP's own remediation string still recommends — is
 a WRITE that re-stamps the cache at the prober's version. Probing with it from
@@ -1053,7 +1053,7 @@ def probe(
                 # case-insensitivity is load-bearing there, because the injection
                 # shape it exists to catch is an interpolated lowercase
                 # ``{table} match '{q}'`` — and requires each one to be classified
-                # as an FTS5 site, a vector site, or declared prose. This module
+                # as an FTS5 site or declared prose. This module
                 # contains no SQL beyond a read-only PRAGMA, so the honest fix is
                 # to not use the word rather than to grow a set that file freezes
                 # on purpose.
@@ -1081,9 +1081,9 @@ def probe(
                     f"{target} — bump nixos-config's `aggregator-src` input "
                     "past the schema bump and rebuild — then let one ingest tick "
                     "re-stamp the cache. Do NOT run `aggregator status` to "
-                    "investigate: every subcommand but `embed` calls migrate(), "
-                    "which re-stamps the cache at the OLD version and destroys the "
-                    "evidence.",
+                    "investigate: every subcommand that opens the cache calls "
+                    "migrate(), which re-stamps the cache at the OLD version and "
+                    "destroys the evidence.",
                 )
             )
         elif cache_version > reader_version:

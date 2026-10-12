@@ -52,9 +52,8 @@ What bounds the model path itself:
   irrelevant: the server is a stdio child of the editor and INHERITS the
   environment of the shell that launched it, and ``downloads_allowed()``
   reads nothing else. One leftover export — from following our own
-  ``aggregator embed --seed-models`` remediation, say — and the claim was
-  false. ``_downloads_denied`` now removes the variable across both model
-  constructions.
+  ``aggregator seed-reranker`` remediation, say — and the claim was false.
+  ``_downloads_denied`` removes the variable across the model construction.
 
 Availability, not code execution, is the realistic failure here — the same
 shape as the page-token decompression bomb fixed above, arrived at
@@ -123,7 +122,6 @@ import os
 import re
 import shutil
 import sqlite3
-import zlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
@@ -131,21 +129,15 @@ from typing import Any
 from fastmcp import FastMCP
 
 from aggregator.core.dsl import DSLError, format_help, parse
-
-# NOT imported here: ``aggregator.core.embed`` / ``aggregator.core.rerank``.
-# Both pull sentence-transformers, and this module is imported by an MCP
-# server the editor starts on demand, so a module-scope import would put a
-# multi-second model-stack load on the cold start of every session — including
-# the ones that never run a vector query. They are imported inside
-# ``_get_embedder`` / ``_get_reranker``; ``tests/test_mcp_cold_start.py``
-# fails if that ever regresses. ``hybrid`` is pure Python and free.
-from aggregator.core.hybrid import (
-    FUSION_ARM_DEPTH,
-    has_standout,
-    rrf_fuse,
-    vector_floor,
-)
 from aggregator.core.provenance import MACHINE_VALUES
+
+# NOT imported here: ``aggregator.core.rerank``. It pulls
+# sentence-transformers, and this module is imported by an MCP server the
+# editor starts on demand, so a module-scope import would put a multi-second
+# model-stack load on the cold start of every session. It is imported inside
+# ``_get_reranker``; ``tests/test_mcp_cold_start.py`` fails if that ever
+# regresses. ``standout`` is pure Python and free.
+from aggregator.core.standout import has_standout
 from aggregator.core.store import (
     CHAT_ORIGINS,
     LEXICAL_RELAX_OR,
@@ -153,7 +145,6 @@ from aggregator.core.store import (
     SCHEMA_VERSION,
     LexicalProbe,
     Store,
-    VectorIndexUnavailableError,
     fts5_match_conjuncts,
     fts5_query_terms,
 )
@@ -173,25 +164,6 @@ _BACKEND_TOKEN_FILE_ENV = "AGGREGATOR_MCP_BACKEND_TOKEN_FILE"
 
 _DEFAULT_PAGE_SIZE_SUMMARY = 200
 _DEFAULT_PAGE_SIZE_FULL = 40
-
-# How many neighbours the vector arm contributes per query. The FTS5 arm is
-# NOT capped — see ``_fused_id_scope`` for why that asymmetry is deliberate,
-# and note that "150 per arm" is a FLOOR, which an uncapped arm satisfies.
-#
-# READ FROM ``hybrid`` RATHER THAN DECLARED HERE. This module carried its own
-# 50 while ``aggregator.evals.search`` carried its own 150, so the pipeline
-# the eval harness measured was not the pipeline this server served, and the
-# harness could have reported a clean run over a configuration nobody uses.
-# Depth is also not a latency knob: below roughly 50 per arm RRF degenerates,
-# because too few documents appear in both lists for the cross-arm agreement
-# signal to fire at all.
-#
-# A COUNT IS NOT THE ONLY LIMIT ON THIS PATH. ``k`` bounds how many neighbours
-# the arm proposes; ``hybrid.vector_floor``, applied in ``_fused_id_scope``,
-# decides how many of them are close enough to the query to be worth fusing at
-# all. Both are needed: a k-nearest search always returns k, however irrelevant
-# the k-th is.
-_VECTOR_ARM_K = FUSION_ARM_DEPTH
 
 # How many hits of a page the cross-encoder reorders when ``rerank=True``.
 # A latency budget, not a quality knob.
@@ -226,34 +198,6 @@ _VECTOR_ARM_K = FUSION_ARM_DEPTH
 # target that stays out of reach either way.
 _RERANK_WINDOW = 20
 
-# THE PAGE TOKEN IS CALLER-CONTROLLED INPUT, NOT SERVER STATE. It looks like
-# state because this server minted it, but it arrives back over MCP from
-# whatever is driving the tool, and it is decompressed before it is validated.
-# Deflate reaches ~1000:1, so an unbounded ``zlib.decompress`` here lets a
-# token the caller can type expand into the process's address space — and this
-# process is an in-process child of the user's editor, with no unit and no
-# memory cgroup to absorb it.
-#
-# The bound is DERIVED FROM THE REAL MAXIMUM, not guessed. A legitimate
-# payload is ``{kind: [ids]}`` over the two ontologies, each capped at
-# ``_VECTOR_ARM_K`` hits by the arm that produced them, so:
-#
-#   2 ontologies x _VECTOR_ARM_K ids x the longest id we mint
-#
-# The longest ids are dropbox records, whose source-specific part is a
-# filesystem path; 512 chars is generously past a 255-byte NAME_MAX component
-# and past every other source's shape (``github:<owner>/<repo>:<n>``, a UUID,
-# a chunk suffix). ``test_a_maximum_legitimate_token_still_round_trips``
-# in ``tests/test_mcp_page_token_hardening.py`` packs exactly that worst case
-# and fails if it no longer fits.
-_MAX_FROZEN_ID_CHARS = 512
-_MAX_FROZEN_PAYLOAD_BYTES = 2 * _VECTOR_ARM_K * (_MAX_FROZEN_ID_CHARS + 8) + 256
-# The same budget measured on the wire. Deflate never expands incompressible
-# input by more than ~0.03% + 11 bytes, and base64 is 4/3, so this is a sound
-# ceiling on a legitimate token and lets an over-long one be rejected BEFORE
-# it is base64-decoded — a 50 MB argument must not first cost a 37 MB decode.
-_MAX_FROZEN_PAYLOAD_B64_CHARS = ((_MAX_FROZEN_PAYLOAD_BYTES + 1024) * 4) // 3
-
 # Bytes of query fingerprint carried in every page token. See
 # ``_query_fingerprint`` for what goes into it and why.
 #
@@ -261,8 +205,7 @@ _MAX_FROZEN_PAYLOAD_B64_CHARS = ((_MAX_FROZEN_PAYLOAD_BYTES + 1024) * 4) // 3
 # fingerprint stops a caller ACCIDENTALLY reusing a token against a changed
 # query; it cannot stop a caller that hand-builds one, and nothing can — the
 # offset field has always been type-able. What it must do is be small: it
-# rides in the token's head on every page, including the FTS5-only tokens
-# that carry no payload at all, so it is 12 base64 characters and no more.
+# rides in every token, so it is 12 base64 characters and no more.
 _FINGERPRINT_BYTES = 9
 
 # Exposed MCP tool names. The search tool deliberately carries "search" and
@@ -301,11 +244,8 @@ and before reading the auto-memory directory. Both of those are strict \
 subsets of what this indexes.
 
 Call `aggregator_capabilities` for the live source inventory and DSL filter \
-keys, and `aggregator_capabilities(embedding_coverage=True)` before reporting \
-that something is NOT in the user's history: the semantic arm is being filled \
-one source at a time over weeks, and a source it has not reached yet is \
-searchable by keyword only. Nothing on this surface writes: \
-`aggregator_ingest` only prints the CLI command a human must run.
+keys. Nothing on this surface writes: `aggregator_ingest` only prints the CLI \
+command a human must run.
 
 `type:` IS A TRANSPORT ROLE, NOT AN AUTHORSHIP CLAIM. `type:user` means the \
 line arrived on the user channel; measured, 59% of those were composed by a \
@@ -513,8 +453,8 @@ def _ahead_cache_response(cache_version: int) -> dict[str, Any]:
     AND IT IS THE FAILURE THAT HIDES BEST. A cache behind the reader refuses
     every call, which is at least an event somebody trips over. A cache ahead
     of the reader ANSWERS: rows selected out of tables whose shape this build
-    has no description of, columns it does not know to read, and a vector index
-    whose provenance it cannot evaluate. Recall that is wrong but looks like
+    has no description of, and columns it does not know to read. Recall that
+    is wrong but looks like
     recall is worse than recall that is dead, because nothing about it prompts
     anyone to look.
 
@@ -629,27 +569,8 @@ def _ensure_cache_ready(store: Store) -> dict[str, Any] | None:
     return None
 
 
-# --- hybrid retrieval -------------------------------------------------------
-#
-# THE DECISION LIVES IN ``_vector_arm_engaged`` AND NOWHERE ELSE. Three
-# routing paths (records, sessions, union) plus the drilldown variant all ask
-# the same function the same question, so "when does hybrid run" is one
-# readable predicate rather than a condition copied four times and drifting.
+# --- reranker + miss log ---------------------------------------------------
 
-#: Which arms answer a free-text query. ``hybrid`` is the default and the only
-#: one an ordinary caller should use.
-#:
-#: THE OTHER TWO ARE A CORRECTNESS TOOL, NOT A CONVENIENCE. Rank fusion has a
-#: weakest-link failure the fused answer cannot show you: fusing a strong arm
-#: with a weak one can score WORSE than the strong arm alone (measured on
-#: TOUCHE at 0.650 nDCG@10 lexical-alone against 0.604 fused), because a weak
-#: arm's rank-1 document collects the full ``1/(k+1)`` credit whether or not it
-#: is relevant — and neither more depth nor a heavier reranker repairs it. The
-#: only way to see that condition is to run each arm on its own, against the
-#: same query, and compare. Without these modes it is undiagnosable.
-_SEARCH_MODES = ("hybrid", "lexical", "vector")
-
-_embedder: object | None = None
 _reranker: object | None = None
 
 #: The zero-result log's open connection, and the cache it belongs to.
@@ -666,59 +587,33 @@ _miss_log: object | None = None
 _miss_log_path: object | None = None
 
 
-class _VectorModeUnavailableError(RuntimeError):
-    """``search_mode='vector'`` was asked for and the vector arm cannot run.
-
-    RAISED RATHER THAN DEGRADED, which inverts this module's rule everywhere
-    else. The default path falls back to FTS5 whenever the vector arm is
-    missing, and that is right for a user who would rather have keyword results
-    than an error. It is wrong here: the whole point of the mode is to attribute
-    an answer to one arm, so quietly answering from the other one files the
-    keyword arm's rows under "vector" and makes a broken vector index look like
-    a working one. That is the empty-result-looks-like-success shape, arrived at
-    by being helpful.
-
-    Carries its own remediation text because the causes are different problems
-    with different fixes — nothing embedded yet, no extension, a dead model —
-    and a single generic message would send the operator to the wrong one.
-    """
-
-    def __init__(self, reason: str, remediation: str):
-        super().__init__(reason)
-        self.reason = reason
-        self.remediation = remediation
-
-
 @contextlib.contextmanager
 def _downloads_denied() -> Iterator[None]:
     """Make "the MCP path never downloads weights" true, rather than claimed.
 
-    THIS PROCESS INHERITS THE USER'S SHELL. It is a stdio child of the editor,
-    registered bare — no systemd unit, no ``Environment=``, no
-    ``HF_HUB_OFFLINE``. ``downloads_allowed()`` reads ``os.environ`` and
-    nothing else, so the offline property depended entirely on
+    THIS PROCESS INHERITS THE USER'S SHELL. ``downloads_allowed()`` reads
+    ``os.environ`` and nothing else, so the offline property depends on
     ``AGGREGATOR_ALLOW_MODEL_DOWNLOAD`` not being exported in whichever shell
-    launched the editor — while this project's own remediation text tells the
-    operator to export exactly that to seed the models. One leftover export
+    launched the server — while this project's own remediation text tells the
+    operator to export exactly that to seed the reranker. One leftover export
     and a single ``rerank=True`` query fetches ~1.2 GB from the hub, in the
-    editor's process, from a tool that advertises ``openWorldHint=False``.
+    server's process, from a tool that advertises ``openWorldHint=False``.
 
     REMOVED, NOT MATCHED. Deleting the variable defers to
     ``downloads_allowed``'s own parsing of it instead of re-implementing the
     accepted spellings here, so the two cannot drift apart.
 
-    SCOPED TO THE CONSTRUCTION, AND RESTORED AFTER. Both loaders resolve their
-    weights eagerly in ``__init__``, so that window is the only moment either
+    SCOPED TO THE CONSTRUCTION, AND RESTORED AFTER. The loader resolves its
+    weights eagerly in ``__init__``, so that window is the only moment it
     consults the flag. Clearing it process-wide would be simpler and wrong:
-    ``aggregator embed --seed-models`` is the one sanctioned downloader, it
-    runs in an interpreter that has imported this module (the CLI borrows
+    ``aggregator seed-reranker`` is the one sanctioned downloader, it runs in
+    an interpreter that has imported this module (the CLI borrows
     ``_get_reranker``), and disarming it would leave no supported way to
     obtain the weights at all.
 
-    The import is deferred for the same reason every other model-side import
-    in this module is — see ``_get_embedder``.
+    The import is deferred for the same reason as in ``_get_reranker``.
     """
-    from aggregator.core.embed import MODEL_DOWNLOAD_ENV
+    from aggregator.core.rerank import MODEL_DOWNLOAD_ENV
 
     prior = os.environ.pop(MODEL_DOWNLOAD_ENV, None)
     try:
@@ -728,29 +623,14 @@ def _downloads_denied() -> Iterator[None]:
             os.environ[MODEL_DOWNLOAD_ENV] = prior
 
 
-def _get_embedder() -> object:
-    """Lazy singleton for the query embedder.
-
-    The import is INSIDE the function on purpose. ``aggregator.mcp`` is
-    imported by an MCP server the editor starts on demand, so anything at
-    module scope is paid by every session — including the overwhelming
-    majority that never run a vector query. Guarded by
-    ``tests/test_mcp_cold_start.py``.
-    """
-    global _embedder
-    if _embedder is None:
-        with _downloads_denied():
-            from aggregator.core.embed import Embedder
-
-            _embedder = Embedder()
-    return _embedder
-
-
 def _get_reranker() -> object:
     """Lazy singleton for the cross-encoder — only ever built on ``rerank=True``.
 
     Costs roughly 2 GB RSS, so a caller who never opts in must not pay even
-    the import. Same discipline and same guard as ``_get_embedder``.
+    the import. The import is INSIDE the function on purpose: ``aggregator.mcp``
+    is imported by an MCP server the editor starts on demand, so anything at
+    module scope is paid by every session. Guarded by
+    ``tests/test_mcp_cold_start.py``.
 
     THIS IS THE ONE PLACE THAT PUTS TORCH IN AN UNSANDBOXED PROCESS. See
     "KNOWN, ACCEPTED EXPOSURE" in the module docstring for what that means and
@@ -767,7 +647,7 @@ def _get_reranker() -> object:
     return _reranker
 
 
-def _log_search_miss(store: Store, query_text: str, search_mode: str) -> str | None:
+def _log_search_miss(store: Store, query_text: str) -> str | None:
     """Record a query that came back with nothing. Returns a notice, or ``None``.
 
     THE LOOP THIS CLOSES. The eval harness can only measure queries somebody
@@ -786,10 +666,8 @@ def _log_search_miss(store: Store, query_text: str, search_mode: str) -> str | N
     database on disk. Two written contracts said otherwise: the design spec's
     §Security ("MCP has no write tools in v1. Not now, not 'just in case.'
     Adding any later requires a documented human-approve gate + a separate
-    credential") and the RAG design's "Read-only MCP invariant preserved: the
-    MCP surface never calls embed writes. The embed worker runs from the CLI
-    path exclusively." The behaviour moved to match them, by the same rule the
-    embed worker already follows. ``readOnlyHint`` is what a client consults
+    credential"). The behaviour moved to match it. ``readOnlyHint`` is what a
+    client consults
     to decide what may run unattended, so it has to be true, and the loop
     loses nothing that matters: ``aggregator query`` is the Raycast target and
     the human's own recall surface, and a question a PERSON asked and got
@@ -806,7 +684,7 @@ def _log_search_miss(store: Store, query_text: str, search_mode: str) -> str | N
     A SEPARATE DATABASE, BESIDE THE CACHE BEING SERVED. Never inside
     ``cache.db`` — the eval store refuses that name outright — because the
     harness must not migrate the artifact it measures, and a baseline has to
-    outlive a re-ingest, a vector rebuild and a model swap. Deriving the
+    outlive a re-ingest. Deriving the
     location from ``store.db_path`` rather than from ``$XDG_DATA_HOME`` makes
     it the same file ``evals.db.default_eval_db_path`` resolves whenever the
     real cache is being served, while a scratch or test cache gets its own
@@ -833,7 +711,7 @@ def _log_search_miss(store: Store, query_text: str, search_mode: str) -> str | N
                     _miss_log.close()
             _miss_log = EvalStore(path)
             _miss_log_path = path
-        _miss_log.record_search_miss(query_text, mode=search_mode)
+        _miss_log.record_search_miss(query_text, mode="lexical")
     except Exception as e:  # noqa: BLE001 — bookkeeping never costs the answer
         _miss_log, _miss_log_path = None, None
         log.exception("could not log the zero-result query %r", query_text)
@@ -847,677 +725,23 @@ def _log_search_miss(store: Store, query_text: str, search_mode: str) -> str | N
     return None
 
 
-def _strip_chunk_suffix(doc_id: str) -> str | None:
-    """Base id for a ``<id>:<n>`` chunk id, or ``None`` if it isn't one.
-
-    Only ever a GUESS, which is why callers keep both readings. The embed
-    worker suffixes a row's vectors ``<id>:0``, ``<id>:1`` … but ONLY when the
-    body needed more than one chunk, and ``stable_id_for`` mints record ids
-    shaped ``github:<owner>/<repo>:<number>`` that already end in
-    ``:<digits>``. So ``github:acme/api:42`` is indistinguishable, by shape,
-    from chunk 42 of ``github:acme/api``. Choosing either reading loses rows.
-    """
-    base, sep, tail = doc_id.rpartition(":")
-    if sep and base and tail.isdigit():
-        return base
-    return None
-
-
-def _widen_chunk_ids(vec_ids: list[str]) -> list[str]:
-    """Both readings of every vector hit, order preserved, deduplicated.
-
-    Resolves the ambiguity in ``_strip_chunk_suffix`` by refusing to resolve
-    it: emit the raw id AND the de-suffixed candidate, and let the SQL
-    ``IN`` filter decide. The wrong reading matches no row, which costs one
-    unused host parameter; guessing wrong would instead cost the row.
-    """
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in vec_ids:
-        for candidate in (raw, _strip_chunk_suffix(raw)):
-            if candidate and candidate not in seen:
-                seen.add(candidate)
-                out.append(candidate)
-    return out
-
-
-def _vector_arm_engaged(
-    store: Store,
-    kind: str,
-    ast: QueryAST,
-    pinned: bool | None,
-    search_mode: str = "hybrid",
-) -> bool:
-    """The single hybrid-vs-FTS5 decision, for every path.
-
-    Four inputs, in priority order:
-
-    0. **``search_mode='lexical'`` → never.** The caller is excluding this arm
-       deliberately, so nothing below may re-enable it.
-    1. **No free text → never.** A pure-filter query (``source:``, ``from:``,
-       ``session:``) has nothing to embed, so it must not construct the model
-       or touch the vector tables.
-    2. **A page token pins the arm.** A continuation reproduces whichever arm
-       minted the page the caller is continuing — see ``_parse_page_token``.
-    3. **Otherwise, is there anything to search?** An empty vector index means
-       the pre-v5 FTS5 path, unchanged and with no model loaded. A missing
-       extension answers the same way.
-
-    Step 3 asks ``has_embedded_rows`` and NOT ``count_vec_rows``: the exact
-    count is a linear scan of the vec0 table (~70 ms at the live cache's 400k
-    vectors) and this runs on every text query. See the store method.
-
-    ``search_mode='vector'`` DOES NOT SHORT-CIRCUIT HERE. It still has to pass
-    steps 1-3, because "the caller wants only the vector arm" and "the vector
-    arm can run" are different questions and the second one is this function's.
-    The refusal is raised by ``_apply_hybrid``, where the reason is known.
-    """
-    if search_mode == "lexical":
-        return False
-    if not ast.text:
-        return False
-    if pinned is not None:
-        return pinned
-    try:
-        return store.has_embedded_rows(kind)
-    except VectorIndexUnavailableError:
-        return False
-
-
-def _query_embedding(text: str) -> object | None:
-    """Embed the query once, or ``None`` if the model cannot answer.
-
-    Separated from the KNN lookup so the union path — which drives two
-    ontologies from one query string — pays for one embedding rather than
-    two. Returning ``None`` rather than raising keeps the degrade-to-FTS5
-    decision in one place.
-    """
-    try:
-        return _get_embedder().embed_query(text)
-    except Exception as e:  # noqa: BLE001 — the vector arm degrades, never fails
-        # Free by the time anything raised: the embedder module is imported by
-        # the construction attempt that got us here.
-        from aggregator.core.embed import EmbedServerError
-
-        if isinstance(e, EmbedServerError):
-            # A stopped embed server is a STATE, not a bug — offline-AI mode
-            # holds it stopped for hours — so one line per query, not a
-            # traceback per query burying whatever else the log says.
-            log.warning("query embedding unavailable, answering from FTS5 alone: %s", e)
-        else:
-            log.exception("query embedding failed; answering from FTS5 alone")
-        return None
-
-
-def _fused_id_scope(
-    store: Store,
-    kind: str,
-    text: str,
-    embedding: object,
-    frozen: list[str] | None = None,
-    search_mode: str = "hybrid",
-    lexical_ast: QueryAST | None = None,
-) -> tuple[frozenset[str] | None, list[str], frozenset[str] | None]:
-    """RRF-fuse the two arms into a candidate id set, or ``None`` for FTS5-only.
-
-    THE FTS5 ARM IS PASSED IN WHOLE AND THE VECTOR ARM IS CAPPED AT
-    ``_VECTOR_ARM_K``. That asymmetry is the point. Truncating the keyword arm
-    to a top-K — the obvious symmetric thing to do — would make a warm vector
-    index REMOVE keyword matches that the same query returned yesterday, and
-    "search got smarter and stopped finding the thing I know is in there" is
-    the one failure that ends a recall tool's usefulness. Fusing an uncapped
-    arm with a capped one keeps the result a strict superset of FTS5's.
-
-    ``None`` means "the vector arm contributed nothing" — no extension, no
-    model, no neighbours, or a failure — and the caller then leaves the AST
-    alone so the query runs down the untouched pre-v5 path. Degrading is
-    always to FTS5 and never to an error: ``VectorIndexUnavailableError`` must
-    not reach the tool boundary.
-
-    RETURNS A SET, AND THE RRF RANKING IS DELIBERATELY DISCARDED — say so
-    plainly, because calling ``rrf_fuse`` and dropping its ordering looks like
-    a bug until you know why. The store orders results by recency, and that
-    ordering is what the page token addresses; re-sorting the stream by
-    relevance would change what "page 2" means and silently invalidate every
-    token already handed out. So fusion decides MEMBERSHIP — which rows are
-    candidates — and ordering stays the caller's existing contract.
-    Relevance ordering is available, opt-in and bounded, via ``rerank=True``.
-
-    THE PER-ARM DISTANCE FLOOR IS APPLIED HERE, and this is its only caller.
-    ``hybrid.vector_floor`` drops neighbours further from the query than
-    ``VECTOR_FLOOR_MAX_DISTANCE``, before fusion and never on the fused score —
-    an RRF score has no absolute meaning across queries, so thresholding it
-    would be thresholding a number that does not mean anything. It runs before
-    ``vec_hits`` is returned for the page token to freeze, so a continuation is
-    cut from the same set as page 1, and it can only ever remove vector-ONLY
-    candidates: when it empties the arm this returns ``None`` and the query
-    falls through to the untouched FTS5 path.
-
-    ``search_mode='vector'`` DROPS THE KEYWORD ARM from the fusion rather than
-    skipping the fusion: ``rrf_fuse`` over one arm is that arm's own ranking,
-    so there is no second code path to keep in step with this one.
-
-    Returns ``(scope, vec_hits, lexical_ids)``. ``vec_hits`` is what the
-    page token freezes: hand it back as ``frozen`` on a continuation and the
-    KNN is not re-run at all, so the candidate set cannot move while the caller
-    pages through it.
-
-    ``lexical_ids`` IS THE KEYWORD ARM'S ID SET AND NOT A BOOLEAN, and that is
-    the fix for a hedge that read the corpus while claiming to describe a page.
-    ``bool(fts_ids)`` cannot answer the question ``_note_confidence`` asks,
-    because the fused scope is a strict SUPERSET of ``fts_ids`` — so "the
-    keyword arm corroborated none of the candidate set" is only ever true when
-    the arm matched nothing anywhere, and a page of vector-only rows served
-    while the arm matched 13,650 rows elsewhere reported full confidence. The
-    ids let the caller ask about the rows it is actually returning.
-
-    THREE STATES AND NOT TWO, and the third is why
-    :data:`LEXICAL_ARM_UNAVAILABLE` exists: an empty ``frozenset()`` means the
-    keyword arm ran and matched nothing, the singleton means it never ran, and
-    conflating them makes the response tell the agent that its words were
-    checked against these rows when they were not.
-
-    ``None`` means the vector arm contributed nothing, so the query answers
-    down the FTS5-only route: every row it returns IS a keyword match, and
-    there is no id set to compare against. That is a different fact from an
-    empty ``frozenset()``, which means the keyword arm ran and matched nothing.
-    """
-    floored_out = 0
-    if frozen is not None:
-        vec_hits = frozen
-    else:
-        try:
-            scored = (
-                store._vec_obs_scored(embedding, _VECTOR_ARM_K)
-                if kind == "observations"
-                else store._vec_record_scored(embedding, _VECTOR_ARM_K)
-            )
-        except VectorIndexUnavailableError as e:
-            log.info(
-                "vector arm unavailable for %r; answering from FTS5 alone", kind
-            )
-            if search_mode == "vector":
-                raise _VectorModeUnavailableError(
-                    f"search_mode='vector' cannot run: the vector index is "
-                    f"unavailable for {kind!r} ({e})",
-                    "Run `aggregator embed --catchup --source both` to build "
-                    "the vector index, or re-run this query with "
-                    "search_mode='lexical' (or the default 'hybrid') to answer "
-                    "it from the keyword arm. Answering a vector-mode query "
-                    "from FTS5 would report the keyword arm's rows as the "
-                    "vector arm's.",
-                ) from e
-            return None, [], None
-        except Exception as e:  # noqa: BLE001 — the arm degrades, never fails
-            log.exception(
-                "vector arm failed for %r; answering from FTS5 alone", kind
-            )
-            if search_mode == "vector":
-                raise _VectorModeUnavailableError(
-                    f"search_mode='vector' cannot run: the vector arm failed "
-                    f"for {kind!r} ({type(e).__name__}: {e})",
-                    "Check the cache with `aggregator status`, then re-run "
-                    "this query with search_mode='hybrid' to answer it from "
-                    "the keyword arm meanwhile.",
-                ) from e
-            return None, [], None
-        # CRITERION D, ON THE DEFAULT PATH. The floor runs here and nowhere
-        # else: before fusion, on the one arm whose scores mean something
-        # relative to each other, and never on the fused RRF score.
-        #
-        # BEFORE THE FREEZE, NOT AFTER. ``vec_hits`` is what the page token
-        # carries, so filtering after it was frozen would apply the floor to
-        # page 1 and to no other page of the same query.
-        vec_hits = vector_floor(scored)
-        floored_out = len(scored) - len(vec_hits)
-        if floored_out:
-            log.debug(
-                "vector floor dropped %d/%d neighbours for %r",
-                floored_out, len(scored), kind,
-            )
-    vec_ids = _widen_chunk_ids(vec_hits)
-    if not vec_ids:
-        if search_mode == "vector":
-            # NAME WHICH OF THE TWO HAPPENED. "nothing is embedded" and "the
-            # neighbours were all too far away" have opposite remedies —
-            # waiting for the backfill fixes one and cannot touch the other —
-            # and a diagnostic mode that conflated them would send an operator
-            # to run a 25-30 day job against a query that abstained on purpose.
-            raise _VectorModeUnavailableError(
-                f"search_mode='vector' returned no candidates for {kind!r}: "
-                + (
-                    f"the vector arm's {floored_out} nearest neighbours were "
-                    "all too far from this query to clear the per-arm distance "
-                    "floor, so it abstained"
-                    if floored_out
-                    else "the vector index holds nothing this query can reach"
-                ),
-                (
-                    "The index answered; nothing in it was close enough. Try "
-                    "different wording, or run the same query with the default "
-                    "search_mode='hybrid' to see what the keyword arm finds."
-                    if floored_out
-                    else "Run `aggregator embed --catchup --source both` and "
-                    "check `aggregator status` for how much of the corpus is "
-                    "embedded. A partially embedded corpus answers vector-mode "
-                    "queries from the fraction that is done, and an empty one "
-                    "cannot answer them at all."
-                ),
-            )
-        return None, [], None
-    lexical_ids: frozenset[str] = frozenset()
-    try:
-        fts_ids = (
-            [] if search_mode == "vector"
-            # ``_scoped_obs_ids`` and not ``_fts_obs_ids``: the keyword arm of a
-            # ``scope:session`` query has to be the widened one, or the fused
-            # scope would be narrower than the FTS5-only route returns for the
-            # same query — the "search got smarter and stopped finding it"
-            # failure this function's own docstring refuses.
-            else store._scoped_obs_ids(lexical_ast or QueryAST(text=text))
-            if kind == "observations"
-            else sorted(store._fts_ids(text))
-        )
-        lexical_ids = frozenset(fts_ids)
-    except sqlite3.OperationalError:
-        # NOT SURFACED ANYWHERE ELSE, AND IT IS A NARROW RACE. The probe in
-        # ``aggregator_query`` runs the same statement, so in practice it fails
-        # first and the query never reaches here — but "in practice" is a lock
-        # that has to still be held a few milliseconds later, and if it was
-        # released in between then this is the only place the caller learns the
-        # keyword arm dropped out. Being rare is exactly why it must not lie
-        # when it happens: a path nobody watches is a path nobody debugs.
-        #
-        # ``LEXICAL_ARM_UNAVAILABLE`` AND NOT ``frozenset()``. Both make the
-        # fusion below behave identically — the arm contributes no ids either
-        # way, which is correct — but only one of them can still say, three
-        # layers up in ``_note_confidence``, that these rows were never checked
-        # against the caller's words. The plain empty set was read as "the
-        # keyword arm matched none of these rows", which is a claim about the
-        # documents made out of a failure of the index.
-        log.warning(
-            "keyword arm failed for %r after a healthy probe; answering from "
-            "the vector arm alone", kind, exc_info=True,
-        )
-        fts_ids = []
-        lexical_ids = LEXICAL_ARM_UNAVAILABLE
-    scope = frozenset(doc_id for doc_id, _ in rrf_fuse(fts_ids, vec_ids))
-    return scope, list(vec_hits), lexical_ids
-
-
-def _apply_hybrid(
-    store: Store,
-    kind: str,
-    ast: QueryAST,
-    pinned: bool | None,
-    embedding: object | None = None,
-    frozen: list[str] | None = None,
-    search_mode: str = "hybrid",
-) -> tuple[QueryAST, bool, list[str], frozenset[str] | None]:
-    """Return ``(ast, engaged, vec_hits, lexical_ids)``.
-
-    When the vector arm engages, the free text is replaced by the fused id
-    set: the arms have already been evaluated and RRF has already merged them,
-    so re-running FTS5 underneath would only narrow the union back down.
-    ``engaged`` is what the page token records, and ``vec_hits`` is what it
-    freezes.
-
-    ``embedding`` lets a caller driving two ontologies from one query string
-    supply the vector it already computed. Omitted, it is computed here — and
-    NOT computed at all when ``frozen`` already supplies the hits, which makes
-    a continuation both cheaper and, more importantly, stable.
-
-    ``lexical_ids`` is the set of ids the keyword arm matched, or ``None`` on
-    the FTS5-only route — that route IS the keyword arm, so every row it
-    returns is a keyword match and there is nothing to compare against. See
-    ``_fused_id_scope`` for why this is an id set rather than the boolean it
-    used to be.
-
-    Raises ``_VectorModeUnavailableError`` under ``search_mode='vector'`` whenever
-    the arm cannot run. Every other mode degrades to FTS5 in silence, which is
-    the correct trade for a user and the wrong one for a diagnosis.
-    """
-    if not _vector_arm_engaged(store, kind, ast, pinned, search_mode):
-        if search_mode == "vector":
-            raise _VectorModeUnavailableError(
-                f"search_mode='vector' cannot run for {kind!r}: "
-                + (
-                    "this query has no free text to embed"
-                    if not ast.text
-                    else "nothing in this ontology is embedded yet"
-                ),
-                "The vector arm needs free text AND an embedded corpus. Add "
-                "search terms, or run `aggregator embed --catchup --source "
-                "both` and check `aggregator status` for per-source progress. "
-                "Re-run with the default search_mode='hybrid' to answer from "
-                "the keyword arm meanwhile.",
-            )
-        return ast, False, [], None
-    if frozen is None:
-        if embedding is None:
-            embedding = _query_embedding(ast.text or "")
-        if embedding is None:
-            if search_mode == "vector":
-                raise _VectorModeUnavailableError(
-                    "search_mode='vector' cannot run: the query could not be "
-                    "embedded, so there is no vector to search with",
-                    "Check `systemctl --user status "
-                    "aggregator-embed-server.service` (offline-AI mode stops "
-                    "it) and run `aggregator embed --seed-models` if the "
-                    "embedding model's weights are missing, then retry. "
-                    "Re-run with the "
-                    "default search_mode='hybrid' to answer from the keyword "
-                    "arm meanwhile.",
-                )
-            return ast, False, [], None
-    scope, vec_hits, lexical_ids = _fused_id_scope(
-        store, kind, ast.text or "", embedding, frozen, search_mode, ast
-    )
-    if scope is None:
-        return ast, False, [], None
-    return replace(ast, text=None, id_scope=scope), True, vec_hits, lexical_ids
-
-
-class _LexicalArmUnavailable(frozenset):
-    """The keyword arm DID NOT RUN. Not "it ran and matched nothing".
-
-    A ``frozenset`` subclass with no members, so every set operation, truth
-    test and membership check treats it exactly as ``frozenset()`` — nothing
-    downstream has to special-case it to stay correct — while ``is`` still
-    tells it apart. That combination is the point: the state has to be
-    invisible to the arithmetic and visible to the sentence.
-
-    IT EXISTS BECAUSE ``frozenset()`` ALONE ERASED A FAILURE. When
-    ``_fts_obs_ids`` raises, the fused path degrades to the vector arm and the
-    caller keeps its answer, which is right. Reporting that as an ordinary
-    empty id set was not: ``_note_confidence`` read it and told the agent "the
-    keyword arm matched none of these rows", which is false — the arm never
-    looked. An agent cannot then distinguish a corpus with no keyword match
-    from a keyword index that fell over, which is the
-    empty-result-looks-like-success failure this project bans by name, and it
-    collapses the same three-valued discipline criterion D applies everywhere
-    else: ``None`` (unaskable) is not ``False`` (asked, answered no).
-
-    AND IT CANNOT BE SPELLED ``None``, which is already taken by the FTS5-only
-    route — where every row IS a keyword match by construction and
-    :func:`_lexical_on_page` short-circuits to ``True``. Reusing it would flip a
-    dropped arm to "fully corroborated", which is worse than the bug.
-    """
-
-    __slots__ = ()
-
-
-#: The singleton. Compare with ``is``; it is equal to ``frozenset()`` and that
-#: is deliberate, so a caller that only cares about the ids stays correct.
-LEXICAL_ARM_UNAVAILABLE = _LexicalArmUnavailable()
-
-
-class _LexicalPageUnknown(frozenset):
-    """The keyword arm RAN AND MATCHED — but we could not tell what it matched
-    ON THIS PAGE. A third state, and the reason is that the sessions path asks
-    the question in two steps.
-
-    ``_fts_obs_ids`` answers "which OBSERVATIONS did the arm match", and the
-    sessions path returns CARDS, so a second FTS5 statement
-    (``_fts_hit_scope``) projects those observation hits up to session ids. Each
-    statement can fail on its own. When the FIRST one fails the arm produced
-    nothing and :data:`LEXICAL_ARM_UNAVAILABLE` is the truth. When only the
-    SECOND fails, the arm ran, and it may well have matched the very rows on
-    this page — reporting that as "the arm was unavailable" says a corpus-wide
-    thing ("nothing here has been checked against your words at all") out of a
-    projection failure, and reporting it as an empty set says the arm missed
-    rows it may have hit.
-
-    Same ``frozenset``-subclass trick as above and for the same reason: the
-    arithmetic must not see it, the sentence must.
-    """
-
-    __slots__ = ()
-
-
-#: The singleton. See :data:`LEXICAL_ARM_UNAVAILABLE` on comparing with ``is``.
-LEXICAL_PAGE_UNKNOWN = _LexicalPageUnknown()
-
-
-def _lexical_contributed(lexical_ids: frozenset[str] | None) -> bool:
-    """Did the keyword arm put any candidate into this result set?
-
-    ``None`` is the FTS5-only route, where the keyword arm produced the whole
-    answer — including when that answer is empty, because the arm still ran and
-    still is the only arm that did. :data:`LEXICAL_ARM_UNAVAILABLE` needs no
-    branch here and gets none: an arm that raised contributed nothing, so the
-    empty-set answer is already the true one.
-    """
-    return lexical_ids is None or bool(lexical_ids)
-
-
-def _lexical_arm_failed(*lexical_ids: frozenset[str] | None) -> bool:
-    """Did the keyword arm drop out for any ontology in this response?
-
-    ``any`` rather than ``all`` because the report is a warning: in union mode
-    one side's arm can fall over while the other's answers, and a response that
-    is half unchecked has to say so.
-
-    ``any`` IS NOT THE WHOLE ANSWER, AND THIS FUNCTION IS NOT WHERE THE REST OF
-    IT LIVES. Saying "an arm dropped out" is true whenever one did; saying
-    "nothing here has been checked against your words at all" is a strictly
-    stronger claim that was ALSO fired off this predicate, and in union mode it
-    was false exactly when it mattered — one ontology's arm falls over, the
-    other runs and corroborates rows on the very page being returned. The
-    strength of the sentence is chosen in :func:`_note_confidence`, from this
-    flag AND the page-scoped corroboration; see the two branches there.
-    """
-    return any(ids is LEXICAL_ARM_UNAVAILABLE for ids in lexical_ids)
-
-
-def _lexical_page_unknown(*lexical_ids: frozenset[str] | None) -> bool:
-    """Did the arm run and match, with its hits unprojectable onto this page?
-
-    Separate from :func:`_lexical_arm_failed` because the two license different
-    sentences and one of them is much stronger than the other. See
-    :class:`_LexicalPageUnknown`.
-    """
-    return any(ids is LEXICAL_PAGE_UNKNOWN for ids in lexical_ids)
-
-
-def _lexical_on_page(
-    ids_on_page: Iterable[str], lexical_ids: frozenset[str] | None
-) -> bool:
-    """Did the keyword arm match any of the rows the caller is holding?
-
-    THE QUESTION THE HEDGE CLAIMS TO ANSWER, and the corpus-wide
-    ``bool(fts_ids)`` it used to ask cannot: the fused scope is a superset of
-    the keyword arm's ids, so a page is a recency-ordered window over a set
-    where keyword-matched and vector-only rows are interleaved, and a page can
-    hold none of the former while the arm matched thousands.
-
-    ``None`` short-circuits to ``True`` — on the FTS5-only route every row is a
-    keyword match by construction, and there is no id set to test.
-
-    :data:`LEXICAL_ARM_UNAVAILABLE` gets NO branch here and answers ``False``
-    like the empty set it is, because "did the keyword arm match a row on this
-    page" is genuinely no when the arm never ran. The distinction lives one
-    layer up, where the answer becomes a SENTENCE: ``_note_confidence`` takes
-    the dropped-arm state as a separate argument and says the true thing
-    instead of this one.
-    """
-    if lexical_ids is None:
-        return True
-    return any(row_id in lexical_ids for row_id in ids_on_page)
-
-
-def _lexical_session_ids(
-    store: Store,
-    text: str | None,
-    obs_type: str | None,
-    lexical_ids: frozenset[str] | None,
-    provenance: str | None = None,
-    scope: str | None = None,
-) -> frozenset[str] | None:
-    """Project the keyword arm's OBSERVATION hits up to session-card ids.
-
-    The sessions path returns cards, not observations, so the arm's obs ids are
-    not comparable to the ``stable_id`` of a row on the page. ``_fts_hit_scope``
-    is the same helper the store itself uses to decide which cards the FTS5-only
-    route would surface, so this cannot drift from what "the keyword arm matched
-    this card" means everywhere else.
-
-    ONE EXTRA FTS5 MATCH PER PAGE, and only on the sessions path with the vector
-    arm engaged: the hybrid route replaced ``ast.text`` with the fused id scope,
-    so the store never computes this scope for itself. Paid deliberately —
-    without it the hedge on the surface an agent actually calls would still be
-    answering the corpus-wide question.
-
-    THE COST, NAMED RATHER THAN LEFT AS "ONE EXTRA MATCH". The scan is
-    CORPUS-WIDE AND UNCAPPED: it is the same statement the FTS5-only route runs,
-    so it returns every card the query matches anywhere in the cache, not just
-    the ones on this page. Measured on the live 505k-row cache, the worst of the
-    86 golden queries projects to 13,650 ids for a page showing 20. That is one
-    additional full-text scan per page of a paginated session search, and it
-    scales with the corpus rather than with the page.
-
-    A LIMIT WOULD BREAK THE THING IT PAYS FOR, which is why there is not one.
-    The question being answered is "did the keyword arm match ANY of the rows on
-    this page", and the page is a recency-ordered window over a fused scope in
-    which keyword-matched and vector-only cards are interleaved. Capping the
-    projection at N ids answers a different question — "did it match any of the
-    first N cards it happened to return" — and answers it wrongly in exactly the
-    case the hedge exists for: a page deep in the recency order whose
-    corroborating hits sort past the cap would be reported as uncorroborated,
-    which is the false-hedge mirror of the corpus-wide bug this replaced. A
-    correct optimisation is a scoped statement (project only the ids ON this
-    page) rather than a truncated one; it needs a store-side query that does not
-    exist yet, and it is not worth inventing before the vector arm has an index
-    to make this path common. Until then the honest trade is a real scan for a
-    true sentence.
-    """
-    if lexical_ids is None or lexical_ids is LEXICAL_ARM_UNAVAILABLE:
-        # Both states are about the arm rather than about its ids, and both
-        # have to survive the projection — returning a plain empty set here
-        # would re-erase exactly what ``LEXICAL_ARM_UNAVAILABLE`` exists to
-        # carry.
-        return lexical_ids
-    if not lexical_ids or not text:
-        return frozenset()
-    try:
-        # ``scope`` rides for the same reason ``obs_type`` and ``provenance``
-        # do: this projection decides which cards count as keyword-matched, and
-        # under ``scope:session`` the store surfaced cards whose conjuncts sit
-        # in different turns. Left at the default here, every one of those cards
-        # would be reported as uncorroborated on the very query that asked for
-        # them — a false hedge, which this helper exists to prevent.
-        roots, exacts = store._text_hit_scope(
-            QueryAST(
-                text=text,
-                obs_type=obs_type,
-                provenance=provenance,
-                scope=scope,
-            )
-        )
-    except sqlite3.OperationalError:
-        # The same race one statement later — AND A DIFFERENT FACT FROM THE
-        # FIRST ONE, which is why it gets its own sentinel. Reaching here means
-        # ``lexical_ids`` came back healthy and non-empty a few milliseconds
-        # ago: the arm ran, and it matched. Only the projection of those hits
-        # onto card ids failed. Returning ``LEXICAL_ARM_UNAVAILABLE`` here made
-        # the response say "nothing here has been checked against your words at
-        # all" about an arm that had just matched rows, and returning
-        # ``frozenset()`` would say it missed them. Neither is true; the true
-        # statement is that we cannot say which.
-        log.warning(
-            "keyword arm matched, but projecting its hits onto session cards "
-            "failed; reporting page corroboration as unknown rather than as "
-            "unmatched or unavailable",
-            exc_info=True,
-        )
-        return LEXICAL_PAGE_UNKNOWN
-    return frozenset(roots | exacts)
-
-
 # --- rerank -----------------------------------------------------------------
 
 
 def _note_confidence(
     result: dict[str, Any],
     query_text: str | None,
-    search_mode: str,
-    lexical_support: bool,
-    rerank_standout: bool | None = None,
-    *,
-    vector_contributed: bool,
-    lexical_contributed: bool,
-    lexical_unavailable: bool,
-    lexical_unknown: bool = False,
-    lexical_matched: int | None = None,
+    rerank_standout: bool | None,
+    lexical_matched: int | None,
 ) -> dict[str, Any]:
-    """Say which arms answered and whether the answer is trusted.
+    """Say whether the answer to a free-text query is trusted.
 
-    TWO FIELDS, TWO SCOPES, AND THEY ARE ALLOWED TO DISAGREE. This is the one
-    thing to read before changing anything here, because the surface has now
-    been wrong in both directions and the second time it was the PROSE that was
-    wrong rather than the code:
+    ONLY FOR FREE-TEXT QUERIES. A pure-filter query ran no retrieval at all,
+    so claiming confidence would assert a judgement nobody made.
 
-    * ``search_mode`` is about THIS RESULT SET — which arms put candidates into
-      the fused scope that this response is a window onto.
-    * ``low_confidence`` / ``lexical_support`` is about THIS PAGE — did the
-      keyword arm match any of the rows the caller is holding right now.
-
-    So ``{"search_mode": "hybrid", "low_confidence_reason": "the keyword arm
-    matched none of these rows"}`` is a COHERENT response, not a contradiction:
-    both arms answered the query, and this particular page happens to hold only
-    the vector arm's rows. The header of this docstring used to claim
-    ``search_mode`` "names the arms that produced THESE ROWS" — page words —
-    four lines above the paragraph deriving it from candidates, and that pair of
-    sentences is what made the response look like it was arguing with itself.
-
-    THE SCOPES ARE NOT INTERCHANGEABLE AND THE CHOICE IS NOT COSMETIC.
-    ``search_mode`` has to be result-set-scoped because it must not move while a
-    caller pages through one query: a field that said ``vector`` on page 1 and
-    ``lexical`` on page 3 would have an agent watching the retrieval mode
-    flicker and re-deciding whether to trust the answer at every page boundary.
-    ``lexical_support`` has to be page-scoped for the mirror-image reason — a
-    corpus-wide predicate can only be false when the arm matched nothing
-    anywhere, so it would never fire on the pages that need it.
-    ``tests/test_mcp_confidence_signals.py`` pins both halves.
-
-    ``search_mode`` NAMES ARMS, NOT THE MODE THE CALLER ASKED FOR. It used to
-    echo the request back, while this docstring and the tool's own said it
-    "echoes which arms answered" — so on a cold vector index a default query
-    answered by FTS5 alone came back ``{"search_mode": "hybrid"}``, telling the
-    caller only what they had already typed. That is not an edge case here: the
-    embedding backfill is a measured 25-30 days of CPU, so "indexed but not
-    embedded" is the normal state of most of this corpus for weeks at a time,
-    and an agent choosing whether to trust a semantic result has no other way to
-    find out.
-
-    The value is derived from which arms CONTRIBUTED CANDIDATES TO A RESULT SET
-    THAT RETURNED ROWS: both is ``hybrid``, the KNN alone is ``vector``, and
-    everything else is ``lexical`` — which covers the vector arm not engaging,
-    the caller excluding it, and the degenerate case where neither arm found
-    anything, since the keyword arm is the one that ran. A requested mode that
-    could not run therefore never appears in the response, which is the whole
-    point.
-
-    THE "RETURNED ROWS" HALF OF THAT IS A ROW GATE THE CALLERS APPLY, and it is
-    there because an arm can engage, retrieve, and still put nothing in front of
-    the caller — a date or type filter downstream of the fused scope removes its
-    candidates, or the ontology is empty. Naming it then claims rows that do not
-    exist; at ``total: 0`` it claimed them for an empty page. The gate was added
-    to the union path first and left off the records and sessions paths, so one
-    query shape got ``vector`` from two paths and ``lexical`` from the third.
-    All three now gate on the same thing: this ontology's result set is
-    non-empty. The gate is deliberately COARSE — it asks whether the result set
-    has rows, not which arm each surviving row came from, because per-arm
-    attribution over a result set the caller never fetched is not answerable
-    from the page. What it buys is the removal of a claim that was false on its
-    face; what it does not buy is per-row provenance, and nothing here should be
-    read as offering that.
-
-    ONLY FOR FREE-TEXT QUERIES. A pure-filter query ran no retrieval arm at
-    all, so naming the mode the caller happened to pass would describe work
-    that did not happen, and claiming confidence would assert a judgement
-    nobody made. Absence here means "no arm ran", which is a different fact
-    from any of the three modes and must not be spelled as one of them.
+    ``search_mode`` is always ``"lexical"``: free text is answered by the FTS5
+    keyword index and nothing else. The key stays in the response so its shape
+    does not change for callers that read it.
 
     ``low_confidence`` IS ALWAYS PRESENT WHEN IT APPLIES, INCLUDING WHEN IT IS
     ``False``. An absent key is unfalsifiable from the caller's side — it reads
@@ -1526,92 +750,18 @@ def _note_confidence(
     the opposite discipline from ``_note_rerank``, whose keys answer a question
     only the rerank caller asked; every free-text caller has this one.
 
-    THREE SIGNALS, AND NONE OF THEM IS THE FUSED SCORE. RRF scores are not
-    probabilities and carry no absolute meaning across queries, so thresholding
-    them is the one thing the design forbids. What is read instead:
+    TWO SIGNALS:
 
     1. **Nothing came back.** The query abstained. Reported as low confidence
-       rather than as a bare empty page, because an agent cannot otherwise tell
-       "we looked and there is nothing" from "the index is not built yet".
-
-       WHY THE EMPTY PAGE IS EMPTY IS NOT DERIVABLE FROM ``total``, and reading
-       only ``total`` is how this sentence came to contradict the notice printed
-       beside it. ``_empty_page_notice`` now diagnoses a filter-emptied page —
-       "the keyword arm matched N row(s), and this query's other filters then
-       excluded every one of them" — while this function, knowing nothing but
-       ``total == 0``, added "nothing matched this query on either arm" to the
-       very same page. One of the two is false, and it is this one: the ladder
-       had already counted the rows. ``lexical_matched`` is that count
-       (``Store.lexical_matches``, threaded from each route), and it is
-       three-valued exactly as the store reports it — ``None`` the ladder never
-       ran, ``0`` it ran and matched nothing, ``> 0`` the words are in the
-       corpus and something downstream removed their rows. Only ``> 0`` changes
-       the sentence; the other two keep the wording they had.
-    2. **The keyword arm corroborated none of THESE ROWS.** The vector arm
-       returns its ``k`` nearest neighbours whether or not any of them is
-       relevant — a recipe corpus answers a question about German stock-option
-       taxation with five recipes — so rows with no lexical support are the
-       shape a no-answer query produces. Only meaningful in ``hybrid`` mode: in
-       ``vector`` mode the caller excluded the keyword arm on purpose, and
-       repeating that back as a warning would be noise.
-
-       ``lexical_support`` IS ABOUT THE PAGE AND NOT ABOUT THE CORPUS, which is
-       the fix for a sentence that never matched its predicate. It used to be
-       ``bool(fts_ids)`` — did the uncapped keyword arm match anything, anywhere
-       — and that can only be false when the arm matched nothing at all, because
-       the fused scope contains every id the arm returned. A page is a
-       recency-ordered window over that scope, so a caller could hold twenty-one
-       rows the keyword arm never saw while the arm had matched 13,650 rows
-       elsewhere in the same result set, and be told the answer was
-       corroborated. The callers compute this over the ids they are about to
-       return, in whichever id space that page speaks (see
-       ``_lexical_on_page`` and ``_lexical_session_ids``).
-
-       AND "THE ARM MATCHED NOTHING" IS NOT "THE ARM NEVER RAN".
-       ``lexical_unavailable`` is that third state, and it REPLACES the
-       sentence above rather than joining it: when ``_fts_obs_ids`` raises, the
-       query still answers from the vector arm — correctly, a broken index must
-       cost the arm and not the answer — but saying "the keyword arm matched
-       none of these rows" then asserts something about the documents out of a
-       failure of the index, and leaves an agent unable to tell a corpus with
-       no keyword match from an FTS5 table that fell over. It is a narrow race
-       (the probe in ``aggregator_query`` runs the same statement and normally
-       fails first), which is the reason it must be honest rather than a reason
-       to let it lie: nobody watches this path, so nobody would catch it.
-
-       THERE ARE FOUR STATES, NOT THREE, AND THE FOURTH IS NOT A REFINEMENT —
-       it is the one the previous fix got wrong in the other direction:
-
-       - matched a row on this page               -> no hedge
-       - ran, matched none of these rows          -> "matched none of these rows"
-       - never ran (``lexical_unavailable``)      -> "UNAVAILABLE"
-       - ran and matched, projection failed       -> ``lexical_unknown``
-
-       The last one is the sessions path only, where answering "did the keyword
-       arm match THIS CARD" takes a second FTS5 statement (see
-       :class:`_LexicalPageUnknown`). It used to report ``UNAVAILABLE``, which
-       says the arm never ran about an arm that had just come back healthy and
-       non-empty — a corpus-wide claim manufactured out of a projection
-       failure. It gets its own sentence, and that sentence promises less than
-       either neighbour rather than more.
-
-       AND ``lexical_unavailable`` DOES NOT SPEAK FOR EVERY ONTOLOGY. In union
-       mode the flag is ``any`` over the ontologies consulted, which is right
-       for "an arm dropped out" and much too strong for "nothing here has been
-       checked against your words at all" — the sentence it used to fire. One
-       side's FTS5 can fall over while the other side runs, matches, and puts
-       corroborated rows on the very page being returned. So the STRENGTH of
-       the sentence is chosen from the flag together with ``lexical_support``
-       AND ``lexical_matched``: corroboration on this page downgrades it from
-       "nothing here" to "part of this response", and so does a ladder that
-       matched rows a filter then removed — on an empty page ``lexical_support``
-       is vacuously false, which is precisely where the absolute wording used to
-       fire beside a diagnosis reporting the arm's own match count.
-    3. **The reranker ran and found nothing that stands out.** The report's
-       preferred abstention signal, and the weakest one HERE, because the
-       cross-encoder is off by default at ~13.7 s per pair on this hardware.
-       ``None`` means it did not run or produced no scores, which is not the
-       same as "nothing was relevant" and must not be read as it.
+       rather than as a bare empty page. WHY the page is empty comes from
+       ``lexical_matched`` (``Store.lexical_matches``), three-valued exactly as
+       the store reports it — ``None`` the ladder never ran, ``0`` it ran and
+       matched nothing, ``> 0`` the words are in the corpus and a filter
+       removed their rows. Only ``> 0`` changes the sentence, and it matches
+       what ``_empty_page_notice`` prints on the same page.
+    2. **The reranker ran and found nothing that stands out.** ``None`` means
+       it did not run or produced no scores, which is not the same as "nothing
+       was relevant" and must not be read as it.
 
     NOTHING IS TRUNCATED. The page comes back whole with a flag on it. An agent
     handed a shorter page cannot distinguish a confident short answer from a
@@ -1620,104 +770,26 @@ def _note_confidence(
     """
     if not query_text:
         return result
-    result["search_mode"] = (
-        "hybrid"
-        if vector_contributed and lexical_contributed
-        else "vector"
-        if vector_contributed
-        else "lexical"
-    )
+    result["search_mode"] = "lexical"
     reasons: list[str] = []
-    if lexical_unavailable and (lexical_support or lexical_matched):
-        # Union mode: one ontology's arm fell over and another's answered. The
-        # absolute sentence below would be false about the rows on this page.
-        #
-        # ``lexical_matched`` COUNTS AS CORROBORATION EVEN WITH NO ROWS TO
-        # SHOW. On an empty page ``lexical_support`` is vacuously false — there
-        # is nothing to corroborate — so the absolute wording fired and told
-        # the caller nothing had been checked against their words, on a page
-        # whose diagnosis one sentence later said the keyword arm matched N
-        # rows and a filter removed them. An arm that matched ran.
-        corroborated = (
-            "Other rows on this page were keyword-matched normally"
-            if lexical_support
-            else "the keyword arm did run, and matched, on the source(s) it "
-            "reached"
-        )
-        reasons.append(
-            "the keyword arm was UNAVAILABLE for PART of this query — it "
-            "failed on one of the two sources searched, so those rows come "
-            "from the semantic arm alone and have not been checked against "
-            f"your words. {corroborated}, and a re-run may answer differently"
-        )
-    elif lexical_unavailable:
-        reasons.append(
-            "the keyword arm was UNAVAILABLE for this query — it failed while "
-            "running, so it contributed nothing and these rows come from the "
-            "semantic arm alone. This is NOT the same as the keyword arm "
-            "finding no match: nothing here has been checked against your "
-            "words at all, and a re-run may answer differently"
-        )
-    elif lexical_unknown:
-        reasons.append(
-            "the keyword arm ran and DID match rows for this query, but the "
-            "second lookup that maps its hits onto these session cards failed, "
-            "so whether it corroborated the rows on this page is UNKNOWN. This "
-            "is weaker than either 'corroborated' or 'not corroborated' — a "
-            "re-run may answer differently"
-        )
     if not result.get("total"):
-        # THE SAME GATE THE DIAGNOSIS USES, mirrored on purpose: see branch 2
-        # of ``_empty_page_notice`` (``search_mode != "vector" and matched``).
-        # The two sentences land on one page, so they have to be chosen from
-        # one condition — a hedge that fired on facts the diagnosis ignores
-        # would recreate the contradiction from the other side.
-        #
-        # AND THE FILTER CASE OUTRANKS THE DROPPED ARM, which is the other way
-        # round from how it was written. ``lexical_unavailable`` is ``any`` over
-        # the union's arms, so one ontology's FTS5 falling over made the page
-        # say "the semantic arm, the only one that ran" — printed directly
-        # beside "the keyword arm matched N row(s)" from the composer, about the
-        # arm that had just run and matched. Whatever failed elsewhere, an arm
-        # that matched rows is not the arm that did not run; the sentence above
-        # has already disclosed the failure, and this one says why the page is
-        # empty, which is the filter.
-        filter_excluded = bool(lexical_matched) and search_mode != "vector"
-        if filter_excluded:
+        if lexical_matched:
             reasons.append(
                 f"the keyword arm matched {lexical_matched} row(s) and this "
                 f"query's filters then excluded every one of them, so this is "
                 f"an abstention by FILTER rather than by the corpus — the "
                 f"words are in the index and different words will not help"
             )
-        elif lexical_unavailable:
-            reasons.append(
-                "nothing matched this query on the semantic arm, the only one "
-                "that ran, so this is an abstention rather than a short answer"
-            )
         else:
             reasons.append(
-                "nothing matched this query on either arm, so this is an "
-                "abstention rather than a short answer"
+                "nothing matched this query, so this is an abstention rather "
+                "than a short answer"
             )
-    else:
-        if (
-            not lexical_unavailable
-            and not lexical_unknown
-            and search_mode == "hybrid"
-            and result.get("records")
-            and not lexical_support
-        ):
-            reasons.append(
-                "the keyword arm matched none of these rows — they come from "
-                "the semantic arm alone, which returns its nearest neighbours "
-                "whether or not any of them is relevant"
-            )
-        if rerank_standout is False:
-            reasons.append(
-                "the reranker scored this page and found nothing that stands "
-                "out from the rest of it"
-            )
+    elif rerank_standout is False:
+        reasons.append(
+            "the reranker scored this page and found nothing that stands out "
+            "from the rest of it"
+        )
     result["low_confidence"] = bool(reasons)
     if not reasons:
         return result
@@ -1807,15 +879,15 @@ def _maybe_rerank(
     window = items[:_RERANK_WINDOW]
     try:
         scores = _get_reranker().score(query, [_rerank_doc(it) for it in window])
-    except Exception as e:  # noqa: BLE001 — rerank degrades to the fused order
+    except Exception as e:  # noqa: BLE001 — rerank degrades to recency order
         log.exception("rerank failed; returning the page in its original order")
         return items, 0, (
             f"rerank did NOT apply: the cross-encoder failed while scoring "
             f"this page ({type(e).__name__}: {e}). These rows are in the "
-            f"fused/recency order — which is exactly what rerank=True asked "
-            f"to replace — so treat their ORDER as unranked. The rows "
+            f"recency order — which is exactly what rerank=True asked to "
+            f"replace — so treat their ORDER as unranked. The rows "
             f"themselves are unaffected: reranking never changes which "
-            f"results you get. Run `aggregator embed --seed-models` if the "
+            f"results you get. Run `aggregator seed-reranker` if the "
             f"cross-encoder's weights are missing."
         ), None
     order = sorted(
@@ -1825,7 +897,7 @@ def _maybe_rerank(
     # were scored, and this line is the one place that knows: it is
     # ``min(len(items), _RERANK_WINDOW)``, not the window. Handing over a
     # constant is what made the signal assert the wrong thing on short pages.
-    standout = has_standout(list(scores), higher_is_better=True)
+    standout = has_standout(list(scores))
     return (
         [window[i] for i in order] + items[_RERANK_WINDOW:],
         len(window),
@@ -1866,49 +938,19 @@ def _note_rerank(
 
 # --- pagination -------------------------------------------------------------
 #
-# THE HAZARD HYBRID INTRODUCES, AND THE FIX. The surface is stateless: a page
-# token is an offset, and it is only meaningful against the result set the
-# previous page was computed from. Hybrid makes that set MOVE — the embed
-# worker is on a timer, so a vector index that was empty when page 1 was
-# served can be non-empty by the time page 2 is asked for, and page 2 would
-# then be an offset into a strictly larger candidate set. Rows shift, the
-# caller re-reads some and can miss others, and nothing anywhere says so.
+# The surface is stateless: a page token is an offset, and it is only
+# meaningful against the result set the previous page was computed from. So
+# every token carries ``_query_fingerprint`` of the query that minted it, and a
+# continuation whose query disagrees is refused structurally rather than served
+# rows at an offset into a different result set. The caller is an LLM that
+# cannot ask a follow-up question, so a wrong-but-plausible page is worse than
+# an error.
 #
-# PINNING THE ARM IS NECESSARY AND IS NOT SUFFICIENT. Recording the arm stops
-# a continuation flipping between FTS5-only and hybrid. It does nothing about
-# the set moving INSIDE a pinned hybrid arm: the KNN was re-run per page, so a
-# batch of vectors landing between page 1 and page 2 added neighbours, and the
-# offset then addressed a set the previous page was never cut from. Measured on
-# a 4-row corpus with one arrival: pages of 2 returned
-# ``[s-o3, s-o2] [s-o2, s-o1]`` — one row twice, one row never. Over a 25-30
-# day backfill that is the normal case, not the edge case.
-#
-# So the token also carries the vector arm's OWN hits, and a continuation
-# reuses them instead of asking the index again. Bounded by construction: at
-# most ``_VECTOR_ARM_K`` ids, ~1.5 KB packed.
-#
-# THE FTS5 ARM IS DELIBERATELY NOT FROZEN. It drifts with ingest exactly as it
-# did before v5 — a property of a stateless offset API over a live corpus, not
-# something hybrid introduced — and unlike the vector arm it is uncapped, so
-# freezing it would put an unbounded id list in the token.
-#
-# AND FREEZING THE ARM'S HITS MADE THE TOKEN QUERY-SPECIFIC WITHOUT SAYING SO.
-# That is the second half of the same fix. An offset was always only meaningful
-# against the result set it was cut from, but an offset alone is at least
-# self-evidently a position; a frozen hit list is a piece of ANOTHER query's
-# retrieval, and ``_fused_id_scope`` substitutes it for the KNN and unions it
-# with whatever the new dsl's FTS arm returns. So a caller that reused a token
-# against a changed query got the previous query's 50 neighbours inside this
-# query's candidate set, at an offset that indexed neither — and got
-# ``ok: True``. The caller is an LLM that cannot ask a follow-up question, so a
-# wrong-but-plausible page is worse than an error. Hence: every token carries
-# ``_query_fingerprint`` of the query that minted it, a disagreement is refused
-# structurally, and frozen hits may not travel without one.
+# The result set itself still drifts with ingest between pages — a property of
+# a stateless offset API over a live corpus.
 
 
-def _query_fingerprint(
-    ast: QueryAST, drilldown: bool, search_mode: str = "hybrid"
-) -> str:
+def _query_fingerprint(ast: QueryAST, drilldown: bool) -> str:
     """Identify the query a page token was minted for.
 
     OVER THE PARSED AST, NOT THE dsl STRING. ``source:github pr`` and
@@ -1920,21 +962,12 @@ def _query_fingerprint(
     WHAT IS IN IT is every input that decides which rows the candidate set
     holds and in what order, because that is what an offset indexes:
 
-    * ``text`` — it is what the vector arm embedded, so it alone determines
-      the frozen hits. Changing it makes them another query's retrieval.
-    * every filter — ``source``, ``tags``, dates, the session keys, ``extra``.
-      None of these reach the KNN, but all of them change the row set the
-      offset is cut from, so a token carried across a change to any of them
-      addresses a position that never existed. This is why the fingerprint
-      rides on FTS5-only tokens too, which have no frozen hits to protect.
+    * ``text`` and every filter — ``source``, ``tags``, dates, the session
+      keys, ``extra``. Each changes the row set the offset is cut from, so a
+      token carried across a change to any of them addresses a position that
+      never existed.
     * ``drilldown`` — not part of the dsl, but it selects WHICH TABLE the
-      offset indexes (session cards vs observation rows). Same hazard, same
-      mechanism, one boolean away; leaving it out would keep exactly one
-      argument that can still hand back a plausible wrong page.
-    * ``search_mode`` — it decides which ARMS produce the candidate set, so
-      the three modes address three different row sets for the same dsl. It
-      belongs with ``drilldown`` and not with ``rerank``: rerank reorders a
-      page already selected, this one selects it.
+      offset indexes (session cards vs observation rows).
 
     WHAT IS DELIBERATELY NOT IN IT:
 
@@ -1944,9 +977,6 @@ def _query_fingerprint(
     * ``fields`` and ``rerank`` — presentation. ``rerank`` reorders the head of
       a page already selected and never changes membership (see
       ``_maybe_rerank``), and ``fields`` only decides whether bodies come back.
-    * ``id_scope`` — no DSL key can set it, and this is computed before
-      ``_apply_hybrid`` fills it in, so it is always ``None`` here. Including
-      it would hash a field that means "the answer" rather than "the question".
     """
     canonical = json.dumps(
         {
@@ -1960,9 +990,9 @@ def _query_fingerprint(
             "top": ast.top_session_id,
             "agent": ast.agent_id,
             "obs_type": ast.obs_type,
-            # ``by:``. It reaches no KNN either, and it changes the row set the
-            # offset is cut from — so a token minted unfiltered and continued
-            # under ``by:human`` would address a position that never existed.
+            # ``by:`` changes the row set the offset is cut from — so a token
+            # minted unfiltered and continued under ``by:human`` would address
+            # a position that never existed.
             "provenance": ast.provenance,
             # ``scope:``, CANONICALISED rather than passed through, because
             # absent and ``scope:observation`` are the same question and must
@@ -1973,7 +1003,6 @@ def _query_fingerprint(
             "active_from": _iso_or_none(ast.active_from),
             "active_to": _iso_or_none(ast.active_to),
             "drilldown": bool(drilldown),
-            "search_mode": search_mode,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -1989,253 +1018,47 @@ def _iso_or_none(value: Any) -> str | None:
 
 @dataclass(frozen=True)
 class _PageCursor:
-    """Everything a continuation needs to reproduce the previous page's set."""
+    """Where a continuation starts, and which query it belongs to."""
 
-    #: Row offset into the ordered candidate set.
+    #: Row offset into the ordered result set.
     offset: int = 0
-    #: ``True``/``False`` pins the arm; ``None`` is a fresh query, free choice.
-    hybrid: bool | None = None
-    #: ``{kind: [vector arm hit ids]}``, or ``None`` to re-run the KNN.
-    frozen: dict[str, list[str]] | None = None
     #: ``_query_fingerprint`` of the query that minted this token. ``None``
-    #: only for the bare pre-fingerprint offsets described in
-    #: ``_parse_page_token``; those can carry no frozen hits.
+    #: only for a bare offset — see ``_parse_page_token``.
     fingerprint: str | None = None
-
-    def __post_init__(self) -> None:
-        """Two states this cursor must not be able to hold.
-
-        ``pin_for`` reads ``frozen`` before ``hybrid``, so a cursor holding
-        both resolved the disagreement silently, in favour of whichever field
-        happened to be read first — the arms pinned ON from a token that said
-        FTS5-only. Rejecting it in the constructor closes the whole class:
-        ``_parse_page_token`` refuses such a token at the boundary, and no
-        future call site can reconstruct the state from the inside either.
-
-        The same argument covers frozen hits with no fingerprint. Those hits
-        are another query's retrieval unless something says which query, so a
-        cursor that carries them unbound is not a cursor — and stripping the
-        fingerprint off a token must not be a route back to the behaviour the
-        fingerprint exists to remove.
-        """
-        if self.frozen is not None and self.hybrid is not True:
-            raise ValueError(
-                f"a cursor with frozen hits must pin the hybrid arm; "
-                f"got hybrid={self.hybrid!r} with frozen={sorted(self.frozen)}"
-            )
-        if self.frozen is not None and not self.fingerprint:
-            raise ValueError(
-                f"a cursor with frozen hits must name the query that minted "
-                f"them; got frozen={sorted(self.frozen)} with no fingerprint"
-            )
-
-    def pin_for(self, kind: str) -> bool | None:
-        """The arm pin for ONE ontology.
-
-        A token carrying frozen hits names exactly the ontologies whose vector
-        arm engaged when it was minted, so an ontology absent from that map did
-        not engage and must not engage now. Without this, the single global
-        ``hybrid`` flag pins both ontologies on, and a continuation pays for a
-        query embedding — and re-runs a KNN — on behalf of an arm the previous
-        page never used. Records and observations backfill independently, so
-        "hybrid" is genuinely a per-ontology fact.
-        """
-        if self.frozen is not None:
-            return kind in self.frozen
-        return self.hybrid
 
 
 class _PageTokenError(ValueError):
     """A page token this server would not have minted.
 
-    Raised rather than absorbed, because the two silent alternatives are both
-    wrong: truncating an over-long payload hands the caller a plausible but
-    WRONG frozen set, and resetting to offset 0 hands back page 1 to a caller
-    that believes it advanced. Both look like success.
+    Raised rather than absorbed: resetting to offset 0 hands back page 1 to a
+    caller that believes it advanced, which looks like success.
     """
-
-
-def _pack_frozen(frozen: dict[str, list[str]]) -> str:
-    payload = json.dumps(frozen, separators=(",", ":"), sort_keys=True).encode()
-    return base64.urlsafe_b64encode(zlib.compress(payload, 9)).decode().rstrip("=")
-
-
-def _frozen_over_budget(frozen: dict[str, list[str]]) -> str | None:
-    """Why this frozen set cannot be minted into a token, or ``None``.
-
-    THE BUDGET WAS DERIVED FROM AN ASSUMPTION AND ENFORCED ONLY ON THE WAY IN.
-    ``_MAX_FROZEN_ID_CHARS`` is "the longest id we mint, a dropbox path" — a
-    claim about today's sources, which ``_unpack_frozen`` then treats as a
-    hard ceiling. Nothing checked it on the way out, so an id family longer
-    than the guess produced a token this same process refused on the next
-    page: a pagination the caller cannot finish, whose remediation ("pass back
-    the exact token, unmodified") is precisely what it already did.
-
-    MEASURED AGAINST THE ARTIFACT, NOT AGAINST A PROXY. The last two checks
-    ask the two questions ``_unpack_frozen`` actually asks, of the exact bytes
-    it would be handed, so the two sides cannot drift apart as the packing
-    changes. The first two come first anyway because they name the CAUSE — "an
-    id is 2 000 characters" is actionable, "the payload expands past 52 256
-    bytes" is a symptom two derivations downstream.
-    """
-    for kind in sorted(frozen):
-        ids = frozen[kind]
-        if len(ids) > _VECTOR_ARM_K:
-            return (
-                f"the {kind} arm produced {len(ids)} hits, past the "
-                f"{_VECTOR_ARM_K} a page token can carry"
-            )
-        longest = max((len(i) for i in ids), default=0)
-        if longest > _MAX_FROZEN_ID_CHARS:
-            return (
-                f"the longest {kind} id is {longest} characters, past the "
-                f"{_MAX_FROZEN_ID_CHARS} the page-token budget was derived from"
-            )
-    payload = json.dumps(frozen, separators=(",", ":"), sort_keys=True).encode()
-    if len(payload) > _MAX_FROZEN_PAYLOAD_BYTES:
-        return (
-            f"the frozen hits are {len(payload)} bytes, past the "
-            f"{_MAX_FROZEN_PAYLOAD_BYTES} a page token can carry"
-        )
-    packed = len(_pack_frozen(frozen))
-    if packed > _MAX_FROZEN_PAYLOAD_B64_CHARS:
-        return (
-            f"the packed hits are {packed} characters, past the "
-            f"{_MAX_FROZEN_PAYLOAD_B64_CHARS} a page token can carry"
-        )
-    return None
-
-
-def _unpack_frozen(payload: str) -> dict[str, list[str]]:
-    """Decode a frozen-set payload, or raise ``_PageTokenError``.
-
-    NO FAILURE HERE IS SURVIVABLE, which is why none of them return quietly.
-    ``_pack_frozen`` is the only thing that mints these, and it always
-    produces a bounded, well-formed, base64'd JSON object. A payload that is
-    not one did not come from this server, so "decode what you can and re-run
-    the KNN for the rest" is answering a question the caller did not ask, at
-    an offset cut from a set that no longer exists.
-
-    BOUNDED AT EVERY STEP, because every byte here came from the caller. The
-    order matters — each check is cheaper than the one it guards:
-
-    1. The base64 length, before decoding it. Rejecting a 50 MB argument must
-       not first cost a 37 MB decode of it.
-    2. The inflate, via ``decompressobj(...).decompress(data, max_length)``.
-       ``zlib.decompress`` has no such parameter, which is how ~1000:1
-       expansion of caller input got into an in-process MCP server.
-    3. The id count, against ``_VECTOR_ARM_K`` — the actual ceiling of the arm
-       that mints these — so a well-formed, in-budget token still cannot
-       smuggle in an oversized candidate set.
-
-    A payload that violates any of them raises ``_PageTokenError``; it is not
-    a stale token, it is one no version of this server ever produced.
-    """
-    if len(payload) > _MAX_FROZEN_PAYLOAD_B64_CHARS:
-        raise _PageTokenError(
-            f"payload is {len(payload)} characters, over the "
-            f"{_MAX_FROZEN_PAYLOAD_B64_CHARS} this server can mint"
-        )
-    try:
-        pad = "=" * (-len(payload) % 4)
-        compressed = base64.urlsafe_b64decode(payload + pad)
-    except Exception as e:  # noqa: BLE001 — malformed base64 is not a frozen set
-        raise _PageTokenError("payload is not valid base64") from e
-    # max_length caps the OUTPUT, so the bomb is never materialised. Anything
-    # left over means the stream wanted to expand past the cap.
-    inflater = zlib.decompressobj()
-    try:
-        raw = inflater.decompress(compressed, _MAX_FROZEN_PAYLOAD_BYTES)
-    except zlib.error as e:
-        raise _PageTokenError("payload is not a valid compressed stream") from e
-    if inflater.unconsumed_tail or not inflater.eof:
-        raise _PageTokenError(
-            f"payload expands past the {_MAX_FROZEN_PAYLOAD_BYTES} byte cap "
-            f"derived from {_VECTOR_ARM_K} hits per ontology"
-        )
-    try:
-        out = json.loads(raw)
-    except Exception as e:  # noqa: BLE001 — not JSON is not a frozen set
-        raise _PageTokenError("payload does not decode to JSON") from e
-    if not isinstance(out, dict):
-        raise _PageTokenError(
-            f"payload decodes to {type(out).__name__}, not a frozen-hit map"
-        )
-    clean: dict[str, list[str]] = {}
-    for kind, ids in out.items():
-        if kind not in ("observations", "records") or not isinstance(ids, list):
-            raise _PageTokenError(f"payload carries an unknown entry {kind!r}")
-        if not all(isinstance(i, str) for i in ids):
-            raise _PageTokenError(f"payload's {kind} hits are not all strings")
-        if len(ids) > _VECTOR_ARM_K:
-            raise _PageTokenError(
-                f"payload claims {len(ids)} {kind} hits; the vector arm "
-                f"returns at most {_VECTOR_ARM_K}"
-            )
-        clean[kind] = ids
-    return clean
 
 
 def _parse_page_token(token: str | None) -> _PageCursor:
     """Decode a page token into a cursor, or raise ``_PageTokenError``.
 
-    ``"h40~<fp>.<payload>"`` — page 40 of a hybrid set minted for the query
-    fingerprinted ``<fp>``, with that set's vector hits carried inline.
-    ``"40~<fp>"`` — page 40 of an FTS5-only set for the same query. Both
-    shapes are what this server mints today; ``~`` separates the head because
-    it is outside the base64url alphabet the fingerprint and payload use, so
-    the split can never land inside a field.
+    ``"40~<fp>"`` — the page at offset 40 of the query fingerprinted ``<fp>``,
+    which is what this server mints. ``~`` separates the head because it is
+    outside the base64url alphabet the fingerprint uses, so the split can never
+    land inside a field. ``"40"`` — a bare offset — is also accepted: it carries
+    only a position, and a caller able to strip the fingerprint is equally able
+    to type an offset.
 
-    ``"h40"`` and ``"40"`` — bare offsets, the shapes minted before the
-    fingerprint and (for ``"h40"``) before the payload. Still accepted: they
-    carry no other query's retrieval, only a position, and refusing them would
-    strand tokens in flight across an upgrade for no gain — a caller able to
-    strip a field is equally able to type a bare offset. A bare offset can
-    never carry frozen hits: ``_PageCursor`` refuses to hold them unbound.
-
-    ANYTHING ELSE IS REFUSED, and it used to reset to offset 0 with a free
-    choice of arm. That looked like graceful degradation and was silent data
-    loss: a caller whose token got mangled in transit received page 1 again,
-    with ``ok: True`` and no notice, and every row between there and where it
-    actually was went unread. The caller cannot detect that — page 1 is a
-    perfectly plausible page — so the loop terminates on a duplicate or never
-    terminates at all. A refusal it can see beats a wrong page it cannot.
-
-    Refusing costs nothing real: the only tokens that exist are the ones this
-    server minted, and the remedy for an unreadable one is to drop it, which
-    is exactly what the old code did silently and the caller can now do
-    knowingly.
+    ANYTHING ELSE IS REFUSED. Resetting a mangled token to offset 0 would hand
+    the caller page 1 again with ``ok: True`` — a perfectly plausible page it
+    cannot tell apart from the one it asked for — and every row between there
+    and where it actually was would go unread. The remedy for an unreadable
+    token is to drop it, which the caller can do knowingly.
     """
     if not token:
         return _PageCursor()
-    hybrid = token.startswith("h")
-    head, _, payload = token.partition(".")
-    body, _, fingerprint = head.partition("~")
+    body, _, fingerprint = token.partition("~")
     try:
-        offset = max(0, int(body[1:] if hybrid else body))
+        offset = max(0, int(body))
     except (TypeError, ValueError) as e:
         raise _PageTokenError(f"{body!r} is not a page offset") from e
-    if payload and not hybrid:
-        # ``_mint_page_token`` returns a bare ``str(offset)`` when the arm was
-        # FTS5-only, so a payload with no ``h`` is a token this server never
-        # produced — it claims the vector arm did not run AND carries that
-        # arm's hits.
-        raise _PageTokenError(
-            "token carries frozen vector hits but does not pin the hybrid arm"
-        )
-    if payload and not fingerprint:
-        # Same shape of contradiction, one field over: frozen hits are only
-        # interpretable against the query they were retrieved for.
-        raise _PageTokenError(
-            "token carries frozen vector hits but does not name the query "
-            "that minted them"
-        )
-    return _PageCursor(
-        offset=offset,
-        hybrid=hybrid,
-        frozen=_unpack_frozen(payload) if payload else None,
-        fingerprint=fingerprint or None,
-    )
+    return _PageCursor(offset=offset, fingerprint=fingerprint or None)
 
 
 def _page_token_refusal(e: _PageTokenError) -> dict[str, Any]:
@@ -2264,9 +1087,7 @@ def _query_changed_refusal(minted_for: str, asked_for: str) -> dict[str, Any]:
     Reported as a failure and not as a ``notice`` on an otherwise-fine page,
     for the reason ``_page_token_refusal`` gives: what is being reported is
     that the caller's position is unknown, so serving rows under it IS the
-    failure. Here it is sharper still — the previous query's frozen vector
-    hits would have been fused into this query's candidate set, so the rows
-    themselves would have been wrong too, not merely mis-positioned.
+    failure.
     """
     return {
         "ok": False,
@@ -2276,81 +1097,22 @@ def _query_changed_refusal(minted_for: str, asked_for: str) -> dict[str, Any]:
         ),
         "remediation": (
             "A page token is only meaningful to the query that minted it: it "
-            "carries that query's position AND its frozen vector hits. Re-run "
-            "this query with no page_token to get its own first page, then "
-            "page it with the tokens it returns. To continue the earlier "
-            "query instead, send its dsl back unchanged — including the same "
-            "filters and the same drilldown setting."
+            "carries that query's position. Re-run this query with no "
+            "page_token to get its own first page, then page it with the "
+            "tokens it returns. To continue the earlier query instead, send "
+            "its dsl back unchanged — including the same filters and the same "
+            "drilldown setting."
         ),
     }
 
 
-def _mint_page_token(
-    offset: int,
-    hybrid: bool,
-    fingerprint: str,
-    frozen: dict[str, list[str]] | None = None,
-) -> str:
+def _mint_page_token(offset: int, fingerprint: str) -> str:
     """Mint the token for the NEXT page of this exact query.
 
     ``fingerprint`` is required rather than defaulted on purpose: a default
-    would let a future call site mint an unbound token by omission, which is
-    the whole defect this argument exists to close.
-
-    A frozen set that will not fit is DROPPED, not truncated and not raised.
-    Truncating would hand back a plausible, wrong frozen set — the thing
-    ``_PageTokenError`` exists to refuse. Raising would destroy a page that is
-    already correct, or (worse) suppress its ``next_page_token`` and read to
-    the caller as the end of the results. Dropping it costs the freeze and
-    nothing else: the arm and the query stay pinned, the KNN is re-run on the
-    next page, and that is exactly the behaviour of every token minted before
-    round 1 — correct, with the drift the freeze exists to remove. The caller
-    is told, by ``_attach_next_page_token``; the operator is told here.
+    would let a future call site mint an unbound token by omission.
     """
-    head = f"h{offset}" if hybrid else str(offset)
-    head = f"{head}~{fingerprint}"
-    if not hybrid or not frozen:
-        return head
-    if problem := _frozen_over_budget(frozen):
-        log.error(
-            "page token minted without its frozen hits: %s. The vector arm "
-            "will be re-run for each page of this query, so the candidate set "
-            "can move underneath the caller. Raise _MAX_FROZEN_ID_CHARS to "
-            "cover this source's ids, or cap the ids the arm returns.",
-            problem,
-        )
-        return head
-    return f"{head}.{_pack_frozen(frozen)}"
-
-
-def _attach_next_page_token(
-    result: dict[str, Any],
-    offset: int,
-    hybrid: bool,
-    fingerprint: str,
-    frozen: dict[str, list[str]] | None,
-) -> None:
-    """Mint the continuation token and, if it lost its freeze, say so.
-
-    A degradation the caller cannot see is the failure mode this file keeps
-    coming back to — see ``_maybe_rerank``. Pages served from a token with no
-    frozen hits can duplicate and skip rows as the embed worker lands vectors
-    between them, which is caller-visible harm, so it is reported in the
-    caller's own response rather than only in a log the editor may swallow.
-    """
-    result["next_page_token"] = _mint_page_token(offset, hybrid, fingerprint, frozen)
-    problem = _frozen_over_budget(frozen) if (hybrid and frozen) else None
-    if not problem:
-        return
-    notice = (
-        f"Pagination is DEGRADED for this query: {problem}, so the page token "
-        f"could not carry the vector arm's hits. Later pages re-run the "
-        f"semantic search, and rows arriving in between can therefore be "
-        f"served twice or skipped. Treat a full pagination of this query as "
-        f"approximate, and prefer a single larger page_size over many pages."
-    )
-    prior = result.get("notice")
-    result["notice"] = f"{notice} {prior}" if prior else notice
+    return f"{offset}~{fingerprint}"
 
 
 # --- summary-mode snippets (D1) ---------------------------------------------
@@ -2892,7 +1654,6 @@ def _empty_page_notice(
     ast: QueryAST,
     mode: str,
     query_text: str | None,
-    search_mode: str = "hybrid",
     facts: _PageFacts = _NO_PAGE_FACTS,
 ) -> str | None:
     """Why an empty page is empty. One diagnosis, chosen from what actually ran.
@@ -2917,15 +1678,11 @@ def _empty_page_notice(
     4. **The ladder ran and every tier came back empty.** The one case where
        "the corpus does not hold these terms" is a measurement rather than an
        inference — ``lexical_matches == 0`` says the ladder looked.
-    5. **``search_mode='vector'``.** No lexical arm ran, so the pre-relaxation
-       conjunction diagnosis is still the honest one, probe and all.
 
     A LADDER THAT NEVER RAN GETS NO SENTENCE. ``lexical_matches is None`` means
-    nobody looked — the keyword arm dropped out mid-query, or the route never
-    reached it — and "no term matches at all" is a claim about the corpus that
-    a failure of the index does not license. ``_note_confidence`` already says
-    the arm was unavailable; this stays quiet rather than converting a broken
-    index into a fact about the words.
+    nobody looked — the route never reached the keyword index — and "no term
+    matches at all" is a claim about the corpus that a failure of the index
+    does not license.
     """
     conjuncts = fts5_match_conjuncts(query_text)
     if not conjuncts:
@@ -2933,7 +1690,7 @@ def _empty_page_notice(
     if ast.tags and mode == "sessions":
         return None
     matched = store.lexical_matches
-    if search_mode != "vector" and matched:
+    if matched:
         return _filter_excluded_notice(
             ast, conjuncts, matched, store.lexical_relaxation, facts
         )
@@ -2951,9 +1708,8 @@ def _empty_page_notice(
         # ``matched == 0`` licenses it: the intersection ran and qualified no
         # session. ``matched > 0`` is the opposite fact and belongs to the
         # filter branch above, which owns it for every ontology. ``None`` is
-        # neither — nobody ran the intersection at all (``search_mode='vector'``
-        # drops the keyword arm) — and reporting the unmeasured case in the
-        # words of the measured one is how this notice came to deny a
+        # neither — nobody ran the intersection at all — and reporting the
+        # unmeasured case in the words of the measured one would deny a
         # co-occurrence the store had never been asked about.
         if matched:
             return _filter_excluded_notice(
@@ -2968,71 +1724,25 @@ def _empty_page_notice(
             f"co-occur in any one session, so try fewer terms, or one quoted "
             f"phrase on its own."
         )
-    if search_mode != "vector":
-        # The default-scope lexical arm RELAXED on the way here (see
-        # ``fts5_relaxation_tiers``), and ``matched`` is what tells the two
-        # remaining stories apart. ``0`` means the ladder ran and no tier
-        # matched, so even OR-of-all-terms and a prefix on the final term
-        # found nothing — which also proves the ``scope:session`` probe cannot
-        # help (a session containing all the terms would need each term to
-        # match somewhere), so it is not run.
-        if matched != 0:
-            return None
-        return (
-            f"Nothing matched. All {len(conjuncts)} terms ({shown}) were "
-            f"first required together in one observation, then automatically "
-            f"relaxed — to rows matching ANY term, then to prefix-matching "
-            f"the final term — and every tier came back empty: the rows this "
-            f"query can see contain none of these terms in any form the "
-            f"index recognizes. The index stems (porter), so singular/plural "
-            f"variants were already covered, and `scope:session` cannot help "
-            f"when no term matches on its own. Try different words, or a "
-            f"single quoted phrase from the text you remember."
-        )
-    # ``search_mode='vector'`` excluded the lexical arm, so no relaxation ran
-    # and the pre-relaxation diagnosis below is still the honest one.
-    #
-    # ``None`` is NOT ZERO here, and conflating them is how a notice starts
-    # lying: zero was measured, None means nobody looked. The spec's own
-    # eleven-word gist is the case that proves it — reported as "no session has
-    # these" under the first, tighter probe bound, while fourteen sessions do.
-    together: int | None = None
-    if _scope_session_hint_ok(ast) and len(conjuncts) <= _SCOPE_PROBE_MAX_CONJUNCTS:
-        try:
-            roots, _exacts = store._session_hit_scope(
-                query_text or "", ast.obs_type, ast.provenance
-            )
-            together = len(roots)
-        except sqlite3.OperationalError:
-            log.warning("scope:session probe failed for %r", query_text)
-            together = None
-    lead = (
-        f"Nothing matched, and the conjunction is why: all {len(conjuncts)} "
-        f"terms ({shown}) had to appear in ONE observation — a single turn — "
-        f"because `scope:` defaults to `observation`. A double-quoted run is "
-        f"one term, so \"a b\" means those words next to each other."
-    )
-    advice = (
-        "Search one phrase at a time — a single quoted phrase is the "
-        "highest-precision query this index answers. The index stems "
-        "(porter), so 'report' and 'reports' already count as one term."
-    )
-    if together:
-        return (
-            f"{lead} {together} session(s) DO contain all of them, spread "
-            f"across different turns: re-run with `scope:session` to see them. "
-            f"{advice}"
-        )
-    if together == 0:
-        return (
-            f"{lead} No session contains all of them even across different "
-            f"turns, so `scope:session` would not help either. {advice}"
-        )
+    # The default-scope lexical arm RELAXED on the way here (see
+    # ``fts5_relaxation_tiers``), and ``matched`` is what tells the two
+    # remaining stories apart. ``0`` means the ladder ran and no tier matched,
+    # so even OR-of-all-terms and a prefix on the final term found nothing —
+    # which also proves the ``scope:session`` probe cannot help (a session
+    # containing all the terms would need each term to match somewhere), so
+    # it is not run.
+    if matched != 0:
+        return None
     return (
-        f"{lead} Whether any session contains all of them across different "
-        f"turns was NOT CHECKED — that probe is one index scan per term and "
-        f"this query has more than {_SCOPE_PROBE_MAX_CONJUNCTS}. Try "
-        f"`scope:session`, which may still find them. {advice}"
+        f"Nothing matched. All {len(conjuncts)} terms ({shown}) were "
+        f"first required together in one observation, then automatically "
+        f"relaxed — to rows matching ANY term, then to prefix-matching "
+        f"the final term — and every tier came back empty: the rows this "
+        f"query can see contain none of these terms in any form the "
+        f"index recognizes. The index stems (porter), so singular/plural "
+        f"variants were already covered, and `scope:session` cannot help "
+        f"when no term matches on its own. Try different words, or a "
+        f"single quoted phrase from the text you remember."
     )
 
 
@@ -3042,13 +1752,12 @@ def _note_empty_page(
     ast: QueryAST,
     mode: str,
     query_text: str | None,
-    search_mode: str = "hybrid",
     facts: _PageFacts = _NO_PAGE_FACTS,
 ) -> dict[str, Any]:
     """Attach :func:`_empty_page_notice` to an empty page. No-op otherwise."""
     if not result.get("ok") or result.get("total") or result.get("records"):
         return result
-    notice = _empty_page_notice(store, ast, mode, query_text, search_mode, facts)
+    notice = _empty_page_notice(store, ast, mode, query_text, facts)
     if not notice:
         return result
     prior = result.get("notice")
@@ -3064,7 +1773,6 @@ def _compose_notices(
     ast: QueryAST,
     mode: str,
     query_text: str | None,
-    search_mode: str,
     facts: _PageFacts,
 ) -> dict[str, Any]:
     """Say why this page looks the way it does — once, coherently.
@@ -3082,7 +1790,7 @@ def _compose_notices(
     from the answer; the diagnosis explains an emptiness the two above only
     contribute to.
     """
-    _note_empty_page(result, store, ast, mode, query_text, search_mode, facts)
+    _note_empty_page(result, store, ast, mode, query_text, facts)
     _note_tag_ontology(result, ast, mode)
     _note_relaxation(result, store, ast, query_text, facts)
     return result
@@ -3154,11 +1862,10 @@ def _snippet(body: str | None, terms: tuple[str, ...]) -> str:
     holds none, which is the thing M1 removed from summary mode in the first
     place.
 
-    NO HIT IS NOT AN ERROR. A pure-filter query has no terms at all, and a row
-    can also be on the page because the VECTOR arm put it there, with no
-    lexical hit anywhere in its body. Both fall back to the head of the body,
-    which is still strictly more legible than the empty string the caller used
-    to get. The leading ellipsis is what tells the two apart on sight: a
+    NO HIT IS NOT AN ERROR. A pure-filter query has no terms at all, and a
+    stemmed or relaxed match need not contain a term verbatim. Both fall back
+    to the head of the body, which is still strictly more legible than the
+    empty string the caller used to get. The leading ellipsis is what tells the two apart on sight: a
     snippet that starts mid-body was centred on something.
     """
     text = _SNIPPET_WS_RE.sub(" ", body or "").strip()
@@ -3211,19 +1918,15 @@ def _wrap_snippet(stable_id: str, source: str, subject: str, snippet: str) -> st
 
 # --- the payload ceiling (D3) -----------------------------------------------
 #
-# THERE WAS NO GOVERNOR. Grepping this module for size caps found the page-token
-# budget (``_frozen_over_budget``, ``_MAX_FROZEN_ID_CHARS``) and the
-# cross-encoder's 512-token pair budget, and neither bounds the response.
+# THERE WAS NO GOVERNOR. Grepping this module for size caps found only the
+# cross-encoder's 512-token pair budget, which does not bound the response.
 # ``page_size`` bounds ROWS, and a single row can carry a whole compacted
 # session — which is how ``page_size=8`` returned 282,110 characters, overran
 # the tool output limit, and got spilled to a file the caller then had to jq.
 #
-# TRUNCATION HERE, REFUSAL FOR PAGE TOKENS, AND THE DIFFERENCE IS NOT TASTE.
-# ``_PageTokenError`` refuses an over-long token rather than truncating it,
-# because a truncated frozen set is plausible and wrong: it looks like a
-# working continuation while addressing different rows. A truncated body is
-# still the right body, and the caller can act on a short one — but only while
-# the cut is DECLARED. That is why ``truncated`` and ``content_length`` are
+# TRUNCATION HERE, AND IT IS SAFE ONLY BECAUSE IT IS DECLARED. A truncated
+# body is still the right body, and the caller can act on a short one — but
+# only while the cut is DECLARED. That is why ``truncated`` and ``content_length`` are
 # emitted on every item rather than only the cut ones, and why neither is
 # optional.
 
@@ -3255,8 +1958,8 @@ _CEILING_PASSES = 3
 def _payload_chars(result: dict[str, Any]) -> int:
     """The response's size, measured on the artifact rather than estimated.
 
-    Same reasoning as ``_frozen_over_budget``: a budget enforced against a
-    proxy drifts away from the thing it is supposed to bound. Characters and
+    A budget enforced against a proxy drifts away from the thing it is
+    supposed to bound. Characters and
     not bytes because that is the unit the failure was reported in, and
     ``ensure_ascii=False`` because the transport is UTF-8 — counting an
     ellipsis as six characters would bill for an escape nobody sends.
@@ -3390,8 +2093,8 @@ def _apply_payload_ceiling(
     # to include JSON escaping, the ``notice`` key's own punctuation, and the
     # length of the sentence explaining the trim — three terms that each cost
     # a handful of characters and, missed, put the "bounded" response 13
-    # characters over its own ceiling. ``_frozen_over_budget`` learned the
-    # same lesson: ask the question of the exact bytes, of the artifact.
+    # characters over its own ceiling. So the question is asked of the exact
+    # bytes, of the artifact.
     # ``slack`` carries any measured deficit into the next pass, so this
     # converges instead of arguing.
     slack = 0
@@ -3777,7 +2480,6 @@ def aggregator_query(
     page_token: str | None = None,
     drilldown: bool = False,
     rerank: bool = False,
-    search_mode: str = "hybrid",
     max_chars: int | None = None,
     _store: Store | None = None,
     _log_misses: bool = False,
@@ -3886,46 +2588,19 @@ def aggregator_query(
               the operator can see it happening. That flag also refuses out
               loud when the cross-encoder's weights cannot be loaded, rather
               than handing back an unranked page. Its weights come from
-              ``aggregator embed --seed-models``, the only path that fetches
-              them.
+              ``aggregator seed-reranker``, the only path that fetches them.
 
               Leaving it off costs ORDERING ONLY. The same rows come back
               either way — reranking never changes WHICH results you get,
               only the order of the first few — so the cheap call is the
               right default, and this is worth paying only when the ranking
               itself is the answer you need and you can afford to wait.
-      search_mode: which retrieval arms answer free text. ``"hybrid"``
-              (default) fuses both. ``"lexical"`` runs the keyword (FTS5) arm
-              alone. ``"vector"`` runs the semantic arm alone.
-
-              A DIAGNOSTIC, NOT A TUNING KNOB — leave it at the default unless
-              you are investigating retrieval itself. Fusing a strong arm with
-              a weak one can score WORSE than the strong arm alone, and the
-              fused answer cannot show you that; running each arm separately
-              against the same query is the only way to see which one is
-              contributing noise.
-
-              ``"vector"`` REFUSES rather than degrading. Every other path
-              here falls back to keyword search when the vector index is
-              missing; this one returns ``ok: False``, because answering a
-              vector-mode query from FTS5 would report the keyword arm's rows
-              as the semantic arm's. It also refuses a query with no free
-              text, which has nothing to embed.
-
-              Ignored by pure-filter queries (no free text) — they run no
-              retrieval arm at all, and the response then carries no
-              ``search_mode`` key rather than claiming one.
       max_chars: ask for a SMALLER response than the default ceiling. It can
               only lower the bound, never raise it: the server caps every
               response regardless, because ``page_size`` bounds rows and one
               row can carry an entire compacted session.
 
-    Free text is answered by a hybrid retriever — keyword (FTS5) and semantic
-    (vector) arms fused with RRF — whenever the vector index has been built on
-    this cache, and by FTS5 alone otherwise. Either way the results are a
-    superset of what keyword search returns, and the ordering, filters and
-    pagination are identical. ``aggregator_capabilities()['vector_index']``
-    says which of the two is answering.
+    Free text is answered by the FTS5 keyword index.
 
     Returns:
       Success: ``{ok: True, records: [...], total: int, mode: str, notice?,
@@ -3984,27 +2659,21 @@ def aggregator_query(
       failing the call, so this flag is the only way to tell the two apart:
       the rows are identical either way.
 
-      ``search_mode`` names the arms that CONTRIBUTED THESE ROWS, which is not
-      necessarily the mode you asked for: a ``hybrid`` request answered by FTS5
-      alone — the normal state of this cache while the embedding backfill runs
-      — comes back ``lexical``, and one answered by the KNN alone comes back
-      ``vector``. It appears only when the query carried free text; a
-      pure-filter query ran no arm, and naming one would describe work that did
-      not happen.
+      ``search_mode`` (always ``"lexical"``) and ``low_confidence`` appear
+      only when the query carried free text; a pure-filter query ran no
+      retrieval, and naming one would describe work that did not happen.
+      ``low_confidence`` is ALWAYS present there, including when it is
+      ``False``: it is a claim about the answer, so it is stated rather than
+      left to be inferred from a missing key. ``True`` means one of two
+      things, and ``low_confidence_reason`` says which — nothing matched at
+      all (or a filter removed every match), or the reranker ran and found
+      nothing on the page that stood out. NOTHING IS TRUNCATED when it is set:
+      the page comes back whole and flagged, because a shorter page cannot be
+      told apart from a confident short answer. Treat a flagged page as
+      candidates rather than as an answer, and say so when reporting it.
 
-      ``low_confidence`` appears under the same condition and is ALWAYS
-      present there, including when it is ``False``: it is a claim about the
-      answer, so it is stated rather than left to be inferred from a missing
-      key. ``True`` means one of three things, and ``low_confidence_reason``
-      says which — nothing matched at all; the rows came from the semantic arm
-      with no keyword corroboration (a ``k``-nearest search returns ``k``
-      results whether or not any of them is relevant); or the reranker ran and
-      found nothing on the page that stood out. NOTHING IS TRUNCATED when it
-      is set: the page comes back whole and flagged, because a shorter page
-      cannot be told apart from a confident short answer. Treat a flagged page
-      as candidates rather than as an answer, and say so when reporting it.
-
-      ``reranked_count`` appears under the same condition and says HOW FAR
+      ``reranked_count`` appears only when ``rerank=True`` was requested and
+      says HOW FAR
       DOWN THE PAGE THE RANKING GOES. Only the head of a page is scored — a
       cross-encoder pass is the 4.5 min — so ``records[:reranked_count]`` are in
       relevance order and ``records[reranked_count:]`` are in the default
@@ -4085,17 +2754,6 @@ def aggregator_query(
             "reason": f"unknown fields mode: {fields!r}",
             "remediation": "Use fields='summary' (default) or fields='full'.",
         }
-    if search_mode not in _SEARCH_MODES:
-        return {
-            "ok": False,
-            "reason": f"unknown search_mode: {search_mode!r}",
-            "remediation": (
-                "Use search_mode='hybrid' (default, both arms fused), "
-                "'lexical' (keyword/FTS5 arm alone) or 'vector' (semantic arm "
-                "alone). The single-arm modes exist to diagnose which arm is "
-                "contributing noise; leave the default alone otherwise."
-            ),
-        }
     # RERANK NEEDS THE BODIES, AND SUMMARY MODE DOES NOT RETURN THEM.
     # ``_rerank_doc`` scores the result ITEM, and an item's ``content`` is
     # empty unless ``fields='full'`` — so under the default this handed the
@@ -4136,11 +2794,9 @@ def aggregator_query(
         cursor = _parse_page_token(page_token)
     except _PageTokenError as e:
         return _page_token_refusal(e)
-    # ONE PLACE COMPUTES IT AND ONE PLACE CHECKS IT. Taken from the AST as
-    # parsed, before ``_apply_hybrid`` rewrites ``text`` into an ``id_scope``,
-    # so what is checked on the way in is byte-identical to what the paths
-    # mint on the way out.
-    fingerprint = _query_fingerprint(ast, drilldown, search_mode)
+    # ONE PLACE COMPUTES IT AND ONE PLACE CHECKS IT, so what is checked on the
+    # way in is byte-identical to what the paths mint on the way out.
+    fingerprint = _query_fingerprint(ast, drilldown)
     if cursor.fingerprint is not None and cursor.fingerprint != fingerprint:
         return _query_changed_refusal(cursor.fingerprint, fingerprint)
 
@@ -4148,7 +2804,7 @@ def aggregator_query(
     try:
         routed = _dispatch(
             store, ast, mode, fields, page_size, cursor, drilldown, rerank,
-            fingerprint, search_mode,
+            fingerprint,
         )
         # POPPED BEFORE THE CEILING MEASURES THE PAYLOAD. The route's own facts
         # are for the composer, not for the caller — and ``_apply_payload_ceiling``
@@ -4160,9 +2816,7 @@ def aggregator_query(
         # route passes through — relaxation, tag ontology and the reason the
         # page is empty, decided together rather than stamped independently.
         # See ``_compose_notices`` for why that had to become one function.
-        _compose_notices(
-            result, store, ast, mode, ast.text, search_mode, facts
-        )
+        _compose_notices(result, store, ast, mode, ast.text, facts)
         # ZERO-RESULT LOGGING, at the one place every route passes through —
         # AND OFF UNLESS THE CALLER IS A WRITER. ``_log_misses`` defaults to
         # False, so the MCP tool adapter, which passes it nothing, cannot
@@ -4187,24 +2841,17 @@ def aggregator_query(
             and not result.get("total")
             and not mode.startswith("mismatch_")
         )
-        if missed and (notice := _log_search_miss(store, ast.text, search_mode)):
+        if missed and (notice := _log_search_miss(store, ast.text)):
             prior = result.get("notice")
             result["notice"] = f"{notice} {prior}" if prior else notice
         return result
-    # The one refusal that is raised rather than returned, because the
-    # condition is discovered four call frames down inside the retrieval the
-    # per-path handlers wrap. See ``_VectorModeUnavailableError``.
-    except _VectorModeUnavailableError as e:
-        return {"ok": False, "reason": e.reason, "remediation": e.remediation}
     # THE LAST STRUCTURED-ERROR BACKSTOP. Every per-path handler below guards
-    # the store call it wraps, and the routing that runs BEFORE those handlers
-    # — ``_apply_hybrid`` -> ``_vector_arm_engaged`` -> ``has_embedded_rows``
-    # — was guarded by nothing broader than ``VectorIndexUnavailableError``.
-    # So a cache that went unreadable between the health check and the probe
-    # (the ingest timer takes the write lock every 30 minutes, so that window
-    # is a scheduled event) put a raw SQLite exception through the tool
-    # boundary. One clause here, rather than a try around each of the four
-    # routing paths, because they all share the same failure and the same
+    # the store call it wraps, but not every read a route makes (the per-card
+    # counts and previews, the notice probes). A cache that goes unreadable
+    # mid-request — the ingest timer takes the write lock every 30 minutes, so
+    # that window is a scheduled event — must not put a raw SQLite exception
+    # through the tool boundary. One clause here, rather than a try around each
+    # routing path, because they all share the same failure and the same
     # answer.
     except sqlite3.DatabaseError as e:
         log.exception("cache read failed during %s routing", mode)
@@ -4223,18 +2870,17 @@ def _dispatch(
     drilldown: bool,
     rerank: bool,
     fingerprint: str,
-    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     """Route a parsed, validated query to the path that answers it."""
     if mode == "sessions":
         return _query_sessions_path(
             store, ast, fields, page_size, cursor, drilldown, rerank,
-            fingerprint=fingerprint, search_mode=search_mode,
+            fingerprint=fingerprint,
         )
     if mode == "records":
         return _query_records_path(
             store, ast, fields, page_size, cursor, rerank,
-            fingerprint=fingerprint, search_mode=search_mode,
+            fingerprint=fingerprint,
         )
     if mode == "mismatch_sessions_on_records":
         return _mismatch_response(
@@ -4261,8 +2907,7 @@ def _dispatch(
         )
     # mode == "union"
     return _query_union_path(
-        store, ast, fields, page_size, cursor, rerank,
-        fingerprint=fingerprint, search_mode=search_mode,
+        store, ast, fields, page_size, cursor, rerank, fingerprint=fingerprint
     )
 
 
@@ -4286,18 +2931,9 @@ def _query_records_path(
     rerank: bool = False,
     *,
     fingerprint: str,
-    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
-    ast, hybrid, vec_hits, lexical_ids = _apply_hybrid(
-        store,
-        "records",
-        ast,
-        cursor.pin_for("records"),
-        frozen=(cursor.frozen or {}).get("records"),
-        search_mode=search_mode,
-    )
     try:
         page_plus_one = store.query(ast, limit=page_size + 1, offset=offset)
         total = store.count(ast)
@@ -4333,28 +2969,10 @@ def _query_records_path(
             "body it has to cut says so in `truncated` / `content_length`."
         )
     if has_more:
-        _attach_next_page_token(
-            result,
-            offset + page_size,
-            hybrid,
-            fingerprint,
-            {"records": vec_hits} if hybrid else None,
-        )
-    _note_confidence(
-        result,
-        query_text,
-        search_mode,
-        _lexical_on_page((it["stable_id"] for it in items), lexical_ids),
-        rr_standout,
-        # ``and total``: the ROW GATE. An arm that engaged and put nothing in
-        # front of the caller must not be named — see _note_confidence.
-        vector_contributed=hybrid and bool(total),
-        lexical_contributed=_lexical_contributed(lexical_ids) and bool(total),
-        lexical_unavailable=_lexical_arm_failed(lexical_ids),
-        # The ladder's own pre-filter count, so an empty page's hedge says the
-        # same thing the empty-page diagnosis does — see _note_confidence.
-        lexical_matched=store.lexical_matches,
-    )
+        result["next_page_token"] = _mint_page_token(offset + page_size, fingerprint)
+    # The ladder's own pre-filter count, so an empty page's hedge says the same
+    # thing the empty-page diagnosis does — see _note_confidence.
+    _note_confidence(result, query_text, rr_standout, store.lexical_matches)
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -4368,19 +2986,9 @@ def _query_sessions_path(
     rerank: bool = False,
     *,
     fingerprint: str,
-    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     offset = cursor.offset
     query_text = ast.text
-    ast, hybrid, vec_hits, lexical_ids = _apply_hybrid(
-        store,
-        "observations",
-        ast,
-        cursor.pin_for("observations"),
-        frozen=(cursor.frozen or {}).get("observations"),
-        search_mode=search_mode,
-    )
-    frozen_out = {"observations": vec_hits} if hybrid else None
     if drilldown:
         try:
             page_plus_one = store.query_observations(
@@ -4422,21 +3030,10 @@ def _query_sessions_path(
         # composed with the relaxation and tag-ontology notices at the single
         # point every route returns through. See ``_compose_notices``.
         if has_more:
-            _attach_next_page_token(
-                result, offset + page_size, hybrid, fingerprint, frozen_out
+            result["next_page_token"] = _mint_page_token(
+                offset + page_size, fingerprint
             )
-        _note_confidence(
-            result,
-            query_text,
-            search_mode,
-            _lexical_on_page((it["obs_id"] for it in items), lexical_ids),
-            rr_standout,
-            # The same row gate as the records path above.
-            vector_contributed=hybrid and bool(total),
-            lexical_contributed=_lexical_contributed(lexical_ids) and bool(total),
-            lexical_unavailable=_lexical_arm_failed(lexical_ids),
-            lexical_matched=store.lexical_matches,
-        )
+        _note_confidence(result, query_text, rr_standout, store.lexical_matches)
         return _note_rerank(result, rerank, rr_count, rr_notice)
 
     try:
@@ -4497,30 +3094,8 @@ def _query_sessions_path(
     # The empty-page diagnosis is composed at the tool boundary, not here —
     # see ``_compose_notices``.
     if has_more:
-        _attach_next_page_token(
-            result, offset + page_size, hybrid, fingerprint, frozen_out
-        )
-    lexical_cards = _lexical_session_ids(
-        store, query_text, ast.obs_type, lexical_ids, ast.provenance, ast.scope
-    )
-    _note_confidence(
-        result,
-        query_text,
-        search_mode,
-        _lexical_on_page((it["stable_id"] for it in items), lexical_cards),
-        rr_standout,
-        # The same row gate as the records path.
-        vector_contributed=hybrid and bool(total),
-        lexical_contributed=_lexical_contributed(lexical_ids) and bool(total),
-        # ``lexical_cards`` too: the projection runs a SECOND FTS5 statement, so
-        # the arm can drop out there as well, after ``lexical_ids`` came back
-        # healthy a few milliseconds earlier. Which of the two failed decides
-        # WHICH sentence the response gets, so the two states are read
-        # separately rather than collapsed into one flag here.
-        lexical_unavailable=_lexical_arm_failed(lexical_ids, lexical_cards),
-        lexical_unknown=_lexical_page_unknown(lexical_cards),
-        lexical_matched=store.lexical_matches,
-    )
+        result["next_page_token"] = _mint_page_token(offset + page_size, fingerprint)
+    _note_confidence(result, query_text, rr_standout, store.lexical_matches)
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -4533,7 +3108,6 @@ def _query_union_path(
     rerank: bool = False,
     *,
     fingerprint: str,
-    search_mode: str = "hybrid",
 ) -> dict[str, Any]:
     """UNION mode: no source hint, no ontology-specific keys.
 
@@ -4561,73 +3135,20 @@ def _query_union_path(
 
     Records-side fetch skips FTS if the caller passed no text — parity
     with ``store.query`` behaviour. Sessions side likewise.
-
-    v5: each ontology gets its OWN vector arm, because they have separate vec
-    tables that backfill independently — records finish in minutes and
-    observations take hours, so insisting both be warm before either is used
-    would waste the half that is ready. The page token records hybrid when
-    either side engaged, which is the conservative direction: it pins a
-    continuation to the same arms rather than letting the slower table's
-    backfill land underneath an in-flight pagination.
     """
     offset = cursor.offset
-    frozen_in = cursor.frozen or {}
-    # One embedding for both ontologies — same query string, same vector, and
-    # embedding is the expensive half of the vector arm. Skipped entirely when
-    # BOTH sides already carry frozen hits, which is the steady state once a
-    # caller is paging: neither ontology needs the model or the index again.
-    embedding = None
-    needs_embedding = any(
-        _vector_arm_engaged(store, kind, ast, cursor.pin_for(kind), search_mode)
-        and frozen_in.get(kind) is None
-        for kind in ("records", "observations")
-    )
-    if needs_embedding:
-        embedding = _query_embedding(ast.text or "")
     # ONE PROBE PER ARM, because the relaxation marker has to be attributable
-    # to the rows on the page. Both arms run the same ladder over the same
-    # text, and the request-wide marker keeps the deeper of the two — so a page
-    # of EXACT record hits was stamped "NOT exact matches" whenever the
-    # observations ladder relaxed on the way past, contradicting, on the same
-    # page, a tag-ontology notice saying the record hits stand. Each arm is
-    # watched separately; ``window`` below decides which watcher's answer the
-    # page is allowed to report. Re-entered around the store queries because
-    # the FTS5-only route runs its ladder there rather than in ``_apply_hybrid``.
-    rec_probe, sess_probe = LexicalProbe(), LexicalProbe()
-    with store.lexical_probe(rec_probe):
-        rec_ast, rec_hybrid, rec_hits, rec_lexical_ids = _apply_hybrid(
-            store,
-            "records",
-            ast,
-            cursor.pin_for("records"),
-            embedding,
-            frozen_in.get("records"),
-            search_mode,
-        )
-    with store.lexical_probe(sess_probe):
-        sess_ast, sess_hybrid, sess_hits, sess_lexical_ids = _apply_hybrid(
-            store,
-            "observations",
-            ast,
-            cursor.pin_for("observations"),
-            embedding,
-            frozen_in.get("observations"),
-            search_mode,
-        )
+    # to the rows on the page. Both ontologies run the same ladder over the
+    # same text, and the request-wide marker keeps the deeper of the two — so a
+    # page of EXACT record hits was stamped "NOT exact matches" whenever the
+    # observations ladder relaxed on the way past. Each arm is watched
+    # separately; ``window`` below decides which watcher's answer the page is
+    # allowed to report.
     query_text = ast.text
-    hybrid = rec_hybrid or sess_hybrid
-    # Each ontology's hits are frozen SEPARATELY. They backfill at different
-    # speeds — records finish in minutes, observations take weeks — so one
-    # shared snapshot would let the faster table drift under the slower one.
-    frozen_out: dict[str, list[str]] = {}
-    if rec_hybrid:
-        frozen_out["records"] = rec_hits
-    if sess_hybrid:
-        frozen_out["observations"] = sess_hits
     try:
-        with store.lexical_probe(rec_probe):
-            rec_rows = store.query(rec_ast, limit=None, offset=0)
-            rec_total = store.count(rec_ast)
+        with store.lexical_probe() as rec_probe:
+            rec_rows = store.query(ast, limit=None, offset=0)
+            rec_total = store.count(ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: records-side query failed for ast=%r", ast)
         return {
@@ -4639,9 +3160,9 @@ def _query_union_path(
             ),
         }
     try:
-        with store.lexical_probe(sess_probe):
-            sess_rows = store.query_sessions(sess_ast, limit=None, offset=0)
-            sess_total = store.count_sessions(sess_ast)
+        with store.lexical_probe() as sess_probe:
+            sess_rows = store.query_sessions(ast, limit=None, offset=0)
+            sess_total = store.count_sessions(ast)
     except Exception as e:  # noqa: BLE001
         log.exception("union: sessions-side query failed for ast=%r", ast)
         return {
@@ -4652,24 +3173,6 @@ def _query_union_path(
                 "aggregator_capabilities() to confirm the store is healthy."
             ),
         }
-
-    # WHICH ARMS ACTUALLY PUT ROWS IN THIS RESPONSE — computed after both
-    # queries, because in union mode an ontology can engage an arm and still
-    # contribute nothing. EITHER ontology counts: union asks one question of two
-    # tables, and requiring both would report every query whose subject exists
-    # in only one of them as single-armed, which is most of them.
-    #
-    # AN EMPTY ONTOLOGY MUST NOT VOTE. Without the row check, a corpus with no
-    # github records at all reported ``search_mode: "hybrid"`` for a query the
-    # vector arm alone answered out of the sessions table — because the records
-    # side had taken the FTS5-only route and that route "is" the keyword arm.
-    # It ran, it returned nothing, and crediting it is the same defect this
-    # field was fixed to stop: naming an arm that produced none of these rows.
-    sides = ((rec_hybrid, rec_lexical_ids, rec_rows), (sess_hybrid, sess_lexical_ids, sess_rows))
-    vector_contributed = any(engaged and rows for engaged, _lex, rows in sides)
-    lexical_contributed = any(
-        _lexical_contributed(lex) and rows for _engaged, lex, rows in sides
-    )
 
     # Merge: build (sort_ts, kind, obj) tuples and sort desc by sort_ts.
     merged: list[tuple[datetime_like, str, Any]] = []
@@ -4696,7 +3199,7 @@ def _query_union_path(
             # (subject = first user prompt, matching_observations count).
             # Kind-aware scope (see round-1 BLOCKER fix in the sessions path).
             subject = _first_user_prompt(store, obj)
-            session_scoped = _count_scope_for(sess_ast, obj)
+            session_scoped = _count_scope_for(ast, obj)
             match_count = store.count_observations(session_scoped)
             preview = _session_body_preview(
                 store, session_scoped, fields, subject, terms
@@ -4704,27 +3207,6 @@ def _query_union_path(
             items.append(
                 _session_to_item(obj, fields, subject, match_count, preview)
             )
-    # Page-scoped lexical support, computed over ``window`` rather than
-    # ``items`` because the two halves speak different id spaces: a record row
-    # is a ``stable_id`` the keyword arm returns directly, a session card is a
-    # session id the arm's observation hits have to be projected onto. The
-    # merged item list no longer says which is which.
-    with store.lexical_probe(sess_probe):
-        sess_lexical_cards = _lexical_session_ids(
-            store,
-            query_text,
-            sess_ast.obs_type,
-            sess_lexical_ids,
-            sess_ast.provenance,
-            sess_ast.scope,
-        )
-    page_lexical_support = any(
-        _lexical_on_page(
-            [obj.stable_id if kind == "record" else obj.session_id],
-            rec_lexical_ids if kind == "record" else sess_lexical_cards,
-        )
-        for _ts, kind, obj in window
-    )
     items, rr_count, rr_notice, rr_standout = _maybe_rerank(
         items, query_text, rerank
     )
@@ -4765,25 +3247,10 @@ def _query_union_path(
         arm_probes=(rec_probe, sess_probe),
     )
     if has_more:
-        _attach_next_page_token(
-            result, offset + page_size, hybrid, fingerprint, frozen_out or None
-        )
-    _note_confidence(
-        result,
-        query_text,
-        search_mode,
-        page_lexical_support,
-        rr_standout,
-        vector_contributed=vector_contributed,
-        lexical_contributed=lexical_contributed,
-        lexical_unavailable=_lexical_arm_failed(
-            rec_lexical_ids, sess_lexical_ids, sess_lexical_cards
-        ),
-        lexical_unknown=_lexical_page_unknown(sess_lexical_cards),
-        # The request-wide probe, which keeps the MAX across both arms — the
-        # same value the diagnosis reads at the tool boundary.
-        lexical_matched=store.lexical_matches,
-    )
+        result["next_page_token"] = _mint_page_token(offset + page_size, fingerprint)
+    # The request-wide probe, which keeps the MAX across both arms — the same
+    # value the diagnosis reads at the tool boundary.
+    _note_confidence(result, query_text, rr_standout, store.lexical_matches)
     return _note_rerank(result, rerank, rr_count, rr_notice)
 
 
@@ -4874,8 +3341,7 @@ def _session_body_preview(
 
     ``scoped`` is the card's own AST from ``_count_scope_for``, so this returns
     the same rows ``matching_observations`` counted: with free text, the
-    observations that matched it; under hybrid, the fused hits inside this
-    session; with neither, the session's opening turns. That is the evidence a
+    observations that matched it; without, the session's opening turns. That is the evidence a
     cross-encoder needs to judge the card, and what a reader wants to see.
 
     SUMMARY MODE READS ONE OBSERVATION AND SNIPPETS IT (D1). It used to return
@@ -4916,28 +3382,7 @@ def _session_body_preview(
     return "\n\n".join(parts) if parts else subject
 
 
-#: Printed beside :func:`aggregator_capabilities`'s per-source coverage rows.
-#:
-#: The tally is worth nothing to an agent that cannot say what it implies, and
-#: the implication is the whole point: a source that is not embedded yet is
-#: still fully searchable BY KEYWORD, so "not yet" is a statement about recall
-#: quality and never about availability. Without that sentence the natural
-#: reading of ``not_started`` is "this source is missing", which is wrong and
-#: would make an agent stop looking.
-_COVERAGE_NOTE = (
-    "Per-source progress of the semantic (vector) arm, in backfill priority "
-    "order. A source that is not 'complete' is STILL FULLY SEARCHABLE BY "
-    "KEYWORD — every arm degrades to FTS5 and results are always a superset of "
-    "keyword search — so this says how good semantic recall is for that "
-    "source, never whether it can be searched at all. 'empty' means the source "
-    "holds no rows, which is a different fact from 'complete' and must not be "
-    "reported as one. The full backfill is a measured 25-30 days of CPU, so "
-    "expect 'not_started' for most sources for weeks."
-)
-
-
-#: Printed beside ``llm_tag_coverage``. Same truthfulness bargain as
-#: :data:`_COVERAGE_NOTE` one surface over: the counts are worth nothing to
+#: Printed beside ``llm_tag_coverage``. The counts are worth nothing to
 #: an agent that cannot say what they imply, and what a partial tally implies
 #: is that ``tag:`` recall is PARTIAL for that source — an untagged record
 #: matches ``tag:`` only through its source-written tags, while its text
@@ -4958,58 +3403,13 @@ _LLM_TAG_NOTE = (
 )
 
 
-def aggregator_capabilities(
-    embedding_coverage: bool = False, _store: Store | None = None
-) -> dict[str, Any]:
+def aggregator_capabilities(_store: Store | None = None) -> dict[str, Any]:
     """Read-only inventory of the aggregator cache.
-
-    ``vector_index`` (v5) reports whether hybrid retrieval is warm on this
-    cache, and keeps apart the situations that all look like "0 embedded".
-    Every ``state``, and what to do about it:
-
-    * ``unavailable`` — sqlite-vec did not load. Search is FTS5-only and no
-      amount of waiting fixes it; the install has to be repaired.
-    * ``not_started`` — the arm works, nothing embedded yet. Run
-      ``aggregator embed`` (or let its timer do it).
-    * ``backfilling`` — partway through. Wait; recall is already better than
-      FTS5 alone and improving. A first full backfill takes weeks, not hours.
-    * ``degraded`` — nothing pending, but ``errors > 0``: the worker set
-      those rows aside, so they are reachable by keyword only and waiting
-      will NOT bring them in. Kept out of ``complete`` on purpose — a
-      stalled index whose counts all read "fine" is the failure this
-      project exists to prevent. Do: run ``aggregator status``, which names
-      the held rows (ledger sources ``embed:observations`` /
-      ``embed:records``) and says whether each will retry or is terminal.
-      Retryable ones return on their own as the backoff elapses; terminal
-      ones never do, and ``errors`` is then the count of documents the
-      vector arm will never reach.
-    * ``empty`` — nothing in the cache to embed.
-    * ``complete`` — everything embedded, nothing set aside.
-
-    Args:
-      embedding_coverage: ``True`` adds ``embedding_coverage`` — the same
-        states as above but PER SOURCE, in backfill priority order — plus
-        ``embedding_coverage_note`` explaining what they mean for a query.
-
-        ASK FOR IT WHENEVER SEMANTIC RECALL MATTERS TO THE ANSWER, and
-        especially before telling the user that something is not in their
-        history. ``vector_index`` above is a single corpus-wide state, and one
-        "backfilling" is compatible with dropbox untouched and with dropbox
-        finished — opposite answers to "can I search my notes yet". The arm is
-        filled one source at a time over a measured 25-30 days, so for most of
-        that window the honest answer differs per source.
-
-        OFF BY DEFAULT BECAUSE IT COSTS REAL TIME. Measured through this
-        function against a read-only snapshot of the live cache (505k
-        observations, 4.3k records, 1.3 GB): **0.041 s without it, 0.307 s
-        with**, both warm, and 4.3 s on a cold page cache. This tool is also
-        called at connect, and that path has to stay cheap.
 
     Returns:
       ``{ok: True, sources: [...], freshness: {...}, counts: {...},
-      vector_index: {...}, date_range, cache_path, schema_version,
-      tool_tier: 'read-only', help: str}``, plus ``embedding_coverage`` and
-      ``embedding_coverage_note`` when ``embedding_coverage=True``.
+      llm_tag_coverage: [...], llm_tag_coverage_note, date_range, cache_path,
+      schema_version, tool_tier: 'read-only', help: str}``.
     """
     store = _store or _default_store()
     if cache_error := _ensure_cache_ready(store):
@@ -5031,9 +3431,8 @@ def aggregator_capabilities(
         "freshness": caps["freshness"],
         "tags_by_source": caps["tags_by_source"],
         "counts": caps.get("counts", {}),
-        "vector_index": caps.get("vector_index", {}),
         # Cheap enough for the connect path (one grouped count over ~4.4k
-        # records, unlike the embed tally) and needed BEFORE a search: an
+        # records) and needed BEFORE a search: an
         # agent must know whether tag: can be trusted per source. The note is
         # what keeps a partially-tagged corpus from looking fully tagged.
         "llm_tag_coverage": caps.get("llm_tag_coverage", []),
@@ -5048,25 +3447,6 @@ def aggregator_capabilities(
             date_range=caps["date_range"],
         ),
     }
-    if embedding_coverage:
-        # INSIDE THE ``if``, AND NOTHING ABOUT IT IS CACHED. The scan is two
-        # grouped queries per ontology over the whole cache; hoisting it or
-        # memoizing it would put a full table scan back on the connect path
-        # that a previous fix cleared, or serve a stale tally to a caller
-        # watching a backfill move.
-        try:
-            result["embedding_coverage"] = store.embed_progress_by_source()
-        except Exception as e:  # noqa: BLE001 — reported, never swallowed
-            # NOT best-effort, unlike the identical scan in ``aggregator
-            # status``. There the tally decorates a run that already did its
-            # work; here it IS what the caller asked for, and returning the
-            # rest of the payload without the key it requested is
-            # indistinguishable from a server that predates the parameter.
-            log.exception("per-source embedding coverage failed")
-            return _cache_unavailable_response(
-                f"embedding coverage unavailable: {type(e).__name__}: {e}"
-            )
-        result["embedding_coverage_note"] = _COVERAGE_NOTE
     return result
 
 
@@ -5099,7 +3479,6 @@ async def _tool_aggregator_query(
     page_token: str | None = None,
     drilldown: bool = False,
     rerank: bool = False,
-    search_mode: str = "hybrid",
     max_chars: int | None = None,
 ) -> dict[str, Any]:
     return aggregator_query(
@@ -5109,15 +3488,12 @@ async def _tool_aggregator_query(
         page_token=page_token,
         drilldown=drilldown,
         rerank=rerank,
-        search_mode=search_mode,
         max_chars=max_chars,
     )
 
 
-async def _tool_aggregator_capabilities(
-    embedding_coverage: bool = False,
-) -> dict[str, Any]:
-    return aggregator_capabilities(embedding_coverage=embedding_coverage)
+async def _tool_aggregator_capabilities() -> dict[str, Any]:
+    return aggregator_capabilities()
 
 
 async def _tool_aggregator_ingest(source: str) -> dict[str, Any]:

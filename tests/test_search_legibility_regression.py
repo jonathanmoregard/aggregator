@@ -18,9 +18,7 @@ so they are kept verbatim and only the corpus is replaced.
 WHAT "RANK IN TOP 5" MEANS HERE, AND WHAT IT DOES NOT. This path has NO
 relevance ordering. ``drilldown=True`` is ``ORDER BY ts ASC`` and
 ``drilldown=False`` is ``ORDER BY last_ts DESC``; ``bm25`` is never consulted,
-and the observation vector arm is cold (0 of 563,991 rows embedded on the live
-cache), so ``_apply_hybrid`` reports ``engaged=False`` and the route is pure
-FTS5. A rank assertion is therefore a statement about **what the filter
+and the route is pure FTS5. A rank assertion is therefore a statement about **what the filter
 admits**, not about scoring: the target ranks where it does because the rows
 that would have preceded it are no longer matched. That is exactly the property
 worth pinning — every rank that moved in this mission moved because a filter
@@ -38,12 +36,6 @@ THE INDEX DOES NOT STEM. ``tokenize='unicode61 remove_diacritics 2'``, no
 ``porter`` — ``report`` and ``reports`` are different terms, and turning that on
 would mean rebuilding ``obs_fts`` over half a million rows. Several fixtures
 here fail *because* of it; none is written to need it.
-
-RE-FREEZE THESE NUMBERS WHEN THE SESSIONS EMBED BACKFILL RUNS. Sessions and
-subagents are fourth in the user's stated backfill order, so there is time — but
-once observations carry vectors the hybrid arm engages, ``ORDER BY ts ASC``
-stops being the ordering, and every rank in this file is stale. The corpus is
-local and deterministic; the *meaning* of the ranks is not.
 """
 from __future__ import annotations
 

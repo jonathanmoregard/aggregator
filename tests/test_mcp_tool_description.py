@@ -176,10 +176,10 @@ def test_the_weight_fetch_command_named_in_a_remediation_exists(capsys):
     # A count now, not a flag: it is how far down the page the ranking got,
     # and ``rerank_applied`` is a view of it. Nothing was ranked here.
     assert reranked == 0
-    assert "aggregator embed --seed-models" in notice
+    assert "aggregator seed-reranker" in notice
     # Criterion D's fourth value. ``None``, not ``False``: the model produced
     # no scores, so it has no opinion about whether anything was relevant, and
     # reading a dead model as "nothing stood out" would invent an answer out
     # of a failure.
     assert standout is None
-    assert "--seed-models" in _cli_help("embed", capsys)
+    assert "seed-reranker" in _cli_help("seed-reranker", capsys)

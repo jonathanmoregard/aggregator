@@ -85,8 +85,8 @@ BASELINE_DEPTH = 10
 #: and it cannot be computed from a shallower list.
 RUN_DEPTH = 50
 
-#: Below this, a query counts as unchanged. Not zero: floating-point noise in
-#: the fused score can reorder tied results without anything having changed.
+#: Below this, a query counts as unchanged. Not zero: the drift metric is a
+#: float, and float noise must not read as a ranking change.
 DRIFT_EPSILON = 1e-9
 
 #: WHAT EACH MODE'S NUMBERS CANNOT SEE, printed on every report.
@@ -103,20 +103,14 @@ DRIFT_EPSILON = 1e-9
 #: an empty caveat, which reads as "nothing is out of scope".
 MODE_SCOPE: dict[str, str] = {
     "lexical": (
-        "Store.query_observations only. NOT in this path: RRF fusion, the "
-        "per-arm vector floor, the confidence signal, routing, pagination — "
-        "everything in aggregator.mcp. Ids are observation ids."
-    ),
-    "hybrid": (
-        "Store-level FTS5 + vector KNN fused with RRF, in RRF rank order. NOT "
-        "in this path: the vector floor, the confidence signal, and the whole "
-        "of aggregator.mcp — the server discards the RRF ordering this mode "
-        "keeps. Ids are observation ids."
+        "Store.query_observations only. NOT in this path: the confidence "
+        "signal, routing, pagination — everything in aggregator.mcp. Ids are "
+        "observation ids."
     ),
     "mcp": (
         "the whole server, via aggregator.mcp.aggregator_query with default "
-        "arguments. Covers fusion, the vector floor, routing, the confidence "
-        "signal and the response shape. Ordering is RECENCY, not relevance, so "
+        "arguments. Covers routing, the confidence signal and the response "
+        "shape. Ordering is RECENCY, not relevance, so "
         "drift here reports membership changes rather than re-ranking. Ids are "
         "session/record stable_ids and are NOT comparable with the other "
         "modes'."
@@ -428,12 +422,7 @@ def retrieval_regression_command(
             from aggregator.core.store import Store
 
             owns_search_store = Store(db_path=db_path, read_only=True)
-            embedder = None
-            if mode == "hybrid":
-                from aggregator.core.embed import Embedder
-
-                embedder = Embedder()
-            search = resolve_search_fn(mode, owns_search_store, embedder)
+            search = resolve_search_fn(mode, owns_search_store)
 
         if action == "freeze":
             frozen = freeze_baseline(eval_store, queries, search, mode=mode)

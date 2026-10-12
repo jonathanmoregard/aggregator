@@ -521,20 +521,19 @@ def test_parse_failures_do_not_count_toward_the_breaker(
 
 @pytest.mark.parametrize("value", ["0", "-5"])
 def test_batch_size_refusal_names_the_tag_failure(tmp_path, capsys, value):
-    """``tag --batch-size`` explains ITS OWN silent failures, not embed's.
+    """``tag --batch-size`` explains ITS OWN silent failures.
 
     The batch walk is ``range(0, len(ids), batch_size)``: 0 crashes it with
     a bare ValueError, a negative value walks no batches and exits 0 with the
     corpus still owed. The refusal has to say that — an error message about
-    ``LIMIT 0`` and ``--catchup`` (embed's ``_positive_int``) describes a
-    command this one is not.
+    ``LIMIT`` (``_positive_int``'s prose) describes a command this one is not.
     """
     with pytest.raises(SystemExit) as exc:
         main(["tag", "--batch-size", value], _store=_store(tmp_path, []))
     assert exc.value.code == 2
     err = capsys.readouterr().err
     assert "records per claude invocation" in err
-    assert "catchup" not in err  # embed's prose must not leak in
+    assert "LIMIT" not in err  # _positive_int's prose must not leak in
 
 
 @pytest.mark.parametrize("value", ["101", "5000"])

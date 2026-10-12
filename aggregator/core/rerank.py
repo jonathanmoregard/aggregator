@@ -1,16 +1,17 @@
 """Qwen3-Reranker-0.6B cross-encoder wrapper.
 
-DO NOT swap in bge-reranker-v2-m3: per Qwen's own eval it *degrades*
-Qwen3-embedded English retrieval (MTEB-R 61.82 → 57.03). Qwen3-Reranker
-is the vendor-tested-safe pairing.
+Reorders the head of an FTS5 result page by relevance when the caller asks for
+``rerank=True``. Lazy load: ``Reranker()`` is instantiated only then. Adds
+~2 GB RSS.
 
-Lazy load: instantiate ``Reranker()`` only when the caller passes
-``rerank=True`` to the MCP tool. Adds ~2 GB RSS + ~300 ms/query.
+Weights load OFFLINE unless :func:`downloads_allowed`; ``aggregator
+seed-reranker`` is the command that fetches them.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 
@@ -18,11 +19,32 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 
-#: Commit sha of the weights this build was verified against. Same rule as
-#: ``embed.QWEN3_EMBEDDING_REVISION``, and it binds harder here: this model is
-#: loaded inside the long-lived MCP server, so an unpinned ``main`` is a
-#: moving artifact executing in the process that holds the user's history.
+#: Commit sha of the weights this build was verified against. Without a
+#: revision every load resolves ``main`` on the hub, so the bytes the MCP
+#: server executes could change with no commit in this repository. A sha
+#: rather than a tag, because a tag is repointable by the repo owner. Only
+#: applied to the DEFAULT model: a pin taken from one repository says nothing
+#: about a model name a caller passed in.
 QWEN3_RERANKER_REVISION = "e61197ed45024b0ed8a2d74b80b4d909f1255473"
+
+#: The ONE opt-in that lets a model load reach the network.
+MODEL_DOWNLOAD_ENV = "AGGREGATOR_ALLOW_MODEL_DOWNLOAD"
+
+
+def downloads_allowed() -> bool:
+    """Whether this process may fetch model weights from the hub.
+
+    FAIL CLOSED. The reranker is constructed inside the MCP server, so without
+    this one ``rerank=True`` query could pull GB-scale weights into the
+    server's process — from a tool whose annotations declare
+    ``openWorldHint=False``.
+
+    An env var like ``HF_HUB_OFFLINE`` cannot guarantee that from inside this
+    package: ``huggingface_hub`` reads it into a module constant at import
+    time, and nothing here controls when that import happens. Hence an
+    explicit per-call ``local_files_only``, which no import order can defeat.
+    """
+    return os.environ.get(MODEL_DOWNLOAD_ENV, "").strip().lower() in ("1", "true", "yes")
 
 #: Hard cap on the tokens of one ``(query, document)`` pair.
 #:
@@ -34,7 +56,7 @@ QWEN3_RERANKER_REVISION = "e61197ed45024b0ed8a2d74b80b4d909f1255473"
 #: it was handed.
 #:
 #: WHAT IT IS FOR, measured on a WAL-consistent read-only snapshot of the real
-#: 505k-observation cache (``scripts/rag_rollout_smoke.py snapshot``), over the
+#: 505k-observation cache, over the
 #: golden query set's real pages at ``fields='full'``:
 #:
 #: * The candidate documents are SHORT IN THE MIDDLE AND ENORMOUS IN THE TAIL
@@ -62,17 +84,13 @@ class Reranker:
     def __init__(self, model_name: str | None = None):
         from sentence_transformers import CrossEncoder
 
-        from aggregator.core.embed import downloads_allowed
-
         pinned = model_name is None
         self.model_name = model_name or _DEFAULT_MODEL
         # NO ``trust_remote_code``. This constructor runs lazily inside the MCP
         # server process — the one holding the user's entire personal history —
-        # and that server is registered bare, with no ``HF_HUB_OFFLINE`` wrapper
-        # (only the timer-driven embed unit sets it). The flag would therefore
-        # let a single ``rerank=True`` query fetch and execute
-        # repository-controlled Python right there, while the tool advertises
-        # ``openWorldHint=False``.
+        # and the flag would let a single ``rerank=True`` query fetch and
+        # execute repository-controlled Python right there, while the tool
+        # advertises ``openWorldHint=False``.
         # Nothing is given up: the Qwen3-Reranker repo ships no modeling code,
         # and the architecture is in-tree in transformers. Verified offline —
         # loads in 0.4 s as ``transformers.models.qwen3.Qwen3ForCausalLM``, and
@@ -84,8 +102,8 @@ class Reranker:
             revision=QWEN3_RERANKER_REVISION if pinned else None,
             # OFFLINE UNLESS EXPLICITLY ALLOWED. This constructor runs inside
             # the MCP server on ``rerank=True``, so without it one query could
-            # start a GB-scale download in the editor's process. See
-            # ``embed.downloads_allowed``.
+            # start a GB-scale download in the server's process. See
+            # ``downloads_allowed``.
             local_files_only=not downloads_allowed(),
             # TRUNCATE. Without this the model's own 40960-token window
             # applies, a batch pads to its longest member, and a single long

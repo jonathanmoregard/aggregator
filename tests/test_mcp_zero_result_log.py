@@ -9,7 +9,7 @@ them at the end of every regression run.
 
 A SEPARATE DATABASE FROM ``cache.db``, and the eval store refuses that name
 outright. The harness must never migrate or write to the artifact it measures,
-and a baseline has to survive a re-ingest, a vector rebuild and a model swap.
+and a baseline has to survive a re-ingest.
 It is co-located with whichever cache is being served, so in production it IS
 ``$XDG_DATA_HOME/aggregator/retrieval_eval.db`` — the same file
 ``default_eval_db_path`` resolves — while a test or a scratch cache gets its
@@ -69,7 +69,7 @@ def store(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _fresh_miss_log(monkeypatch):
-    """The log connection is a module singleton, like the embedder. Tests share
+    """The log connection is a module singleton, like the reranker. Tests share
     a process, so one test's connection would otherwise answer another test's
     cache — and point at a ``tmp_path`` that has already been torn down."""
     monkeypatch.setattr("aggregator.mcp._miss_log", None)
@@ -94,13 +94,10 @@ def test_a_zero_result_text_query_is_logged(store, tmp_path):
     assert misses[0]["result_count"] == 0
 
 
-def test_the_log_records_which_arms_were_asked(store, tmp_path):
-    """A miss under ``lexical`` and a miss under ``hybrid`` are different
-    facts about the pipeline, and a log that cannot tell them apart cannot say
-    whether the vector arm would have found it."""
-    aggregator_query(
-        "beef wellington", search_mode="lexical", _store=store, _log_misses=True
-    )
+def test_the_log_records_the_retrieval_that_missed(store, tmp_path):
+    """The eval log keys misses by mode; the server's only retrieval is the
+    keyword index, so every miss it logs is a ``lexical`` one."""
+    aggregator_query("beef wellington", _store=store, _log_misses=True)
     assert _misses(tmp_path)[0]["mode"] == "lexical"
 
 

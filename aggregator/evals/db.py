@@ -10,8 +10,8 @@ reasons, both load-bearing. First, the live cache is 1.2 GB, WAL-hot, and has
 an ingest timer writing to it every 30 minutes; adding eval bookkeeping tables
 to it would be a schema migration on the artifact under measurement, applied
 by the tool whose job is to notice when that artifact changes. Second, a
-baseline has to survive things the cache does not — a re-ingest, a vector
-rebuild, a model swap — and the whole point of a baseline is that it does not
+baseline has to survive things the cache does not — a re-ingest, a
+rebuild — and the whole point of a baseline is that it does not
 move when the thing it measures moves.
 
 NOTHING HERE SWALLOWS AN ERROR. A miss that cannot be logged starves the

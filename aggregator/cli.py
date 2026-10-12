@@ -39,39 +39,27 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
-import hashlib
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aggregator.core.chunk import chunk_body
-from aggregator.core.embed import (
-    MODEL_DOWNLOAD_ENV,
-    Embedder,
-    EmbedServerError,
-    downloads_allowed,
-    seed_embedder,
-)
 from aggregator.core.provenance import classify
+from aggregator.core.rerank import MODEL_DOWNLOAD_ENV, downloads_allowed
 from aggregator.core.rescrub import DEFAULT_CHUNK as _RESCRUB_CHUNK
 from aggregator.core.rescrub import DEFAULT_JOBS as _RESCRUB_JOBS
 from aggregator.core.rescrub import rescrub
 from aggregator.core.scrub_error import ScrubUnavailableError
 from aggregator.core.store import (
-    EMBED_BACKLOG_ORDER,
     EmptyRebuildRefusedError,
     SchemaAheadError,
     Store,
@@ -85,7 +73,6 @@ from aggregator.core.store import (
 from aggregator.evals.harness import retrieval_regression_command
 from aggregator.evals.search import SEARCH_MODES
 from aggregator.imports.ingest_state import (
-    POISON_MAX_ATTEMPTS,
     SOURCE_CURSORS,
     PoisonLedger,
     Watermarks,
@@ -339,7 +326,7 @@ def _default_sources() -> dict[str, Any]:
 #: The ONE command that is allowed to fetch model weights, spelled exactly as
 #: a human would type it. Every message that needs somebody to go and get
 #: weights names this, so "what do I run?" is never left as an exercise.
-SEED_MODELS_COMMAND = f"{MODEL_DOWNLOAD_ENV}=1 aggregator embed --seed-models"
+SEED_RERANKER_COMMAND = f"{MODEL_DOWNLOAD_ENV}=1 aggregator seed-reranker"
 
 
 def _reranker_load_failure(error: BaseException) -> str:
@@ -348,11 +335,11 @@ def _reranker_load_failure(error: BaseException) -> str:
         f"ERROR: --rerank could not load the cross-encoder "
         f"({type(error).__name__}: {error}).\n"
         f"No results were printed: without the reranker this command returns "
-        f"the fused/recency order, which is exactly what --rerank was asked "
-        f"to replace, and a page that silently is not ranked is worse than "
-        f"no page.\n"
+        f"the recency order, which is exactly what --rerank was asked to "
+        f"replace, and a page that silently is not ranked is worse than no "
+        f"page.\n"
         f"If the weights are simply not on this machine yet, fetch them once "
-        f"with `{SEED_MODELS_COMMAND}` (needs network); otherwise re-run "
+        f"with `{SEED_RERANKER_COMMAND}` (needs network); otherwise re-run "
         f"without --rerank."
     )
 
@@ -406,14 +393,14 @@ def _cmd_query(args: argparse.Namespace, store: Store) -> int:
         return 1
     if args.rerank:
         # BEFORE THE QUERY, and loudly. ``_maybe_rerank`` catches a rerank
-        # failure and returns the page in its fused order — right for the MCP
-        # tool, where a lost ordering must not cost the caller their answer,
-        # and wrong here, where the ordering IS what was asked for.
+        # failure and returns the page in its recency order — right for the
+        # MCP tool, where a lost ordering must not cost the caller their
+        # answer, and wrong here, where the ordering IS what was asked for.
         #
         # That degrade is no longer silent: it now sets ``rerank_applied:
         # False`` and leads the response with a ``notice`` naming the exception
-        # and pointing at ``aggregator embed --seed-models``, which this
-        # command prints. What the up-front load still buys is WHEN and WITH
+        # and pointing at ``aggregator seed-reranker``, which this command
+        # prints. What the up-front load still buys is WHEN and WITH
         # WHAT EXIT CODE. Measured on this path with a reranker that loads and
         # then raises while scoring: exit 0, the whole page printed, and the
         # notice on the line after the last row — an operator who waited four
@@ -576,25 +563,12 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     # index, and the date a human was first told. Nothing here is a count
     # summary — a quarantine you cannot name is one you cannot fix.
     known_faults = store.fault_summary()
-    # WHICH SOURCES THE VECTOR ARM CAN ACTUALLY ANSWER FOR. The backfill is a
-    # measured 25-30 days on this hardware and runs in the user's chosen order
-    # (dropbox, substack, claude-web/chatgpt, sessions, subagents, then the
-    # rest), so for most of its life this cache is PARTIALLY embedded — and a
-    # source nobody has reached yet returns exactly what a finished source with
-    # nothing on the topic returns: no vector hits. This is where those two are
-    # told apart, per source, by name.
-    #
-    # Read here rather than added to ``aggregator_capabilities``: that surface
-    # is on the MCP connect path, and a full table scan — 0.27 s warm, 4.3 s
-    # cold on the live corpus — belongs on a command a human typed.
-    embedding_progress = store.embed_progress_by_source()
     if args.json:
         caps["ticktick_uncovered_projects"] = uncovered
         caps["stale_input_markers"] = stale_inputs
         caps["ingest_state"] = ingest_state
         caps["held_records"] = held_records
         caps["known_faults"] = known_faults
-        caps["embedding_progress"] = embedding_progress
         print(json.dumps(caps, indent=2, default=str))
         return 0
     print(f"cache_path: {caps['cache_path']}")
@@ -604,18 +578,10 @@ def _cmd_status(args: argparse.Namespace, store: Store) -> int:
     for s in caps["sources"]:
         fresh = caps["freshness"].get(s, "n/a")
         print(f"  {s}: last_updated={fresh}")
-    print("embedding progress by source (highest priority first):")
-    for row in embedding_progress:
-        print(
-            f"  {row['source']}: {row['state']} — {row['embedded']}/{row['total']} "
-            f"embedded, {row['pending']} pending, {row['skipped']} nothing to "
-            f"embed, {row['errors']} held ({row['kind']})"
-        )
-    # The tag backfill's truth surface, same bargain as the block above: a
-    # partially-tagged corpus must never look fully tagged, and per-source is
-    # the granularity a human actually asks at ("can I trust tag: for my
-    # dropbox notes yet"). Riding on capabilities' llm_tag_coverage — cheap,
-    # unlike the embed tally.
+    # The tag backfill's truth surface: a partially-tagged corpus must never
+    # look fully tagged, and per-source is the granularity a human actually
+    # asks at ("can I trust tag: for my dropbox notes yet"). Riding on
+    # capabilities' llm_tag_coverage, which is cheap.
     print("llm tag coverage by source (`aggregator tag` backfill):")
     for row in caps.get("llm_tag_coverage", []):
         print(
@@ -1531,10 +1497,9 @@ def _desktop_channel_wanted(args: argparse.Namespace) -> bool:
 
 #: The schema alarm's OWN debounce receipt, and it shares with nothing.
 #:
-#: ``nix/aggregator.nix`` documents the reproduction: run the embed and
-#: embed-seed failure notifiers against one state dir, in either order, and
-#: each silences the other for a day. Two faults a human must act on separately
-#: need two receipts, so this one is named for its own condition.
+#: Two failure notifiers sharing one stamp silence each other for a day. Two
+#: faults a human must act on separately need two receipts, so this one is
+#: named for its own condition.
 SCHEMA_AHEAD_STAMP_NAME = "schema-ahead-notified"
 
 #: How long a DELIVERED schema alarm buys silence on the desktop channel.
@@ -1866,354 +1831,6 @@ def _print_run_report(report: RunReport) -> None:
     )
 
 
-def _approve_vector_reindex(store: Store, *, assume_yes: bool) -> bool:
-    """Show what ``--reindex`` would destroy, then ask. Round 3's H1, CLI half.
-
-    THE ASYMMETRY THIS REMOVES. ``ingest --rebuild`` drops rows it can re-fetch
-    in minutes, and it still prints a count and demands a ``y`` on stdin.
-    Deleting the vector index costs 25-30 days of continuous CPU to put back,
-    and its opt-in was a shell variable that every command honoured in silence.
-    The cheaper operation had the louder gate.
-
-    So: the same gate, on the more expensive operation. The count comes off
-    disk rather than out of an estimate, because "some vectors" is not a
-    number anyone can weigh a month of CPU against.
-
-    A REINDEX WITH NOTHING TO DELETE IS NOT A QUESTION. ``migrate()`` already
-    adopts an empty or absent index for free — nothing computed exists, so
-    nothing is at stake — and prompting there would train the operator to
-    answer ``y`` without reading, which is exactly how the real prompt stops
-    working.
-
-    ``--yes`` is for scripted use and mirrors ``ingest --yes``. It skips the
-    question, never the report: the counts are printed either way, so a run
-    in a journal still says what it destroyed.
-    """
-    vectors, rows = store.vector_reindex_preview()
-    if not vectors:
-        print(
-            "embed --reindex: no computed vectors on disk, so there is "
-            "nothing to delete and nothing to confirm. Continuing."
-        )
-        return True
-    print(
-        f"embed --reindex will DELETE {vectors} vector(s) from this cache and "
-        f"return {rows} row(s) to the embed backlog.\n"
-        f"They cannot be converted, only recomputed: the last full backfill "
-        f"of this corpus was measured at 25-30 days of continuous CPU.\n"
-        f"Do this only if the embedding model genuinely changed. If "
-        f"AGGREGATOR_EMBED_BACKEND is merely exported in this shell, "
-        f"`unset AGGREGATOR_EMBED_BACKEND` is the whole fix and costs nothing.",
-        file=sys.stderr,
-    )
-    if assume_yes:
-        print("embed --reindex: --yes given; proceeding without asking.")
-        return True
-    if _confirm_force_on_stdin("Type 'y' to delete them and re-embed: "):
-        return True
-    print(
-        "aborted: vector reindex not confirmed. NOTHING WAS DELETED — the "
-        "vectors on disk are intact and the backlog is untouched. The vector "
-        "arm stays switched off for mismatched provenance; FTS5 keyword "
-        "search is unaffected.",
-        file=sys.stderr,
-    )
-    return False
-
-
-def _cmd_embed(args: argparse.Namespace, _store: Store | None = None) -> int:
-    """Background embed worker — fills the v5 vector index.
-
-    ``--catchup`` drains the whole backlog and IS WHAT THE TIMER RUNS
-    (``embed --catchup --source both``, see ``nix/aggregator.nix``);
-    ``--once`` does a single batch and exits, and no deployed unit uses it —
-    it is a hand-run probe. This comment used to say the opposite, which was
-    wrong in the direction that costs the most: a batch is bounded at
-    ``_MAX_BATCH_CHUNKS`` chunks, about fifteen minutes of encoder time, so one
-    batch per 30-minute tick would run a backfill measured in weeks at half
-    speed at best.
-
-    Both take an OS-level ``flock`` on ``<cache>.embed.lock``, so a slow
-    catchup and a timer tick cannot both consume the same batch. A tick that
-    finds the lock held is a healthy no-op and exits 0.
-
-    REFUSES TO RUN WITHOUT A WRITABLE VECTOR INDEX, loudly and non-zero, and
-    the arm can be unusable for two unrelated reasons. With sqlite-vec missing
-    the store's vec writers no-op; embedding the batch anyway would advance
-    ``embedding_state`` past rows that have no vector, and nothing ever looks
-    at a row twice. That is the watermark-ahead-of-data failure the ingest
-    rules forbid. With the extension loaded but the index under an S1
-    provenance refusal, the writes would be this build's vectors landing in a
-    table another model filled. Both are checked HERE, before a row is
-    selected, so the run is refused and the backlog is left exactly where it
-    was — see the second check for what discovering it late used to cost.
-
-    THIS IS ALSO THE ONLY COMMAND THAT MAY DELETE THE VECTOR INDEX, under
-    ``--reindex``, and that is round 3's H1. The consent used to be
-    ``AGGREGATOR_VECTOR_REINDEX=1`` read inside ``Store.migrate()`` — which
-    every subcommand calls — so it was ambient, sticky, and honoured by reads.
-    It belongs here because the reindex is embed-side maintenance: this is the
-    command that owns the index, and the only one that can put back what it
-    destroys.
-    """
-    store = _store or Store()
-    # BEFORE ``migrate()``, because migrate is what would do the deleting.
-    if args.reindex and not _approve_vector_reindex(store, assume_yes=args.yes):
-        return 1
-
-    if not store.vector_available:
-        print(
-            "ERROR: aggregator embed cannot run — the sqlite-vec extension "
-            "did not load, so no vector can be written. Refusing rather than "
-            "advancing embedding_state past rows with no vector. FTS5 search "
-            "is unaffected. Reinstall the `sqlite-vec` wheel for this "
-            "interpreter and re-run `aggregator embed --catchup`.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # THE OTHER WAY THE ARM IS OFF, and round 3's H2. ``vector_available``
-    # answers "did the extension load?" — which under an S1 provenance refusal
-    # is YES, while the index it loaded is one this build may not write to.
-    # Without this check the worker got all the way to
-    # ``commit_embed_batch``, where ``_require_vector`` raises, having already
-    # embedded a full batch: an uncaught traceback, the unit marked failed, a
-    # CRITICAL toast naming missing weights and a missing wheel (neither of
-    # which applied), the run's ledger report discarded with the exception,
-    # and 500 rows of CPU spent on work that was never written. On a
-    # 30-minute timer, every tick, indefinitely.
-    #
-    # The store's own refusal text is reprinted verbatim rather than
-    # summarised: it already names what disagreed, that nothing was deleted,
-    # and the two opposite remedies — and only the operator knows which one
-    # they meant.
-    #
-    # ASKED TWICE, AND BOTH ARE CHEAP. This first call uses the no-argument
-    # form — "what would ``Embedder()`` load here?" — which is the answer the
-    # read path uses and costs one indexed ``meta`` lookup. It is asked BEFORE
-    # the weights load so the common mismatch (a stray
-    # ``AGGREGATOR_EMBED_BACKEND``) is refused without paying a model load.
-    refusal = store.vector_quarantine
-    if refusal is not None:
-        print(
-            f"ERROR: aggregator embed cannot run — {refusal}\n"
-            f"No row was embedded and the backlog is untouched.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # THE EMBEDDER IS BUILT BEFORE ``migrate()``, and that is round 4's
-    # triple-converged finding. ``migrate(embedder=)`` landed in round 3 so the
-    # provenance stamp could name the model that actually fills the index —
-    # and nothing ever passed it. ``grep -rn 'migrate(embedder' aggregator/``
-    # returned nothing, so the only write path in the codebase went on stamping
-    # from ``AGGREGATOR_EMBED_BACKEND`` and ``vector_provenance(embedder)`` was
-    # dead code: a fix with no production caller, which is a passing test and
-    # not a fix.
-    #
-    # The order costs one model load ahead of the second quarantine check
-    # below, and that is the right trade now that the version string carries
-    # the QUANTIZATION and the CHUNKER version. Neither is knowable from the
-    # environment, so a stamp written before the embedder exists cannot be
-    # right about them — while the load itself is seconds against a backfill
-    # measured in weeks, and the cheap refusal above has already caught the
-    # common case.
-    #
-    # THE ENCODER MAY SIMPLY NOT BE THERE, and on the ``server`` backend that
-    # is routine rather than exceptional: offline-AI mode stops
-    # ``aggregator-embed-server.service`` for hours at a time, and this timer
-    # keeps firing through it. Caught here, BEFORE ``migrate()``, so a tick
-    # that finds the unit stopped changes nothing at all — no stamp, no claim,
-    # no ledger entry, no row — and says which unit to look at instead of
-    # printing a socket traceback. Non-zero, because a run that embedded
-    # nothing must not read as one that finished.
-    try:
-        embedder = Embedder()
-    except EmbedServerError as e:
-        print(
-            f"ERROR: aggregator embed cannot run — {e}\n"
-            f"No row was embedded and the backlog is untouched; the next tick "
-            f"resumes once the embed server is back.",
-            file=sys.stderr,
-        )
-        return 1
-    # ``embed`` MIGRATES ITSELF (see ``main``), so it needs its own copy of the
-    # guard rather than inheriting one. It runs on its own thirty-minute timer
-    # with its own OnFailure= notifier, so an unhandled refusal here would be a
-    # second alarm-fatigue channel for the identical condition.
-    try:
-        store.migrate(allow_vector_reindex=args.reindex, embedder=embedder)
-    except SchemaAheadError as e:
-        return _report_schema_ahead(e, desktop_channel=_desktop_channel_wanted(args))
-
-    # THE SECOND ASKING, now that the index has been reconciled against the
-    # embedder that will write it. The first call answered for the process; a
-    # mismatch that only the embedder's own identity reveals surfaces here, and
-    # it must still refuse before a row is selected.
-    refusal = store.vector_quarantine
-    if refusal is not None:
-        print(
-            f"ERROR: aggregator embed cannot run — {refusal}\n"
-            f"No row was embedded and the backlog is untouched.",
-            file=sys.stderr,
-        )
-        return 1
-
-    if _would_start_a_second_index_by_accident(store):
-        return 1
-
-    lock_path = Path(str(store.db_path) + ".embed.lock")
-    lock_path.touch(exist_ok=True)
-    lock_fd = os.open(str(lock_path), os.O_RDWR)
-    try:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("another embed worker is running; exiting")
-            return 0
-
-        plan = _embed_plan(args.source)
-        outcome = _EmbedOutcome()
-        ledger = PoisonLedger(store)
-        # BEFORE any row is selected: a claim left on disk means the previous
-        # worker did not survive that row, and it must be set aside now or the
-        # very next select hands it back and this process dies the same way.
-        _blame_crashed_row(store, ledger, outcome)
-        try:
-            # WHAT MAKES THE CLAIM A CRASH DETECTOR RATHER THAN A REBOOT
-            # DETECTOR. The claim is written before the attempt and can only
-            # be cleared by code that gets to run, so under SIGTERM's default
-            # disposition — no handler, no unwinding — a `systemctl stop`, a
-            # reboot or a deploy left one behind and the NEXT run read it as a
-            # kill: a good row held in the quarantine ledger, marked 'error',
-            # printed to stderr, a non-zero exit and a CRITICAL toast. On a
-            # 25-30 day backfill that is a false alarm every reboot, and the
-            # row it names stays out of the index.
-            #
-            # Same shape ingest already uses (``graceful_shutdown``): the
-            # handler only sets a flag, the row in flight finishes and
-            # releases its claim, and the loop stops at a boundary it chose.
-            # A signal that CANNOT be handled — SIGKILL, an OOM kill, a
-            # segfault — still leaves the claim, so the crash-blame path is
-            # untouched. Which signal the process could handle is exactly the
-            # crash/shutdown distinction, so it is the one being read.
-            with graceful_shutdown() as stop:
-                # ONCE PER ONTOLOGY, ABOVE THE WALK. See ``_requeue_due_rows``:
-                # the walk visits an ontology up to four times, and a requeue
-                # inside it would make "no row is retried by the run that held
-                # it" depend on the backoff outlasting a pass.
-                for kind in dict.fromkeys(k for k, _ in plan):
-                    _requeue_due_rows(store, ledger, kind)
-                for kind, source in plan:
-                    worked = _embed_backlog(
-                        store, embedder, kind, args, ledger, outcome, stop,
-                        source=source,
-                    )
-                    if outcome.interrupted:
-                        break
-                    # ``--once`` IS ONE BATCH, NOT ONE PER GROUP — and it has to
-                    # skip PAST the groups that are already drained, or a
-                    # finished dropbox starves everything ranked behind it and
-                    # the priority order becomes a deadlock.
-                    if args.once and worked:
-                        break
-            _flip_completed_pointer(store, args, outcome)
-            _report_embed_progress(store)
-        except (EmbedderUnhealthyError, EmbedStoreUnavailableError) as e:
-            # ANNOUNCE FIRST, THEN ABORT. Rows attributed earlier in this run
-            # passed their own health probe and have ledger entries already
-            # written; swallowing their lines here would leave each one
-            # known-but-never-reported, i.e. quiet on this run and quiet on
-            # every run after it. Exactly the silence the ledger's bargain
-            # forbids.
-            _report_embed_outcome(outcome)
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 1
-    finally:
-        os.close(lock_fd)
-    return _report_embed_outcome(outcome)
-
-
-def _would_start_a_second_index_by_accident(store: Store) -> bool:
-    """Refuse a whole new backfill that only a shell variable asked for.
-
-    ROUND 3'S H1, TRANSPOSED. Keying vectors on ``(chunk_id, model)`` means a
-    stray ``AGGREGATOR_EMBED_BACKEND`` can no longer DELETE the index — the old
-    vectors keep their own key and nothing is dropped. What it can still do is
-    commit this machine to building a second one, and on this hardware that is
-    a multi-week backfill (``docs/embedding-throughput.md``) for a model nobody
-    chose. "Costs weeks of CPU on the strength of a leftover export" is the
-    failure being guarded, and it does not care which direction the weeks go.
-
-    THE DISCRIMINATOR IS THE VARIABLE, not the change. A model change that came
-    from SOURCE — a new pin in ``aggregator/core/embed.py``, deployed as a new
-    store path — is deliberate by construction: someone edited a constant,
-    reviewed it and rebuilt. There is no ambiguity to resolve and no prompt
-    worth showing. A change that exists only because a variable is exported in
-    this shell is exactly the ambiguous case, and it is the one this refuses.
-
-    So there is no new flag: ``unset AGGREGATOR_EMBED_BACKEND`` is the fix when
-    it was a mistake, and editing the pin is the fix when it was not.
-    """
-    if not os.environ.get("AGGREGATOR_EMBED_BACKEND", "").strip():
-        return False
-    other = store.other_indexed_model()
-    if other is None:
-        return False
-    print(
-        f"ERROR: aggregator embed cannot run — refusing to use the vector "
-        f"index this shell is pointing at. This cache holds vectors for "
-        f"{other!r}, this process is configured for "
-        f"{store.embedding_model!r}, and the difference comes from "
-        f"AGGREGATOR_EMBED_BACKEND being exported here. Starting the backfill "
-        f"would commit this machine to building a SECOND index from scratch — "
-        f"weeks of CPU on this hardware, see docs/embedding-throughput.md.\n"
-        f"NOTHING WAS DELETED and the backlog is untouched: vectors are keyed "
-        f"(chunk_id, model), so the existing index is intact and still serves "
-        f"any process configured for it.\n"
-        f"If this was a leftover export, `unset AGGREGATOR_EMBED_BACKEND` is "
-        f"the whole fix. If the model change is intended, make it in source — "
-        f"the pin in aggregator/core/embed.py — so the deployed artifact and "
-        f"the index agree; a shell variable cannot say that.",
-        file=sys.stderr,
-    )
-    return True
-
-
-def _flip_completed_pointer(
-    store: Store, args: argparse.Namespace, outcome: _EmbedOutcome
-) -> None:
-    """Publish the index once the backlog is genuinely drained.
-
-    RULE 4 OF THE REFERENCE DESIGN, the caller's half. ``completed_at`` is what
-    keeps a half-built index for a NEW model from being served while the
-    previous one is still good — a partially filled embedding space answers
-    with plausible scores drawn from whichever rows happened to be embedded
-    first, and nothing in a result says so.
-
-    ONLY FROM A RUN THAT COULD SEE THE WHOLE BACKLOG. ``--once`` does a single
-    batch by design, and an interrupted or stalled ``--catchup`` stopped
-    somewhere it chose rather than at the end. The store refuses over a live
-    backlog anyway — this is the cheaper guard in front of that one, and it
-    keeps a ``--once`` probe from paying for a scan it cannot act on.
-
-    Best-effort and quiet on refusal: rows arriving from ingest between the
-    last batch and here are an ordinary race, and the next tick flips it.
-    """
-    if args.once or outcome.interrupted or outcome.stalled:
-        return
-    if args.source != "both":
-        # Only one ontology was drained, so "the index is complete" is not a
-        # claim this run is entitled to make about the other.
-        return
-    try:
-        model = store.mark_embedding_version_complete()
-    except RuntimeError:
-        return
-    if store.embedding_version_state(model)["completed_at"]:
-        print(f"embed: index complete for {model}")
-
-
 #: Rows per committed chunk of the provenance backfill.
 #:
 #: SIZED AGAINST WHAT A KILL COSTS, not against throughput. Each chunk is one
@@ -2251,10 +1868,8 @@ def _cmd_provenance(
     Both call the same ``classify``, so ingest and backfill cannot disagree.
 
     IT IS A PURE UPDATE OF ONE COLUMN. No re-ingest, no re-scrub, no ``body``
-    write, no ``src_hash`` write, no ``embedding_state`` reset. That is not an
-    optimisation: a re-ingest of this corpus is ~11 hours of Presidio at the
-    measured 827 rows/min, and resetting ``embedding_state`` would discard the
-    observation vector arm — weeks of CPU — the moment that arm is warm.
+    write, no ``src_hash`` write. That is not an optimisation: a re-ingest of
+    this corpus is ~11 hours of Presidio at the measured 827 rows/min.
 
     RESUMABILITY IS ``provenance IS NULL`` AND NOTHING ELSE. The watermark lives
     in the rows it describes, so there is no sidecar to fall out of step with
@@ -2459,9 +2074,8 @@ def _provenance_from_db(
 ) -> tuple[int, bool]:
     """Route 2: classify what is left from type, body and the session's kind.
 
-    The chunk is ``WHERE provenance IS NULL LIMIT n`` — the same shape
-    ``select_unembedded`` uses, and resumable for the same reason: the query IS
-    the ledger, so running it twice equals running it once.
+    The chunk is ``WHERE provenance IS NULL LIMIT n``, resumable because the
+    query IS the ledger: running it twice equals running it once.
 
     A CHUNK THAT SELECTS ROWS AND WRITES NONE STOPS THE RUN. Without that the
     next iteration asks the identical question and gets the identical rows, for
@@ -2537,10 +2151,9 @@ def _flush_provenance(store: Store, pending: list[tuple[str, str]]) -> int:
 # local ``claude`` CLI via subprocess — the same shell-out precedent as ``gh``
 # and ``notify-send`` in this file; ``aggregator.mcp`` stays subprocess-free.
 
-#: The record sources the tagger walks. The row-per-unit-of-work, non-chat
-#: sources — the corpus segment whose vector-arm coverage is weakest, which is
-#: exactly why it gets lexical tags. Sessions/chat ontology is deliberately
-#: absent: those rows live in ``sessions``/``observations``, not ``records``.
+#: The record sources the tagger walks: the row-per-unit-of-work, non-chat
+#: sources. Sessions/chat ontology is deliberately absent: those rows live in
+#: ``sessions``/``observations``, not ``records``.
 _TAG_SOURCES = (
     "dropbox",
     "substack",
@@ -2559,9 +2172,7 @@ _TAG_BATCH = 15
 
 #: Body chars shipped per record. Tags describe what a record is ABOUT; the
 #: opening 4000 characters carry that for these sources, and the cap is what
-#: keeps a 15-record batch from blowing past the prompt budget. Same figure
-#: as the embed chunker's geometry, for the same "enough to characterize"
-#: reason.
+#: keeps a 15-record batch from blowing past the prompt budget.
 _TAG_BODY_CAP = 4000
 
 #: Cap on tags accepted per record. The prompt asks for 3-8; the parser
@@ -2622,7 +2233,7 @@ DEFAULT_TAG_MODEL = "haiku"
 #: * ``--no-session-persistence`` writes no transcript. Belt half of the
 #:   feedback-loop fix: transcripts under ``~/.claude/projects`` are exactly
 #:   what the sessions source ingests, so a persisted tag run would re-inject
-#:   every record body it read into the corpus and the embed backlog.
+#:   every record body it read into the corpus.
 #:
 #: All four verified against the deployed CLI (2026-09-04 smoke: 3 synthetic
 #: records, injection bait tagged as data, no transcript directory created).
@@ -2836,8 +2447,8 @@ def _tag_batch_size(raw: str) -> int:
     """``argparse`` type for ``tag --batch-size``: records per LLM call.
 
     Refused at the parser rather than at runtime because every bad value
-    fails in TAG-specific ways that ``embed``'s ``_positive_int`` prose does
-    not describe (and that one stays as it is): the batch walk is
+    fails in TAG-specific ways that ``_positive_int``'s prose does not
+    describe (and that one stays as it is): the batch walk is
     ``range(0, len(ids), batch_size)``, so 0 crashes it with a bare
     ``ValueError`` (range step of zero) and a negative value makes the walk
     EMPTY — the run prints ``tagged=0`` and exits 0 with the whole corpus
@@ -2994,147 +2605,56 @@ def _cmd_tag(args: argparse.Namespace, store: Store) -> int:
     return 0
 
 
-def _cmd_seed_models() -> int:
-    """Fetch/verify the model weights. NO DATABASE, NO ROWS, NO LOCK.
+def _cmd_seed_reranker() -> int:
+    """Fetch/verify the cross-encoder's weights. NO DATABASE, NO ROWS, NO LOCK.
 
-    WHY THIS IS ITS OWN COMMAND. The seed unit ran ``embed --once --source
-    observations``, which builds only the ``Embedder``. Nothing anywhere else
-    builds the ``Reranker`` outside a live ``rerank=True`` call, and every
-    model load is offline unless a human opts in — so the reranker's weights
-    were never fetched by ANY path, and ``rerank`` was guaranteed to fail on
-    this machine forever no matter how often the seed unit ran.
-
-    The second half is what it was doing instead: opening the index,
-    migrating it, taking the embed lock, claiming a row of an untrusted
-    corpus and advancing a watermark, all as a side effect of "make sure the
-    model is downloaded". This command is dispatched before ``main`` builds a
-    ``Store`` at all, so warming a model cache cannot write to the index.
-
-    BOTH ARE ATTEMPTED EVEN IF THE FIRST FAILS. The operator is doing this to
-    find out what is missing; reporting one model per invocation would make
-    them run it twice to learn something one run already knew.
+    Every model load is offline unless a human opts in, and the reranker is
+    otherwise only ever built inside a live ``rerank=True`` call — so this is
+    the one path that can put its weights on a machine. Dispatched before
+    ``main`` builds a ``Store`` at all, so warming a model cache cannot write
+    to the index.
     """
     from aggregator.core.rerank import Reranker
 
-    allowed = downloads_allowed()
-    failures: list[tuple[str, BaseException]] = []
-    for label, build in (("embedder", seed_embedder), ("reranker", Reranker)):
-        try:
-            build()
-        except Exception as e:  # noqa: BLE001 - reported per model, not handled
-            failures.append((label, e))
-        else:
-            print(f"embed --seed-models: {label} ready")
-    if not failures:
-        return 0
-    for label, error in failures:
+    try:
+        Reranker()
+    except Exception as error:  # noqa: BLE001 - reported, not handled
         print(
-            f"ERROR: the {label} weights could not be loaded "
+            f"ERROR: the reranker weights could not be loaded "
             f"({type(error).__name__}: {error})",
             file=sys.stderr,
         )
-    if allowed:
+    else:
+        print("seed-reranker: reranker ready")
+        return 0
+    if downloads_allowed():
         print(
             f"Downloads were permitted ({MODEL_DOWNLOAD_ENV} is set), so this "
             f"is not the offline guard — the hub, the network or the disk is "
-            f"the problem. Re-run `{SEED_MODELS_COMMAND}` once it is fixed.",
+            f"the problem. Re-run `{SEED_RERANKER_COMMAND}` once it is fixed.",
             file=sys.stderr,
         )
     else:
-        # NAMED IN FULL, because the whole failure mode this command exists
-        # for is weights nothing was ever going to fetch. "Enable downloads"
-        # would leave the operator to work out how.
+        # NAMED IN FULL: "enable downloads" would leave the operator to work
+        # out how.
         print(
             f"Model loads are offline unless a human asks for them, and "
             f"{MODEL_DOWNLOAD_ENV} is not set, so nothing was fetched. Run "
             f"this once, with network access:\n"
-            f"    {SEED_MODELS_COMMAND}",
+            f"    {SEED_RERANKER_COMMAND}",
             file=sys.stderr,
         )
     return 1
-
-
-def _report_embed_outcome(outcome: _EmbedOutcome) -> int:
-    """Say what was set aside, and decide whether this run failed.
-
-    THE KNOWN-POISON BARGAIN, one layer below where PR #5 struck it. A row the
-    worker has never failed on before is NEWS: its id and its error go to
-    stderr and the run exits non-zero, because "fail loudly" means an operator
-    learns of each new problem exactly once. A row already in the ledger is
-    NOT news: it becomes a count on stdout and the run exits 0, because the
-    same permanent problem shouting twice an hour is how an operator learns to
-    ignore the notifier, and that costs the next real failure its audience.
-
-    Quiet is only defensible while it is not the same as forgotten, so the
-    quiet line still carries a number and still names where the detail lives.
-    """
-    if outcome.interrupted:
-        # Said out loud on every interrupted run, because "stopped early" and
-        # "drained the backlog" both otherwise print nothing at all, and the
-        # difference is whether the next tick has work left.
-        print(
-            "embed: INTERRUPTED — a stop was requested, the row in flight "
-            "finished and its vectors were committed, and the rest of the "
-            "backlog is untouched. The next run resumes from here."
-        )
-    if outcome.new_failures:
-        for line in outcome.new_failures:
-            print(line, file=sys.stderr)
-        print(
-            f"embed: {len(outcome.new_failures)} row(s) set aside this run and "
-            f"recorded in the quarantine ledger. Each is retried with backoff "
-            f"and given up on after {POISON_MAX_ATTEMPTS} attempts; the rest of "
-            f"the backlog was embedded. `aggregator status` lists them. This is "
-            f"reported once per row — later runs stay quiet.",
-            file=sys.stderr,
-        )
-        return 1
-    if outcome.known_failures:
-        print(
-            f"embed: {outcome.known_failures} known-bad row(s) failed again "
-            f"(already reported once; see `aggregator status`)"
-        )
-    if outcome.released:
-        print(f"embed: {outcome.released} previously-bad row(s) embedded cleanly")
-    if outcome.superseded:
-        print(
-            f"embed: {outcome.superseded} row(s) were edited by ingest while "
-            f"being embedded; the stale vector was discarded and they stay in "
-            f"the backlog for the next run"
-        )
-    if outcome.stalled:
-        # SAID OUT LOUD, because "drained the backlog" and "gave up on it"
-        # otherwise both print nothing and exit 0, and the difference is
-        # whether the index is still filling. Not a failure: every row is
-        # intact at NULL, and a writer that is outrunning the worker is a
-        # condition the next tick may well not find.
-        print(
-            f"embed: STOPPED WITHOUT PROGRESS — {_MAX_STALLED_BATCHES} "
-            f"consecutive batches moved no row out of the backlog, so this run "
-            f"ended rather than re-reading the same rows indefinitely. The "
-            f"usual cause is ingest rewriting those bodies faster than they "
-            f"can be embedded. Nothing was lost: every row is still queued and "
-            f"the next run re-reads it from its current body. If `aggregator "
-            f"status` shows the pending count flat across several runs, the "
-            f"writer is not backing off and the two timers need separating."
-        )
-    return 0
 
 
 def _positive_int(raw: str) -> int:
     """An ``argparse`` type that refuses the two values SQLite reinterprets.
 
     Both failures are silent, which is why this is a parser-level refusal
-    rather than a runtime check. ``--batch-size 0`` becomes ``LIMIT 0``, so
-    ``select_unembedded`` returns nothing, ``_embed_backlog`` concludes the
-    backlog is drained, and ``--catchup`` exits 0 having embedded nothing —
-    under a timer, an index that never fills while every run looks
-    successful. ``--batch-size -5`` becomes ``LIMIT -1``, which SQLite reads
-    as NO limit, collapsing the chunked and checkpointed worker into one
-    unbounded batch over 483k rows.
-
-    The Nix option already enforces a positive int; the CLI did not, so a
-    hand-run command had no such protection.
+    rather than a runtime check: a chunk size of 0 becomes ``LIMIT 0``, so a
+    chunked pass reads nothing and reports itself done, and a negative one
+    becomes ``LIMIT -1``, which SQLite reads as NO limit — one unbounded
+    chunk over the whole corpus.
     """
     try:
         value = int(raw)
@@ -3142,888 +2662,11 @@ def _positive_int(raw: str) -> int:
         raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from e
     if value < 1:
         raise argparse.ArgumentTypeError(
-            f"must be at least 1, got {value}. 0 makes --catchup a silent "
-            f"no-op (LIMIT 0 returns no rows, so the backlog reads as "
-            f"drained); a negative value reaches SQLite as LIMIT -1, i.e. one "
-            f"unbounded batch over the whole corpus."
+            f"must be at least 1, got {value}. 0 makes a chunked pass a silent "
+            f"no-op (LIMIT 0 returns no rows); a negative value reaches SQLite "
+            f"as LIMIT -1, i.e. one unbounded chunk over the whole corpus."
         )
     return value
-
-
-@dataclass
-class _EmbedOutcome:
-    """What one ``aggregator embed`` invocation did to the poison ledger."""
-
-    #: Ready-to-print stderr lines, one per row failing for the FIRST time.
-    new_failures: list[str] = field(default_factory=list)
-    #: Rows that failed again having already been reported. Counted, not named.
-    known_failures: int = 0
-    #: Rows that used to fail and embedded cleanly this time.
-    released: int = 0
-    #: Rows whose body was edited while the worker was embedding it. Their old
-    #: vector was discarded and they stay in the backlog for the next run —
-    #: self-healing, so this is a count rather than a failure.
-    superseded: int = 0
-    #: A stop was requested (SIGTERM/SIGINT) and the run ended at a boundary
-    #: with backlog still to do. Reported, but NOT a failure: the same event
-    #: ``ingest`` prints as INTERRUPTED. A run that exited non-zero for being
-    #: asked to stop is the false alarm this flag exists to replace.
-    interrupted: bool = False
-    #: ``--catchup`` ended because consecutive batches moved no row out of the
-    #: backlog, not because the backlog was empty. Reported, not failed: every
-    #: row is intact at NULL and the next tick re-reads it from its current
-    #: body. See ``_MAX_STALLED_BATCHES``.
-    stalled: bool = False
-
-
-class EmbedderUnhealthyError(RuntimeError):
-    """The embedder could not embed a known-good probe. Not a bad row.
-
-    Raised out of the batch loop so the whole run stops without attributing
-    anything to a record. See :func:`_embedder_is_healthy`.
-    """
-
-
-#: A body the model must be able to embed if it is working at all: short,
-#: plain ASCII, nothing a chunker or tokenizer has any reason to choke on.
-_EMBED_HEALTH_PROBE = "aggregator embed health probe"
-
-#: How many consecutive batches may move NO row out of the backlog before
-#: ``--catchup`` gives up and lets the next tick try.
-#:
-#: Three, not one: a single zero-write batch is an ordinary race — ingest
-#: rewrote a body while the worker held it — and the very next pass re-reads
-#: the new fingerprint and succeeds, so stopping on the first would abandon a
-#: healthy backlog over one unlucky interleaving. Three consecutive passes that
-#: all move nothing is no longer a race; it is a writer keeping ahead of the
-#: worker, and more attempts inside this run will not change that.
-#:
-#: Not large, either. The cost of stopping is one timer tick (30 minutes) and
-#: nothing else — every row is still at NULL with its vectors intact — while
-#: the cost of not stopping is a worker spinning at full CPU on a laptop.
-_MAX_STALLED_BATCHES = 3
-
-#: The measured cost of one full chunk, in wall-clock seconds. 4000 characters
-#: ≈ 804 tokens at the ~40 tokens/second of ``docs/embedding-throughput.md``.
-#: Named here so the cap below and the ``--help`` sentence describing it are the
-#: same arithmetic rather than two numbers that can drift apart.
-_SECONDS_PER_CHUNK = 20
-
-#: How much ENCODER TIME one checkpointed batch may buy, counted in chunks.
-#:
-#: THE BATCH IS BOUNDED BY CHUNKS BECAUSE THE BILL IS PER CHUNK. ``--batch-size``
-#: bounds rows, and rows differ in chunk count by two orders of magnitude, so
-#: the interval between durable checkpoints was whatever the backlog happened to
-#: hold rather than anything anyone chose. Measured read-only against the live
-#: cache on 2026-08-25, at the chunker's own ``chunk-4000-400`` geometry:
-#: dropbox is 1536 records ≈ 3838 chunks, and the FIRST 500-row batch of it is
-#: ≈1149 chunks — ~6.4 hours before a single vector is written. Confirmed live
-#: rather than inferred: twenty minutes into a run, ``chunk_embeddings`` was
-#: still empty. The 2026-08-16 directive asks for "bounded batches with
-#: committed checkpoints, so a kill at any moment loses at most one chunk"; 6.4
-#: unprotected hours is not that, and it fell out of a unit mismatch.
-#:
-#: FORTY-FIVE, WHICH IS ABOUT FIFTEEN MINUTES at the rate above. That is half
-#: the embed timer's 30-minute period, so an ungraceful death costs at most half
-#: a tick — the largest loss that still reads as "the next tick catches up"
-#: rather than as work thrown away. There is no throughput argument for a bigger
-#: number: one SELECT plus one commit is a few hundred milliseconds against 900
-#: seconds of encoding, i.e. well under 0.1% overhead, and
-#: ``docs/embedding-throughput.md`` measured enlarging the model's own batch at
-#: under 10% and negative past 8, so nothing is being amortised here either.
-#:
-#: A CONSTANT AND NOT A FLAG, like ``_MAX_STALLED_BATCHES`` beside it. It is
-#: derived from a measured rate rather than from a preference: raising it
-#: re-creates the defect it exists to close, and lowering it buys nothing the
-#: overhead arithmetic above has not already given away.
-_MAX_BATCH_CHUNKS = 45
-
-#: How many chunks may go to the model in ONE ``embed_documents`` call.
-#:
-#: THIS IS WHAT MAKES A STOP REACHABLE. The stop flag is read between calls and
-#: nowhere else, so the largest call is the longest a SIGTERM can go unanswered.
-#: A whole row used to be one call: measured read-only against the live cache at
-#: ``chunk-4000-400``, 1,348 rows exceed 300 s that way and the largest is 257
-#: chunks — about 86 minutes — against a ``TimeoutStopSec`` of 5 minutes. So
-#: systemd escalated to SIGKILL with the claim held, and the next run's
-#: ``_blame_crashed_row`` booked a good row as poison; three of those and the
-#: row is terminal, permanently absent from the vector arm.
-#:
-#: FOUR, which is ~80 seconds at ``_SECONDS_PER_CHUNK``. That leaves the rest of
-#: the 300-second window for the flush and commit that follow, with room to
-#: spare on a machine under load — the number is chosen against the window it
-#: has to fit inside, not for its own sake.
-#:
-#: AND IT COSTS ESSENTIALLY NOTHING, which is why it is not a larger number
-#: hedged with a comment. ``docs/embedding-throughput.md`` measured enlarging
-#: the model's own batch at under 10% and NEGATIVE past 8, so four is already
-#: near the flat part of that curve; the throughput given up is a rounding
-#: error against a backfill measured in weeks, and it buys the difference
-#: between a stop that works and one that loses a row.
-#:
-#: NOT A FLAG, for the same reason as the two constants above: raising it
-#: re-opens the gap it exists to close.
-_MAX_CHUNKS_PER_ENCODE = 4
-
-
-def _embedder_is_healthy(embedder: Embedder) -> bool:
-    """THE TRANSIENT/PERMANENT DISCRIMINATOR, asked at the moment of failure.
-
-    "Was that the row's fault or the machine's?" cannot be answered from the
-    exception: a model that has not finished loading, an allocator that ran out
-    of memory, and a body that deterministically kills the tokenizer all arrive
-    as ``RuntimeError`` from ``sentence-transformers``. Sniffing types would be
-    a guess, and a wrong guess in either direction is expensive — condemn a
-    transient and the row is lost from the index, excuse a permanent and the
-    backlog never drains.
-
-    So ask the question directly, by re-running the same call on input that is
-    known to be fine. If the probe embeds, the embedder works and the failure
-    discriminated between two bodies, which makes it a property of the ROW. If
-    the probe fails too, the failure discriminates between nothing, so nothing
-    may be blamed on a record: the caller aborts, marks no row, holds no row,
-    and leaves the backlog exactly where it was.
-
-    That covers each named transient exactly. A cold model fails the probe. An
-    OOM fails the probe. An I/O blip on the model files fails the probe. A body
-    that kills the tokenizer does not.
-
-    It is not asked to cover everything, and it does not have to: the second
-    axis is reproducibility. A row that passes this test is HELD with backoff,
-    not condemned — a large row that OOMed while the small probe fit is
-    attempted again later and released the moment it succeeds. Only failing
-    ``POISON_MAX_ATTEMPTS`` times across separate runs, minimum fifteen minutes
-    apart, makes a row terminal, and by then "deterministic" is evidence rather
-    than inference.
-
-    Costs one short embed per FAILING row and nothing at all on a healthy run.
-    Deliberately not memoised across a batch: an embedder that dies partway
-    through must be caught then, not excused by a probe that passed earlier.
-    """
-    try:
-        embedder.embed_documents([_EMBED_HEALTH_PROBE])
-    except Exception:
-        # Including the probe's own unexpected failures. Every unknown here
-        # resolves to "do not attribute", which is the direction that costs a
-        # re-read rather than a permanently dropped row.
-        return False
-    return True
-
-
-class EmbedStoreUnavailableError(RuntimeError):
-    """The CACHE failed mid-batch. Not a bad row, and not the embedder either.
-
-    Its own type so the run reports an environment fault in the vocabulary of
-    an environment fault. The sibling of :class:`EmbedderUnhealthyError`, for
-    the half of the try block round 2's probe reasoning never covered.
-    """
-
-
-def _embed_store_unavailable(
-    kind: str, error: BaseException
-) -> EmbedStoreUnavailableError:
-    """The message an operator gets when the cache, not the corpus, failed.
-
-    It has to say the row was NOT blamed, because the whole failure mode is a
-    good row being condemned for a transient lock and quietly leaving the
-    index.
-
-    IT MUST NO LONGER BLAME THE INGEST TIMER, and that correction is the point
-    of this revision. It used to read "the usual cause is another writer
-    holding the database — the ingest timer runs every 30 minutes and a long
-    run overlaps the embed tick", which was true when it was written and is
-    now the one thing this cannot be: aggregator's writers queue for
-    ``Store._CacheWriteLock`` before touching SQLite, so an overlap makes embed
-    WAIT, not fail. Pointing a human at the ingest timer would now send them to
-    read a schedule that is working as designed.
-
-    What is left when a lock still surfaces here is a writer outside that
-    scheme, and the two real ones are worth naming because they need opposite
-    responses: a half-deployed upgrade, where one unit is running a build that
-    predates the lock and therefore does not queue, and a human holding a
-    transaction at an interactive ``sqlite3`` prompt.
-    """
-    return EmbedStoreUnavailableError(
-        f"aggregator embed stopped: the cache could not be written while "
-        f"embedding {kind} "
-        f"({type(error).__name__}: {error}). That is the STORE failing, not "
-        f"bad data and not the embedder, so NO row was blamed for it, nothing "
-        f"was added to the poison ledger, and every row still unembedded "
-        f"stays in the backlog exactly where it was. The next run resumes from "
-        f"the watermark. This should be RARE: aggregator's own writers queue "
-        f"for an OS lock on <cache>.write.lock and wait for each other, so a "
-        f"normal ingest/embed overlap can no longer cause this. Look instead "
-        f"for a writer outside that scheme — a half-finished deploy leaving one "
-        f"unit on a build older than the lock, or an interactive `sqlite3` "
-        f"session holding a transaction open."
-    )
-
-
-class EmbedWorkerKilledError(RuntimeError):
-    """A previous worker process died on a row without raising anything.
-
-    Its own type so the ledger entry, and therefore ``aggregator status``,
-    names the failure mode rather than showing a generic RuntimeError next to
-    genuinely different faults.
-    """
-
-
-def _blame_crashed_row(
-    store: Store, ledger: PoisonLedger, outcome: _EmbedOutcome
-) -> None:
-    """Set aside the row a previous process died on, if there is one.
-
-    THE WEDGE THIS EXISTS TO BREAK. Chunk N's isolation depends on catching an
-    exception: the row is held, marked ``'error'``, and the backlog drains
-    past it. A row that OOM-kills the worker, or segfaults inside a native
-    tokenizer, raises nothing at all — no handler runs, no ledger entry is
-    written, ``embedding_state`` stays NULL, and ``select_unembedded``'s
-    ``ORDER BY ts DESC`` hands the identical row to the next tick. Twice an
-    hour, forever, and the only external symptom is ``vector_index`` counts
-    that stop moving, which is not something a human watches for a month.
-
-    A ROUTINE SHUTDOWN NEVER GETS HERE. SIGTERM and SIGINT are handled in
-    ``_cmd_embed``: the row in flight finishes, its claim is released, and the
-    run stops at a boundary. So a claim that survives is one no handler could
-    run for — a SIGKILL, an OOM kill, a segfault — which is what makes the
-    claim evidence of a crash rather than evidence of a reboot. Before that
-    handler existed, every `systemctl stop` condemned whichever good row was
-    in flight, twice an hour on a month-long backfill.
-
-    Routed through the SAME ledger as every other per-row failure, so the
-    residual case — a SIGTERM the worker could not act on before
-    ``TimeoutStopSec`` escalated it to SIGKILL — costs one delayed row rather
-    than a condemned one: the row is held with backoff, comes back when it is
-    due, and only becomes terminal after ``POISON_MAX_ATTEMPTS`` sightings at
-    least fifteen minutes apart. A row that reliably kills the worker stops
-    being attempted.
-    """
-    claim = store.pending_embed_claim()
-    if claim is None:
-        return
-    kind, row_id = claim
-    source = _embed_ledger_source(kind)
-    error = EmbedWorkerKilledError(
-        f"a previous `aggregator embed` process died while embedding {kind} "
-        f"row {row_id!r} — no exception was raised, so this is a kill "
-        f"(OOM, segfault in a native extension, or an external SIGKILL) "
-        f"rather than bad data the worker could catch. The row is set aside "
-        f"so the backlog can drain past it."
-    )
-    previous = ledger.entries(source).get(row_id)
-    held = ledger.hold(source, row_id, error, previous=previous)
-    # ``expected=None`` said out loud: this makes no claim about the row's
-    # content, only that a previous process died on it.
-    store.mark_embedded(kind, [row_id], state="error", expected=None)
-    store.release_embed_claim()
-    if previous is None:
-        outcome.new_failures.append(
-            f"embed: {kind} row {row_id!r} killed a previous worker process "
-            f"and was set aside — {held.error_detail}"
-        )
-    else:
-        outcome.known_failures += 1
-
-
-def _embed_ledger_source(kind: str) -> str:
-    """What the embed worker calls itself in the quarantine ledger.
-
-    Namespaced per ontology so an ``obs_id`` and a ``stable_id`` that happen to
-    collide cannot inherit each other's attempt count, and so the line
-    ``aggregator status`` prints says which worker set the row aside rather
-    than colliding with an ingest source of the same name.
-    """
-    return f"embed:{kind}"
-
-
-def _embed_plan(source_arg: str) -> list[tuple[str, str]]:
-    """The ``(kind, source)`` groups this run drains, IN PRIORITY ORDER.
-
-    THE USER'S 2026-08-21 DIRECTIVE, executed. ``dropbox -> blog -> llm ->
-    claude code``, then the sources they did not rank. The worker used to loop
-    over ontologies — all observations, then all records — and no ordering
-    inside ``select_unembedded`` could have produced the user's sequence,
-    because it cuts across the ontologies: two records sources come before
-    every observation and four more come after. So the loop is over the plan
-    and the ontology is a property of each step.
-
-    That matters at the scale this runs at. The full backfill is a measured
-    25-30 days of continuous CPU; under the old loop dropbox — the source the
-    user put FIRST — queued behind 505k observations, which is weeks.
-
-    ``--source observations|records`` still narrows to one ontology, and
-    narrowing does not flatten: the surviving groups keep their relative order.
-    """
-    if source_arg == "both":
-        return list(EMBED_BACKLOG_ORDER)
-    return [(k, s) for k, s in EMBED_BACKLOG_ORDER if k == source_arg]
-
-
-def _report_embed_progress(store: Store, out=None) -> None:
-    """Print how far each source has got. The answer to the question asked.
-
-    "Which sources are fully embedded" is what a user wants to know about a
-    multi-week backfill, and a global percentage cannot answer it: one "62%"
-    is compatible with dropbox untouched and with dropbox finished, which are
-    opposite answers to "can I search my notes yet".
-
-    EVERY GROUP IS LISTED, INCLUDING THE EMPTY ONES. A source holding no rows
-    and a source fully embedded return the same zero vector hits for every
-    query, so ``empty`` is printed as its own word rather than rolled into
-    ``complete`` or omitted. Same reason the states are the ones
-    ``Store.vector_index_state`` already uses.
-
-    Two grouped queries per ontology — measured against a snapshot of the live
-    cache at 0.27 s warm and 4.3 s on a cold page cache — so a 30-minute timer
-    can afford it once per run, at the end, where it costs nothing the embed
-    pass has not already paid. Best-effort: a progress display must never be
-    the thing that fails a run which embedded rows successfully.
-    """
-    out = out or sys.stdout
-    try:
-        rows = store.embed_progress_by_source()
-    except Exception as e:  # noqa: BLE001 - reporting must not fail the run
-        print(f"embedding progress unavailable: {e}", file=sys.stderr)
-        return
-    print("embedding progress by source (highest priority first):", file=out)
-    for row in rows:
-        print(
-            f"  {row['source']}: {row['state']} — {row['embedded']}/{row['total']} "
-            f"embedded, {row['pending']} pending, {row['skipped']} nothing to "
-            f"embed, {row['errors']} held ({row['kind']})",
-            file=out,
-        )
-
-
-def _requeue_due_rows(store: Store, ledger: PoisonLedger, kind: str) -> None:
-    """Put back the rows whose backoff has expired. ONCE PER RUN, PER ONTOLOGY.
-
-    A row that failed left the backlog under ``embedding_state = 'error'``, so
-    ``select_unembedded`` cannot see it and no amount of draining would ever
-    try it again. Putting the due ones back is what makes the hold a RETRY
-    rather than a deletion.
-
-    IT LIVES HERE, ABOVE THE PRIORITY WALK, and that placement is the whole
-    reason it is its own function. It used to sit at the top of
-    ``_embed_backlog``, which was called once per ontology; the walk calls that
-    up to eight times per run, so leaving it there would have re-asked the
-    ledger for due rows in the middle of the run that set some of them aside.
-    ``PoisonLedger.due`` filters on ``next_attempt_at``, so nothing would
-    actually have been requeued early — but "a row cannot be requeued into the
-    same run that just held it" would have gone from a structural guarantee to
-    a coincidence of the backoff being longer than one pass.
-    """
-    due = ledger.due(_embed_ledger_source(kind))
-    if due:
-        store.requeue_embedding(kind, sorted(due))
-
-
-def _embed_row_text(kind: str, row: sqlite3.Row) -> tuple[str, str]:
-    """The id, and the EXACT text the model will be handed, for one backlog row.
-
-    ONE DEFINITION, TWO CALLERS, which is the whole reason it is a function.
-    ``_embed_batch`` encodes this string; ``_row_chunk_cost`` sizes the batch
-    from it. If the two ever disagreed the cap would be enforced against text
-    nobody embeds. Records are the trap: they go to the model as
-    ``subject + "\\n\\n" + body``, so a records row costs more chunks than its
-    body alone, and a cost function reading ``body`` would under-count every
-    record in the corpus.
-    """
-    if kind == "observations":
-        return row["obs_id"], (row["body"] or "")
-    return row["stable_id"], f"{row['subject']}\n\n{row['body']}"
-
-
-def _row_chunk_cost(kind: str, row: sqlite3.Row) -> int:
-    """What this row will cost the encoder, in chunks. COUNTED, not estimated.
-
-    By actually chunking it, because an estimate that can under-count does not
-    bound anything. ``chunk_body`` has two branches — greedy paragraph packing
-    when every paragraph fits the window, hard windowing otherwise — and a
-    length-based estimate describes only the second. On prose whose paragraphs
-    run just over half a window, packing yields one chunk per paragraph while
-    the arithmetic predicts roughly half that: a ~2x under-count, and a cap that
-    can be exceeded twofold is not a cap. The price of counting exactly is
-    string slicing, against ~20 seconds per chunk of encoding. It does not
-    register.
-
-    A ROW THAT CANNOT BE COUNTED COSTS 1, rather than raising. Every per-row
-    failure in this file is caught inside ``_embed_batch`` precisely so that one
-    bad row costs one row, and moving ``chunk_body`` earlier must not move a
-    raise outside that isolation — a chunker that threw here would abort the
-    whole run on a traceback, which is the shape of the 2026-08-15 doom loop.
-    Costing it 1 is honest as well as safe: a row this cannot chunk is a row the
-    worker cannot embed either, so it will spend no encoder time. It joins the
-    batch, fails there, and is attributed there, exactly as before.
-    """
-    try:
-        return len(chunk_body(_embed_row_text(kind, row)[1]))
-    except Exception:  # noqa: BLE001 - attribution belongs to ``_embed_batch``
-        return 1
-
-
-def _pack_batch(kind: str, rows: list, chunk_cap: int) -> list:
-    """The longest PREFIX of ``rows`` whose chunks fit under ``chunk_cap``.
-
-    The cap is counted in CHUNKS, which the name says because a ROW count —
-    ``args.batch_size`` — is in scope at the only call site and would type-check
-    here without complaint. Swapping the two would silently change what a
-    checkpoint interval is made of, and nothing downstream would notice.
-
-    A PREFIX, NOT A SELECTION. ``select_unembedded`` hands back an ordered
-    backlog — ``ts DESC``, within one group of ``EMBED_BACKLOG_ORDER`` — and
-    stepping over a row that does not fit, to reach smaller ones behind it,
-    would let a large row be passed over for as long as small ones keep
-    arriving. Stopping at the first row that does not fit leaves it at the head
-    of the next SELECT, so the queue always moves forward and nothing can be
-    perpetually deferred.
-
-    THE FIRST ROW IS ALWAYS TAKEN, whatever it costs, and that exemption is
-    load-bearing in two directions at once.
-
-    A row is indivisible here. Committing part of its chunks would write
-    ``chunk_embeddings`` rows under its ``owner_id``, and ``select_unembedded``
-    is a LEFT JOIN against that table — the row would read as embedded and
-    nothing would ever come back for the rest of it. So the cap cannot be
-    honoured by splitting; it can only be honoured by refusing, and refusing is
-    the worse bug.
-
-    And an empty batch writes nothing, which ``_embed_backlog`` reads as a
-    stall. Three of those end the run, and ``ts DESC`` puts the same oversized
-    row at the head of the next SELECT — so a packer that refused it would turn
-    the cap into a row filter that strands that row and everything queued behind
-    it, forever, while every count reports the index simply not filling. The cap
-    bounds how many rows are GROUPED. It is not a statement about which rows are
-    eligible.
-
-    Rows with nothing to embed cost 0 and are therefore never rationed by this.
-    Deliberate: about a third of the corpus has an empty body
-    (``docs/embedding-throughput.md``), those rows are marked ``'skip'`` and
-    spend no encoder time at all, and bounding them is what ``--batch-size`` is
-    still for.
-    """
-    batch: list = []
-    total = 0
-    for row in rows:
-        cost = _row_chunk_cost(kind, row)
-        if batch and total + cost > chunk_cap:
-            break
-        batch.append(row)
-        total += cost
-    return batch
-
-
-def _embed_backlog(
-    store: Store,
-    embedder: Embedder,
-    kind: str,
-    args: argparse.Namespace,
-    ledger: PoisonLedger,
-    outcome: _EmbedOutcome,
-    stop: Callable[[], bool] | None = None,
-    source: str | None = None,
-) -> bool:
-    """Drain one backlog group in bounded batches. Returns WHETHER IT WORKED.
-
-    Chunked and checkpointed for the same reason ingest is: each batch commits
-    its vectors and its watermark before the next one starts, so a kill at any
-    moment costs at most one batch and the next run resumes where this stopped.
-
-    AND THE BATCH IS BOUNDED BY CHUNKS, which is what makes "at most one batch"
-    a number rather than a shrug. ``--batch-size`` bounds the SELECT, but rows
-    differ in chunk count by two orders of magnitude and the encoder is billed
-    per chunk, so a row bound alone left the checkpoint interval to whatever the
-    backlog happened to hold — measured at ~6.4 hours on the first batch of
-    dropbox. ``_pack_batch`` trims the SELECT's result to a prefix that fits
-    ``_MAX_BATCH_CHUNKS``.
-
-    ``source`` NAMES ONE GROUP OF ``EMBED_BACKLOG_ORDER``. Resumability inside a
-    group needs nothing extra: the backlog is a LEFT JOIN, so a run killed
-    halfway through dropbox asks the same question next time and gets what it
-    had not reached. Mid-source resume and between-source resume are the same
-    mechanism.
-
-    THE RETURN VALUE IS FOR ``--once``. That flag means one batch, and the walk
-    visits up to eight groups — so the caller has to be able to tell "this
-    group did a batch" from "this group was already empty". Without it, --once
-    either does eight batches or stops dead at the first finished source and
-    never reaches the ones behind it.
-    """
-    stalls = 0
-    worked = False
-    while True:
-        if stop is not None and stop():
-            outcome.interrupted = True
-            return worked
-        rows = store.select_unembedded(kind, limit=args.batch_size, source=source)
-        if not rows:
-            return worked
-        # BOUNDED TWICE, because the two bounds answer different questions.
-        # ``--batch-size`` bounds ROWS, which is what keeps a batch of rows that
-        # cost the encoder nothing — empty bodies, about a third of the corpus —
-        # from being unbounded. ``_MAX_BATCH_CHUNKS`` bounds CHUNKS, which is
-        # what the interval between durable checkpoints is actually made of. The
-        # SELECT can only express the first: chunk count is not a column and
-        # cannot be one, since it depends on the chunker's geometry. So the
-        # second is applied here, to the SELECT's own result.
-        batch = _pack_batch(kind, rows, chunk_cap=_MAX_BATCH_CHUNKS)
-        moved = _embed_batch(store, embedder, kind, batch, ledger, outcome, stop)
-        worked = True
-        if args.once:
-            return worked
-        # THE TERMINATION ARGUMENT. Every other exit from this loop is "the
-        # backlog is empty"; this one is "the backlog is not emptying".
-        #
-        # Until round 2's S4 the first was enough, because a batch always
-        # emptied itself — each row left as 'ok', 'skip' or 'error', so the
-        # next SELECT could not return it. S4 made the writes a
-        # compare-and-swap, and a batch whose CAS all fails writes NOTHING:
-        # every row stays at NULL and the identical batch is selected again.
-        #
-        # In practice each pass re-reads a fresh ``src_hash``, so one failed
-        # CAS self-corrects on the next pass and a real spin needs rewrites
-        # landing faster than the worker embeds. Rare — and not the point. The
-        # 2026-08-16 shape requires each chunk to commit a checkpoint, which
-        # means every pass must either advance the watermark or end the run.
-        # A loop that cannot say why it stops is one that can fail to.
-        #
-        # RE-DERIVED FOR THE CHUNK BOUND, not assumed to carry over, because
-        # that argument turns on "the identical batch is selected again" and
-        # ``_pack_batch`` changed what the batch IS. It still holds: packing is
-        # a pure function of the rows the SELECT returned and a constant cap,
-        # and a zero-write pass leaves every one of those rows exactly where it
-        # found them — so the next SELECT returns the same rows and the same
-        # prefix comes out. It also cannot degenerate into a stall of its own
-        # making: the packer never returns an empty batch for a non-empty
-        # SELECT, so every pass still attempts at least one row and a stall
-        # remains evidence about the CAS rather than about the packing.
-        #
-        # THREE IS STILL THE RIGHT NUMBER, and for a slightly sharper reason
-        # than before. Batches are smaller now, so a single concurrent rewrite
-        # can zero a whole one where it used to be diluted across 500 rows —
-        # which makes a stall MORE informative, not less. ``ts DESC`` means
-        # three consecutive zero-write passes are three failures on the same
-        # head row, i.e. a writer holding that row, which is exactly the
-        # condition this bound exists to stop spinning on.
-        if moved:
-            stalls = 0
-            continue
-        stalls += 1
-        if stalls >= _MAX_STALLED_BATCHES:
-            outcome.stalled = True
-            return worked
-
-
-def _chunk_sha(text: str) -> str:
-    """The content address of one chunk: sha256 of the exact bytes encoded.
-
-    OF THE CHUNK, NOT OF THE ROW. ``src_hash`` already fingerprints the row and
-    answers a different question ("did the body move under the worker?"). This
-    one answers "have these exact bytes been through the model already", and it
-    has to describe what the encoder saw or a reuse would hand back a vector
-    for different text.
-    """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _embed_batch(
-    store: Store,
-    embedder: Embedder,
-    kind: str,
-    rows: list,
-    ledger: PoisonLedger,
-    outcome: _EmbedOutcome,
-    stop: Callable[[], bool] | None = None,
-) -> int:
-    """Embed one batch, then advance the watermark — IN THAT ORDER.
-
-    RETURNS HOW MANY ROWS LEFT THE BACKLOG, which is what makes ``--catchup``'s
-    loop terminating rather than merely usually-terminating. Since round 2's S4
-    the writes are a compare-and-swap, so a batch can legitimately write
-    nothing at all and leave every row exactly where it found it — and the next
-    SELECT then returns that same batch. See ``_MAX_STALLED_BATCHES``.
-
-    Vectors are written before ``embedding_state`` moves. The reverse order is
-    the one that loses rows: a crash between the two would leave rows marked
-    embedded that nothing will ever come back for.
-
-    A row with no chunks (empty or whitespace-only body — roughly half the
-    corpus sits in that bucket) is marked ``'skip'`` rather than ``'ok'``. It
-    has to leave the backlog or the worker re-reads it every run forever, but
-    "nothing to embed" and "embedded" are different facts and the table keeps
-    them apart.
-
-    ONE BAD ROW COSTS ONE ROW. Every per-row failure is caught here, and the
-    reason it must be is the 30-minute timer: ``select_unembedded`` orders
-    ``ts DESC``, so a row that aborted the run was the first row of the next
-    run too, forever. That is the 2026-08-15 ingest doom loop with a different
-    query at the bottom of it. A caught failure is held in the quarantine
-    ledger, marked ``'error'`` so the backlog can drain past it, and — if this
-    is the first time — named on stderr.
-
-    THE LEDGER IS WRITTEN BEFORE THE MARK, and that order is the safe one. A
-    kill in between leaves a ledger entry for a row still sitting at NULL: it
-    is attempted again next run and its attempt count runs one high, which
-    costs one embed. The reverse leaves a row marked ``'error'`` with nothing
-    holding it, which no ``due`` set would ever requeue — a row silently gone
-    from the index with no record of why, i.e. the failure this whole file is
-    about.
-
-    ``except Exception``, never ``BaseException``: a ``KeyboardInterrupt``, a
-    ``SystemExit`` or a test's deliberate ``BaseException`` sentinel means stop,
-    not "this row is poison".
-
-    THE STOP CHECK IS PER ROW, not per batch, and the granularity is the
-    point. A batch is up to ``_MAX_BATCH_CHUNKS`` chunks of encoding — about a
-    quarter of an hour — and a ``TimeoutStopSec`` is far shorter than that, so
-    "finish the batch in flight" would still be SIGKILLed partway — leaving
-    the claim that makes the next run condemn a good row, which is the whole
-    thing being fixed. One row is the unit of work here and the unit the claim
-    covers, so it is the boundary. Whatever embedded before the stop is
-    flushed and committed below; the rest stays in the backlog.
-
-    AND IT IS READ INSIDE THE ROW TOO, which is what makes the row boundary an
-    honest promise rather than an aspiration. A row used to be a single
-    ``embed_documents`` call over all of its chunks, so the flag was not read
-    again until that call returned: measured read-only against the live cache,
-    1348 rows exceed 300 s that way and the largest is 257 chunks — about 86
-    minutes — against a 5-minute ``TimeoutStopSec``. A stop landing inside one
-    of those was SIGKILLed with the claim held, and ``_blame_crashed_row`` then
-    attributed it to a good row. The encode is sliced at
-    ``_MAX_CHUNKS_PER_ENCODE`` now, so the longest a stop can go unanswered is
-    ~80 seconds regardless of how long the row is.
-
-    A ROW INTERRUPTED PARTWAY IS NOT MARKED AND DOES NOT COMMIT. The row stays
-    the unit that commits even though it is no longer the unit that encodes:
-    chunks written under a partially-embedded row's ``owner_id`` would make
-    ``select_unembedded``'s LEFT JOIN read it as done, and the rest of it would
-    never be asked for again. It stays at NULL and the next run re-embeds it
-    whole — one row of repeated work, against a row silently missing from the
-    index.
-
-    A ROW THAT MOVED WHILE THE WORKER HELD IT IS NOT MARKED. Ingest sets
-    ``embedding_state`` back to NULL and drops a row's vectors whenever its
-    body changes — that is the only thing that ever re-embeds an edited row.
-    Interleave the two and the worker undoes it: it embeds the OLD body,
-    ingest invalidates the row, and the worker then upserts the old vector
-    back and marks the row ``'ok'``. ``select_unembedded`` only looks at NULL,
-    so nothing comes back for it until the body is edited AGAIN, and until
-    then the vector arm answers with text the row no longer contains while the
-    keyword arm (which has a trigger) answers with the text it does.
-
-    The fingerprint the batch is judged against therefore comes from
-    ``select_unembedded``'s OWN row set, alongside the body, and the comparison
-    happens inside the writes themselves — see ``Store.commit_embed_batch``.
-    Re-reading it here instead left a window: an edit landing between the
-    SELECT and the re-read makes both snapshots show the new hash, so the row
-    reads as untouched while the text in hand is stale. Rows that moved are
-    counted ``superseded`` rather than failed, because they stay at NULL and
-    the next run embeds them from their current body — it self-heals, and a
-    ledger entry would only make ``aggregator status`` overstate the damage.
-    """
-    source = _embed_ledger_source(kind)
-    entries = ledger.entries(source)
-    id_key = "obs_id" if kind == "observations" else "stable_id"
-    # The body and its fingerprint out of one statement, so "unchanged since
-    # the worker took it" is a claim the SELECT itself can support.
-    expected = {r[id_key]: r["src_hash"] for r in rows}
-    ok_ids: list[str] = []
-    skip_ids: list[str] = []
-    error_ids: list[str] = []
-    all_vecs: list[tuple[str, str, Any]] = []
-    #: ``chunk_id -> content_sha256``, handed to the store so a later run can
-    #: prove the same bytes were already embedded. See ``reusable_chunk_vectors``.
-    chunk_hashes: dict[str, str] = {}
-    #: ``content_sha256 -> vector`` for text this batch already has an answer
-    #: for, whether from the index on disk or from an earlier row of this same
-    #: batch. THE ONLY LEVER THAT MOVES THE BACKFILL. Measured on this hardware
-    #: the encoder runs at ~40 tokens/second, so one 4000-character chunk is
-    #: ~19 seconds and a lookup that avoids one is worth ~19 seconds; batching,
-    #: by contrast, was measured at under 10% and negative past batch 8
-    #: (``docs/embedding-throughput.md``). Chat transcripts repeat themselves
-    #: constantly — quoted text, re-pasted tool output, the same file read
-    #: twice — and every repeat is a chunk that does not have to be computed.
-    known: dict[str, Any] = {}
-    unhealthy: EmbedderUnhealthyError | None = None
-    store_fault: sqlite3.Error | None = None
-    for row in rows:
-        if stop is not None and stop():
-            outcome.interrupted = True
-            break
-        # THROUGH THE SAME HELPER THE PACKER USED. The batch was sized from
-        # this exact string; reading the body a second way here would let the
-        # cap describe text that never reaches the model.
-        row_id, body = _embed_row_text(kind, row)
-        try:
-            chunks = chunk_body(body)
-            if not chunks:
-                skip_ids.append(row_id)
-                continue
-            hashes = [_chunk_sha(text) for text in chunks]
-            # ASK THE INDEX BEFORE ASKING THE MODEL. One indexed SELECT per
-            # row, against ~19 seconds per chunk it can save. Scoped to this
-            # model by the store — a hash match under a different model is the
-            # same text in a different embedding space, and reusing it would be
-            # exactly the silent mixing the (chunk_id, model) key exists to
-            # prevent.
-            unknown = [h for h in hashes if h not in known]
-            if unknown:
-                known.update(store.reusable_chunk_vectors(unknown))
-            missing = [i for i, h in enumerate(hashes) if h not in known]
-            if missing:
-                # WRITTEN AND COMMITTED BEFORE THE ATTEMPT. Everything else in
-                # this handler needs an exception; a row that OOM-kills or
-                # segfaults the process raises nothing, so the claim on disk is
-                # the only trace that survives. See ``Store.claim_embed_row``.
-                #
-                # Only when there is something to attempt: a row whose every
-                # chunk was reused never reaches the model, so there is no
-                # crash to attribute and claiming it would be a lie about what
-                # this process was doing.
-                store.claim_embed_row(kind, row_id)
-                # SLICED, SO THE STOP FLAG IS REACHABLE INSIDE THE ROW. This
-                # used to be one ``embed_documents`` call over every chunk of
-                # the row, and the flag was not read again until it returned —
-                # which made "the stop check is per row" a promise the longest
-                # rows could not keep. See ``_MAX_CHUNKS_PER_ENCODE``.
-                interrupted_mid_row = False
-                for at in range(0, len(missing), _MAX_CHUNKS_PER_ENCODE):
-                    if stop is not None and stop():
-                        interrupted_mid_row = True
-                        break
-                    part = missing[at : at + _MAX_CHUNKS_PER_ENCODE]
-                    fresh = embedder.embed_documents([chunks[i] for i in part])
-                    for i, vec in zip(part, fresh, strict=False):
-                        known[hashes[i]] = vec
-                store.release_embed_claim()
-                if interrupted_mid_row:
-                    # THE ROW IS PUT DOWN, NOT PUT AWAY. It is not appended to
-                    # ``ok_ids`` and nothing of it reaches ``all_vecs``, so
-                    # ``commit_embed_batch`` never sees a partial row: chunks
-                    # written under this ``owner_id`` would make
-                    # ``select_unembedded``'s LEFT JOIN read it as embedded and
-                    # the missing chunks would be unreachable forever. It stays
-                    # at NULL and the next run re-embeds it from scratch.
-                    #
-                    # The slices that DID encode stay in ``known``, which is
-                    # not a partial commit: that dict is keyed by content hash,
-                    # so it only ever writes a chunk on behalf of a row that
-                    # completes. If another row in this batch holds the same
-                    # text, the work is still saved.
-                    outcome.interrupted = True
-                    break
-            vecs = [known[h] for h in hashes]
-        except sqlite3.Error as e:
-            # THE STORE FAILED, NOT THE ROW — round 3's M3. Two of the three
-            # calls above are writes to the cache, and the ingest timer can
-            # lock it at any moment. ``_embedder_is_healthy`` cannot see that:
-            # it probes the EMBEDDER, which is working perfectly, so the
-            # handler below concluded the fault discriminated between bodies
-            # and blamed whichever row was in flight. Reproduced: a single
-            # `database is locked` put all three rows of the batch in the
-            # poison ledger, each with an attempt count, on their way to
-            # becoming terminal after POISON_MAX_ATTEMPTS — permanently out of
-            # the vector arm because two writers overlapped once.
-            #
-            # A lock discriminates between nothing, exactly like a cold model
-            # or an OOM, so it gets the same answer round 2 gave those: abort,
-            # blame nobody, leave the backlog untouched.
-            #
-            # AND DISOWN THE ROW ON THE WAY OUT — 2026-08-27, observed in
-            # production four times in three hours. "Blame nobody" was true of
-            # this run and false of the next one: the claim written before the
-            # encode was still on disk, so the following run's
-            # `_blame_crashed_row` read it as a kill and booked a row that had
-            # embedded perfectly well into the poison ledger. The intent was
-            # defeated one function call away.
-            #
-            # This is reachable now because the claim lives beside the
-            # database rather than inside it (`Store.embed_claim_path`), so
-            # releasing it does not need the lock that just failed.
-            # `release_embed_claim` never raises, by construction, so this
-            # cannot become one more way to leave a claim behind.
-            store.release_embed_claim()
-            store_fault = e
-            break
-        except Exception as e:
-            # NO GUARD AROUND THE RELEASE ANY MORE, and its absence is the
-            # point. This used to catch `sqlite3.Error` here because the
-            # release was a database write and could fail for the very reason
-            # the row had — so the run aborted to avoid leaving a claim it
-            # could not clear. The claim is a file beside the database now
-            # (`Store.embed_claim_path`) and `release_embed_claim` swallows
-            # its own errors, so there is no failure left to route: the row is
-            # disowned before anything else is decided about it.
-            store.release_embed_claim()
-            if not _embedder_is_healthy(embedder):
-                unhealthy = EmbedderUnhealthyError(
-                    f"aggregator embed stopped after {kind} row {row_id!r} failed "
-                    f"({type(e).__name__}: {e}) and the embedder then could not "
-                    f"embed a known-good probe string either. That is an "
-                    f"environment fault — a model that has not loaded, an OOM, "
-                    f"an I/O blip, an embed server that stopped answering — "
-                    f"and not bad data, so that row was NOT "
-                    f"blamed for it and every row still unembedded stays in "
-                    f"the backlog. Fix the model and re-run "
-                    f"`aggregator embed --catchup`."
-                )
-                break
-            held = ledger.hold(source, row_id, e, previous=entries.get(row_id))
-            error_ids.append(row_id)
-            if row_id in entries:
-                outcome.known_failures += 1
-            else:
-                outcome.new_failures.append(
-                    f"embed: {kind} row {row_id!r} could not be embedded and was "
-                    f"set aside — {held.error_detail}"
-                )
-            continue
-        for i, vec in enumerate(vecs):
-            chunk_id = row_id if len(chunks) == 1 else f"{row_id}:{i}"
-            all_vecs.append((row_id, chunk_id, vec))
-            chunk_hashes[chunk_id] = hashes[i]
-        ok_ids.append(row_id)
-        if row_id in entries:
-            # It used to fail and does not any more. A fault that no longer
-            # reproduces describes no gap, and leaving the row behind would
-            # have ``aggregator status`` overstating the damage forever.
-            ledger.release(source, row_id)
-            outcome.released += 1
-    # The vectors and the watermark, in one guarded transaction. Anything the
-    # guard rejected moved underneath the worker and is reported as such.
-    #
-    # ATTEMPTED EVEN AFTER A STORE FAULT, because the rows that embedded before
-    # the lock are real work and discarding them means re-doing it next tick —
-    # which the 2026-08-16 rules call a bug even when the answer comes out
-    # right. If the cache is still locked this raises too, and it becomes the
-    # fault that is reported.
-    try:
-        written_ok, written_skip = store.commit_embed_batch(
-            kind,
-            vectors=all_vecs,
-            ok_ids=ok_ids,
-            skip_ids=skip_ids,
-            error_ids=error_ids,
-            expected=expected,
-            hashes=chunk_hashes,
-        )
-    except sqlite3.Error as e:
-        raise _embed_store_unavailable(kind, store_fault or e) from e
-    outcome.superseded += (len(ok_ids) - len(written_ok)) + (
-        len(skip_ids) - len(written_skip)
-    )
-    # ``error_ids`` count: they are marked unguarded, so they always leave the
-    # backlog, and a batch that only set rows aside has still made progress.
-    moved = len(written_ok) + len(written_skip) + len(error_ids)
-    if unhealthy is not None:
-        # The rows that DID embed before the model died are flushed above and
-        # keep their vectors: a run that threw away completed work would be
-        # re-doing it on the next tick, which the ingest rules call a bug even
-        # when the answer comes out right.
-        raise unhealthy
-    if store_fault is not None:
-        raise _embed_store_unavailable(kind, store_fault)
-    return moved
 
 
 def _cmd_github_token_status(
@@ -4175,15 +2818,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="lexical",
         choices=SEARCH_MODES,
         help=(
-            "what to measure. 'lexical' and 'hybrid' read the Store and CANNOT "
-            "SEE aggregator.mcp — no fusion membership rule, no vector floor, "
-            "no confidence signal — so a clean run in either says nothing "
-            "about the server. 'mcp' drives the same entry point the agent "
-            "calls and covers all of it. Baselines are per-mode and result ids "
-            "differ between them, so runs are never compared across modes. "
-            "'hybrid' and 'mcp' both REFUSE on a cache with no vector index "
-            "rather than quietly measuring the keyword arm and filing it under "
-            "the mode you asked for. Every report prints what its mode could "
+            "what to measure. 'lexical' reads the Store and CANNOT SEE "
+            "aggregator.mcp — no routing, no confidence signal — so a clean "
+            "run says nothing about the server. 'mcp' drives the same entry "
+            "point the agent calls and covers all of it. Baselines are "
+            "per-mode and result ids differ between them, so runs are never "
+            "compared across modes. Every report prints what its mode could "
             "not reach"
         ),
     )
@@ -4265,106 +2905,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="assume 'y' for any --force confirmation (scripted use)",
     )
 
-    p_embed = sub.add_parser(
-        "embed",
-        help="background embed worker (fills the v5 vector index)",
-    )
-    mode = p_embed.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
-        "--catchup",
-        action="store_true",
+    sub.add_parser(
+        "seed-reranker",
         help=(
-            "embed every unembedded row, then exit, in bounded per-batch "
-            "committed chunks — this is what the systemd timer runs (with "
-            "--source both), and what to run by hand against a stalled index. "
-            "Sources are drained in priority order — "
-            + " then ".join(s for _, s in EMBED_BACKLOG_ORDER[:6])
-            + ", then everything unranked — and each is finished before the "
-            "next begins, so `aggregator status` says which are searchable "
-            "today rather than one percentage for the whole corpus"
-        ),
-    )
-    mode.add_argument(
-        "--once",
-        action="store_true",
-        help=(
-            "embed a single batch and exit. A HAND-RUN PROBE — no deployed "
-            "unit runs this: the timer runs --catchup and the seed unit runs "
-            "--seed-models. Useful to watch one batch go through; useless for "
-            "filling the index, since a batch is bounded at about fifteen "
-            "minutes of encoder time, so one per 30-minute tick runs a "
-            "backfill measured in weeks at half speed at best. Use --catchup "
-            "for that"
-        ),
-    )
-    mode.add_argument(
-        "--seed-models",
-        dest="seed_models",
-        action="store_true",
-        help=(
-            "load the embedder AND the cross-encoder reranker, then exit — no "
-            "database is opened and no row is read or written. This is the "
-            "only path that fetches the reranker's weights, and it is what "
-            f"the human-triggered seed unit runs. Set {MODEL_DOWNLOAD_ENV}=1 "
+            "load the cross-encoder reranker behind `query --rerank`, then "
+            "exit — no database is opened and no row is read or written. "
+            f"The only path that fetches its weights: set {MODEL_DOWNLOAD_ENV}=1 "
             "to permit the download; without it this reports what is missing "
             "and exits non-zero"
         ),
-    )
-    p_embed.add_argument(
-        "--source",
-        choices=["observations", "records", "both"],
-        # ``both``, matching the deployed unit and every remediation string in
-        # this codebase — all of which tell the operator to run a bare
-        # `aggregator embed --catchup`. A default of ``observations`` made that
-        # exact command leave records keyword-only, so `vector_index` kept
-        # reporting records as never started while the person who had just
-        # "fixed" it believed otherwise.
-        default="both",
-        help=(
-            "which ontology to embed (default: both, matching the timer unit). "
-            "This narrows the priority walk; it does not flatten it — the "
-            "surviving sources keep their relative order"
-        ),
-    )
-    p_embed.add_argument(
-        "--batch-size",
-        type=_positive_int,
-        default=500,
-        dest="batch_size",
-        help=(
-            f"rows per checkpointed batch (default: 500, must be >= 1). NO "
-            f"LONGER THE ONLY BOUND, and usually not the one that binds: a "
-            f"batch also stops at {_MAX_BATCH_CHUNKS} chunks, which is about "
-            f"{_MAX_BATCH_CHUNKS * _SECONDS_PER_CHUNK // 60} minutes of "
-            f"encoder time at the measured ~{_SECONDS_PER_CHUNK} s per "
-            f"4000-character chunk (docs/embedding-throughput.md), and that "
-            f"chunk cap is the CEILING on the interval between durable "
-            f"checkpoints. This flag still means what it always did — rows "
-            f"per batch — and a row count low enough to bind first still "
-            f"shortens that interval; what it can no longer do is lengthen it "
-            f"past the ceiling. What it bounds on its own is rows the encoder "
-            f"never sees: an empty body costs no chunks, and about a third of "
-            f"the corpus is empty bodies"
-        ),
-    )
-    p_embed.add_argument(
-        "--reindex",
-        action="store_true",
-        help=(
-            "DELETE every vector in the cache and re-embed from scratch. Only "
-            "does anything when the index on disk was written by a different "
-            "model or dimension than this build produces — otherwise it is a "
-            "no-op. Prints how many vectors it would destroy and asks for a "
-            "'y' on stdin first (--yes skips the question, not the report). "
-            "The last full backfill of this corpus took 25-30 days of CPU, so "
-            "check `unset AGGREGATOR_EMBED_BACKEND` is not the real fix before "
-            "using this. Nothing outside this flag can authorise the deletion"
-        ),
-    )
-    p_embed.add_argument(
-        "--yes",
-        action="store_true",
-        help="assume 'y' for the --reindex confirmation (scripted use)",
     )
 
     p_prov = sub.add_parser(
@@ -4381,7 +2930,7 @@ def build_parser() -> argparse.ArgumentParser:
             "is the watermark and it lives in the rows it describes, so a kill "
             "costs at most one chunk and a re-run over a classified corpus "
             "reads nothing. It is a pure UPDATE of one column — no re-ingest, "
-            "no re-scrub, no embedding_state reset. Single-threaded: it loads "
+            "no re-scrub. Single-threaded: it loads "
             "no model and holds no thread pool, so it cannot take more than "
             "one core"
         ),
@@ -4393,8 +2942,8 @@ def build_parser() -> argparse.ArgumentParser:
             "reset every observation to unclassified and run the backfill "
             "again. This is what to run after CHANGING the classifier. It is "
             "cheap and safe precisely because provenance is not part of "
-            "`_src_hash`: nothing else in the corpus notices, no body is "
-            "re-scrubbed and no vector is discarded"
+            "`_src_hash`: nothing else in the corpus notices and no body is "
+            "re-scrubbed"
         ),
     )
     p_prov.add_argument(
@@ -4526,29 +3075,22 @@ def main(
 ) -> int:
     args = build_parser().parse_args(argv)
     # BEFORE ANY STORE IS BUILT. Seeding a model cache must not open, create
-    # or migrate the index — see ``_cmd_seed_models``. Every other subcommand
-    # needs the store, so it stays eagerly built for them.
-    if args.cmd == "embed" and args.seed_models:
-        return _cmd_seed_models()
+    # or migrate the index — see ``_cmd_seed_reranker``. Every other
+    # subcommand needs the store, so it stays eagerly built for them.
+    if args.cmd == "seed-reranker":
+        return _cmd_seed_reranker()
     store = _store or Store()
-    # ``embed`` MIGRATES ITSELF, and must be the one to do it. It is the only
-    # command that may authorise a vector reindex (``--reindex``), and that
-    # authority is an argument to ``migrate()``. Migrating eagerly here would
-    # run the provenance check first, without the argument — logging a refusal
-    # that names two fixes, immediately before the run that applies one of
-    # them. Every other subcommand still gets its schema up front.
-    if args.cmd != "embed":
-        # THE ONE EXCEPTION THAT MUST NOT REACH systemd AS A TRACEBACK. Every
-        # other fault here is either transient or specific to one subcommand;
-        # a cache newer than this build is neither, and an unhandled raise on
-        # a thirty-minute timer whose OnFailure= notifier has no debounce is
-        # forty-eight critical toasts a day. See ``_report_schema_ahead``.
-        try:
-            store.migrate()
-        except SchemaAheadError as e:
-            return _report_schema_ahead(
-                e, desktop_channel=_desktop_channel_wanted(args)
-            )
+    # THE ONE EXCEPTION THAT MUST NOT REACH systemd AS A TRACEBACK. Every other
+    # fault here is either transient or specific to one subcommand; a cache
+    # newer than this build is neither, and an unhandled raise on a
+    # thirty-minute timer whose OnFailure= notifier has no debounce is
+    # forty-eight critical toasts a day. See ``_report_schema_ahead``.
+    try:
+        store.migrate()
+    except SchemaAheadError as e:
+        return _report_schema_ahead(
+            e, desktop_channel=_desktop_channel_wanted(args)
+        )
 
     def sources() -> dict[str, Any]:
         """Build the source registry ON THE COMMAND THAT NEEDS IT.
@@ -4604,8 +3146,6 @@ def main(
         # doing so would commit the DELETE before the transaction and
         # reintroduce the non-atomic gap this fix closes.
         return _cmd_ingest(args, store, sources())
-    if args.cmd == "embed":
-        return _cmd_embed(args, _store=store)
     if args.cmd == "provenance":
         return _cmd_provenance(args, store, sources())
     if args.cmd == "tag":

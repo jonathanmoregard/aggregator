@@ -336,13 +336,12 @@ def test_no_run_of_any_kind_lowers_the_stamp(ahead_db, tmp_path, monkeypatch):
         c.close()
 
 
-def test_the_receipt_is_its_own_and_not_the_embed_units(
+def test_the_receipt_is_its_own_and_not_a_units(
     ahead_db, tmp_path, monkeypatch
 ):
-    """A SHARED STAMP IS A BUG, and one this repo has already reproduced —
-    ``nix/aggregator.nix`` documents running the embed and embed-seed notifiers
-    against one state dir in both orders and watching each silence the other.
-    Two faults that a human must act on separately need two receipts."""
+    """A SHARED STAMP IS A BUG, and one this repo has already reproduced: two
+    failure notifiers on one state dir silence each other. Two faults that a
+    human must act on separately need two receipts."""
     script, _log = _recording_notifier(tmp_path)
     monkeypatch.setenv(NOTIFY_COMMAND_ENV_VAR, str(script))
 
@@ -350,8 +349,7 @@ def test_the_receipt_is_its_own_and_not_the_embed_units(
 
     stamp = _stamp_path()
     assert stamp.exists(), "the receipt was never armed"
-    assert stamp.name != "embed-failure-notified"
-    assert stamp.name != "embed-seed-failure-notified"
+    assert stamp.name != "tag-failure-notified"
 
 
 def test_a_current_cache_runs_the_command_and_arms_nothing(tmp_path, monkeypatch):

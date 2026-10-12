@@ -52,7 +52,7 @@ _CORPUS_BLAME = (
 #: FALSE beside the filter diagnosis — which is the contradiction pinned below:
 #: the two sentences are composed onto one page from two functions, so they can
 #: only agree if the second is told what the first measured.
-_EITHER_ARM = "nothing matched this query on either arm"
+_NOTHING_MATCHED = "nothing matched this query, so this is an abstention"
 
 
 def _rec(sid: str, subject: str, body: str, tags=(), source="github") -> Record:
@@ -180,8 +180,8 @@ def test_the_confidence_note_agrees_with_the_filter_diagnosis(filtered):
     # The diagnosis is on the page…
     assert "matched 1 row(s)" in notice, notice
     # …so the hedge beside it may not deny it, in either surface.
-    assert _EITHER_ARM not in reason, reason
-    assert _EITHER_ARM not in notice, notice
+    assert _NOTHING_MATCHED not in reason, reason
+    assert _NOTHING_MATCHED not in notice, notice
     # Still an abstention, still hedged — the page has no rows either way.
     assert result["low_confidence"] is True
     assert "matched 1 row(s)" in reason, reason
@@ -206,10 +206,10 @@ def test_a_genuinely_empty_corpus_still_says_every_tier_was_tried(tmp_path):
     assert "every tier came back empty" in notice, notice
     assert "contain none of these terms" in notice, notice
     # AND SO DOES THE HEDGE'S HALF OF IT. The ladder ran and matched nothing,
-    # so "neither arm" is a measurement here, not the mis-stated filter case:
+    # so "nothing matched" is a measurement here, not the mis-stated filter case:
     # teaching the note about the filters must not cost it this sentence.
-    assert _EITHER_ARM in result["low_confidence_reason"], result
-    assert _EITHER_ARM in notice, notice
+    assert _NOTHING_MATCHED in result["low_confidence_reason"], result
+    assert _NOTHING_MATCHED in notice, notice
 
 
 # --- 2. the relaxation marker names the arm whose rows are on the page -------

@@ -2,9 +2,8 @@
 
 WHY THIS FILE EXISTS. ``sentence-transformers`` pulls ``torch``, and the
 default PyPI ``torch`` wheel declares the whole NVIDIA CUDA stack as hard
-dependencies. This deployment is CPU-only — every throughput figure in
-``docs/embedding-throughput.md`` is measured on a 15 W i7-1365U — so none of
-that can ever execute. It is also not merely wasted bytes: packaging the
+dependencies. This deployment is CPU-only, so none of that can ever
+execute. It is also not merely wasted bytes: packaging the
 default wheel for NixOS FAILS, because ``nvidia-cufile`` ships
 ``libcufile_rdma.so.1`` linked against libmlx5 / librdmacm / libibverbs, and
 auto-patchelf cannot satisfy those InfiniBand libraries. The whole

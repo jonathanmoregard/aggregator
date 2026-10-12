@@ -274,16 +274,6 @@ class QueryAST:
       text matches, not which matched rows survive — so it lives in
       ``Store._text_hit_scope`` / ``Store._scoped_obs_ids`` and NOT in
       ``Store._obs_where``.
-
-    v5 adds ``id_scope``, and it is the one field with NO DSL key. The hybrid
-    retriever fuses an FTS5 arm and a vector arm into a ranked id list that no
-    FTS5 MATCH expression can express, so the MCP layer computes those ids and
-    hands them down here while every other filter still applies normally. The
-    DSL surface is unchanged: nothing parses this, and no caller can set it.
-
-    ``None`` means "no id filter". The EMPTY frozenset means "nothing
-    matched" and is a real, different value — it renders as a no-match clause,
-    because SQL ``IN ()`` is a syntax error rather than an empty result.
     """
 
     source: str | None = None
@@ -303,8 +293,6 @@ class QueryAST:
     provenance: str | None = None
     # v6 conjunction scope (``scope:``). See the class docstring.
     scope: str | None = None
-    # v5 hybrid retrieval: internal-only id filter. See the class docstring.
-    id_scope: frozenset[str] | None = None
 
 
 @runtime_checkable

@@ -40,13 +40,13 @@ def seeded(tmp_data_home):
     for obs_id, body in (("o-leak", f"my key is {token_obs} ok"), ("o-clean", "plain words")):
         c.execute(
             "INSERT INTO observations(obs_id, session_id, root_session_id, type, "
-            "ts, body, src_hash, embedding_state) VALUES (?, 's1', 's1', 'user', "
-            "'2026-10-01T00:00:00+00:00', ?, 'h-' || ?, 'done')",
+            "ts, body, src_hash) VALUES (?, 's1', 's1', 'user', "
+            "'2026-10-01T00:00:00+00:00', ?, 'h-' || ?)",
             (obs_id, body, obs_id),
         )
     c.execute(
-        "INSERT INTO records(stable_id, source, subject, body, tags, src_hash, "
-        "embedding_state) VALUES ('r1', 'dropbox', ?, ?, '[]', 'h-r1', 'done')",
+        "INSERT INTO records(stable_id, source, subject, body, tags, src_hash) "
+        "VALUES ('r1', 'dropbox', ?, ?, '[]', 'h-r1')",
         (f"subject {token_rec}", f"body {token_rec}"),
     )
     c.execute(_RECORDS_FTS_REFRESH_SQL, ("r1",))
@@ -74,26 +74,22 @@ def test_write_run_redacts_and_keeps_derived_state_consistent(seeded):
     report = rescrub(store, dry_run=False, chunk_size=1, jobs=2)
     assert report.changed["observations"] == 1
 
-    body, state, src = _row(
-        store,
-        "SELECT body, embedding_state, src_hash FROM observations WHERE obs_id='o-leak'",
+    body, src = _row(
+        store, "SELECT body, src_hash FROM observations WHERE obs_id='o-leak'"
     )
     assert obs_secret not in body and "[REDACTED:" in body
-    assert state is None, "a rewritten row must go back into the embed backlog"
     assert src == "h-o-leak", "src_hash describes the source and must not move"
-    # Untouched row keeps its vector state.
-    assert _row(store, "SELECT embedding_state FROM observations WHERE obs_id='o-clean'")[0] == "done"
+    assert _row(store, "SELECT body FROM observations WHERE obs_id='o-clean'")[0] == "plain words"
     # Keyword index follows the body (observations_au trigger).
     hits = store._c().execute(
         "SELECT COUNT(*) FROM obs_fts WHERE obs_fts MATCH ?", (f'"{obs_secret}"',)
     ).fetchone()[0]
     assert hits == 0
 
-    subject, rbody, rstate = _row(
-        store, "SELECT subject, body, embedding_state FROM records WHERE stable_id='r1'"
+    subject, rbody = _row(
+        store, "SELECT subject, body FROM records WHERE stable_id='r1'"
     )
     assert rec_secret not in subject and rec_secret not in rbody
-    assert rstate is None
     fts = store._c().execute(
         "SELECT COUNT(*) FROM records_fts WHERE records_fts MATCH ?", (f'"{rec_secret}"',)
     ).fetchone()[0]
