@@ -91,10 +91,10 @@ def test_rebuild_refuses_when_records_empty_and_errors_nonempty(
     _seed(store, 5)
 
     source = _StubSource(records=[], errors=[
-        "/search/issues?q=is:pr+author:@me: transport failure",
-        "/search/issues?q=is:pr+review-requested:@me: transport failure",
-        "/search/issues?q=is:issue+author:@me: transport failure",
-        "/search/issues?q=is:issue+assignee:@me: transport failure",
+        "/search/issues?q=is:pr+author:jonathanmoregard: transport failure",
+        "/search/issues?q=is:pr+review-requested:jonathanmoregard: transport failure",
+        "/search/issues?q=is:issue+author:jonathanmoregard: transport failure",
+        "/search/issues?q=is:issue+assignee:jonathanmoregard: transport failure",
     ])
     rc = cli.main(
         ["ingest", "github", "--rebuild"],

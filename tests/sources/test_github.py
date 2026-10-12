@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
+from aggregator.sources.base import QueryAST
 from aggregator.sources.github import (
     GhApiError,
     GitHubSource,
@@ -172,7 +173,7 @@ def test_default_api_fetcher_raises_on_called_process_error():
         "aggregator.sources.github.subprocess.run",
         side_effect=subprocess.CalledProcessError(returncode=1, cmd=["gh"]),
     ), pytest.raises(GhApiError):
-        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
 
 
 def test_default_api_fetcher_raises_on_gh_missing():
@@ -180,7 +181,7 @@ def test_default_api_fetcher_raises_on_gh_missing():
         "aggregator.sources.github.subprocess.run",
         side_effect=FileNotFoundError("gh not installed"),
     ), pytest.raises(GhApiError):
-        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
 
 
 def test_default_api_fetcher_raises_on_timeout():
@@ -188,7 +189,7 @@ def test_default_api_fetcher_raises_on_timeout():
         "aggregator.sources.github.subprocess.run",
         side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=1),
     ), pytest.raises(GhApiError):
-        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
 
 
 def test_default_api_fetcher_raises_on_non_json():
@@ -198,7 +199,7 @@ def test_default_api_fetcher_raises_on_non_json():
     with patch(
         "aggregator.sources.github.subprocess.run", return_value=fake
     ), pytest.raises(GhApiError):
-        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
 
 
 def test_default_api_fetcher_handles_multi_page_search_via_jsonl():
@@ -223,7 +224,7 @@ def test_default_api_fetcher_handles_multi_page_search_via_jsonl():
     with patch(
         "aggregator.sources.github.subprocess.run", return_value=fake
     ) as run:
-        result = _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        result = _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
 
     assert len(result) == 3
     assert [r["id"] for r in result] == [1, 2, 3]
@@ -242,7 +243,7 @@ def test_default_api_fetcher_jsonl_tolerates_empty_output():
     with patch(
         "aggregator.sources.github.subprocess.run", return_value=fake
     ):
-        result = _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        result = _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
     assert result == []
 
 
@@ -253,7 +254,7 @@ def test_default_api_fetcher_uses_explicit_get():
     with patch(
         "aggregator.sources.github.subprocess.run", return_value=fake
     ) as run:
-        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
 
     assert run.call_args.args[0][0:4] == ["gh", "api", "--method", "GET"]
 
@@ -263,7 +264,7 @@ def test_default_api_fetcher_uses_explicit_get():
     [
         "/repos/o/r/issues/1",
         "--method=DELETE",
-        "/search/issues?q=is:pr+author:@me\n--method DELETE",
+        "/search/issues?q=is:pr+author:jonathanmoregard\n--method DELETE",
     ],
 )
 def test_default_api_fetcher_rejects_paths_outside_capability(path):
@@ -676,7 +677,7 @@ def _gh_err(stderr: str) -> subprocess.CalledProcessError:
 def test_default_api_fetcher_retries_a_transient_failure(exc):
     ok = subprocess.CompletedProcess(args=["gh"], returncode=0, stdout='{"id": 1}\n', stderr="")
     with patch("aggregator.sources.github.subprocess.run", side_effect=[exc, ok]) as run:
-        items = _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        items = _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
     assert items == [{"id": 1}]
     assert run.call_count == 2
 
@@ -694,7 +695,7 @@ def test_default_api_fetcher_retries_a_transient_failure(exc):
 def test_default_api_fetcher_does_not_retry_a_permanent_failure(exc):
     with patch("aggregator.sources.github.subprocess.run", side_effect=exc) as run, \
          pytest.raises(GhApiError):
-        _default_api_fetcher("/search/issues?q=is:pr+author:@me")
+        _default_api_fetcher("/search/issues?q=is:pr+author:jonathanmoregard")
     assert run.call_count == 1
 
 
@@ -706,3 +707,121 @@ def test_default_scope_fetcher_retries_a_transient_failure():
     ) as run:
         assert _default_scope_fetcher() == ["public_repo"]
     assert run.call_count == 2
+
+
+# -- GitHub App installation token: literal login + per-repo fan-out --------
+
+
+def _recording_source(private, rows=None):
+    seen: list[str] = []
+
+    def fetch(path):
+        seen.append(path)
+        return rows(path) if rows else []
+
+    src = GitHubSource(
+        _scope_fetcher=lambda: [], _api_fetcher=fetch, _repo_lister=lambda: private
+    )
+    return src, seen
+
+
+def test_queries_never_use_at_me():
+    src, seen = _recording_source(["o/priv"])
+    src.ingest(since=None)
+    src.search(QueryAST(source="github"))
+    assert seen and all("@me" not in p for p in seen)
+    assert all("jonathanmoregard" in p for p in seen)
+
+
+def test_login_is_configurable():
+    seen: list[str] = []
+    GitHubSource(
+        _api_fetcher=lambda p: seen.append(p) or [], _repo_lister=lambda: None,
+        login="someone-else",
+    ).ingest(since=None)
+    assert len(seen) == 4 and all(":someone-else" in p for p in seen)
+
+
+def test_private_repos_fan_out_to_repo_qualified_queries():
+    repos = ["jonathanmoregard/klaffat", "jonathanmoregard/.claude"]
+    src, seen = _recording_source(repos)
+    src.ingest(since=datetime(2026, 1, 2, tzinfo=UTC))
+    # 4 global + 4 per repo, every per-repo query names its repo exactly once
+    assert len(seen) == 4 + 4 * len(repos)
+    for repo in repos:
+        scoped = [p for p in seen if f"+repo:{repo}" in p]
+        assert len(scoped) == 4
+        assert all(p.endswith("+updated:>=2026-01-02") for p in scoped)
+    assert len([p for p in seen if "repo:" not in p]) == 4
+
+
+def test_no_fan_out_when_installation_endpoint_unavailable():
+    src, seen = _recording_source(None)
+    result = src.ingest(since=None)
+    assert len(seen) == 4 and all("repo:" not in p for p in seen)
+    assert result.errors == []
+
+
+def test_enumeration_failure_is_reported_but_global_queries_still_run():
+    def boom():
+        raise GhApiError("network down")
+
+    seen: list[str] = []
+    src = GitHubSource(
+        _api_fetcher=lambda p: seen.append(p) or [], _repo_lister=boom
+    )
+    result = src.ingest(since=None)
+    assert len(seen) == 4
+    assert any("installation/repositories" in e for e in result.errors)
+
+
+def _gh_failure(stderr):
+    return subprocess.CalledProcessError(returncode=1, cmd=["gh"], stderr=stderr)
+
+
+def test_default_lister_returns_private_full_names(monkeypatch):
+    from aggregator.sources import github as gh
+
+    monkeypatch.undo()  # drop the autouse stub
+    fake = subprocess.CompletedProcess(
+        args=["gh"], returncode=0, stdout="o/a\no/b\n", stderr=""
+    )
+    with patch("aggregator.sources.github.subprocess.run", return_value=fake) as run:
+        assert gh._default_private_repo_lister() == ["o/a", "o/b"]
+    argv = run.call_args.args[0]
+    assert "--paginate" in argv and "/installation/repositories?per_page=100" in argv
+
+
+@pytest.mark.parametrize("stderr", ["gh: Not Found (HTTP 404)", "gh: Forbidden (HTTP 403)"])
+def test_default_lister_none_for_non_installation_token(monkeypatch, stderr):
+    from aggregator.sources import github as gh
+
+    monkeypatch.undo()
+    with patch("aggregator.sources.github.subprocess.run", side_effect=_gh_failure(stderr)):
+        assert gh._default_private_repo_lister() is None
+
+
+def test_default_lister_raises_on_rate_limit_and_server_errors(monkeypatch):
+    from aggregator.sources import github as gh
+
+    monkeypatch.undo()
+    for stderr in ("HTTP 403: API rate limit exceeded", "HTTP 500: boom"):
+        with (
+            patch("aggregator.sources.github.subprocess.run", side_effect=_gh_failure(stderr)),
+            patch("aggregator.sources.github.call_with_retry", side_effect=lambda f, **k: f()),
+            pytest.raises(GhApiError),
+        ):
+            gh._default_private_repo_lister()
+
+
+def test_validator_accepts_repo_qualified_and_rejects_foreign_paths():
+    from aggregator.sources.github import _validate_search_path
+
+    _validate_search_path("/search/issues?q=is:pr+author:jonathanmoregard+repo:o/.claude+updated:>=2026-01-02")
+    for bad in (
+        "/search/issues?q=is:pr+author:@me",
+        "/search/issues?q=is:pr+author:x+repo:o/r/../../user",
+        "/search/issues?q=is:pr+author:x+repo:o/r\n--method DELETE",
+    ):
+        with pytest.raises(GhApiError):
+            _validate_search_path(bad)
