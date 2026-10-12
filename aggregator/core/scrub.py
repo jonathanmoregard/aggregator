@@ -1,18 +1,16 @@
-"""Scrubber: applied pre-store AND pre-return (spec §Security constraint 3).
+"""Scrubber: applied before anything is stored (spec §Security constraint 3).
 
 Two layers:
 
-1. **Secrets**: **gitleaks**, through the vendored ``gitleaks_driver`` with
-   ``secret-rules.toml`` (every default rule — ~220 providers — plus the
-   formats gitleaks lacks, including known prefixes at any body length and
-   truncated private keys). Each target string the driver returns is
-   replaced by ``[REDACTED:<rule-id>]``. FAIL CLOSED: if the scan does not
-   complete, ``scrub``/``scrub_many`` raise :class:`ScrubUnavailableError`
-   and the caller must neither store nor return the text.
+1. **Secrets**: the ``secret-redact`` CLI (nixos-config ``pkgs.secret-redact``:
+   gitleaks with pinned rules), on PATH. Each secret becomes
+   ``[REDACTED:<rule-id>:<n>chars]``. FAIL CLOSED: if the CLI is missing or
+   fails, ``scrub``/``scrub_many`` raise :class:`ScrubUnavailableError` and the
+   caller must not store the text.
 
-   A gitleaks call costs ~100 ms of process start, so callers with many
-   texts use :func:`scrub_many`: one call, and the same per-text result as
-   ``scrub`` on each.
+   One CLI call costs ~100 ms, so callers with many texts use
+   :func:`scrub_many`: one call for all of them. A secret found in any text
+   of a call is redacted in all of them.
 
 2. **PII detection**:
    - If `presidio_analyzer` + `presidio_anonymizer` are importable, use them
@@ -35,9 +33,9 @@ once, under a lock, blocking — and ``start_background_init`` lets a process th
 must answer something else first pay for it in parallel. ``scrub`` is unchanged
 in behaviour: the first call initialises, every later call is one atomic read.
 
-`scrub()` is intentionally idempotent — the pre-store + pre-return arrangement
-means the same text may be scrubbed twice; the second pass MUST NOT mangle the
-first pass's ``[REDACTED:*]`` tokens. All patterns are chosen so redactions
+`scrub()` is intentionally idempotent — ``aggregator rescrub`` scrubs stored
+text again; the second pass MUST NOT mangle the first pass's ``[REDACTED:*]``
+tokens. All patterns are chosen so redactions
 don't themselves match any other pattern.
 
 Returns a structured ``ScrubResult`` with counts by finding-type. Counts are
@@ -46,21 +44,16 @@ metadata only — the redacted content of individual findings is never surfaced
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from aggregator.core import gitleaks_driver
-from aggregator.core.gitleaks_driver import GitleaksError
-
-#: The scrubber's fail-closed error: the scan did not complete, so the text
-#: must be neither stored nor returned. An alias, not a subclass, so it is the
-#: same class after ``importlib.reload`` of this module (tests reload it).
-ScrubUnavailableError = GitleaksError
+from aggregator.core.scrub_error import ScrubUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -317,55 +310,51 @@ def _run_patterns(
     return text
 
 
-# --- gitleaks layer ----------------------------------------------------------
+# --- secret layer: the secret-redact CLI ----------------------------------------
 
-#: The vendored rules: gitleaks' defaults plus the formats it lacks. A
-#: byte-identical copy of ``hooks/secret-rules.toml`` in the ``~/.claude``
-#: config repo, which redacts tool output with the same rules; the copies are
-#: pinned to one checksum by ``tests/core/test_scrub_gitleaks.py``.
-GITLEAKS_RULES = Path(__file__).with_name("secret-rules.toml")
+#: nixos-config's ``pkgs.secret-redact``. The Nix wrapper puts it on PATH,
+#: because a systemd unit's own PATH is minimal.
+SECRET_REDACT = "secret-redact"
 
-#: Names the gitleaks binary. Set by the Nix wrapper to a store path, because
-#: a systemd unit's PATH is minimal and must not decide whether text is
-#: scanned. Unset: ``gitleaks`` on PATH.
-GITLEAKS_ENV = "AGGREGATOR_GITLEAKS"
+#: One CLI call may take this long; only a hung scanner reaches it.
+SECRET_REDACT_TIMEOUT_S = 300.0
 
-#: One gitleaks call may take this long; only a hung scanner reaches it.
-GITLEAKS_TIMEOUT_S = 300.0
-
-#: Go threads per gitleaks call. Unbounded it takes every core and burns ~3x
-#: the CPU for the same scan (8.6 MB of real rows: 17.6 s CPU on 24 threads,
-#: 6.1 s on 2), and ingest runs on a timer in the background.
-_GITLEAKS_CHILD_ENV = {"GOMAXPROCS": "2"}
+#: Go threads per gitleaks process the CLI starts. Unbounded it takes every core
+#: and burns ~3x the CPU for the same scan (8.6 MB of real rows: 17.6 s CPU on
+#: 24 threads, 6.1 s on 2), and ingest runs on a timer in the background.
+_SCANNER_ENV = {"GOMAXPROCS": "2"}
 
 
-def _gitleaks_redact_many(texts: list[str], counts: list[dict[str, int]]) -> list[str]:
-    """Redact every gitleaks finding in the text it was found in. Fails closed.
-
-    All gitleaks handling lives in the vendored ``gitleaks_driver``; this
-    names the binary and counts what was redacted.
-    """
-    found = gitleaks_driver.find_secrets(
-        list(texts),
-        gitleaks=os.environ.get(GITLEAKS_ENV) or "gitleaks",
-        rules=str(GITLEAKS_RULES),
-        timeout=GITLEAKS_TIMEOUT_S,
-        env=_GITLEAKS_CHILD_ENV,
-    )
-    return [
-        gitleaks_driver.redact(t, targets, _counting_marker(c))
-        for t, targets, c in zip(texts, found, counts, strict=True)
-    ]
-
-
-def _counting_marker(counts: dict[str, int]) -> Callable[[str, int], str]:
-    """``[REDACTED:<rule>]``, counting each one under its rule."""
-
-    def marker(rule: str, _length: int) -> str:
-        counts[rule] = counts.get(rule, 0) + 1
-        return f"[REDACTED:{rule}]"
-
-    return marker
+def _secret_redact_many(texts: list[str], counts: list[dict[str, int]]) -> list[str]:
+    """``texts`` through one ``secret-redact`` call, counting per text. Fails closed."""
+    if not any(texts):
+        return list(texts)
+    request = json.dumps({"texts": texts, "timeout": SECRET_REDACT_TIMEOUT_S})
+    try:
+        proc = subprocess.run(
+            [SECRET_REDACT], input=request.encode(), capture_output=True, check=False,
+            timeout=SECRET_REDACT_TIMEOUT_S + 10, env={**os.environ, **_SCANNER_ENV},
+        )
+    except subprocess.TimeoutExpired:
+        raise ScrubUnavailableError(f"{SECRET_REDACT} did not finish") from None
+    except OSError as e:
+        raise ScrubUnavailableError(
+            f"{SECRET_REDACT} could not run: {e.strerror or type(e).__name__}"
+        ) from None
+    if proc.returncode != 0:
+        reason = proc.stderr.decode("utf-8", "replace").strip()[-300:]
+        raise ScrubUnavailableError(f"{SECRET_REDACT} exited {proc.returncode}: {reason}")
+    try:
+        result = json.loads(proc.stdout)
+        out, found = result["texts"], result["counts"]
+        if len(out) != len(texts) or len(found) != len(texts):
+            raise ValueError("one result per text")
+    except (ValueError, KeyError, TypeError):
+        raise ScrubUnavailableError(f"{SECRET_REDACT} wrote no readable result") from None
+    for c, per_text in zip(counts, found, strict=True):
+        for rule, n in per_text.items():
+            c[rule] = c.get(rule, 0) + n
+    return out
 
 
 # Presidio entity allowlist: real PII we want scrubbed at the boundary.
@@ -447,15 +436,15 @@ def scrub(text: str) -> ScrubResult:
       propagate straight out of this function. Deliberate: a ctrl-c during a
       50-second model load has to keep killing the process. It simply is not
       "never raises".
-    * A non-empty text needs gitleaks. When it cannot run this raises
+    * A non-empty text needs ``secret-redact``. When it cannot run this raises
       :class:`ScrubUnavailableError` — fail closed, by design: the caller
-      must not store or return the text.
+      must not store the text.
     """
     return scrub_many([text])[0]
 
 
 def scrub_secrets_many(texts: Sequence[str]) -> list[ScrubResult]:
-    """The SECRET layer only (gitleaks) over every text.
+    """The SECRET layer only (``secret-redact``) over every text.
 
     For re-scrubbing text that already went through the full ``scrub`` once
     (``aggregator rescrub``): its PII pass is already applied, and Presidio is
@@ -463,17 +452,16 @@ def scrub_secrets_many(texts: Sequence[str]) -> list[ScrubResult]:
     for nothing. Fails closed exactly like :func:`scrub`.
     """
     counts: list[dict[str, int]] = [{} for _ in texts]
-    cleaned = _gitleaks_redact_many(list(texts), counts)
+    cleaned = _secret_redact_many(list(texts), counts)
     return [ScrubResult(text=t, counts=c) for t, c in zip(cleaned, counts, strict=True)]
 
 
 def scrub_many(texts: Sequence[str]) -> list[ScrubResult]:
-    """:func:`scrub` over many texts, with ONE gitleaks call per ~4 MB.
+    """:func:`scrub` over many texts, with ONE ``secret-redact`` call.
 
-    ``scrub_many(xs)[i] == scrub(xs[i])`` for every i — batching changes the
-    cost, never the result (see :func:`_gitleaks_redact_many`). Raises
-    :class:`ScrubUnavailableError` when the secret scanner cannot run, and
-    then NO text in the batch may be stored or returned.
+    Same as ``scrub`` on each text, except that a secret found in any text is
+    redacted in all of them. Raises :class:`ScrubUnavailableError` when the
+    secret scanner cannot run, and then NO text in the batch may be stored.
     """
     results = scrub_secrets_many(texts)
     return [ScrubResult(text=_scrub_pii(r.text, r.counts), counts=r.counts) for r in results]

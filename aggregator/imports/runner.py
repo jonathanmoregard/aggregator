@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from aggregator.core.scrub import ScrubUnavailableError
+from aggregator.core.scrub_error import ScrubUnavailableError
 from aggregator.imports.ingest_state import (
     STALE_INPUTS,
     FaultVerdict,
@@ -465,7 +465,7 @@ async def _write_chunk(
       That distinction is the whole reason the isolation pass counts successes.
 
     A SECRET SCANNER THAT CANNOT RUN IS A BROKEN SINK, ALWAYS. ``scrub`` fails
-    closed with ``ScrubUnavailableError`` when gitleaks is missing or errors,
+    closed with ``ScrubUnavailableError`` when secret-redact is missing or errors,
     and every changed row in the chunk hits it — but rows that need no scrub
     (session rows, unchanged rows) still "survive" the isolation pass, which
     would make the scrubbed ones look like poison and park them in the

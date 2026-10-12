@@ -2,11 +2,11 @@
 
 THE DECISION THIS FILE PINS. The recall path is NOT narrowed to human-only, in
 ``Store`` or in the tool. A default filter measured as breaking for three
-in-repo callers — ``_first_user_row`` (29% of sampled user turns are
+in-repo callers — ``_first_user_prompt`` (29% of sampled user turns are
 ``hook``-class and headless sessions OPEN with one, so session cards lose their
 labels), the frozen eval baseline (criterion E could then no longer separate a
 retrieval win from a filter), and ``_count_scope_for`` /
-``_render_session_preview``, which would under-count in silence.
+``_session_body_preview``, which would under-count in silence.
 
 Instead: every row carries ``provenance``, ``by:`` narrows on request, and the
 ``notice`` says out loud how much of the page a machine wrote. That is the same
@@ -119,7 +119,7 @@ def test_the_default_query_returns_the_machine_rows_as_well(store):
 
 
 def test_session_cards_keep_their_labels(store):
-    """``_first_user_row`` must not be filtered — this is the concrete
+    """``_first_user_prompt`` must not be filtered — this is the concrete
     breakage a human-only default caused: a headless session OPENS with a
     hook-class turn, so its card would fall back to ``session <uuid>``."""
     s = Store(db_path=store.db_path)
@@ -282,7 +282,7 @@ def test_a_session_card_page_filtered_to_nothing_comes_back_empty(store):
 
 
 def test_the_store_applies_no_default_filter(store):
-    """The eval harness and ``_first_user_row`` both go through here."""
+    """The eval harness and ``_first_user_prompt`` both go through here."""
     assert len(store.query_observations(QueryAST())) == 3
     assert store.count_observations(QueryAST()) == 3
 

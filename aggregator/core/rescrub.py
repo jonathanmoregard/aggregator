@@ -50,12 +50,12 @@ from aggregator.core.store import (
     _vec_table_usable,
 )
 
-#: Rows per chunk. Each chunk is one read, one gitleaks call and, when not a
+#: Rows per chunk. Each chunk is one read, one secret-redact call and, when not a
 #: dry run, one committed write — so this bounds what a SIGTERM costs, not
 #: the throughput.
 DEFAULT_CHUNK = 2000
 
-#: Chunks scanned concurrently, each by its own gitleaks process (the GIL is
+#: Chunks scanned concurrently, each by its own secret-redact process (the GIL is
 #: released while it runs, and the scrubber caps it at 2 threads). Writes
 #: stay serial.
 DEFAULT_JOBS = 4

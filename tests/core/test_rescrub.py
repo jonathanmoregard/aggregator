@@ -2,7 +2,7 @@
 
 Rows are written RAW (straight SQL, bypassing the ingest scrub) to stand in
 for rows stored before the scanner knew their format. Tokens are generated at
-test time; see test_scrub_gitleaks.py for why there are no literals.
+test time; see test_scrub_secret_redact.py for why there are no literals.
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import string
 import pytest
 
 from aggregator.cli import main
+from aggregator.core import scrub as scrub_mod
 from aggregator.core.rescrub import rescrub
-from aggregator.core.scrub import GITLEAKS_ENV
 from aggregator.core.store import _RECORDS_FTS_REFRESH_SQL, Store
 
 _ALNUM = string.ascii_letters + string.digits
@@ -112,13 +112,13 @@ def test_cli_prints_counts_never_values(seeded, capsys):
     out = capsys.readouterr()
     text = out.out + out.err
     assert "observations: scanned=2 would_change=1" in text
-    assert any(f"rule {r}: " in text for r in ("tavily-api-key", "known-prefix-token"))
+    assert "rule stub: 3" in text
     assert obs_secret not in text and rec_secret not in text
 
 
 def test_cli_fails_closed_without_the_scanner(seeded, monkeypatch, tmp_path, capsys):
     store, obs_secret, _ = seeded
-    monkeypatch.setenv(GITLEAKS_ENV, str(tmp_path / "absent"))
+    monkeypatch.setattr(scrub_mod, "SECRET_REDACT", str(tmp_path / "absent"))
     assert main(["rescrub"]) == 3
     body = _row(store, "SELECT body FROM observations WHERE obs_id='o-leak'")[0]
     assert obs_secret in body

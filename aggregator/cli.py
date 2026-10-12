@@ -69,7 +69,7 @@ from aggregator.core.provenance import classify
 from aggregator.core.rescrub import DEFAULT_CHUNK as _RESCRUB_CHUNK
 from aggregator.core.rescrub import DEFAULT_JOBS as _RESCRUB_JOBS
 from aggregator.core.rescrub import rescrub
-from aggregator.core.scrub import ScrubUnavailableError
+from aggregator.core.scrub_error import ScrubUnavailableError
 from aggregator.core.store import (
     EMBED_BACKLOG_ORDER,
     EmptyRebuildRefusedError,
@@ -4412,7 +4412,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rescrub = sub.add_parser(
         "rescrub",
         help=(
-            "re-apply the secret scanner (regex floor + gitleaks) to rows "
+            "re-apply the secret scanner (secret-redact) to rows "
             "already stored; prints counts by rule, never values"
         ),
     )
@@ -4434,7 +4434,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=_RESCRUB_JOBS,
         help=(
-            f"chunks scanned concurrently, one gitleaks process each "
+            f"chunks scanned concurrently, one secret-redact process each "
             f"(default: {_RESCRUB_JOBS}); writes stay serial"
         ),
     )

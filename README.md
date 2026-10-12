@@ -165,29 +165,20 @@ some session and `scope:session` will show them. The index does **not** stem:
 
 ## Secret scrubbing
 
-`aggregator/core/scrub.py` redacts secrets with gitleaks before anything is
-stored and again before anything is returned, using the vendored
-`aggregator/core/secret-rules.toml` (gitleaks' ~220 default rules plus custom
-ones for what they miss: known token prefixes at any body length, and private
-keys cut by truncation; byte-identical to `hooks/secret-rules.toml` in the `~/.claude` config
-repo, pinned by checksum in `tests/core/test_scrub_gitleaks.py`). Findings
-become `[REDACTED:<rule-id>]`.
+`aggregator/core/scrub.py` redacts secrets before anything is stored, by
+calling `secret-redact` (nixos-config's `pkgs.secret-redact`: gitleaks with
+pinned rules, the same CLI the `~/.claude` output hooks call). Findings become
+`[REDACTED:<rule-id>:<n>chars]`. Results are returned as stored: there is no
+second scrub on the way out.
 
-**gitleaks is a hard runtime dependency and the scrubber fails closed.** The
-binary comes from `AGGREGATOR_GITLEAKS` (set it to a store path in any Nix
-wrapper — systemd units have a minimal PATH), else `PATH`. When it is
+**`secret-redact` is a hard runtime dependency and the scrubber fails closed.**
+The Nix wrapper puts it on PATH (systemd units have a minimal PATH). When it is
 missing or errors, ingest writes nothing for the affected source and exits 3
-(the runner treats it as a broken sink, never as poison records), and
-`aggregator_search_memory` returns `ok: false` with the reason instead of
-results. Ingest batches each write group into one gitleaks call
-(`scrub_many`): a gitleaks process costs ~100 ms before it reads a byte.
-How gitleaks is run lives in `aggregator/core/gitleaks_driver.py`, a
-byte-identical copy of `hooks/gitleaks_driver.py` in the `~/.claude` repo
-(sha256-pinned like the rules file): each text is its own scanned file under
-one gitleaks read, behind a `BM` header, in a fresh tmpfs dir — gitleaks
-otherwise cuts long inputs mid-token, skips input that sniffs as binary, and
-lets one text's keywords switch rules on for another — and a scan that read
-fewer bytes than it was given fails closed.
+(the runner treats it as a broken sink, never as poison records). Ingest
+batches each write group into one CLI call (`scrub_many`): a call costs about
+100 ms before it reads a byte. The test suite runs against a stub of the CLI
+(`tests/secret_redact_stub.py`); the CLI's own behaviour is tested in
+nixos-config.
 
 Rows stored before a format was detectable are fixed in place with
 
@@ -206,7 +197,7 @@ values. See `aggregator/core/rescrub.py` for why this replaces a
 
 - GitHub authority is constrained at the operation boundary: only explicit GET requests to the source's fixed `/search/issues` paths are accepted. OAuth scopes are reported by `aggregator github-token-status`, not used as the safety boundary.
 - MCP has NO write tools in v1.
-- Scrub (Presidio + gitleaks) pre-store AND pre-return. See **Secret scrubbing** above.
+- Scrub (Presidio + secret-redact) pre-store. See **Secret scrubbing** above.
 - All returned content wrapped in `<ExternalContent source="…">` delimiters.
 - Stable local IDs persist across `--rebuild`.
 

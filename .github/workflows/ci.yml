@@ -31,15 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      # The scrubber fails CLOSED without gitleaks (ingest stores nothing,
-      # search withholds results), so the suite needs the real binary — the
-      # same version the flake pins, taken from flake.lock's nixpkgs.
-      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
-      - name: gitleaks for the scrubber
-        run: |
-          nix build --inputs-from . nixpkgs#gitleaks --out-link "$RUNNER_TEMP/gitleaks"
-          echo "AGGREGATOR_GITLEAKS=$RUNNER_TEMP/gitleaks/bin/gitleaks" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/gitleaks/bin/gitleaks" version
       - name: ruff
         run: uv run --extra dev ruff check aggregator tests
       - name: pytest

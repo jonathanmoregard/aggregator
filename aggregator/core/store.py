@@ -44,8 +44,8 @@ one virtual table per base table with ``content=base_table content_rowid=rowid``
 plus AFTER INSERT/DELETE/UPDATE triggers to keep the index in sync without
 duplicating body text.
 
-Scrub-on-write (spec constraint 3, defense in depth: also runs pre-return at
-MCP/CLI boundary). WAL + busy_timeout=5000 (Codex Phase 2 MEDIUM #2 —
+Scrub-on-write (spec constraint 3; ``aggregator rescrub`` brings older rows up
+to date, and results are returned as stored). WAL + busy_timeout=5000 (Codex Phase 2 MEDIUM #2 —
 concurrent-writer safety).
 
 v3→v4 is additive and migrates IN PLACE. It adds:
@@ -2905,11 +2905,11 @@ class Store:
         vec_present = _vec_table_usable(c, "vec_observations")
 
         # DIGESTS FIRST, THEN ONE SCRUB FOR THE WHOLE GROUP. The secret scanner
-        # is a gitleaks process whose start-up alone is ~100 ms, so scrubbing
-        # row by row would put a process spawn on every changed row; batched it
-        # is one spawn per group. ``scrub_many`` gives each body exactly what
-        # ``scrub`` would, and raises ``ScrubUnavailableError`` when the scanner
-        # cannot run — nothing in the group is written then (fail closed).
+        # is a ``secret-redact`` process whose start-up alone is ~100 ms, so
+        # scrubbing row by row would put a process spawn on every changed row;
+        # batched it is one spawn per group. ``scrub_many`` raises
+        # ``ScrubUnavailableError`` when the scanner cannot run — nothing in the
+        # group is written then (fail closed).
         obs_digest: dict[int, str] = {}
         to_scrub: list[int] = []
         for pos, e in enumerate(group):
@@ -5829,9 +5829,9 @@ class Store:
         """Append the ``by:`` predicate, or nothing at all.
 
         NOTHING AT ALL IS THE DEFAULT AND STAYS THE DEFAULT. A human-only
-        default here would narrow ``_first_user_row`` (which labels every
+        default here would narrow ``_first_user_prompt`` (which labels every
         session card), ``count_observations`` (which is
-        ``matching_observations``), ``_render_session_preview`` and the frozen
+        ``matching_observations``), ``_session_body_preview`` and the frozen
         eval baseline — four callers that never asked for a filter, in one
         edit, invisibly.
         """

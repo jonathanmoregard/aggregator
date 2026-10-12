@@ -2,7 +2,7 @@
 
 Security note (spec §Security): sources MUST use read-only credentials only. The
 github source enforces this via `gh auth` scope inspection (see spec constraint 1).
-Every source's `ingest()` scrubs pre-store (Presidio + gitleaks) via core/scrub.py.
+Every source's `ingest()` scrubs pre-store (Presidio + secret-redact) via core/scrub.py.
 
 Schema v2 (Langfuse-derived, Schema B from
 ``research-agent/reports/0212132731c649a99d54eaf72c6e220c.md``): sessions now
@@ -261,7 +261,7 @@ class QueryAST:
       shorthand ``'machine'`` for any non-human member. ``None`` means NO
       FILTER, exactly like ``obs_type``: nothing in this codebase applies a
       default here, because a default would silently narrow
-      ``_first_user_row``, the frozen eval baseline and every
+      ``_first_user_prompt``, the frozen eval baseline and every
       ``matching_observations`` count at once.
     * ``active_from``/``active_to`` — activity-window overlap:
       ``first_ts <= active_to AND last_ts >= active_from``. Different from

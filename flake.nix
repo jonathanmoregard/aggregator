@@ -23,16 +23,6 @@
               # NOTE: fastmcp / presidio / claude-runner may need overlays or
               # pip install in the devShell if not in nixpkgs. See nix/README.md.
             ];
-            # RUNTIME DEPENDENCY, NOT A NICETY: core/scrub.py fails CLOSED
-            # without gitleaks — ingest stores nothing and the MCP surface
-            # withholds results. A systemd unit's PATH is minimal, so the
-            # wrapper names the binary by store path instead of hoping PATH
-            # has it. Any other packaging of this repo (nixos-config's uv2nix
-            # overlay) must do the same: `--set AGGREGATOR_GITLEAKS <path>`
-            # on every wrapped entry point.
-            makeWrapperArgs = [
-              "--set" "AGGREGATOR_GITLEAKS" "${pkgs.gitleaks}/bin/gitleaks"
-            ];
             doCheck = false;
           };
 
