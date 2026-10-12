@@ -7,6 +7,8 @@ Invariants:
 - Nothing in or around the input can silence a finding (no ignore files, gitleaks:allow ignored).
 - Any scanner fault raises GitleaksError; an empty result means "read it all, found nothing".
 - Results are plain target strings (never containing a redaction marker); no coordinates leave.
+- An armored private key is found on the whole text, BEGIN to its END or to the end of the
+  text: pieces overlap by only 16 KB, so a long block would lose its middle.
 - ``redact`` replaces every occurrence of every target; overlapping ones become one marker.
 Stdlib only: vendored byte-identical into the aggregator repo.
 """
@@ -34,6 +36,8 @@ ENCODED_RUN = re.compile(r"[A-Za-z0-9+/=_%\-]{16,}")
 MARKER = "[REDACTED:"
 # An existing marker on a decoded line is not an encoded run (its rule id could look like one).
 MARKER_SPAN = re.compile(r"\[REDACTED:[^\]\n]*\]")
+# Armor lines of a private key (PEM, OpenSSH, PGP); bounded, so a scan for them is linear.
+ARMOR = re.compile(r"-----(BEGIN|END)[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----")
 # gitleaks' log line with its own read count.
 SCANNED = re.compile(r"scanned ~(\d+) bytes")
 # gitleaks colours its fatal log lines even under --no-color.
@@ -69,7 +73,25 @@ def find_secrets(texts: list[str], *, gitleaks: str, rules: str, timeout: float,
                     result[i][target] = min(finding["RuleID"], result[i].get(target, finding["RuleID"]))
     except (ValueError, KeyError, TypeError, IndexError) as e:
         raise GitleaksError("gitleaks report was unreadable") from e
+    for i, text in enumerate(texts):
+        for block in _armored_blocks(text):
+            result[i][block] = min("private-key", result[i].get(block, "private-key"))
     return result
+
+
+def _armored_blocks(text: str) -> list[str]:
+    """Each armored private key in ``text``: BEGIN to the END after it, or to the end of
+    the text when none follows (output cut by truncation)."""
+    blocks, start = [], None
+    for armor in ARMOR.finditer(text):
+        if armor[1] == "BEGIN" and start is None:
+            start = armor.start()
+        elif armor[1] == "END" and start is not None:
+            blocks.append(text[start : armor.end()])
+            start = None
+    if start is not None:
+        blocks.append(text[start:])
+    return blocks
 
 
 def _run(gitleaks: str, rules: str, files: list[bytes], timeout: float,
