@@ -69,13 +69,18 @@ class GhApiError(RuntimeError):
 #: Not ``@me``: a GitHub App installation token has no user, so ``@me`` (and
 #: ``/user``) return nothing or 403 for it. A literal login works for both an
 #: App token and a personal token. Override per instance via ``login=``.
+#:
+#: The four global queries cover every repository the token can read, private
+#: ones included, for both token kinds (the App is installed on all
+#: repositories with Issues and Pull requests read). There is deliberately no
+#: per-repository fan-out: GitHub search allows 30 calls a minute, and four
+#: per repository exhausts that on the first run and fails the source.
 GITHUB_LOGIN = "jonathanmoregard"
 
 _SEARCH_PATH = re.compile(
     r"/search/issues\?q=is:"
     r"(?:pr\+(?:author|review-requested)|issue\+(?:author|assignee))"
     r":[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})"
-    r"(?:\+repo:[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100})?"
     r"(?:\+updated:>=\d{4}-\d{2}-\d{2})?\Z"
 )
 
@@ -320,38 +325,6 @@ def token_status(
     )
 
 
-_NO_INSTALLATION = re.compile(r"HTTP (?:401|403|404)", re.IGNORECASE)
-_RATE_LIMITED = re.compile(r"rate limit|abuse|secondary", re.IGNORECASE)
-
-
-def _default_private_repo_lister() -> list[str] | None:
-    """Private repos reachable by an App installation token, or ``None``.
-
-    Probes ``GET /installation/repositories`` (paginated, 100 per page). A
-    private repository only shows up in a search when the query names it
-    with ``repo:``, so the caller fans the author queries out per repo.
-    ``None`` means the token is not an installation token (a personal token
-    answers 403/404 there) and the single global query already sees
-    everything the token can; any other failure raises ``GhApiError`` so it
-    lands in the ingest errors instead of silently dropping private repos.
-    """
-    argv = [
-        "gh", "api", "--method", "GET", "--paginate",
-        "--jq", ".repositories[] | select(.private) | .full_name",
-        "/installation/repositories?per_page=100",
-    ]
-    try:
-        out = _run_gh(argv, timeout=120).stdout
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr or ""
-        if _NO_INSTALLATION.search(stderr) and not _RATE_LIMITED.search(stderr):
-            return None
-        raise GhApiError(f"gh api /installation/repositories failed: {e}") from e
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        raise GhApiError(f"gh api /installation/repositories failed: {e}") from e
-    return [ln.strip() for ln in out.splitlines() if ln.strip()]
-
-
 def _default_api_fetcher(path: str) -> list[dict]:
     """Call ``gh api <path> --paginate --jq '.items[]'`` and return the
     JSON-decoded item list.
@@ -426,10 +399,8 @@ class GitHubSource:
         _scope_fetcher: Callable[[], list[str]] = _default_scope_fetcher,
         _api_fetcher: Callable[[str], list[dict]] = _default_api_fetcher,
         _gh_token_fetcher: Callable[[], str | None] = _default_gh_token_fetcher,
-        _repo_lister: Callable[[], list[str] | None] | None = None,
         login: str = GITHUB_LOGIN,
     ):
-        self._repo_lister = _repo_lister or _default_private_repo_lister
         self.login = login
         self._scope_fetcher = _scope_fetcher
         self._api_fetcher = _api_fetcher
@@ -565,28 +536,11 @@ class GitHubSource:
         ("issue", "assigned", "/search/issues?q=is:issue+assignee:{login}"),
     ]
 
-    def _endpoints(self, errors: list[str] | None) -> list[tuple[str, str, str]]:
-        """The (kind, subkind, path) queries for this run.
-
-        Always the four global queries for ``self.login``. When the token is an
-        App installation token, additionally the same four per private repo it
-        can reach, qualified ``+repo:<full_name>`` (the only way private repos
-        appear in search for such a token). Cost: 4 calls per private repo.
-        """
-        base = [
+    def _endpoints(self) -> list[tuple[str, str, str]]:
+        """The four global (kind, subkind, path) queries for ``self.login``."""
+        return [
             (k, sk, tpl.format(login=self.login)) for k, sk, tpl in self._ENDPOINTS
         ]
-        try:
-            private = self._repo_lister()
-        except Exception as e:  # noqa: BLE001 -- partial ingest beats none
-            log.warning("private repo enumeration failed: %s", e)
-            if errors is not None:
-                errors.append(f"/installation/repositories: {e}")
-            return base
-        out = list(base)
-        for repo in private or []:
-            out.extend((k, sk, f"{p}+repo:{repo}") for k, sk, p in base)
-        return out
 
     def iter_records(
         self,
@@ -618,7 +572,7 @@ class GitHubSource:
         still not aborting the ingest (per-item faults are collected by
         design, spec §Error handling).
         """
-        for kind, subkind, path in self._endpoints(errors):
+        for kind, subkind, path in self._endpoints():
             scoped_path = self._apply_since(path, since)
             try:
                 rows = self._api_fetcher(scoped_path)
