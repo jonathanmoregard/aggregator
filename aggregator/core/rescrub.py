@@ -3,20 +3,17 @@
 WHY THIS EXISTS INSTEAD OF A ``SCRUB_FINGERPRINT`` BUMP. ``core/store.py``'s
 fingerprint is the documented way to carry a scrubber change to stored rows:
 bump it and every row re-scrubs on the next ingest. For a change that only
-ADDS secret detection that is the wrong tool, three ways over:
+ADDS secret detection that is the wrong tool, two ways over:
 
 * it re-runs Presidio on every row — ~11 hours at the measured 827 rows/min —
   to re-derive PII redactions that are already in the stored text;
-* the ingest UPSERT resets ``embedding_state`` and drops the vectors of every
-  row it rewrites, so the whole vector arm (weeks of CPU) would be discarded
-  to change a few hundred rows;
 * it only reaches rows whose source still exists on disk.
 
 ``scrub`` is idempotent, so running its secret layers over the STORED text
 redacts exactly what the new detectors find there and leaves every other
-byte alone. Only rows whose text actually changes are written, and only
-those lose their vectors. A change to the PII layers, or one that REMOVES a
-redaction, still needs the fingerprint bump.
+byte alone. Only rows whose text actually changes are written. A change to
+the PII layers, or one that REMOVES a redaction, still needs the fingerprint
+bump.
 
 WHAT A WRITE KEEPS CONSISTENT, per row that changed:
 
@@ -25,9 +22,6 @@ WHAT A WRITE KEEPS CONSISTENT, per row that changed:
 * ``records.subject`` / ``records.body`` — ``records_fts`` is not
   external-content, so its row is deleted and rebuilt from the stored row,
   as ``Store._write_one_record`` does.
-* the vector arm — ``embedding_state = NULL`` puts the row back in the embed
-  backlog and its vectors (and ``chunk_embeddings`` rows) are dropped, so no
-  vector keeps describing text that is no longer there.
 * ``src_hash`` is NOT touched. It fingerprints the SOURCE's row, which did
   not change; leaving it means the next ingest still skips the row instead
   of re-scrubbing it from scratch.
@@ -43,12 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from aggregator.core.scrub import scrub_secrets_many
-from aggregator.core.store import (
-    _RECORDS_FTS_REFRESH_SQL,
-    Store,
-    _drop_row_vectors,
-    _vec_table_usable,
-)
+from aggregator.core.store import _RECORDS_FTS_REFRESH_SQL, Store
 
 #: Rows per chunk. Each chunk is one read, one secret-redact call and, when not a
 #: dry run, one committed write — so this bounds what a SIGTERM costs, not
@@ -151,20 +140,16 @@ def _apply_observations(store: Store, changed) -> None:
     # scan is the slow part and must not hold the ingest timer off.
     store._ensure_writable()
     c = store._c()
-    vec = _vec_table_usable(c, "vec_observations")
     try:
-        for (rowid, obs_id, body), (res,) in changed:
+        for (rowid, _obs_id, body), (res,) in changed:
             # COMPARE-AND-SWAP on the body that was scanned. An ingest that
             # rewrote the row between our read and our lock stored text the
             # current scrubber already cleaned; overwriting it with a rescrub
             # of the OLD text would put stale content back.
-            cur = c.execute(
-                "UPDATE observations SET body = ?, embedding_state = NULL "
-                "WHERE rowid = ? AND body = ?",
+            c.execute(
+                "UPDATE observations SET body = ? WHERE rowid = ? AND body = ?",
                 (res.text, rowid, body),
             )
-            if cur.rowcount and vec:
-                _drop_row_vectors(c, "vec_observations", "obs_id", obs_id)
     except BaseException:
         c.rollback()
         raise
@@ -188,19 +173,16 @@ def _scan_records(rows) -> list[tuple]:
 def _apply_records(store: Store, changed) -> None:
     store._ensure_writable()
     c = store._c()
-    vec = _vec_table_usable(c, "vec_records")
     try:
         for (rowid, stable_id, old_subject, old_body), (subj, body) in changed:
             # Compare-and-swap, for the reason given in _apply_observations.
             cur = c.execute(
-                "UPDATE records SET subject = ?, body = ?, embedding_state = NULL "
+                "UPDATE records SET subject = ?, body = ? "
                 "WHERE rowid = ? AND subject = ? AND body = ?",
                 (subj.text, body.text, rowid, old_subject, old_body),
             )
             if not cur.rowcount:
                 continue
-            if vec:
-                _drop_row_vectors(c, "vec_records", "stable_id", stable_id)
             c.execute("DELETE FROM records_fts WHERE stable_id = ?", (stable_id,))
             c.execute(_RECORDS_FTS_REFRESH_SQL, (stable_id,))
     except BaseException:

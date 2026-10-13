@@ -5,9 +5,9 @@ unescaped-``MATCH`` defect has now been found three separate times on this
 branch, each time in a site a sibling of the one just fixed:
 
 * ``b4eab9b`` whitelisted the six statements in ``aggregator.core.store``.
-* ``29b2e8b`` fixed ``scripts/rag_rollout_smoke.py:_fts_ranked`` and pinned it
-  with a test whose own docstring claimed it covered "the ONE helper standing
-  between a raw query string and ``MATCH``".
+* ``29b2e8b`` fixed a since-deleted smoke script's ``_fts_ranked`` and pinned
+  it with a test whose own docstring claimed it covered "the ONE helper
+  standing between a raw query string and ``MATCH``".
 * There were two. ``store_fts_all`` in the same file still bound raw user text,
   and its only caller swallowed the resulting ``OperationalError`` into an
   empty set — so six of seven realistic queries failed and nothing went red.
@@ -17,13 +17,13 @@ by *reasoning* about which sites exist, and a reasoned enumeration of call
 sites in a 5000-line module is worth nothing. So this file does not reason. It
 parses every module under ``aggregator/`` and ``scripts/`` and finds every
 string literal containing the SQL keyword ``MATCH``, then requires each one to
-fall into exactly one of three declared buckets. A site nobody thought of is
+fall into exactly one of two declared buckets. A site nobody thought of is
 not "missed" — it lands in no bucket and this file goes red, naming the file
 and line.
 
 THE PARTITION IS THE POINT. ``test_every_match_literal_is_classified`` is what
 makes the enumeration complete rather than merely long: it asserts that the
-three buckets cover the whole set, so a new MATCH shape (a differently-named
+two buckets cover the whole set, so a new MATCH shape (a differently-named
 FTS table, an f-string that interpolates a table variable under another name,
 a MATCH built by concatenation) cannot pass silently. It forces a decision.
 
@@ -35,7 +35,7 @@ test above still passed, because every test above asserts something about the
 literals the scanner FOUND. A mechanical enumeration is only worth what its
 collector is worth, so the collector is now itself tested, against planted
 sites in shapes nobody here wrote: lowercase, mixed case, lowercase inside an
-f-string, lowercase sqlite-vec. That is the difference between "we parse the
+f-string. That is the difference between "we parse the
 source" and "we would catch it".
 """
 
@@ -74,10 +74,6 @@ _MATCH_WORD = re.compile(r"(?<![\w.])MATCH(?![\w])", re.IGNORECASE)
 #: would be reverted within a day.
 _FTS_SITE = re.compile(r"(?:\b\w*_fts\b|\{table\})\s+MATCH\b", re.IGNORECASE)
 
-#: A sqlite-vec KNN site: the left operand is the ``embedding`` column and the
-#: bound parameter is a float32 blob, never user text.
-_VEC_SITE = re.compile(r"\bembedding\s+MATCH\b", re.IGNORECASE)
-
 #: Literals that mention MATCH but are not SQL at all. Frozen deliberately:
 #: adding one is a decision, not a formality.
 #:
@@ -95,29 +91,7 @@ _NOT_SQL = {
     (
         "aggregator/core/store.py",
         "Store._fts_rows",
-        "FTS5 MATCH failed for %r (rewritten to %r) — the lexical arm "
-        "contributes nothing to this query",
-    ),
-    # Both of these are sentences shown to the AGENT, in ``low_confidence_reason``.
-    # They say "no match" / "DID match" about the keyword arm in English and
-    # touch no SQL at all.
-    (
-        "aggregator/mcp.py",
-        "_note_confidence",
-        "the keyword arm was UNAVAILABLE for this query — it failed while "
-        "running, so it contributed nothing and these rows come from the "
-        "semantic arm alone. This is NOT the same as the keyword arm finding "
-        "no match: nothing here has been checked against your words at all, "
-        "and a re-run may answer differently",
-    ),
-    (
-        "aggregator/mcp.py",
-        "_note_confidence",
-        "the keyword arm ran and DID match rows for this query, but the second "
-        "lookup that maps its hits onto these session cards failed, so whether "
-        "it corroborated the rows on this page is UNKNOWN. This is weaker than "
-        "either 'corroborated' or 'not corroborated' — a re-run may answer "
-        "differently",
+        "FTS5 MATCH failed for %r (rewritten to %r)",
     ),
 }
 
@@ -306,28 +280,27 @@ def test_the_scan_covers_every_non_test_python_file_in_the_repo():
 def test_the_scan_found_the_sites_it_is_supposed_to_be_watching():
     """A scanner that silently matches nothing passes every other test here.
 
-    The floor is deliberately concrete rather than ``> 0``: the store alone has
-    six FTS5 statements and the smoke script has three, and a refactor that
-    drops the count without deleting the feature is itself worth a red test.
+    The floor is deliberately concrete rather than ``> 0``: the store has
+    eight FTS5 statement literals, and a refactor that drops the count without
+    deleting the feature is itself worth a red test.
     """
-    assert len(_FTS_LITERALS) >= 9, [repr(lit) for lit in _FTS_LITERALS]
+    assert len(_FTS_LITERALS) >= 8, [repr(lit) for lit in _FTS_LITERALS]
     files = {lit.path for lit in _FTS_LITERALS}
     assert "aggregator/core/store.py" in files
-    assert "scripts/rag_rollout_smoke.py" in files
 
 
 def test_every_match_literal_is_classified():
-    """THE COMPLETENESS PROPERTY. Three buckets, and they cover everything.
+    """THE COMPLETENESS PROPERTY. Two buckets, and they cover everything.
 
     Not "we fixed this one and now there are five". A MATCH literal that is
-    neither an FTS5 site nor a sqlite-vec KNN nor a declared non-SQL string is
-    a site nobody classified, and it fails here with its file and line.
+    neither an FTS5 site nor a declared non-SQL string is a site nobody
+    classified, and it fails here with its file and line.
     """
     unclassified = [
         lit
         for lit in _LITERALS
         if not _FTS_SITE.search(lit.text)
-        and not _VEC_SITE.search(lit.text)
+        
         and (lit.path, lit.func, lit.text) not in _NOT_SQL
     ]
     assert not unclassified, (
@@ -432,12 +405,10 @@ def _empty_binding(handler: ast.ExceptHandler) -> str | None:
 def test_no_operational_error_on_the_match_path_is_swallowed_into_an_empty_result():
     """Fail loudly: an emptied set is indistinguishable from "no matches".
 
-    The smoke script's ``cmd_distances`` caught the ``OperationalError`` that
+    A since-deleted smoke script caught the ``OperationalError`` that its
     ``store_fts_all`` raised on six of seven realistic queries and assigned
-    ``set()``, which silently emptied the "already reachable by FTS5"
-    exclusion feeding ``cosine_distance.vector_only_relevant`` — the
-    distribution the distance floor is judged against. Six sevenths of that
-    exclusion vanished and the JSON looked exactly the same.
+    ``set()``, which silently emptied a set its report depended on. Six
+    sevenths of it vanished and the JSON looked exactly the same.
 
     Scoped to the MATCH path by the CALL GRAPH rather than by a hand-listed
     set of functions, so this cannot be defeated by adding one more wrapper.
@@ -502,10 +473,6 @@ _SMUGGLED = {
         'def sneak(con, q, table):\n'
         '    return con.execute(f"SELECT rowid FROM {table} WHERE {table} match ?", (q,))\n'
     ),
-    "lowercase vec KNN": (
-        'def sneak(con, v):\n'
-        '    return con.execute("SELECT rowid FROM vec0 WHERE embedding match ?", (v,))\n'
-    ),
 }
 
 
@@ -531,7 +498,7 @@ def test_the_scanner_is_not_defeated_by_lowercasing_the_operator(shape):
         "other test in this file, including the completeness property"
     )
     lit = found[0]
-    assert _FTS_SITE.search(lit.text) or _VEC_SITE.search(lit.text), (
+    assert _FTS_SITE.search(lit.text), (
         f"the {shape} site was collected but fell in no bucket: {lit.text!r}"
     )
 
@@ -571,6 +538,6 @@ def test_prose_that_merely_says_match_is_not_mistaken_for_sql():
     found, _calls = _collect("aggregator/prose.py", source)
     assert found, "case-insensitive collection has to see it at all"
     lit = found[0]
-    assert not _FTS_SITE.search(lit.text) and not _VEC_SITE.search(lit.text), (
+    assert not _FTS_SITE.search(lit.text), (
         f"English prose classified as a SQL site: {lit.text!r}"
     )

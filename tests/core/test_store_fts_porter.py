@@ -258,9 +258,9 @@ def test_porter_rebuild_commit_keeps_the_write_baton(tmp_path, monkeypatch):
 
     ``_WriteLockedConnection.commit`` releases the cache write lock, so the
     ``c.commit()`` that makes the porter rebuild durable used to leave the
-    REST of ``migrate()`` — the DDL pass, the vec reconcile, the version
-    stamp — running unlocked on the first post-deploy invocation, exactly
-    when the ingest/embed timers are most likely to pile in behind it.
+    REST of ``migrate()`` — the DDL pass and the version stamp — running
+    unlocked on the first post-deploy invocation, exactly when the ingest
+    timer is most likely to pile in behind it.
     """
     db = _seeded_v6_db(tmp_path)
     held_after: list[bool] = []

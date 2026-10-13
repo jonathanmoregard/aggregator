@@ -1,20 +1,14 @@
 """Two aggregator processes must not be able to make each other fail.
 
 OBSERVED IN PRODUCTION, 2026-08-30, on EVERY tick for at least five hours.
-``aggregator-embed.service`` died with ``sqlite3.OperationalError: database is
-locked`` ten runs out of ten between 19:15 and 23:47, each failure timestamped
-inside a window in which ``aggregator-ingest.service`` was running. Twice the
-death was the unhandled traceback at startup — ``cli._cmd_embed`` ->
-``Store.migrate`` -> the ``embedding_versions`` INSERT — 33 seconds after the
-run began, which is the 30s ``busy_timeout`` expiring plus the statement that
-gave up. Eight times it was the batch write, after up to 47 minutes of encoder
-work that then had nowhere to land.
+A background writer died with ``sqlite3.OperationalError: database is locked``
+ten runs out of ten, each failure timestamped inside a window in which
+``aggregator-ingest.service`` was running — the 30s ``busy_timeout`` expiring
+against a longer transaction.
 
-WHY THE PREVIOUS DESIGN COULD NOT HOLD. ``nix/aggregator.nix`` stated the
-correctness story as "WAL journal mode plus a 30s busy_timeout, and on the
-worker side one short write transaction per batch rather than one long one per
-run". Both halves are true of the embed worker and the second half is simply
-false of ingest: ``cli._ingest_entities`` calls ``store.upsert_entities(
+WHY THE PREVIOUS DESIGN COULD NOT HOLD. The correctness story was "WAL journal
+mode plus a 30s busy_timeout, and one short write transaction per batch rather
+than one long one per run". The second half is false of ingest: ``cli._ingest_entities`` calls ``store.upsert_entities(
 entities)`` once for a whole source, and ``_do_write_entities`` chunks only the
 hash PROBE, not the commit. One transaction covers every changed row.
 
@@ -119,8 +113,8 @@ def _spawn(script):
 #: GENEROUS ON PURPOSE, because this is setup and not the property under test.
 #: The holder pays for a fresh interpreter, the ``aggregator.core.store`` import
 #: chain (which reaches Presidio) and a ``migrate()`` before it can announce
-#: anything, and these tests run on a machine whose whole point is a background
-#: embed worker at ``Nice=19`` eating every core. At 30s this was observed
+#: anything, and these tests run on machines that are often under heavy
+#: background load. At 30s this was observed
 #: failing in a full-suite run and passing standalone — i.e. measuring the load
 #: on the box rather than the lock. What the lock does is asserted afterwards,
 #: against ``_HOLD_SECONDS``, and no amount of slow setup can make that pass.
@@ -161,16 +155,14 @@ def test_a_write_waits_out_another_process_instead_of_failing_locked(
 ):
     """THE PRODUCTION REGRESSION, at the smallest layer that carries it.
 
-    Ingest holds a long write transaction; embed writes into it. Before the
-    cross-process lock this raised ``database is locked`` — ten times out of
-    ten on the deployed machine, and deterministically here, because 200ms of
-    busy handler cannot outlast a two-second transaction.
+    One process holds a long write transaction; another writes into it.
+    Before the cross-process lock this raised ``database is locked`` — ten
+    times out of ten on the deployed machine, and deterministically here,
+    because 200ms of busy handler cannot outlast a two-second transaction.
 
     The assertion is that the write SUCCEEDS, not that it is fast. Waiting is
-    the correct behaviour and the embed unit is built for it
-    (``TimeoutStartSec=infinity``, a watermark it resumes from). What is not
-    correct is throwing away up to 47 minutes of encoder work because another
-    process was mid-commit.
+    the correct behaviour; failing because another process was mid-commit is
+    not.
     """
     ready = tmp_path / "held"
     holder = _spawn(_holder_script(cache, ready))
@@ -180,8 +172,7 @@ def test_a_write_waits_out_another_process_instead_of_failing_locked(
         started = time.monotonic()
         s = Store(db_path=cache)
         try:
-            # The embed worker's own first write is ``migrate()``'s INSERT into
-            # embedding_versions — store.py:1386 in the production traceback.
+            # ``migrate()`` writes the schema stamp, so it needs the baton.
             s.migrate()
         finally:
             s.close()
@@ -202,9 +193,9 @@ def test_the_baton_is_handed_back_when_the_transaction_ends(cache, impatient, tm
     """A lock that is never released is not a fix, it is a nicer-looking outage.
 
     The failure this guards is the easy way to make the test above pass: hold
-    the lock for the life of the process. That would serialise the two units
-    down to one, turning a 30-minute embed tick into a 30-minute block on
-    ingest — which is the same starvation with the blame moved.
+    the lock for the life of the process. That would serialise every writer
+    behind the longest-running one — which is the same starvation with the
+    blame moved.
 
     So: after the holder commits and exits, an unrelated process must be able
     to take the baton immediately. Sequential, not concurrent, on purpose —

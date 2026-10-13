@@ -8,16 +8,11 @@ spill is not free: it forces a jq round-trip to read anything, which degrades
 the tool to the grep workflow it exists to replace, plus the cost of having
 called it.
 
-Grepping ``mcp.py`` for size caps before this change found the page-token
-budget (``_frozen_over_budget``, ``_MAX_FROZEN_ID_CHARS``) and the
-cross-encoder's 512-token pair budget. Neither bounds the response. There was
-no governor at all.
+Grepping ``mcp.py`` for size caps before this change found nothing that
+bounds the response. There was no governor at all.
 
-WHY TRUNCATION HERE AND REFUSAL THERE. ``_PageTokenError`` deliberately refuses
-an over-long page token rather than truncating it, because a truncated frozen
-set is "plausible but wrong" — it looks like a working continuation and
-silently addresses different rows. Content is the opposite call: a truncated
-body is still the right body, and the caller can see it is short. That only
+WHY TRUNCATION IS SAFE HERE. A truncated body is still the right body, and the
+caller can see it is short. That only
 holds while the cut is DECLARED, which is why ``truncated`` and
 ``content_length`` are on every item rather than only on the cut ones, and why
 they are not optional.

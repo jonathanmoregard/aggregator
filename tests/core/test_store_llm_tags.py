@@ -8,15 +8,14 @@ additive ``llm_tags`` column with ``llm_tags_src_hash`` recording which
 indexes the space-joined union, so a record reachable by an LLM tag is
 reachable by exactly the same search paths as one reachable by a source tag.
 
-THE WATERMARK LIVES IN THE ROWS IT DESCRIBES, like ``provenance IS NULL`` and
-``embedding_state IS NULL`` before it: a record needs tagging when
+THE WATERMARK LIVES IN THE ROWS IT DESCRIBES, like ``provenance IS NULL``
+before it: a record needs tagging when
 ``llm_tags_src_hash`` is NULL or disagrees with the row's current
 ``src_hash``. No sidecar, so a kill can never leave the ledger ahead of the
 data.
 
 TRUTHFULNESS: a partially-tagged corpus must never look fully tagged, which
-is what ``llm_tag_progress_by_source`` exists for — the same argument as
-``embed_progress_by_source`` one abstraction over.
+is what ``llm_tag_progress_by_source`` exists for.
 """
 
 from __future__ import annotations
@@ -237,22 +236,6 @@ def test_source_tags_are_never_clobbered_by_llm_tag_writes(tmp_path):
     assert after["tags"] == before["tags"]
     assert json.loads(after["tags"]) == ["source-tag", "another"]
     assert after["src_hash"] == before["src_hash"]
-
-
-def test_llm_tag_write_does_not_reset_embedding_state(tmp_path):
-    """Tags are additive metadata; they must not re-queue the vector arm."""
-    s = _store(tmp_path)
-    s.upsert([_rec("github:e", "S", "b")])
-    c = s._c()
-    c.execute(
-        "UPDATE records SET embedding_state = 'ok' WHERE stable_id = 'github:e'"
-    )
-    c.commit()
-    s.write_llm_tags([("github:e", ["a-topic"], "h1")])
-    row = c.execute(
-        "SELECT embedding_state FROM records WHERE stable_id = 'github:e'"
-    ).fetchone()
-    assert row["embedding_state"] == "ok"
 
 
 # --- the watermark ----------------------------------------------------------

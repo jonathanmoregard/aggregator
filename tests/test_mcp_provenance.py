@@ -216,12 +216,12 @@ def test_an_unknown_by_value_is_refused_not_silently_empty(store):
 def test_the_page_token_fingerprint_binds_the_by_filter():
     """Omit it and a token minted under one filter continues under another,
     addressing a row position that never existed in the new result set."""
-    unfiltered = mcp._query_fingerprint(parse("source:sessions clickable"), True, "hybrid")
+    unfiltered = mcp._query_fingerprint(parse("source:sessions clickable"), True)
     human = mcp._query_fingerprint(
-        parse("source:sessions by:human clickable"), True, "hybrid"
+        parse("source:sessions by:human clickable"), True
     )
     machine = mcp._query_fingerprint(
-        parse("source:sessions by:machine clickable"), True, "hybrid"
+        parse("source:sessions by:machine clickable"), True
     )
     assert len({unfiltered, human, machine}) == 3
 
@@ -255,15 +255,6 @@ def test_by_scopes_the_session_card_projection(store):
     assert roots == {"sess-a"}
     only_hook = store._fts_hit_scope("NixOS", provenance=HUMAN)
     assert only_hook == (set(), set())
-
-
-def test_by_scopes_the_hybrid_id_projection(store):
-    """``_obs_id_hit_scope`` is the v5 twin and must stay behaviourally
-    identical to its FTS sibling, filter included."""
-    all_ids = ["o-human", "o-hook", "o-agent"]
-    roots, _exacts = store._obs_id_hit_scope(all_ids, provenance=HUMAN)
-    assert roots == {"sess-a"}
-    assert store._obs_id_hit_scope(["o-hook"], provenance=HUMAN) == (set(), set())
 
 
 def test_by_filters_a_session_card_page(store):

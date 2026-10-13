@@ -7,7 +7,7 @@ TWO TRUTHFULNESS RULES, both load-bearing:
   silently mixed with machine-generated ones.
 * A partially-tagged corpus must never look fully tagged: capabilities
   carries per-source tagged/total counts plus a note saying what they mean
-  for a ``tag:`` filter, the same shape as the vector arm's coverage story.
+  for a ``tag:`` filter.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def test_search_result_items_carry_llm_tags_separately(tmp_path):
     s = _store(tmp_path)
     s.upsert([_rec("github:x", "subject", "body", tags=["src-tag"])])
     s.write_llm_tags([("github:x", ["llm-topic", "other-topic"], "h1")])
-    result = aggregator_query("tag:llm-topic", search_mode="lexical", _store=s)
+    result = aggregator_query("tag:llm-topic", _store=s)
     assert result["ok"] is True
     (item,) = result["records"]
     assert item["tags"] == ["src-tag"]
@@ -55,7 +55,7 @@ def test_search_result_items_carry_llm_tags_separately(tmp_path):
 def test_untagged_record_item_has_empty_llm_tags(tmp_path):
     s = _store(tmp_path)
     s.upsert([_rec("github:y", "subject", "body", tags=["src-tag"])])
-    result = aggregator_query("tag:src-tag", search_mode="lexical", _store=s)
+    result = aggregator_query("tag:src-tag", _store=s)
     (item,) = result["records"]
     assert item["llm_tags"] == []
 

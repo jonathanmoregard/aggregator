@@ -10,10 +10,8 @@ across statements forever.
 Both halves of that promise are false here, and the consequences are not
 theoretical — each test below was watched to fail against ``immutable=1``:
 
-* Data committed to the ``-wal`` is invisible, so ``has_embedded_rows`` —
-  the v5 hybrid routing predicate — reports a warm vector index as cold.
-  That no longer costs freshness only; it silently changes which retrieval
-  arms run.
+* Data committed to the ``-wal`` is invisible, so recall silently misses
+  everything ingested since the last checkpoint.
 * Once a checkpoint or VACUUM rewrites the main file underneath the cached
   pages, the reader returns *wrong row counts with no error at all*, and
   then ``database disk image is malformed``.
@@ -56,37 +54,6 @@ def _checkpoint(store):
     c = store._c()
     c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     c.commit()
-
-
-def test_routing_predicate_sees_rows_a_live_writer_just_embedded(tmp_path):
-    """``has_embedded_rows`` must not report a warm index as cold.
-
-    This is the v5-specific consequence: the predicate decides whether the
-    vector arm engages at all, so a stale answer changes retrieval, not just
-    freshness.
-
-    The writer WRITES VECTORS rather than only flipping a column, because
-    that is what the predicate now reads. ``embedding_state`` could never
-    answer this honestly — it cannot say which model embedded the row, so it
-    reports a warm index after a model change and a cold one after a source
-    rebuild resets it. ``chunk_embeddings`` is written by the same call that
-    writes the vector, so the two cannot disagree.
-    """
-    import numpy as np
-
-    db = tmp_path / "cache.db"
-    writer = Store(db_path=db)
-    writer.migrate()
-    _seed_observations(writer, 5)
-
-    reader = Store(db_path=db, read_only=True)
-    assert reader.has_embedded_rows("observations") is False
-
-    vec = np.zeros(768, dtype=np.float32)
-    vec[0] = 1.0
-    writer.upsert_vec_observations([(f"o{i:06d}", vec) for i in range(5)])
-
-    assert reader.has_embedded_rows("observations") is True
 
 
 def test_reader_sees_rows_committed_after_it_opened(tmp_path):
@@ -145,7 +112,7 @@ def test_readonly_store_still_refuses_writes(tmp_path):
 
     reader = Store(db_path=db, read_only=True)
     with pytest.raises(RuntimeError, match="read-only Store cannot write"):
-        reader.mark_embedded("observations", ["o000000"], "ok")
+        reader.migrate()
     with pytest.raises(sqlite3.OperationalError):
         reader._c().execute("DELETE FROM observations")
 

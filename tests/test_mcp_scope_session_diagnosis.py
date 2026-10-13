@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import numpy as np
 import pytest
 
 from aggregator.core.store import Store
@@ -193,45 +192,3 @@ def test_a_filter_on_top_of_a_real_miss_still_blames_neither(apart):
     notice = result["notice"]
     assert _DENIAL in notice, notice
     assert "THE WORDS ARE NOT THE PROBLEM" not in notice, notice
-
-
-# --- not measured is not zero ------------------------------------------------
-
-
-class _StubEmbedder:
-    """No real model, ever. One axis, so every text is its own neighbour."""
-
-    @staticmethod
-    def _vec(text: str) -> np.ndarray:
-        v = np.zeros(768, dtype=np.float32)
-        v[0] = 1.0
-        return v
-
-    def embed_query(self, query: str) -> np.ndarray:
-        return self._vec(query)
-
-    def embed_documents(self, docs: list[str]) -> np.ndarray:
-        return np.array([self._vec(d) for d in docs], dtype=np.float32)
-
-
-def test_vector_mode_claims_nothing_about_co_occurrence(co_occurring, monkeypatch):
-    """``search_mode='vector'`` DROPS THE KEYWORD ARM, so no intersection ran —
-    and a branch that reads ``lexical_matches`` as falsy would report the
-    unmeasured case exactly like a measured zero. ``None`` is not ``0``: the
-    page may say it is empty, never why the words are not in any session."""
-    monkeypatch.setattr("aggregator.mcp._get_embedder", lambda: _StubEmbedder())
-    vecs = _StubEmbedder().embed_documents(["a", "b"])
-    co_occurring.upsert_vec_observations(
-        [("o-fix", vecs[0]), ("o-bug", vecs[1])]
-    )
-    co_occurring.mark_embedded("observations", ["o-fix", "o-bug"], state="ok")
-    result = aggregator_query(
-        dsl="source:sessions type:user scope:session fix bug from:2030-01-01",
-        drilldown=True,
-        search_mode="vector",
-        _store=co_occurring,
-    )
-    assert result["ok"] is True, result
-    assert result["total"] == 0
-    assert co_occurring.lexical_matches is None, "precondition: no ladder ran"
-    assert _DENIAL not in (result.get("notice") or ""), result.get("notice")

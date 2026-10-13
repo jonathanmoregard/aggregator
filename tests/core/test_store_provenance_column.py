@@ -2,15 +2,13 @@
 
 The column is metadata-only (``ADD COLUMN`` with no default touches no page:
 measured at 0.006 s on a throwaway database at 1/5 of live scale), and NULL for
-every pre-existing row — which is the backfill's cursor, exactly as
-``embedding_state IS NULL`` is the embed worker's.
+every pre-existing row — which is the backfill's cursor.
 
 THE TEST THAT MATTERS MOST HERE IS
 :func:`test_provenance_is_not_in_the_source_digest`. If the classifier's output
 enters ``_src_hash``, every classifier revision changes all 549,952 digests,
 the next ingest takes the ``DO UPDATE`` branch for every row, re-runs Presidio
-on each (~11 hours at this repo's measured 827 rows/min) and sets
-``embedding_state = NULL`` — discarding the observation vector arm. The
+on each (~11 hours at this repo's measured 827 rows/min). The
 ``SCRUB_FINGERPRINT`` comment right above the digest actively invites exactly
 that pattern, so the refusal is pinned rather than commented.
 """
@@ -69,15 +67,15 @@ def _columns(c: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
 
 
-def test_schema_version_is_seven():
-    """v6 added ``provenance``; v7 (porter stemming, ``ededbf2``) is current.
+def test_schema_version_is_eight():
+    """v6 added ``provenance``; v8 (vector index removed) is current.
 
     Pinned to the literal so a migration bump is a conscious edit here rather
     than silent drift — same precedent as ``test_store.py``'s
-    ``test_schema_version_is_7``. The provenance column this file guards
-    shipped in v6 and survives unchanged through v7.
+    ``test_schema_version_is_8``. The provenance column this file guards
+    shipped in v6 and survives unchanged through v8.
     """
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 8
 
 
 def test_a_fresh_database_has_the_column_and_its_index(tmp_path):
@@ -112,7 +110,7 @@ def test_a_v5_database_upgrades_in_place_with_every_row_unclassified(tmp_path):
     c.execute("PRAGMA user_version = 5")
     c.commit()
     before = c.execute(
-        "SELECT body, src_hash, embedding_state FROM observations WHERE obs_id='o1'"
+        "SELECT body, src_hash FROM observations WHERE obs_id='o1'"
     ).fetchone()
     s.close()
 
@@ -121,37 +119,31 @@ def test_a_v5_database_upgrades_in_place_with_every_row_unclassified(tmp_path):
     c2 = s2._c()
     assert "provenance" in _columns(c2, "observations")
     row = c2.execute(
-        "SELECT body, src_hash, embedding_state, provenance FROM observations "
-        "WHERE obs_id='o1'"
+        "SELECT body, src_hash, provenance FROM observations WHERE obs_id='o1'"
     ).fetchone()
     assert row["provenance"] is None
-    assert (row["body"], row["src_hash"], row["embedding_state"]) == tuple(before)
+    assert (row["body"], row["src_hash"]) == tuple(before)
     assert s2.schema_version() == SCHEMA_VERSION
     s2.close()
 
 
 def test_provenance_is_not_in_the_source_digest(tmp_path):
-    """A classifier revision must not re-scrub the corpus or void its vectors.
+    """A classifier revision must not re-scrub the corpus.
 
     Same row, same body, different provenance: the digest is over what the
     SOURCE produced, so the second write is recognised as unchanged and never
-    reaches the ``DO UPDATE`` branch that would reset ``embedding_state``.
+    reaches the ``DO UPDATE`` branch that would rewrite the row.
     """
     s = Store(db_path=tmp_path / "cache.db")
     s.migrate()
     s.upsert_entities([_session(), _obs("o1", "a turn", provenance=HUMAN)])
     c = s._c()
-    c.execute("UPDATE observations SET embedding_state = 'ok' WHERE obs_id = 'o1'")
-    c.commit()
 
     unchanged = s.upsert_entities([_session(), _obs("o1", "a turn", provenance=HOOK)])
     assert unchanged == 2
-    row = c.execute(
-        "SELECT provenance, embedding_state FROM observations WHERE obs_id='o1'"
-    ).fetchone()
-    # The row was not rewritten, so the vector arm keeps its state AND the
-    # stored provenance is the one the backfill owns — not the new guess.
-    assert row["embedding_state"] == "ok"
+    row = c.execute("SELECT provenance FROM observations WHERE obs_id='o1'").fetchone()
+    # The row was not rewritten, so the stored provenance is the one the
+    # backfill owns — not the new guess.
     assert row["provenance"] == HUMAN
     s.close()
 
@@ -160,8 +152,7 @@ def test_there_is_no_provenance_fingerprint_constant():
     """The trap ``SCRUB_FINGERPRINT`` invites, named so it stays refused.
 
     A ``PROVENANCE_FINGERPRINT`` beside it would be the one-line way to put the
-    classifier's version into every digest — ~11 hours of re-scrub now, and
-    weeks of discarded embedding CPU once the observation vector arm is warm.
+    classifier's version into every digest — ~11 hours of re-scrub.
     """
     assert not hasattr(store_module, "PROVENANCE_FINGERPRINT")
 

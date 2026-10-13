@@ -43,7 +43,7 @@ tasks/arftl-run.json
 /hygiene.out
 
 # `nix build` drops this symlink into the repo root, and the verifier's
-# `nix build --rebuild .#checks…aggregator-embed-unit-hygiene` runs on every
+# `nix build --rebuild .#checks…aggregator-unit-hygiene` runs on every
 # gate — so it reappears after each one. Untracked, it is exactly what the
 # sync-agent cron auto-commits: a dangling /nix/store pointer published to a
 # public repo and broken on every other machine. Anchored so a source file

@@ -464,8 +464,7 @@ def test_two_processes_concurrent_writes_succeed(tmp_data_home):
     p1.start()
     p2.start()
     # NOT 30s. THE OLD BUDGET WAS SPENT ALMOST ENTIRELY ON `import`, NOT ON THE
-    # DATABASE. Measured on a 12-core box under load average ~25, with the
-    # embed worker running: importing `aggregator.core.store` in a spawned
+    # DATABASE. Measured on a 12-core box under load average ~25: importing `aggregator.core.store` in a spawned
     # child costs 27.7-30.4s, while the child's own work -- open the Store and
     # upsert 50 records -- costs 0.08s, and the bootstrap migrate costs 0.07s.
     # Two spawned children finish in 34-36s wall, both exit 0, both writes
@@ -519,10 +518,10 @@ def test_read_only_store_skips_wal_and_refuses_migration(tmp_path):
 # --- v2 sessions + observations -------------------------------------------
 
 
-def test_schema_version_is_7(tmp_data_home):
+def test_schema_version_is_8(tmp_data_home):
     s = Store()
     s.migrate()
-    assert s.schema_version() == SCHEMA_VERSION == 7
+    assert s.schema_version() == SCHEMA_VERSION == 8
 
 
 def test_upsert_entities_writes_sessions_and_observations(tmp_data_home):
@@ -741,7 +740,7 @@ def test_migrate_upgrades_v2_db_in_place_without_data_loss(tmp_data_home):
 
     s2 = Store()
     s2.migrate()
-    assert s2.schema_version() == SCHEMA_VERSION == 7
+    assert s2.schema_version() == SCHEMA_VERSION == 8
     cols = {r[1] for r in s2._c().execute("PRAGMA table_info(sessions)")}
     assert "origin" in cols
     rows = s2.query_sessions(QueryAST(top_session_id="pre-v3"))

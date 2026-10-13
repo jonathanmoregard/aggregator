@@ -13,10 +13,10 @@ covered both" rather than "which moment said it". It is never the default,
 because the moment is what a recall tool is asked for and a session here runs to
 hundreds of turns.
 
-THE FOUR SITES THAT BREAK WITHOUT A TEST FAILURE, each covered below:
+THE THREE SITES THAT BREAK WITHOUT A TEST FAILURE, each covered below:
 the page-token fingerprint (a token minted under one scope continuing under
-another), the sessions-vs-records routing predicate, the session-card
-projection, and the keyword arm inside the fused hybrid scope.
+another), the sessions-vs-records routing predicate, and the session-card
+projection.
 """
 from __future__ import annotations
 
@@ -232,13 +232,11 @@ def test_absent_stays_none_so_the_ast_does_not_always_carry_a_key():
 def test_the_page_token_fingerprint_binds_the_scope():
     """A token minted under one scope must not continue under the other: the
     widened query cuts its offsets from a strictly larger row set."""
-    default = mcp._query_fingerprint(parse("source:sessions a b"), True, "hybrid")
+    default = mcp._query_fingerprint(parse("source:sessions a b"), True)
     named = mcp._query_fingerprint(
-        parse("source:sessions scope:observation a b"), True, "hybrid"
+        parse("source:sessions scope:observation a b"), True
     )
-    widened = mcp._query_fingerprint(
-        parse("source:sessions scope:session a b"), True, "hybrid"
-    )
+    widened = mcp._query_fingerprint(parse("source:sessions scope:session a b"), True)
     # Absent and the default spelled out are the SAME question and must share
     # a token — refusing a caller who said the default out loud would be a
     # refusal with no cause.
@@ -270,9 +268,8 @@ def test_scope_alone_routes_to_the_sessions_ontology():
 
 
 def test_scope_widens_the_session_card_projection(store):
-    """``_text_hit_scope`` is what decides which cards the keyword arm matched.
-    Left at the default there, every card ``scope:session`` surfaced would be
-    reported as uncorroborated on the query that asked for it."""
+    """``_text_hit_scope`` is what decides which cards the keyword arm matched,
+    so ``scope:session`` has to widen it."""
     default = store._text_hit_scope(
         QueryAST(text="green pull request", obs_type="user")
     )
@@ -282,24 +279,6 @@ def test_scope_widens_the_session_card_projection(store):
     )
     assert default[0] == {"sess-together"}
     assert widened[0] == {"sess-split", "sess-together"}
-    assert mcp._lexical_session_ids(
-        store, "green pull request", "user",
-        frozenset({"o-early", "o-late"}), None, SCOPE_SESSION,
-    ) >= frozenset({"sess-split"})
-
-
-def test_scope_widens_the_keyword_arm_of_the_fused_scope(store, monkeypatch):
-    """The hybrid route computes its own keyword arm. Narrower there than the
-    FTS5-only route is the "search got smarter and stopped finding it" failure
-    ``_fused_id_scope`` refuses by name."""
-    monkeypatch.setattr(mcp, "_widen_chunk_ids", lambda ids: list(ids))
-    ast = parse("source:sessions type:user scope:session green pull request")
-    scope, _hits, lexical = mcp._fused_id_scope(
-        store, "observations", ast.text or "", object(), frozen=["o-both"],
-        lexical_ast=ast,
-    )
-    assert lexical == frozenset({"o-both", "o-early", "o-late"})
-    assert scope == frozenset({"o-both", "o-early", "o-late"})
 
 
 # --- the widening is computed once per response, not once per card ----------

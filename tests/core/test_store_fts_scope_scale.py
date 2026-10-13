@@ -17,10 +17,9 @@ Reproduced at real scale rather than against a lowered cap: the point is the
 corpus size, and a mocked limit would not have shown that the two surfaces
 disagree.
 
-Round 1 fixed exactly this class in ``_apply_id_scope`` (the hybrid arm) with
-``json_each``. These tests pin the same technique across the FTS5 arm — one
-bound parameter per id set, however many ids — because two techniques for one
-defect is how the next site gets missed.
+These tests pin ``json_each`` across the FTS5 arm — one bound parameter per
+id set, however many ids — because two techniques for one defect is how the
+next site gets missed.
 """
 
 import pytest

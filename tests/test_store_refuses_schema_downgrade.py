@@ -13,8 +13,7 @@ because A SUCCESSFUL DOWNGRADE LOOKS EXACTLY LIKE A SUCCESSFUL MIGRATION.
 The unconditional stamp is what made it invisible. A cache stamped ABOVE this
 build's ``SCHEMA_VERSION`` means an older build is running against a newer
 cache — this process does not know what the newer schema contains, which
-columns are now NOT NULL, which triggers now fire, or what the vector tables
-are shaped like — so writing into it is how a cache that merely could not be
+columns are now NOT NULL, or which triggers now fire — so writing into it is how a cache that merely could not be
 read becomes a cache that is wrong. There is exactly one safe move and it is to
 stop.
 
@@ -270,8 +269,8 @@ def test_the_refusal_says_nothing_was_written(ahead_db):
 
     The operator's first fear on seeing a schema error is that the cache has
     been half-migrated into an unreadable state. It has not, and saying so is
-    what keeps them from reaching for a rebuild that would destroy weeks of
-    vectors to fix a problem that does not exist.
+    what keeps them from reaching for a rebuild to fix a problem that does
+    not exist.
     """
     text = _refusal_text(ahead_db).lower()
     assert "nothing was written" in text, text

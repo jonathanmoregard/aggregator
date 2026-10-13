@@ -2,7 +2,7 @@
 
 WHY THIS IS ITS OWN CHANGE. ``observations_au`` was ``AFTER UPDATE ON
 observations`` with no column list, so *any* write to *any* column — a
-provenance stamp, an ``embedding_state`` flip — did a full FTS5 ``'delete'``
+provenance stamp, say — did a full FTS5 ``'delete'``
 plus re-insert of the whole body. With ``auto_vacuum=0`` the freed pages are
 never handed back (the mechanism already documented at ``store.py`` around the
 ingest UPSERT), so the cost is permanent file growth on a 1.4 GB database.
@@ -121,7 +121,7 @@ def test_a_non_body_update_does_not_rewrite_the_fts_index(tmp_path):
     before = _fts_segments(c)
     for i in range(200):
         c.execute(
-            "UPDATE observations SET embedding_state = 'ok' WHERE obs_id = ?",
+            "UPDATE observations SET provenance = 'human' WHERE obs_id = ?",
             (f"o{i}",),
         )
     c.commit()

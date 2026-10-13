@@ -19,10 +19,8 @@ than a mocked one:
    process held the write lock. That is a wrong answer, not a missing one.
 3. ``store.capabilities()`` had no handler at all.
 
-And the routing probe: ``_vector_arm_engaged`` catches only
-``VectorIndexUnavailableError``, and ``_apply_hybrid`` reaches it BEFORE the
-per-path ``try``. Anything else from ``has_embedded_rows`` went straight out
-of the tool.
+And the reads a route makes outside its per-path ``try`` — the per-card
+counts — went straight out of the tool.
 
 The fix reuses ``CacheUnavailableError``'s existing response shape rather
 than inventing a second vocabulary for the same condition.
@@ -141,22 +139,22 @@ def test_capabilities_refuses_structurally_on_a_malformed_cache(corrupt_db):
     assert result["remediation"]
 
 
-# --- the routing probe, which runs before every per-path handler ------------
+# --- a read no per-path handler wraps --------------------------------------
 
 
-def test_a_locked_db_at_the_routing_probe_does_not_escape(healthy_db, monkeypatch):
-    """``_vector_arm_engaged`` catches only VectorIndexUnavailableError.
-
-    A lock taken between the health check and the probe — the ingest timer
-    fires every 30 minutes, so this is a scheduled event, not a freak one —
-    left ``sqlite3.OperationalError`` to walk out of the tool.
+def test_a_locked_db_in_an_unguarded_read_does_not_escape(healthy_db, monkeypatch):
+    """Every per-path handler guards the store call it wraps, but not every
+    read a route makes — the per-card match counts are outside them. A lock
+    taken mid-request (the ingest timer fires every 30 minutes, so this is a
+    scheduled event, not a freak one) must not walk out of the tool as a raw
+    ``sqlite3.OperationalError``.
     """
     store = _reader(healthy_db)
 
-    def _locked(_kind):
+    def _locked(_ast):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(store, "has_embedded_rows", _locked)
+    monkeypatch.setattr(store, "count_observations", _locked)
     result = aggregator_query("voting", _store=store)
     assert result["ok"] is False
     assert result["remediation"]

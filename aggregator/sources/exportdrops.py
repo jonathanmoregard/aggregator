@@ -140,7 +140,7 @@ def discover_export_files(
     the winner. Measured live 2026-09-03 before it existed: a stale substack
     zip left beside the fresh one made every ingest tick write each post
     once per zip (updated=522 for 261 posts), flip-flopping the row on
-    ``extra.zip_path`` and resetting ``embedding_state`` every 30 minutes.
+    ``extra.zip_path`` every 30 minutes.
 
     The FILE's mtime, not any member's, for the same reason as
     :func:`newest_export_mtime`: the question is which archive the human

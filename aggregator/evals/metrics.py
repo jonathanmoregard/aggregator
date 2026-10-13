@@ -116,7 +116,7 @@ def overlap_at_k(
 
     Reported alongside drift because the two disagree usefully: overlap 1.0
     with non-zero drift means the same documents came back in a different
-    order, which is what a fusion or rerank change looks like.
+    order, which is what a rerank change looks like.
     """
     head_b = list(baseline[:k])
     head_c = list(current[:k])

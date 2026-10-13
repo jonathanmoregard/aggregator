@@ -78,10 +78,10 @@ def test_baselines_are_kept_per_mode(eval_store):
         {"q1": ["a"]}, mode="lexical", query_texts={"q1": "x"}, frozen_at=FROZEN
     )
     eval_store.freeze_baseline(
-        {"q1": ["b"]}, mode="hybrid", query_texts={"q1": "x"}, frozen_at=FROZEN
+        {"q1": ["b"]}, mode="mcp", query_texts={"q1": "x"}, frozen_at=FROZEN
     )
     assert eval_store.baseline("lexical") == {"q1": ["a"]}
-    assert eval_store.baseline("hybrid") == {"q1": ["b"]}
+    assert eval_store.baseline("mcp") == {"q1": ["b"]}
 
 
 def test_refreezing_replaces_the_previous_baseline_for_that_mode(eval_store):
@@ -188,10 +188,10 @@ def test_runs_come_back_newest_first(eval_store):
 
 
 def test_a_zero_result_query_is_logged_and_reads_back(eval_store):
-    eval_store.record_search_miss("wifi-6E", mode="hybrid", observed_at=FROZEN)
+    eval_store.record_search_miss("wifi-6E", mode="mcp", observed_at=FROZEN)
     misses = eval_store.search_misses()
     assert [m["query_text"] for m in misses] == ["wifi-6E"]
-    assert misses[0]["mode"] == "hybrid"
+    assert misses[0]["mode"] == "mcp"
     assert misses[0]["result_count"] == 0
 
 

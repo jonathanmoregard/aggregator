@@ -7,7 +7,7 @@ Personal "everything about me, currently, one prompt" aggregator. Caches Claude 
 v1: nine registered sources (see [Sources](#sources) below), SQLite+FTS5 store with WAL-mode concurrent-writer safety, four surfaces:
 
 - **FastMCP** (`aggregator-mcp`) — three read-only tools: `aggregator_query`, `aggregator_capabilities`, `aggregator_ingest` (a human-approve gate that only prints the CLI command).
-- **CLI** (`aggregator`) — `query`, `ingest SOURCE [--since ISO] [--rebuild]`, `status`, `embed`, `provenance`.
+- **CLI** (`aggregator`) — `query`, `ingest SOURCE [--since ISO] [--rebuild]`, `status`, `provenance`.
 - **Raycast** — scripts in `scripts/raycast/` wrap the CLI for one-shot triage.
 - **Nix module** (`nix/aggregator.nix`) — home-manager module with systemd user timers on `*:0/30`, currently for `sessions` and `github` only. Note that this module is not what runs in production: `nixos-config` ships a standalone duplicate (`modules/nixos/aggregator-github-timer.nix`) because this repo is local-only and cannot be a flake input on a CI runner. Every other source is hand-run today.
 
@@ -79,8 +79,8 @@ the backfill below has run over a cache, treat every `type:user` result as
 
 The `observations.provenance` column (schema v6) records the author as one of
 five closed values — `human` / `agent` / `hook` / `command` / `system` — and
-`NULL` for "not classified yet". `NULL` is the backfill's cursor, exactly as
-`embedding_state IS NULL` is the embed worker's; `'unknown'` is never stored,
+`NULL` for "not classified yet". `NULL` is the backfill's cursor; `'unknown'`
+is never stored,
 because "we looked and could not tell" and "nobody has looked" are different
 facts.
 
@@ -115,10 +115,10 @@ It classifies from the JSONL archive where that exists (the structural fields
 only live there) and from type + body + the owning session's `kind` for
 everything else — the `claude-web` rows whose export is not on disk, live files
 the walk skips, sessions whose archive is gone. It writes one column: no
-re-ingest, no re-scrub, no `embedding_state` reset. `provenance` is deliberately
-**not** part of `_src_hash`, so a classifier revision costs nothing beyond the
-re-run; putting it in the digest would re-run Presidio over the whole corpus
-(~11 hours at the measured 827 rows/min) and discard the observation vector arm.
+re-ingest, no re-scrub. `provenance` is deliberately **not** part of
+`_src_hash`, so a classifier revision costs nothing beyond the re-run; putting
+it in the digest would re-run Presidio over the whole corpus (~11 hours at the
+measured 827 rows/min).
 
 ## Conjunction — free text is an AND, inside one turn
 
@@ -188,8 +188,8 @@ aggregator rescrub             # rewrites only the rows that change
 ```
 
 It applies the secret layers to the stored text (no Presidio re-run), keeps
-`obs_fts`/`records_fts` in step, resets `embedding_state` and drops vectors
-for changed rows only, and leaves `src_hash` alone. Output is counts, never
+`obs_fts`/`records_fts` in step for changed rows only, and leaves `src_hash`
+alone. Output is counts, never
 values. See `aggregator/core/rescrub.py` for why this replaces a
 `SCRUB_FINGERPRINT` bump for detection-only changes.
 

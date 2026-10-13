@@ -20,7 +20,7 @@ did not exist and then against deliberately broken variants — a probe that
 returns FINE unconditionally passes none of them. In particular
 ``test_probe_never_writes_the_cache`` is the regression lock for the trap that
 makes this whole class of bug self-concealing: ``cli.py`` calls ``migrate()``
-on every subcommand but ``embed``, and ``migrate()`` WRITES ``user_version``,
+on every subcommand that opens the cache, and ``migrate()`` WRITES ``user_version``,
 so probing the cache with ``aggregator status`` re-stamps the very value it
 was asked to report. A probe built the obvious way performs the damage it
 exists to detect.
@@ -80,7 +80,7 @@ def _fake_tree(root: Path, version: int) -> Path:
     Written as a real source file rather than a stub the probe is handed,
     because the probe reads the constant out of that file by text — the one
     way to learn the reader's requirement without importing the package (and
-    dragging torch into a session-start budget).
+    dragging the model stack into a session-start budget).
     """
     core = root / "aggregator" / "core"
     core.mkdir(parents=True, exist_ok=True)
@@ -652,8 +652,8 @@ def test_meta_row_disagreeing_with_the_pragma_is_reported(world):
 def test_probe_never_writes_the_cache(tmp_path):
     """THE regression lock. Probing must not perform the damage it reports.
 
-    ``cli.py`` runs ``store.migrate()`` on every subcommand except ``embed``,
-    and ``migrate()`` ends by stamping ``PRAGMA user_version = SCHEMA_VERSION``.
+    ``cli.py`` runs ``store.migrate()`` on every subcommand that opens the
+    cache, and ``migrate()`` ends by stamping ``PRAGMA user_version = SCHEMA_VERSION``.
     So the obvious probe — shell out to ``aggregator status`` and read what it
     prints — re-stamps the cache at the prober's own version. From the
     schema-5 build that is exactly the write that has been erasing the
@@ -1556,8 +1556,8 @@ def test_cli_runs_without_the_aggregator_package_importable(tmp_path):
     """The script must be stdlib-only, standalone, and free of package imports.
 
     Both consumers run it outside any venv. If it ever grows
-    ``from aggregator.core.store import SCHEMA_VERSION`` it will import torch
-    on a session-start budget and time out — and a timed-out hook has its
+    ``from aggregator.core.store import SCHEMA_VERSION`` it will import the
+    scrubber's model stack on a session-start budget and time out — and a timed-out hook has its
     output discarded, which for a health check is the same as never noticing.
     """
     proc = _run_cli(tmp_path, cache=6, reader=6, writer=6)
@@ -1652,7 +1652,7 @@ def test_the_packaged_entry_point_imports_nothing_heavy():
         "heavy = sorted(m for m in sys.modules if m.split('.')[0] in {\n"
         "    'torch', 'spacy', 'thinc', 'transformers', 'presidio_analyzer',\n"
         "    'presidio_anonymizer', 'sentence_transformers', 'numpy',\n"
-        "    'sqlite_vec', 'fastmcp',\n"
+        "    'fastmcp',\n"
         "})\n"
         "assert not heavy, heavy\n"
     )
