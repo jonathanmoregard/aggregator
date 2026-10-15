@@ -889,7 +889,7 @@ EXPIRY_ENV_VAR = "TICKTICK_TOKEN_EXPIRES_AT"
 
 # What a human must run to fix an expired token. This leg runs unattended from
 # a timer, so it cannot do the browser re-authorization itself.
-RELOGIN_COMMAND = "~/.claude/todo-add --login"
+RELOGIN_COMMAND = "~/.claude/ticktick-login"
 
 
 def _reject_if_expired(expires_at: str | None, source: str) -> None:
