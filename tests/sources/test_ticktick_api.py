@@ -1198,7 +1198,7 @@ def test_resolve_token_expired_shared_token_raises_and_names_the_fix(
     )
     with pytest.raises(ticktick_api.TokenUnavailableError) as excinfo:
         ticktick_api.resolve_token(None, None)
-    assert "todo-add --login" in str(excinfo.value)
+    assert "ticktick-login" in str(excinfo.value)
 
 
 def test_resolve_token_unparseable_expiry_does_not_block_a_usable_token(
