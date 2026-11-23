@@ -35,7 +35,7 @@ if [ "$1" = git ]; then
   [ -z "${GITLEAKS_GIT_HOOK:-}" ] || bash -c "$GITLEAKS_GIT_HOOK"
   exit "${GITLEAKS_GIT_RC:-0}"
 fi
-exit 0
+exit "${GITLEAKS_DIR_RC:-0}"
 EOF
 cat >"$WORK/bin/notify-send" <<'EOF'
 #!/usr/bin/env bash
@@ -222,7 +222,7 @@ check "agent moves origin ref: notify_failure fired" "$(notified 'Oversized')" "
 new_pair noclaude
 local_commit noclaude "local only"
 mkdir "$WORK/bin-noclaude"
-for t in bash git dirname basename id head numfmt stat sort tr; do ln -s "$(command -v "$t")" "$WORK/bin-noclaude/$t"; done
+for t in bash git dirname basename id head numfmt stat sort tr mktemp rm; do ln -s "$(command -v "$t")" "$WORK/bin-noclaude/$t"; done
 ln -s "$WORK/bin/gitleaks" "$WORK/bin/notify-send" "$WORK/bin-noclaude/"
 RUN_PATH="$WORK/bin-noclaude" run_sync noclaude
 check "claude missing, clean but ahead: exit 0" "$?" "0"
@@ -316,6 +316,59 @@ RUN_PATH="$WORK/bin-catfail:$WORK/bin:$PATH" run_sync catfail
 check "git cat-file fails: exit non-zero" "$([ "$?" -ne 0 ] && echo yes)" "yes"
 check "git cat-file fails: nothing pushed" \
   "$(git --git-dir="$WORK/catfail-origin.git" log -1 --format=%s main)" "base"
+
+# The ignore helper is generated on every run that reaches the agent.
+new_pair helper
+echo change >"$WORK/helper/new.txt"
+run_sync helper
+HELPER="$WORK/helper/.git/sync-agent-ignore"
+(cd "$WORK/helper" && "$HELPER" --reason $'x\n!.env\n#' foo.tmp) >/dev/null 2>&1
+check "helper: newline in --reason refused" "$?" "1"
+check "helper: newline in --reason writes nothing" \
+  "$(cat "$WORK/helper/.gitignore" 2>/dev/null | grep -c -x -F -e '!.env')" "0"
+(cd "$WORK/helper" && "$HELPER" '/*') >/dev/null 2>&1
+check "helper: '/*' (whole top level) refused" "$?" "1"
+(cd "$WORK/helper" && "$HELPER" '../outside') >/dev/null 2>&1
+check "helper: pathspec git rejects is refused, not read as untracked" "$?" "1"
+(cd "$WORK/helper" && "$HELPER" --reason scratch 'scratch.tmp') >/dev/null 2>&1
+check "helper: ordinary pattern still accepted" "$?" "0"
+
+new_pair deleted
+git -C "$WORK/deleted" rm -q --cached base.txt && rm "$WORK/deleted/base.txt"
+git -C "$WORK/deleted" commit -q -m "drop base" && git -C "$WORK/deleted" push -q origin main 2>/dev/null
+echo two >"$WORK/deleted/two.txt"
+git -C "$WORK/deleted" add two.txt && git -C "$WORK/deleted" commit -q -m two
+git -C "$WORK/deleted" push -q origin main 2>/dev/null
+rm "$WORK/deleted/two.txt"
+run_sync deleted
+check "deletion-only change: exit 0" "$?" "0"
+check "deletion-only change: agent ran and the deletion reached origin" \
+  "$(git --git-dir="$WORK/deleted-origin.git" ls-tree --name-only main two.txt)" ""
+
+new_pair difffail
+echo change >"$WORK/difffail/new.txt"
+mkdir "$WORK/bin-difffail"
+printf '#!/usr/bin/env bash\n[ "${1:-}" = diff ] && exit 1\nexec %q "$@"\n' "$REAL_GIT" >"$WORK/bin-difffail/git"
+chmod +x "$WORK/bin-difffail/git"
+RUN_PATH="$WORK/bin-difffail:$WORK/bin:$PATH" run_sync difffail
+check "git diff fails while listing candidates: exit non-zero" "$([ "$?" -ne 0 ] && echo yes)" "yes"
+check "git diff fails while listing candidates: notified once" "$(notified 'repo-autosync FAILED')" "1"
+
+new_pair linked
+git -C "$WORK/linked" worktree add -q -b wt "$WORK/linked-wt" 2>/dev/null
+git -C "$WORK/linked-wt" config core.hooksPath /dev/null
+echo change >"$WORK/linked-wt/new.txt"
+run_sync linked-wt
+check "linked worktree: exit 0" "$?" "0"
+check "linked worktree: no 'not a git repository'" "$(notified 'not a git repository')" "0"
+check "linked worktree: commit reaches origin" \
+  "$(git --git-dir="$WORK/linked-origin.git" log -1 --format=%s wt 2>&1)" "stub: sync"
+
+new_pair glerr
+echo change >"$WORK/glerr/new.txt"
+GITLEAKS_DIR_RC=1 run_sync glerr
+check "pre-commit gitleaks exit 1: log line does not claim secrets were found" \
+  "$(grep -c -F 'gitleaks found secrets' "$WORK/glerr.out")" "0"
 
 [ "$fail" -eq 0 ] && rm -r "$WORK"
 exit "$fail"
