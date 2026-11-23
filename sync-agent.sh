@@ -57,8 +57,23 @@ Log:  $REPO/sync.log"; then
 # (detached HEAD, unreadable file, git blowing up mid-run).
 trap 'rc=$?; notify_failure "unexpected error (exit $rc) at line $LINENO"' ERR
 
-# Skip if nothing to commit
+# The agent only commits; pushing happens here, outside any agent sandbox that
+# has no git credentials.
+push_branch() {
+  local branch push_out
+  branch="$(git symbolic-ref --short HEAD)"
+  if ! push_out="$(git push origin "$branch" 2>&1)"; then
+    notify_failure "git push origin $branch failed — commits are local only.
+$(printf '%s\n' "$push_out" | head -10)"
+    exit 1
+  fi
+}
+
+# Nothing to commit. Commits left behind by an earlier failed push still go out.
 if [ -z "$(git status --porcelain)" ]; then
+  if [ "$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)" -gt 0 ]; then
+    push_branch
+  fi
   exit 0
 fi
 
@@ -79,6 +94,9 @@ done < <(
 )
 
 if [ ${#candidates[@]} -eq 0 ]; then
+  if [ "$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)" -gt 0 ]; then
+    push_branch
+  fi
   exit 0
 fi
 
@@ -241,7 +259,7 @@ THEN commit what is left — source, config, docs, notes. Group into logical com
 
 If you cannot tell whether something is runtime state or real content, leave it untracked and uncommitted rather than guessing — that outcome is logged for human review, not treated as a failure.
 
-After all commits are done, push origin $BRANCH once. Do nothing else."
+After all commits are done, stop. Do nothing else."
 
 # Capture the agent's output as well as tee it to the log. Claude Code prints
 # "You've hit your org's monthly usage limit" and "API Error: ..." to stdout
@@ -254,7 +272,7 @@ claude_rc=0
 claude_out="$(
   "$CLAUDE" \
     --model claude-sonnet-4-6 \
-    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git push:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
+    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
     -p "$PROMPT" 2>&1
 )" || claude_rc=$?
 printf '%s\n' "$claude_out"
@@ -274,9 +292,9 @@ Usual causes: usage limit reached, expired auth (claude /login), or API unreacha
   exit 1
 fi
 
-# The agent is prompted to commit everything and push, but it is an agent —
-# it can stop early, or push can fail. Verify rather than assume, so a
-# half-done sync is not indistinguishable from a clean one.
+# The agent is prompted to commit everything, but it is an agent — it can
+# stop early. Verify rather than assume, so a half-done sync is not
+# indistinguishable from a clean one.
 #
 # Only *tracked* changes count as incomplete. The agent is deliberately given
 # judgment over what belongs in the repo, and it exercises it: aggregator's
@@ -285,7 +303,6 @@ fi
 # permanent red — nothing ever removes the file — so an untracked-only
 # leftover is logged, not escalated.
 tracked_dirty="$(git status --porcelain --untracked-files=no)"
-unpushed="$(git log --oneline "origin/$BRANCH..$BRANCH" 2>/dev/null || true)"
 
 if [ -n "$tracked_dirty" ]; then
   notify_failure "claude exited 0 but tracked changes are still uncommitted — sync incomplete.
@@ -293,11 +310,7 @@ $(printf '%s\n' "$tracked_dirty" | head -20)$api_hint"
   exit 1
 fi
 
-if [ -n "$unpushed" ]; then
-  notify_failure "Commits were made but not pushed — origin/$BRANCH is behind.
-$(printf '%s\n' "$unpushed" | head -10)$api_hint"
-  exit 1
-fi
+push_branch
 
 skipped="$(git ls-files --others --exclude-standard)"
 if [ -n "$skipped" ]; then
