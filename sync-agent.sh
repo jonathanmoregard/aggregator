@@ -74,6 +74,12 @@ ORIGIN_EXCLUDES="${origin_excludes[*]}"
 
 # Raise the ceiling per repo with SYNC_MAX_FILE_BYTES.
 MAX_FILE_BYTES="${SYNC_MAX_FILE_BYTES:-5242880}" # 5 MiB
+# A non-integer would make every [ -gt ] below error, read as "not oversized".
+case "$MAX_FILE_BYTES" in
+  "" | *[!0-9]*)
+    notify_failure "SYNC_MAX_FILE_BYTES must be a whole number of bytes, got '$MAX_FILE_BYTES' — nothing synced."
+    exit 1 ;;
+esac
 
 require_gitleaks() {
   if ! command -v gitleaks >/dev/null 2>&1; then
@@ -115,7 +121,7 @@ ahead_of_origin() {
 # The range ends at one resolved SHA and that SHA is what gets pushed, so a
 # commit landing on the branch mid-scan cannot ride along unscanned.
 push_branch() {
-  local branch sha push_out range leaks_out objects oversized="" type size path
+  local branch sha push_out range leaks_out objects sizes oversized="" type size path
   branch="$(git symbolic-ref --short HEAD)"
   sha="$(git rev-parse --verify 'HEAD^{commit}')"
 
@@ -128,20 +134,24 @@ push_branch() {
 $(printf '%s\n' "$objects" | head -10)"
     exit 1
   fi
+  # Assigned, not fed through < <(…): a failing cat-file there would leave the
+  # loop reading nothing and the size check passing.
+  sizes="$(printf '%s\n' "$objects" | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)')"
   while read -r type size path; do
     if [ "$type" = blob ] && [ "$size" -gt "$MAX_FILE_BYTES" ]; then
       oversized+="  $(numfmt --to=iec --suffix=B "$size")  $path"$'\n'
     fi
-  done < <(printf '%s\n' "$objects" | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)')
+  done <<<"$sizes"
   [ -z "$oversized" ] || abort_oversized "$oversized" pushed
 
   # -m: without it git log shows no diff for merge commits, so a secret added
   # only in a merge resolution would go out unscanned.
   # gitleaks exits 1 for a config error as well as for leaks, so the message
   # cannot tell them apart; its output below does.
-  if ! leaks_out="$(gitleaks git --no-banner --redact --exit-code 1 --log-level error --log-opts="-m $range" . 2>&1)"; then
+  # -v: without it gitleaks prints no findings and the notification names no file.
+  if ! leaks_out="$(gitleaks git -v --no-color --no-banner --redact --exit-code 1 --log-level error --log-opts="-m $range" . 2>&1)"; then
     notify_failure "gitleaks failed or found secrets in commits about to be pushed — nothing pushed.
-$(printf '%s\n' "$leaks_out" | head -10)"
+$(printf '%s\n' "$leaks_out" | head -15)"
     exit 1
   fi
 
@@ -151,9 +161,12 @@ $(printf '%s\n' "$push_out" | head -10)"
     exit 1
   fi
   # A branch with no upstream gets origin's; an existing upstream (a fork
-  # tracking another remote) is left alone.
-  if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-    git branch -q --set-upstream-to="origin/$branch"
+  # tracking another remote, even one whose ref is gone) is left alone. Written
+  # as config, not --set-upstream-to, which needs a tracking ref that a
+  # single-branch clone never creates.
+  if ! git config --get "branch.$branch.remote" >/dev/null; then
+    git config "branch.$branch.remote" origin
+    git config "branch.$branch.merge" "refs/heads/$branch"
   fi
 }
 

@@ -271,5 +271,51 @@ run_sync upstream
 check "existing upstream on another remote: kept" \
   "$(git -C "$WORK/upstream" rev-parse --abbrev-ref 'main@{u}')" "upstream/main"
 
+new_pair goneup
+git -C "$WORK/goneup" config branch.main.remote upstream
+git -C "$WORK/goneup" config branch.main.merge refs/heads/gone
+local_commit goneup "local only"
+run_sync goneup
+check "configured upstream without a tracking ref: remote kept" \
+  "$(git -C "$WORK/goneup" config branch.main.remote)" "upstream"
+check "configured upstream without a tracking ref: merge kept" \
+  "$(git -C "$WORK/goneup" config branch.main.merge)" "refs/heads/gone"
+
+new_pair single
+git clone -q --single-branch "$WORK/single-origin.git" "$WORK/single1" 2>/dev/null
+git -C "$WORK/single1" config user.email t@example.com
+git -C "$WORK/single1" config user.name t
+git -C "$WORK/single1" config core.hooksPath /dev/null
+git -C "$WORK/single1" checkout -q -b f
+local_commit single1 "on f"
+run_sync single1
+check "single-branch clone, new branch: exit 0" "$?" "0"
+run_sync single1
+check "single-branch clone, second run: exit 0" "$?" "0"
+check "single-branch clone, second run: no notification" "$(notified 'repo-autosync FAILED')" "0"
+check "single-branch clone: commit reaches origin" \
+  "$(git --git-dir="$WORK/single-origin.git" log -1 --format=%s f 2>&1)" "on f"
+
+new_pair badceiling
+head -c 6291456 /dev/zero >"$WORK/badceiling/big.bin"
+git -C "$WORK/badceiling" add -A && git -C "$WORK/badceiling" commit -q -m big
+SYNC_MAX_FILE_BYTES=5M run_sync badceiling
+check "non-numeric SYNC_MAX_FILE_BYTES: exit 1" "$?" "1"
+check "non-numeric SYNC_MAX_FILE_BYTES: nothing pushed" \
+  "$(git --git-dir="$WORK/badceiling-origin.git" log -1 --format=%s main)" "base"
+check "non-numeric SYNC_MAX_FILE_BYTES: notified" "$(notified 'SYNC_MAX_FILE_BYTES')" "1"
+
+new_pair catfail
+head -c 6291456 /dev/zero >"$WORK/catfail/big.bin"
+git -C "$WORK/catfail" add -A && git -C "$WORK/catfail" commit -q -m big
+mkdir "$WORK/bin-catfail"
+REAL_GIT="$(command -v git)"
+printf '#!/usr/bin/env bash\n[ "${1:-}" = cat-file ] && exit 1\nexec %q "$@"\n' "$REAL_GIT" >"$WORK/bin-catfail/git"
+chmod +x "$WORK/bin-catfail/git"
+RUN_PATH="$WORK/bin-catfail:$WORK/bin:$PATH" run_sync catfail
+check "git cat-file fails: exit non-zero" "$([ "$?" -ne 0 ] && echo yes)" "yes"
+check "git cat-file fails: nothing pushed" \
+  "$(git --git-dir="$WORK/catfail-origin.git" log -1 --format=%s main)" "base"
+
 [ "$fail" -eq 0 ] && rm -r "$WORK"
 exit "$fail"
