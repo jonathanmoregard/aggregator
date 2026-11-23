@@ -147,6 +147,12 @@ push_branch() {
   if [ "$branch" = "$BRANCH" ] && [ "$ORIGIN_BRANCH_SHA" = "$sha" ]; then
     return 0 # origin already has this branch here: nothing to scan or push
   fi
+  # Behind origin (fetched, not merged): nothing of ours to send, and pushing
+  # would only be rejected as non-fast-forward.
+  if [ "$branch" = "$BRANCH" ] && [ -n "$ORIGIN_BRANCH_SHA" ] &&
+    git merge-base --is-ancestor "$sha" "$ORIGIN_BRANCH_SHA" 2>/dev/null; then
+    return 0
+  fi
 
   # $range is deliberately unquoted: it is several rev-list arguments.
   if ! objects="$(git rev-list --objects $range 2>&1)"; then
@@ -184,10 +190,14 @@ $(printf '%s\n' "$leaks_out" | head -15)"
     # The scan above reads `git log -p`, which prints "Binary files differ"
     # instead of content for anything git calls binary (a NUL byte in the blob,
     # or -diff in .gitattributes), so a key in such a file never reaches it.
-    # The outgoing blobs are therefore scanned as content as well; cat-file's
-    # own "<oid> blob <size>" header lines are just extra text to the scanner.
+    # The outgoing blobs are therefore scanned as content as well, in one
+    # stream. Each header is a bare "#" line, not cat-file's default
+    # "<oid> blob <size>": a file ending in "SECRET_KEY=" ran into the next
+    # header, and generic-api-key read the hex id as the key's value
+    # (measured). "#" is not a character a key value can contain.
+    # (gitleaks dir over unpacked files is no alternative: it skips binaries.)
     if [ -n "$blob_oids" ] &&
-      ! leaks_out="$(printf '%s' "$blob_oids" | git cat-file --batch |
+      ! leaks_out="$(printf '%s' "$blob_oids" | git cat-file --batch='#' |
         gitleaks stdin -v --no-color --no-banner --redact --exit-code 1 --log-level error 2>&1)"; then
       notify_failure "gitleaks failed or found secrets in file content about to be pushed — nothing pushed.
 $(printf '%s\n' "$leaks_out" | head -15)"

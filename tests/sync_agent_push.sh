@@ -171,8 +171,10 @@ local_commit corrupt "local only"
 echo 1111111111111111111111111111111111111111 >"$WORK/corrupt/.git/refs/remotes/origin/main"
 run_sync corrupt
 check "unreadable origin ref: not silently treated as in sync (exit 1)" "$?" "1"
-check "unreadable origin ref: failure notified" \
-  "$([ "$(wc -l <"$WORK/notify.log")" -ge 1 ] && echo yes)" "yes"
+check "unreadable origin ref: says the commit list could not be read" \
+  "$(notified 'could not list the commits')" "1"
+check "unreadable origin ref: nothing pushed" \
+  "$(git --git-dir="$WORK/corrupt-origin.git" log -1 --format=%s main)" "base"
 
 new_pair badtarget
 echo change >"$WORK/badtarget/new.txt"
@@ -515,9 +517,36 @@ if [ -n "${REAL_GITLEAKS:-}" ]; then
   check "secret in a NUL-containing file: exit 1" "$?" "1"
   check "secret in a NUL-containing file: nothing pushed" \
     "$(git --git-dir="$WORK/binleak-origin.git" log -1 --format=%s main)" "base"
+
+  # Each blob is scanned on its own: an empty "SECRET_KEY=" at the end of one
+  # file must not pick up the next object's header as its value.
+  new_pair emptykey
+  printf 'DEBUG=true\nSECRET_KEY=' >"$WORK/emptykey/.env.example"
+  echo other >"$WORK/emptykey/z.txt"
+  git -C "$WORK/emptykey" add -A
+  git -C "$WORK/emptykey" commit -q -m "env example"
+  RUN_PATH="$WORK/bin:$PATH" GITLEAKS_REAL="$REAL_GITLEAKS" run_sync emptykey
+  check "empty SECRET_KEY= in a file: exit 0" "$?" "0"
+  check "empty SECRET_KEY= in a file: pushed" \
+    "$(git --git-dir="$WORK/emptykey-origin.git" log -1 --format=%s main)" "env example"
 else
   echo "SKIP binary-blob secret scan: real gitleaks not on PATH"
 fi
+
+# Behind origin (fetched, never merged) with only untracked leftovers: there
+# is nothing to push, so no rejected push and no "local only" alarm.
+new_pair behind
+git clone -q "$WORK/behind-origin.git" "$WORK/behind-other" 2>/dev/null
+git -C "$WORK/behind-other" -c user.email=o@example.com -c user.name=o \
+  commit -q --allow-empty -m "newer on origin"
+git -C "$WORK/behind-other" push -q origin main 2>/dev/null
+git -C "$WORK/behind" fetch -q origin
+echo scratch >"$WORK/behind/scratch.txt"
+# The stub's commit is undone, leaving scratch.txt untracked.
+STUB_AFTER='git reset -q --soft HEAD~1 && git reset -q' run_sync behind
+check "behind origin, only untracked files: exit 0" "$?" "0"
+check "behind origin, only untracked files: no push failure notified" \
+  "$(notified 'local only')" "0"
 
 [ "$fail" -eq 0 ] && rm -r "$WORK"
 exit "$fail"
