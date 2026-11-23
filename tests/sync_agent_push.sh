@@ -91,8 +91,13 @@ check "agent argv: git push disallowed" \
   "$(grep -c -F -e '<--disallowedTools><Bash(git push:*)>' "$WORK/claude-args.log")" "1"
 check "agent argv: tool surface limited to Read and Bash" \
   "$(grep -c -F -e '<--tools><Read,Bash>' "$WORK/claude-args.log")" "1"
+# The whole Bash surface, in order: a grant added by accident (git log, a bare
+# Bash, anything beyond these git subcommands) breaks this, where a grep for
+# one subcommand would not.
 check "agent argv: allowed tools recorded" \
-  "$(grep -c -F -e 'Bash(git commit:*)' "$WORK/claude-args.log")" "1"
+  "$(grep -c -F -e '<--allowedTools><Read Bash(git status:*) Bash(git add:*) Bash(git commit:*) Bash(git rm:*) Bash(git check-ignore:*) Bash(' "$WORK/claude-args.log")" "1"
+check "agent argv: the only non-git grant is the generated ignore helper" \
+  "$(grep -c -E -e 'Bash\(/[^ >]*/sync-agent-ignore:\*\)>' "$WORK/claude-args.log")" "1"
 check "agent argv: no git log/diff, whose --output writes files" \
   "$(grep -c -E -e 'Bash\(git (log|diff):' "$WORK/claude-args.log")" "0"
 
@@ -383,6 +388,22 @@ helper_says '/build/' >/dev/null
 check "helper: anchored directory rule accepted" "$?" "0"
 helper_says --reason scratch 'scratch.tmp' >/dev/null
 check "helper: ordinary pattern still accepted" "$?" "0"
+out="$(helper_says '!keep.txt')"; rc=$?
+check "helper: negation refused" "$rc:$(grep -c 'refusing negation' <<<"$out")" "1:1"
+out="$(helper_says $'foo.tmp\n!.env')"; rc=$?
+check "helper: newline in a pattern refused" "$rc:$(grep -c 'newline' <<<"$out")" "1:1"
+check "helper: newline in a pattern writes nothing" \
+  "$(cat "$WORK/helper/.gitignore" 2>/dev/null | grep -c -x -F -e '!.env')" "0"
+# git failing is not an answer: read as "not ignored" it waves patterns through.
+mkdir "$WORK/bin-ci128"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = check-ignore ] && exit 128; done\nexec %q "$@"\n' \
+  "$REAL_GIT" >"$WORK/bin-ci128/git"
+chmod +x "$WORK/bin-ci128/git"
+out="$(cd "$WORK/helper" && PATH="$WORK/bin-ci128:$PATH" "$HELPER" ci128.tmp 2>&1)"; rc=$?
+check "helper: check-ignore exit 128 refuses the pattern" \
+  "$rc:$(grep -c 'check-ignore failed' <<<"$out")" "1:1"
+check "helper: check-ignore exit 128 writes nothing" \
+  "$(cat "$WORK/helper/.gitignore" 2>/dev/null | grep -c -x -F -e 'ci128.tmp')" "0"
 # Over 64 KB of tracked matches: the refusal must still explain itself.
 blob="$(git -C "$WORK/helper" hash-object -w --stdin </dev/null)"
 for i in $(seq 1 4000); do printf '100644 %s\tmany/f_%04d_padding_padding_padding\n' "$blob" "$i"; done |
@@ -426,6 +447,77 @@ echo change >"$WORK/glerr/new.txt"
 GITLEAKS_DIR_RC=1 run_sync glerr
 check "pre-commit gitleaks exit 1: log line does not claim secrets were found" \
   "$(grep -c -F 'gitleaks found secrets' "$WORK/glerr.out")" "0"
+
+new_pair leftover
+echo change >"$WORK/leftover/new.txt"
+STUB_AFTER='echo x >>base.txt' run_sync leftover
+check "agent exits 0 leaving tracked changes: exit 1" "$?" "1"
+check "agent exits 0 leaving tracked changes: notified" "$(notified 'still uncommitted')" "1"
+check "agent exits 0 leaving tracked changes: what it did commit reaches origin" \
+  "$(git --git-dir="$WORK/leftover-origin.git" log -1 --format=%s main)" "stub: sync"
+
+# Nothing is outgoing object-wise (origin/side already has the commit), but
+# origin/main still has to move, so "no objects" must not mean "no push".
+new_pair ffside
+git -C "$WORK/ffside" checkout -q -b side
+local_commit ffside "on side"
+git -C "$WORK/ffside" push -q origin side 2>/dev/null
+git -C "$WORK/ffside" fetch -q origin 2>/dev/null
+git -C "$WORK/ffside" checkout -q main
+git -C "$WORK/ffside" merge -q --ff-only side
+run_sync ffside
+check "main ff'd to a commit origin has on another branch: exit 0" "$?" "0"
+check "main ff'd to a commit origin has on another branch: origin/main advances" \
+  "$(git --git-dir="$WORK/ffside-origin.git" log -1 --format=%s main)" "on side"
+
+# Exits on the dirty path happen before the agent runs; commits from an
+# earlier run must still get out, or a tree that stays dirty strands them.
+new_pair stranded
+local_commit stranded "earlier work"
+head -c 6291456 /dev/zero >"$WORK/stranded/big.bin"
+run_sync stranded
+check "oversized dirty file with an older commit: exit 1" "$?" "1"
+check "oversized dirty file with an older commit: notified once" "$(notified 'Oversized')" "1"
+check "oversized dirty file with an older commit: the older commit reaches origin" \
+  "$(git --git-dir="$WORK/stranded-origin.git" log -1 --format=%s main)" "earlier work"
+
+new_pair stranded2
+local_commit stranded2 "earlier work"
+echo change >"$WORK/stranded2/new.txt"
+RUN_PATH="$WORK/bin-noclaude" run_sync stranded2
+check "claude missing, dirty, with an older commit: exit 1" "$?" "1"
+check "claude missing, dirty, with an older commit: the older commit reaches origin" \
+  "$(git --git-dir="$WORK/stranded2-origin.git" log -1 --format=%s main)" "earlier work"
+
+# A whitelist repo ignores everything but one directory. The probes must be
+# matched against the candidate pattern alone, not against those rules too.
+new_pair whitelist
+printf '/*\n!/src/\n' >"$WORK/whitelist/.gitignore"
+git -C "$WORK/whitelist" add -f .gitignore && git -C "$WORK/whitelist" commit -q -m whitelist
+echo change >>"$WORK/whitelist/base.txt"
+run_sync whitelist
+check "whitelist repo: exit 0" "$?" "0"
+HELPER_W="$WORK/whitelist/.git/sync-agent-ignore"
+whitelist_says() { (cd "$WORK/whitelist" && "$HELPER_W" "$@") 2>&1; }
+whitelist_says --reason runtime 'logs/*.log' >/dev/null
+check "whitelist repo: ordinary pattern still accepted" "$?" "0"
+out="$(whitelist_says '**/*')"; rc=$?
+check "whitelist repo: the probes still catch a too-broad pattern" \
+  "$rc:$(grep -c 'too broad' <<<"$out")" "1:1"
+
+if [ -n "${REAL_GITLEAKS:-}" ]; then
+  new_pair binleak
+  printf 'aws_access_key_id = %s%s\n' AKIAIOSFODNN7 EXAMPLF >"$WORK/binleak/blob.bin"
+  printf '\000binary\000' >>"$WORK/binleak/blob.bin"
+  git -C "$WORK/binleak" add -A
+  git -C "$WORK/binleak" commit -q -m "binary-looking file"
+  RUN_PATH="$WORK/bin:$PATH" GITLEAKS_REAL="$REAL_GITLEAKS" run_sync binleak
+  check "secret in a NUL-containing file: exit 1" "$?" "1"
+  check "secret in a NUL-containing file: nothing pushed" \
+    "$(git --git-dir="$WORK/binleak-origin.git" log -1 --format=%s main)" "base"
+else
+  echo "SKIP binary-blob secret scan: real gitleaks not on PATH"
+fi
 
 [ "$fail" -eq 0 ] && rm -r "$WORK"
 exit "$fail"

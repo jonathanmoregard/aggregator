@@ -74,6 +74,14 @@ origin_refs="$(git for-each-ref --format='^%(objectname)' refs/remotes/origin)"
 mapfile -t origin_excludes <<<"$origin_refs"
 ORIGIN_EXCLUDES="${origin_excludes[*]}"
 
+BRANCH="$(git symbolic-ref --short HEAD)"
+# Where origin has this branch, read now and held in this shell for the same
+# reason: push_branch uses it to decide whether a push is needed at all, and
+# an agent that writes refs/remotes/origin/$BRANCH could otherwise make its
+# own commit look already-pushed and skip the scan-and-push entirely.
+# Empty (missing or unreadable ref) means "push", never "in sync".
+ORIGIN_BRANCH_SHA="$(git rev-parse --verify -q "refs/remotes/origin/$BRANCH^{commit}" || true)"
+
 # Raise the ceiling per repo with SYNC_MAX_FILE_BYTES.
 MAX_FILE_BYTES="${SYNC_MAX_FILE_BYTES:-5242880}" # 5 MiB
 # A non-integer would make every [ -gt ] below error, read as "not oversized".
@@ -124,12 +132,21 @@ ahead_of_origin() {
 # The range ends at one resolved SHA and that SHA is what gets pushed, so a
 # commit landing on the branch mid-scan cannot ride along unscanned.
 push_branch() {
-  local branch sha push_out range leaks_out objects sizes oversized="" type size path
+  local branch sha push_out range leaks_out objects sizes blob_oids oversized="" type size oid path
   branch="$(git symbolic-ref --short HEAD)"
   sha="$(git rev-parse --verify 'HEAD^{commit}')"
 
   require_gitleaks
   range="$sha${ORIGIN_EXCLUDES:+ $ORIGIN_EXCLUDES}"
+
+  # Whether a push is needed is decided by where origin has this branch, never
+  # by "are there outgoing objects": ff-merging main to a commit that only
+  # origin/side carries leaves nothing to scan while origin/main still has to
+  # be moved. The SHA is the one held since before the agent ran, and it is
+  # only an answer while HEAD is still that branch; anything else pushes.
+  if [ "$branch" = "$BRANCH" ] && [ "$ORIGIN_BRANCH_SHA" = "$sha" ]; then
+    return 0 # origin already has this branch here: nothing to scan or push
+  fi
 
   # $range is deliberately unquoted: it is several rev-list arguments.
   if ! objects="$(git rev-list --objects $range 2>&1)"; then
@@ -137,36 +154,53 @@ push_branch() {
 $(printf '%s\n' "$objects" | head -10)"
     exit 1
   fi
-  # Nothing origin lacks: no push, and no "commits are local only" claim if
-  # origin happens to be unreachable.
-  [ -n "$objects" ] || return 0
-  # Assigned, not fed through < <(…): a failing cat-file there would leave the
-  # loop reading nothing and the size check passing.
-  sizes="$(printf '%s\n' "$objects" | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)')"
-  while read -r type size path; do
-    if [ "$type" = blob ] && [ "$size" -gt "$MAX_FILE_BYTES" ]; then
-      oversized+="  $(numfmt --to=iec --suffix=B "$size")  $path"$'\n'
-    fi
-  done <<<"$sizes"
-  [ -z "$oversized" ] || abort_oversized "$oversized" pushed
 
-  # -m: without it git log shows no diff for merge commits, so a secret added
-  # only in a merge resolution would go out unscanned.
-  # gitleaks exits 1 for a config error as well as for leaks, so the message
-  # cannot tell them apart; its output below does.
-  # -v: without it gitleaks prints no findings and the notification names no file.
-  if ! leaks_out="$(gitleaks git -v --no-color --no-banner --redact --exit-code 1 --log-level error --log-opts="-m $range" . 2>&1)"; then
-    notify_failure "gitleaks failed or found secrets in commits about to be pushed — nothing pushed.
+  # Only the scans are skipped when origin already has every object (the ref
+  # still moves below); with nothing outgoing there is nothing to scan.
+  if [ -n "$objects" ]; then
+    # Assigned, not fed through < <(…): a failing cat-file there would leave the
+    # loop reading nothing and the size check passing.
+    sizes="$(printf '%s\n' "$objects" | git cat-file --batch-check='%(objecttype) %(objectsize) %(objectname) %(rest)')"
+    blob_oids=""
+    while read -r type size oid path; do
+      [ "$type" = blob ] || continue
+      blob_oids+="$oid"$'\n'
+      if [ "$size" -gt "$MAX_FILE_BYTES" ]; then
+        oversized+="  $(numfmt --to=iec --suffix=B "$size")  $path"$'\n'
+      fi
+    done <<<"$sizes"
+    [ -z "$oversized" ] || abort_oversized "$oversized" pushed
+
+    # -m: without it git log shows no diff for merge commits, so a secret added
+    # only in a merge resolution would go out unscanned.
+    # gitleaks exits 1 for a config error as well as for leaks, so the message
+    # cannot tell them apart; its output below does.
+    # -v: without it gitleaks prints no findings and the notification names no file.
+    if ! leaks_out="$(gitleaks git -v --no-color --no-banner --redact --exit-code 1 --log-level error --log-opts="-m $range" . 2>&1)"; then
+      notify_failure "gitleaks failed or found secrets in commits about to be pushed — nothing pushed.
 $(printf '%s\n' "$leaks_out" | head -15)"
-    exit 1
-  fi
-  # gitleaks git reads diffs only; commit messages go out too (measured: a key
-  # only in a message passed the scan above).
-  # $range is deliberately unquoted, as above.
-  if ! leaks_out="$(git log --format=%B $range | gitleaks stdin -v --no-color --no-banner --redact --exit-code 1 --log-level error 2>&1)"; then
-    notify_failure "gitleaks failed or found secrets in commit messages about to be pushed — nothing pushed.
+      exit 1
+    fi
+    # The scan above reads `git log -p`, which prints "Binary files differ"
+    # instead of content for anything git calls binary (a NUL byte in the blob,
+    # or -diff in .gitattributes), so a key in such a file never reaches it.
+    # The outgoing blobs are therefore scanned as content as well; cat-file's
+    # own "<oid> blob <size>" header lines are just extra text to the scanner.
+    if [ -n "$blob_oids" ] &&
+      ! leaks_out="$(printf '%s' "$blob_oids" | git cat-file --batch |
+        gitleaks stdin -v --no-color --no-banner --redact --exit-code 1 --log-level error 2>&1)"; then
+      notify_failure "gitleaks failed or found secrets in file content about to be pushed — nothing pushed.
 $(printf '%s\n' "$leaks_out" | head -15)"
-    exit 1
+      exit 1
+    fi
+    # gitleaks git reads diffs only; commit messages go out too (measured: a key
+    # only in a message passed the scan above).
+    # $range is deliberately unquoted, as above.
+    if ! leaks_out="$(git log --format=%B $range | gitleaks stdin -v --no-color --no-banner --redact --exit-code 1 --log-level error 2>&1)"; then
+      notify_failure "gitleaks failed or found secrets in commit messages about to be pushed — nothing pushed.
+$(printf '%s\n' "$leaks_out" | head -15)"
+      exit 1
+    fi
   fi
 
   if ! push_out="$(git push origin "$sha:refs/heads/$branch" 2>&1)"; then
@@ -197,6 +231,16 @@ if [ -z "$status" ]; then
   exit 0
 fi
 
+# A dirty tree must not strand commits an earlier run left behind. Every exit
+# between here and the agent (oversized candidate, leaked candidate, no claude,
+# bad SYNC_IGNORE_TARGET) happens before any push, so without this those
+# commits would wait for a clean tree that may never arrive — the tree is
+# dirty precisely because something keeps failing. push_branch scans whatever
+# it sends, so pushing before the pre-commit checks weakens nothing.
+if ahead_of_origin "$BRANCH"; then
+  push_branch
+fi
+
 # The exact set of files this run could commit: tracked changes vs HEAD plus
 # untracked-but-not-ignored. Both guards below scan only this set. Scanning
 # the whole worktree instead would walk gitignored runtime dirs — in a repo
@@ -206,7 +250,8 @@ fi
 # Listed into a file first: inside < <(…) a failing git diff or ls-files is
 # invisible to set -e and reads as "nothing to commit".
 cand_file="$(mktemp)"
-trap 'rm -f "$cand_file"' EXIT
+# .sorted too: a failing sort exits the script with that file already created.
+trap 'rm -f "$cand_file" "$cand_file.sorted"' EXIT
 {
   git diff --name-only -z HEAD
   git ls-files --others --exclude-standard -z
@@ -320,6 +365,20 @@ esac
 probe_root="sync-agent-probe-$RANDOM$RANDOM"
 probe_dir="sync-agent-probe-dir-$RANDOM$RANDOM"
 
+# The probes are matched in a scratch repo, not in $REPO. check-ignore applies
+# the repo's own .gitignore and info/exclude on top of core.excludesFile, so a
+# whitelist repo (a "/*" rule plus "!/src/") makes every probe ignored no
+# matter what $p says, and every pattern gets refused as too broad. An empty
+# repo puts only $p in play. Pattern semantics are path-based, so matching
+# there answers the same question.
+probe_repo="$(mktemp -d)"
+rule_file=""
+trap 'rm -rf "$probe_repo"; [ -z "$rule_file" ] || rm -f "$rule_file"' EXIT
+if ! git init -q "$probe_repo" >/dev/null 2>&1; then
+  echo "sync-agent-ignore: could not create a scratch repo to test patterns in" >&2
+  exit 1
+fi
+
 # Fail the whole call on a bad pattern rather than applying it partially —
 # a half-applied ignore set is harder to reason about than none.
 for p in "${patterns[@]}"; do
@@ -337,15 +396,23 @@ for p in "${patterns[@]}"; do
   # semantics (anchors, trailing blanks, '**', basename matches at any depth).
   rule_file="$(mktemp)"
   printf '%s\n' "$p" >"$rule_file"
-  tracked="$(git -C "$REPO" ls-files -ci --exclude-from="$rule_file")" || { rm -f "$rule_file"; exit 1; }
+  tracked="$(git -C "$REPO" ls-files -ci --exclude-from="$rule_file")" || exit 1
   broad=""
   for probe in "$probe_root" "$probe_dir/$probe_root" ".gitignore"; do
-    if git -C "$REPO" -c core.excludesFile="$rule_file" check-ignore -q --no-index -- "$probe"; then
-      broad="$probe"
-      break
-    fi
+    probe_rc=0
+    git -C "$probe_repo" -c core.excludesFile="$rule_file" \
+      check-ignore -q --no-index -- "$probe" || probe_rc=$?
+    case "$probe_rc" in
+      0) broad="$probe"; break ;;
+      1) ;; # not ignored: this probe is fine
+      # 128 and anything else is git failing, not an answer. Reading it as
+      # "not ignored" would wave the pattern through unchecked.
+      *) echo "sync-agent-ignore: git check-ignore failed (exit $probe_rc) while testing '$p' — refusing it" >&2
+         exit 1 ;;
+    esac
   done
   rm -f "$rule_file"
+  rule_file=""
   if [ -n "$broad" ]; then
     echo "sync-agent-ignore: refusing '$p' — it would ignore '$broad': too broad (the whole repo or the ignore file itself)" >&2
     exit 1
@@ -456,6 +523,10 @@ fi
 tracked_dirty="$(git status --porcelain --untracked-files=no)"
 
 if [ -n "$tracked_dirty" ]; then
+  # Same reason as the claude-failed path above: the agent may have committed
+  # part of its work and left the rest. Exiting here without pushing kept
+  # those commits local for as long as the leftovers stayed uncommitted.
+  push_branch
   notify_failure "claude exited 0 but tracked changes are still uncommitted — sync incomplete.
 $(printf '%s\n' "$tracked_dirty" | head -20)$api_hint"
   exit 1
