@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Spins off a Claude agent to commit and push any changes in a git repo.
+# Commits any changes in a git repo with a confined Claude agent, then scans and pushes.
 # Designed to be run from system cron — no Claude Code session required.
 # Place this script inside the repo it should sync; path is inferred automatically.
 
@@ -56,27 +56,52 @@ Log:  $REPO/sync.log"; then
 
 # Catch-all for anything set -e kills that isn't handled explicitly below
 # (detached HEAD, unreadable file, git blowing up mid-run).
-trap 'rc=$?; notify_failure "unexpected error (exit $rc) at line $LINENO"' ERR
+# set -E makes command substitutions inherit this trap; only the main shell
+# notifies, or one failure would raise two notifications.
+trap 'rc=$?; if [ "$BASHPID" = "$$" ]; then notify_failure "unexpected error (exit $rc) at line $LINENO"; fi' ERR
+
+# Raise the ceiling per repo with SYNC_MAX_FILE_BYTES.
+MAX_FILE_BYTES="${SYNC_MAX_FILE_BYTES:-5242880}" # 5 MiB
 
 require_gitleaks() {
   if ! command -v gitleaks >/dev/null 2>&1; then
     echo "sync-agent: gitleaks not installed — refusing to auto-push without secret scan" >&2
-    notify_failure "gitleaks not on PATH — refusing to auto-push without a secret scan. Nothing committed."
+    notify_failure "gitleaks not on PATH — refusing to auto-push without a secret scan. Nothing was pushed."
     exit 1
   fi
 }
 
-# A branch with no origin/<branch> ref has never been pushed, so it counts as ahead.
-ahead_of_origin() {
-  ! git rev-parse --verify -q "refs/remotes/origin/$1" >/dev/null ||
-    [ "$(git rev-list --count "origin/$1..HEAD")" -gt 0 ]
+# Bulk data landing in a source repo (datasets, transcript dumps, DB snapshots,
+# archives) is nearly always a misplacement, and once pushed it is only
+# removable by a history rewrite — so oversized files fail closed.
+# $1 is the formatted list of oversized files, $2 what did not happen ("committed"/"pushed").
+abort_oversized() {
+  {
+    echo "sync-agent: oversized file(s) in $REPO — aborting auto-sync"
+    echo "  ceiling: $(numfmt --to=iec --suffix=B "$MAX_FILE_BYTES") (override: SYNC_MAX_FILE_BYTES)"
+    echo "$1"
+    echo "Resolve by moving the data out of the repo or adding it to .gitignore."
+  } >&2
+  notify_failure "Oversized file(s) — nothing $2.
+$1
+Move the data out of the repo or .gitignore it."
+  exit 1
 }
 
-# The agent only commits; pushing happens here, outside any agent sandbox that
-# has no git credentials. Commits that were never scanned (hand-made work in
-# progress, an earlier failed push) are scanned here, before they go out.
+# An origin ref that cannot be read must not look like "not ahead": the push
+# then runs and its own error surfaces.
+ahead_of_origin() {
+  local count
+  git rev-parse --verify -q "refs/remotes/origin/$1" >/dev/null || return 0
+  count="$(git rev-list --count "origin/$1..HEAD" 2>/dev/null)" || return 0
+  [ "$count" -gt 0 ]
+}
+
+# The agent only commits; pushing happens here. Every push, including commits
+# that were never scanned (hand-made work in progress, an earlier failed push),
+# is scanned and size-checked over its outgoing range before it goes out.
 push_branch() {
-  local branch push_out range leaks_out
+  local branch push_out range leaks_out objects oversized="" type size path
   branch="$(git symbolic-ref --short HEAD)"
 
   require_gitleaks
@@ -85,7 +110,23 @@ push_branch() {
   else
     range="HEAD --not --remotes=origin"
   fi
-  if ! leaks_out="$(gitleaks git --no-banner --redact --exit-code 1 --log-level error --log-opts="$range" . 2>&1)"; then
+
+  # $range is deliberately unquoted: it is several rev-list arguments.
+  if ! objects="$(git rev-list --objects $range 2>&1)"; then
+    notify_failure "could not list the commits about to be pushed — nothing pushed.
+$(printf '%s\n' "$objects" | head -10)"
+    exit 1
+  fi
+  while read -r type size path; do
+    if [ "$type" = blob ] && [ "$size" -gt "$MAX_FILE_BYTES" ]; then
+      oversized+="  $(numfmt --to=iec --suffix=B "$size")  $path"$'\n'
+    fi
+  done < <(printf '%s\n' "$objects" | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)')
+  [ -z "$oversized" ] || abort_oversized "$oversized" pushed
+
+  # -m: without it git log shows no diff for merge commits, so a secret added
+  # only in a merge resolution would go out unscanned.
+  if ! leaks_out="$(gitleaks git --no-banner --redact --exit-code 1 --log-level error --log-opts="-m $range" . 2>&1)"; then
     notify_failure "gitleaks found secrets in commits about to be pushed — nothing pushed.
 $(printf '%s\n' "$leaks_out" | head -10)"
     exit 1
@@ -131,11 +172,6 @@ if [ ${#candidates[@]} -eq 0 ]; then
   exit 0
 fi
 
-# Abort if any pending file is oversized. Bulk data landing in a source repo
-# (datasets, transcript dumps, DB snapshots, archives) is nearly always a
-# misplacement, and once pushed it is only removable by a history rewrite —
-# so this fails closed. Raise the ceiling per repo with SYNC_MAX_FILE_BYTES.
-MAX_FILE_BYTES="${SYNC_MAX_FILE_BYTES:-5242880}" # 5 MiB
 oversized=""
 for f in "${candidates[@]}"; do
   size="$(stat -c %s "$f")"
@@ -143,19 +179,7 @@ for f in "${candidates[@]}"; do
     oversized+="  $(numfmt --to=iec --suffix=B "$size")  $f"$'\n'
   fi
 done
-
-if [ -n "$oversized" ]; then
-  {
-    echo "sync-agent: oversized file(s) pending in $REPO — aborting auto-sync"
-    echo "  ceiling: $(numfmt --to=iec --suffix=B "$MAX_FILE_BYTES") (override: SYNC_MAX_FILE_BYTES)"
-    echo "$oversized"
-    echo "Resolve by moving the data out of the repo or adding it to .gitignore."
-  } >&2
-  notify_failure "Oversized file(s) pending — nothing committed.
-$oversized
-Move the data out of the repo or .gitignore it."
-  exit 1
-fi
+[ -z "$oversized" ] || abort_oversized "$oversized" committed
 
 # Abort if gitleaks finds secrets in anything about to be committed. Without
 # this guard an accidentally-dropped secret gets auto-pushed to the remote.
@@ -189,14 +213,19 @@ fi
 # The grant is a single generated command rather than the Edit tool because
 # --allowedTools cannot path-scope Edit/Write (probed 2026-08-01), so "let it
 # edit .gitignore" would in practice mean unrestricted edit on an unattended
-# cron agent. This can only append ignore rules to one file in one repo.
+# cron agent. The agent has no Edit/Write tool at all (--tools) and no user
+# settings (--setting-sources ''); its Bash surface is the git subcommands and
+# this command, which can only append ignore rules to one file in one repo.
 #
 # Regenerated every run so improvements propagate with the script, and kept
 # under .git/ so it can never itself become a pending change.
 case "${SYNC_IGNORE_TARGET:-gitignore}" in
   exclude)   IGNORE_FILE="$REPO/.git/info/exclude"; IGNORE_LABEL=".git/info/exclude (local-only, never committed)" ;;
   gitignore) IGNORE_FILE="$REPO/.gitignore";        IGNORE_LABEL=".gitignore (tracked — commit it)" ;;
-  *) echo "sync-agent: SYNC_IGNORE_TARGET must be 'gitignore' or 'exclude'" >&2; exit 1 ;;
+  *)
+    echo "sync-agent: SYNC_IGNORE_TARGET must be 'gitignore' or 'exclude'" >&2
+    notify_failure "SYNC_IGNORE_TARGET must be 'gitignore' or 'exclude' — nothing committed."
+    exit 1 ;;
 esac
 
 IGNORE_TOOL="$REPO/.git/sync-agent-ignore"
@@ -297,6 +326,8 @@ claude_rc=0
 claude_out="$(
   "$CLAUDE" \
     --model claude-sonnet-4-6 \
+    --setting-sources '' \
+    --tools "Read,Bash" \
     --disallowedTools "Bash(git push:*)" \
     --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
     -p "$PROMPT" 2>&1
