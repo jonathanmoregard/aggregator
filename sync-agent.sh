@@ -4,6 +4,7 @@
 # Place this script inside the repo it should sync; path is inferred automatically.
 
 set -euo pipefail
+set -E # without errtrace the ERR trap below never fires inside functions
 
 # Normally the script lives in the repo it syncs and infers the path from its
 # own location. SYNC_REPO overrides that, so a repo can be synced without
@@ -57,21 +58,51 @@ Log:  $REPO/sync.log"; then
 # (detached HEAD, unreadable file, git blowing up mid-run).
 trap 'rc=$?; notify_failure "unexpected error (exit $rc) at line $LINENO"' ERR
 
+require_gitleaks() {
+  if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "sync-agent: gitleaks not installed — refusing to auto-push without secret scan" >&2
+    notify_failure "gitleaks not on PATH — refusing to auto-push without a secret scan. Nothing committed."
+    exit 1
+  fi
+}
+
+# A branch with no origin/<branch> ref has never been pushed, so it counts as ahead.
+ahead_of_origin() {
+  ! git rev-parse --verify -q "refs/remotes/origin/$1" >/dev/null ||
+    [ "$(git rev-list --count "origin/$1..HEAD")" -gt 0 ]
+}
+
 # The agent only commits; pushing happens here, outside any agent sandbox that
-# has no git credentials.
+# has no git credentials. Commits that were never scanned (hand-made work in
+# progress, an earlier failed push) are scanned here, before they go out.
 push_branch() {
-  local branch push_out
+  local branch push_out range leaks_out
   branch="$(git symbolic-ref --short HEAD)"
-  if ! push_out="$(git push origin "$branch" 2>&1)"; then
-    notify_failure "git push origin $branch failed — commits are local only.
+
+  require_gitleaks
+  if git rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null; then
+    range="origin/$branch..HEAD"
+  else
+    range="HEAD --not --remotes=origin"
+  fi
+  if ! leaks_out="$(gitleaks git --no-banner --redact --exit-code 1 --log-level error --log-opts="$range" . 2>&1)"; then
+    notify_failure "gitleaks found secrets in commits about to be pushed — nothing pushed.
+$(printf '%s\n' "$leaks_out" | head -10)"
+    exit 1
+  fi
+
+  if ! push_out="$(git push -u origin "$branch" 2>&1)"; then
+    notify_failure "git push -u origin $branch failed — commits are local only.
 $(printf '%s\n' "$push_out" | head -10)"
     exit 1
   fi
 }
 
+BRANCH="$(git symbolic-ref --short HEAD)"
+
 # Nothing to commit. Commits left behind by an earlier failed push still go out.
 if [ -z "$(git status --porcelain)" ]; then
-  if [ "$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)" -gt 0 ]; then
+  if ahead_of_origin "$BRANCH"; then
     push_branch
   fi
   exit 0
@@ -94,7 +125,7 @@ done < <(
 )
 
 if [ ${#candidates[@]} -eq 0 ]; then
-  if [ "$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)" -gt 0 ]; then
+  if ahead_of_origin "$BRANCH"; then
     push_branch
   fi
   exit 0
@@ -128,11 +159,7 @@ fi
 
 # Abort if gitleaks finds secrets in anything about to be committed. Without
 # this guard an accidentally-dropped secret gets auto-pushed to the remote.
-if ! command -v gitleaks >/dev/null 2>&1; then
-  echo "sync-agent: gitleaks not installed — refusing to auto-push without secret scan" >&2
-  notify_failure "gitleaks not on PATH — refusing to auto-push without a secret scan. Nothing committed."
-  exit 1
-fi
+require_gitleaks
 
 leaked=""
 for f in "${candidates[@]}"; do
@@ -151,8 +178,6 @@ $leaked
 Remove the secret or add a gitleaks allowlist entry."
   exit 1
 fi
-
-BRANCH="$(git symbolic-ref --short HEAD)"
 
 # Give the agent a way to ignore runtime state instead of committing it.
 #
@@ -272,6 +297,7 @@ claude_rc=0
 claude_out="$(
   "$CLAUDE" \
     --model claude-sonnet-4-6 \
+    --disallowedTools "Bash(git push:*)" \
     --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
     -p "$PROMPT" 2>&1
 )" || claude_rc=$?
