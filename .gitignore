@@ -21,7 +21,7 @@ sync.log
 
 # Claude Code machine-local state. settings.local.json is per-machine
 # permissions CC rewrites on its own; the lock is per-run. Without this,
-# sync-agent.sh commits both on its next run.
+# a `git add -A` commits both.
 .claude/settings.local.json
 
 # Runtime lockfiles only — flake.lock and uv.lock are tracked source.
@@ -33,9 +33,8 @@ sync.log
 tasks/arftl-run.json
 
 # Stage output the verifier redirects per run. They exist only while a gate is
-# in flight — the script deletes them at the end — but the sync-agent cron
-# auto-commits untracked files and does not know that, so a run that overlaps
-# the cron publishes a test log to a public repo. Exit codes are read directly
+# in flight — the script deletes them at the end — but a `git add -A` during
+# a run would publish a test log to a public repo. Exit codes are read directly
 # from these, never through a pipe, so they cannot become /dev/null.
 /pytest.out
 /ruff.out
@@ -44,9 +43,9 @@ tasks/arftl-run.json
 
 # `nix build` drops this symlink into the repo root, and the verifier's
 # `nix build --rebuild .#checks…aggregator-unit-hygiene` runs on every
-# gate — so it reappears after each one. Untracked, it is exactly what the
-# sync-agent cron auto-commits: a dangling /nix/store pointer published to a
-# public repo and broken on every other machine. Anchored so a source file
+# gate — so it reappears after each one. Untracked, a `git add -A` would
+# publish it: a dangling /nix/store pointer in a public repo, broken on every
+# other machine. Anchored so a source file
 # legitimately named `result` further down the tree stays tracked.
 /result
 /result-*
@@ -60,9 +59,9 @@ tasks/arftl-run.json
 # ~/.claude/tasks/aggregator/ so every existing path still resolves while the
 # content stays out of git.
 #
-# A daily cron runs sync-agent.sh, which auto-commits and pushes anything it
-# finds — so an un-ignored note file here is not a risk of publication, it is
-# a guarantee of it.
+# A daily sync-agent.sh cron used to auto-commit and push anything it found
+# (retired 2026-11-23). These stay ignored: a `git add -A` would still
+# publish them.
 tasks
 tasks/
 HANDOVER.md
