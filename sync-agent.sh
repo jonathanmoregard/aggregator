@@ -13,14 +13,9 @@ set -E # without errtrace the ERR trap below never fires inside functions
 # superpowers fork gitignores this script for exactly that reason, which is
 # also how it went missing and left its cron erroring on every run).
 REPO="${SYNC_REPO:-$(cd "$(dirname "$0")" && pwd)}"
-CLAUDE="$(command -v claude)"
-
-if [ ! -d "$REPO/.git" ]; then
-  echo "sync-agent: $REPO is not a git repository — aborting" >&2
-  exit 1
-fi
-
-cd "$REPO"
+# Checked only where the agent is needed: pushing commits already made does
+# not need it, and a lookup failing here would exit before the ERR trap exists.
+CLAUDE="$(command -v claude || true)"
 
 # Surface failures. A cron job has nobody watching its output: aggregator's
 # sync failed on 4 consecutive runs (Claude usage limit, then a refused
@@ -59,6 +54,23 @@ Log:  $REPO/sync.log"; then
 # set -E makes command substitutions inherit this trap; only the main shell
 # notifies, or one failure would raise two notifications.
 trap 'rc=$?; if [ "$BASHPID" = "$$" ]; then notify_failure "unexpected error (exit $rc) at line $LINENO"; fi' ERR
+
+if [ ! -d "$REPO/.git" ]; then
+  echo "sync-agent: $REPO is not a git repository — aborting" >&2
+  notify_failure "not a git repository — nothing synced."
+  exit 1
+fi
+
+cd "$REPO"
+
+# What origin already has, read before the agent runs. The agent can write
+# files under .git (and so move refs/remotes/origin/*), so the outgoing range
+# is computed from these SHAs, held in this shell, never from refs read later.
+# Space-joined "^sha" excludes with no trailing blank: gitleaks splits
+# --log-opts on spaces, and a trailing one made it scan nothing (measured).
+origin_refs="$(git for-each-ref --format='^%(objectname)' refs/remotes/origin)"
+mapfile -t origin_excludes <<<"$origin_refs"
+ORIGIN_EXCLUDES="${origin_excludes[*]}"
 
 # Raise the ceiling per repo with SYNC_MAX_FILE_BYTES.
 MAX_FILE_BYTES="${SYNC_MAX_FILE_BYTES:-5242880}" # 5 MiB
@@ -100,16 +112,15 @@ ahead_of_origin() {
 # The agent only commits; pushing happens here. Every push, including commits
 # that were never scanned (hand-made work in progress, an earlier failed push),
 # is scanned and size-checked over its outgoing range before it goes out.
+# The range ends at one resolved SHA and that SHA is what gets pushed, so a
+# commit landing on the branch mid-scan cannot ride along unscanned.
 push_branch() {
-  local branch push_out range leaks_out objects oversized="" type size path
+  local branch sha push_out range leaks_out objects oversized="" type size path
   branch="$(git symbolic-ref --short HEAD)"
+  sha="$(git rev-parse --verify 'HEAD^{commit}')"
 
   require_gitleaks
-  if git rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null; then
-    range="origin/$branch..HEAD"
-  else
-    range="HEAD --not --remotes=origin"
-  fi
+  range="$sha${ORIGIN_EXCLUDES:+ $ORIGIN_EXCLUDES}"
 
   # $range is deliberately unquoted: it is several rev-list arguments.
   if ! objects="$(git rev-list --objects $range 2>&1)"; then
@@ -126,23 +137,33 @@ $(printf '%s\n' "$objects" | head -10)"
 
   # -m: without it git log shows no diff for merge commits, so a secret added
   # only in a merge resolution would go out unscanned.
+  # gitleaks exits 1 for a config error as well as for leaks, so the message
+  # cannot tell them apart; its output below does.
   if ! leaks_out="$(gitleaks git --no-banner --redact --exit-code 1 --log-level error --log-opts="-m $range" . 2>&1)"; then
-    notify_failure "gitleaks found secrets in commits about to be pushed — nothing pushed.
+    notify_failure "gitleaks failed or found secrets in commits about to be pushed — nothing pushed.
 $(printf '%s\n' "$leaks_out" | head -10)"
     exit 1
   fi
 
-  if ! push_out="$(git push -u origin "$branch" 2>&1)"; then
-    notify_failure "git push -u origin $branch failed — commits are local only.
+  if ! push_out="$(git push origin "$sha:refs/heads/$branch" 2>&1)"; then
+    notify_failure "git push origin $branch failed — commits are local only.
 $(printf '%s\n' "$push_out" | head -10)"
     exit 1
+  fi
+  # A branch with no upstream gets origin's; an existing upstream (a fork
+  # tracking another remote) is left alone.
+  if ! git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    git branch -q --set-upstream-to="origin/$branch"
   fi
 }
 
 BRANCH="$(git symbolic-ref --short HEAD)"
 
 # Nothing to commit. Commits left behind by an earlier failed push still go out.
-if [ -z "$(git status --porcelain)" ]; then
+# Assigned rather than tested inline: a failing git status inside [ -z "$(…)" ]
+# reads as "clean" and set -e never sees it.
+status="$(git status --porcelain)"
+if [ -z "$status" ]; then
   if ahead_of_origin "$BRANCH"; then
     push_branch
   fi
@@ -197,9 +218,14 @@ if [ -n "$leaked" ]; then
     echo "sync-agent: gitleaks found secrets in $REPO — aborting auto-sync"
     echo "$leaked"
   } >&2
-  notify_failure "gitleaks found secrets — nothing committed.
+  notify_failure "gitleaks failed or found secrets — nothing committed.
 $leaked
 Remove the secret or add a gitleaks allowlist entry."
+  exit 1
+fi
+
+if [ -z "$CLAUDE" ]; then
+  notify_failure "claude not on PATH — nothing committed."
   exit 1
 fi
 
@@ -216,6 +242,8 @@ fi
 # cron agent. The agent has no Edit/Write tool at all (--tools) and no user
 # settings (--setting-sources ''); its Bash surface is the git subcommands and
 # this command, which can only append ignore rules to one file in one repo.
+# git log and git diff are left out on purpose: their --output=<file> writes
+# any file, .git/config and this helper included.
 #
 # Regenerated every run so improvements propagate with the script, and kept
 # under .git/ so it can never itself become a pending change.
@@ -303,6 +331,8 @@ chmod 755 "$IGNORE_TOOL"
 
 PROMPT="There are uncommitted changes in $REPO.
 
+Inspect them with 'git status -vv' (shows the diffs) and the Read tool.
+
 FIRST, triage them. Generated and runtime files must NOT be committed: logs, caches, build output, per-run or per-session state, PID and lock files, timestamped .bak-* backups, coverage and profiling output, downloaded artifacts — anything a tool rewrites on its own. To ignore those instead of committing them, run:
 
   $IGNORE_TOOL --reason \"<short why>\" <pattern> [<pattern>...]
@@ -329,7 +359,7 @@ claude_out="$(
     --setting-sources '' \
     --tools "Read,Bash" \
     --disallowedTools "Bash(git push:*)" \
-    --allowedTools "Read Bash(git status:*) Bash(git diff:*) Bash(git add:*) Bash(git commit:*) Bash(git log:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
+    --allowedTools "Read Bash(git status:*) Bash(git add:*) Bash(git commit:*) Bash(git rm:*) Bash(git check-ignore:*) Bash($IGNORE_TOOL:*)" \
     -p "$PROMPT" 2>&1
 )" || claude_rc=$?
 printf '%s\n' "$claude_out"
@@ -344,7 +374,7 @@ $api_hint"
 fi
 
 if [ "$claude_rc" -ne 0 ]; then
-  notify_failure "claude exited $claude_rc — changes still uncommitted.
+  notify_failure "claude exited $claude_rc — sync incomplete, nothing pushed this run. Any commits it made stay local; the next run scans and pushes them.
 Usual causes: usage limit reached, expired auth (claude /login), or API unreachable.$api_hint"
   exit 1
 fi
