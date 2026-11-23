@@ -77,8 +77,9 @@ ORIGIN_EXCLUDES="${origin_excludes[*]}"
 # Raise the ceiling per repo with SYNC_MAX_FILE_BYTES.
 MAX_FILE_BYTES="${SYNC_MAX_FILE_BYTES:-5242880}" # 5 MiB
 # A non-integer would make every [ -gt ] below error, read as "not oversized".
+# Over 18 digits it no longer fits bash's 64-bit test and errors the same way.
 case "$MAX_FILE_BYTES" in
-  "" | *[!0-9]*)
+  "" | *[!0-9]* | ???????????????????*)
     notify_failure "SYNC_MAX_FILE_BYTES must be a whole number of bytes, got '$MAX_FILE_BYTES' — nothing synced."
     exit 1 ;;
 esac
@@ -136,6 +137,9 @@ push_branch() {
 $(printf '%s\n' "$objects" | head -10)"
     exit 1
   fi
+  # Nothing origin lacks: no push, and no "commits are local only" claim if
+  # origin happens to be unreachable.
+  [ -n "$objects" ] || return 0
   # Assigned, not fed through < <(…): a failing cat-file there would leave the
   # loop reading nothing and the size check passing.
   sizes="$(printf '%s\n' "$objects" | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)')"
@@ -153,6 +157,14 @@ $(printf '%s\n' "$objects" | head -10)"
   # -v: without it gitleaks prints no findings and the notification names no file.
   if ! leaks_out="$(gitleaks git -v --no-color --no-banner --redact --exit-code 1 --log-level error --log-opts="-m $range" . 2>&1)"; then
     notify_failure "gitleaks failed or found secrets in commits about to be pushed — nothing pushed.
+$(printf '%s\n' "$leaks_out" | head -15)"
+    exit 1
+  fi
+  # gitleaks git reads diffs only; commit messages go out too (measured: a key
+  # only in a message passed the scan above).
+  # $range is deliberately unquoted, as above.
+  if ! leaks_out="$(git log --format=%B $range | gitleaks stdin -v --no-color --no-banner --redact --exit-code 1 --log-level error 2>&1)"; then
+    notify_failure "gitleaks failed or found secrets in commit messages about to be pushed — nothing pushed.
 $(printf '%s\n' "$leaks_out" | head -15)"
     exit 1
   fi
@@ -199,11 +211,13 @@ trap 'rm -f "$cand_file"' EXIT
   git diff --name-only -z HEAD
   git ls-files --others --exclude-standard -z
 } >"$cand_file"
+sort -zu "$cand_file" >"$cand_file.sorted"
+mv "$cand_file.sorted" "$cand_file"
 candidates=()
 while IFS= read -r -d '' f; do
   [ -f "$f" ] || continue # deletions add no content to scan
   candidates+=("$f")
-done < <(sort -zu "$cand_file")
+done <"$cand_file"
 # No candidates with a dirty tree means only deletions: they still go to the
 # agent to be committed; the scans below have nothing to look at.
 
@@ -301,6 +315,11 @@ case "$reason" in
   *$'\n'* | *$'\r'*) echo "sync-agent-ignore: refusing --reason containing a newline" >&2; exit 1 ;;
 esac
 
+# Random names no sane runtime-state rule matches: a rule that ignores one of
+# them ignores (nearly) everything.
+probe_root="sync-agent-probe-$RANDOM$RANDOM"
+probe_dir="sync-agent-probe-dir-$RANDOM$RANDOM"
+
 # Fail the whole call on a bad pattern rather than applying it partially —
 # a half-applied ignore set is harder to reason about than none.
 for p in "${patterns[@]}"; do
@@ -308,18 +327,31 @@ for p in "${patterns[@]}"; do
     "" | " "*) echo "sync-agent-ignore: refusing empty/blank pattern" >&2; exit 1 ;;
     "!"*) echo "sync-agent-ignore: refusing negation '$p' — un-ignoring can expose files an existing rule deliberately hides" >&2; exit 1 ;;
     "*" | "**" | "/" | "." | "./" | "*/" | "**/" | "/*" | "/**" | "/*/" | "/**/")
-      echo "sync-agent-ignore: refusing '$p' — that ignores the entire repo" >&2; exit 1 ;;
+      echo "sync-agent-ignore: refusing '$p' — too broad: that ignores the entire repo" >&2; exit 1 ;;
   esac
-  if [ "$p" != "${p%$'\n'*}" ]; then
-    echo "sync-agent-ignore: refusing pattern containing a newline" >&2; exit 1
-  fi
-  # A pathspec git rejects (outside the repo, malformed) must not read as
-  # "matches nothing tracked".
-  if ! tracked="$(git -C "$REPO" ls-files -- "$p" 2>&1)"; then
-    echo "sync-agent-ignore: refusing '$p' — git rejects it as a path: $tracked" >&2
+  case "$p" in
+    *$'\n'* | *$'\r'*) echo "sync-agent-ignore: refusing pattern containing a newline" >&2; exit 1 ;;
+  esac
+  # What the rule would do is asked of git's own ignore matcher, never
+  # re-derived here: pathspecs and hand-kept lists disagree with gitignore
+  # semantics (anchors, trailing blanks, '**', basename matches at any depth).
+  rule_file="$(mktemp)"
+  printf '%s\n' "$p" >"$rule_file"
+  tracked="$(git -C "$REPO" ls-files -ci --exclude-from="$rule_file")" || { rm -f "$rule_file"; exit 1; }
+  broad=""
+  for probe in "$probe_root" "$probe_dir/$probe_root" ".gitignore"; do
+    if git -C "$REPO" -c core.excludesFile="$rule_file" check-ignore -q --no-index -- "$probe"; then
+      broad="$probe"
+      break
+    fi
+  done
+  rm -f "$rule_file"
+  if [ -n "$broad" ]; then
+    echo "sync-agent-ignore: refusing '$p' — it would ignore '$broad': too broad (the whole repo or the ignore file itself)" >&2
     exit 1
   fi
-  tracked="$(printf '%s\n' "$tracked" | head -3)"
+  # sed, not head: head exits early and pipefail turns that into a silent 141.
+  tracked="$(printf '%s\n' "$tracked" | sed -n 1,3p)"
   if [ -n "$tracked" ]; then
     {
       echo "sync-agent-ignore: refusing '$p' — it matches files already tracked in git:"
@@ -401,7 +433,12 @@ $api_hint"
 fi
 
 if [ "$claude_rc" -ne 0 ]; then
-  notify_failure "claude exited $claude_rc — sync incomplete, nothing pushed this run. Any commits it made stay local; the next run scans and pushes them.
+  # What it did commit is scanned and pushed now: while claude keeps failing
+  # the tree stays dirty, every run ends here, and commits would never leave.
+  push_branch
+  left="$(git status --porcelain --untracked-files=no)"
+  if [ -n "$left" ]; then left="tracked changes remain uncommitted"; else left="no tracked changes remain"; fi
+  notify_failure "claude exited $claude_rc — sync incomplete. Anything it committed was scanned and pushed; $left.
 Usual causes: usage limit reached, expired auth (claude /login), or API unreachable.$api_hint"
   exit 1
 fi

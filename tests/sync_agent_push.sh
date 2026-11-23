@@ -35,6 +35,10 @@ if [ "$1" = git ]; then
   [ -z "${GITLEAKS_GIT_HOOK:-}" ] || bash -c "$GITLEAKS_GIT_HOOK"
   exit "${GITLEAKS_GIT_RC:-0}"
 fi
+if [ "$1" = stdin ]; then
+  cat >/dev/null
+  exit "${GITLEAKS_STDIN_RC:-0}"
+fi
 exit "${GITLEAKS_DIR_RC:-0}"
 EOF
 cat >"$WORK/bin/notify-send" <<'EOF'
@@ -222,7 +226,7 @@ check "agent moves origin ref: notify_failure fired" "$(notified 'Oversized')" "
 new_pair noclaude
 local_commit noclaude "local only"
 mkdir "$WORK/bin-noclaude"
-for t in bash git dirname basename id head numfmt stat sort tr mktemp rm; do ln -s "$(command -v "$t")" "$WORK/bin-noclaude/$t"; done
+for t in bash git dirname basename id head numfmt stat sort tr mktemp rm mv; do ln -s "$(command -v "$t")" "$WORK/bin-noclaude/$t"; done
 ln -s "$WORK/bin/gitleaks" "$WORK/bin/notify-send" "$WORK/bin-noclaude/"
 RUN_PATH="$WORK/bin-noclaude" run_sync noclaude
 check "claude missing, clean but ahead: exit 0" "$?" "0"
@@ -260,7 +264,47 @@ echo change >"$WORK/agentfail/new.txt"
 STUB_RC=1 run_sync agentfail
 check "agent commits then exits 1: exit 1" "$?" "1"
 check "agent commits then exits 1: no false 'still uncommitted'" "$(notified 'still uncommitted')" "0"
-check "agent commits then exits 1: says commits are local" "$(notified 'claude exited 1')" "1"
+check "agent commits then exits 1: notified once" "$(notified 'repo-autosync FAILED')" "1"
+check "agent commits then exits 1: says claude failed" "$(notified 'claude exited 1')" "1"
+check "agent commits then exits 1: its commit is scanned and pushed" \
+  "$(git --git-dir="$WORK/agentfail-origin.git" log -1 --format=%s main)" "stub: sync"
+
+new_pair agentfail2
+echo change >"$WORK/agentfail2/new.txt"
+STUB_RC=1 STUB_AFTER='echo more >>base.txt' run_sync agentfail2
+STUB_RC=1 STUB_AFTER='echo more >>base.txt' run_sync agentfail2
+check "agent keeps failing with a dirty tree: its commits still reach origin" \
+  "$(git --git-dir="$WORK/agentfail2-origin.git" rev-list --count main)" "3"
+
+new_pair nothingahead
+echo scratch >"$WORK/nothingahead/scratch.txt"
+git -C "$WORK/nothingahead" remote set-url origin "$WORK/does-not-exist.git"
+STUB_AFTER='git reset -q --soft HEAD~1 && git reset -q' run_sync nothingahead
+check "dirty, agent commits nothing, origin down: exit 0" "$?" "0"
+check "dirty, agent commits nothing, origin down: no false 'commits are local'" "$(notified 'local only')" "0"
+
+new_pair msgleak
+git -C "$WORK/msgleak" commit -q --allow-empty -m "harmless"
+GITLEAKS_STDIN_RC=1 run_sync msgleak
+check "secret in a commit message: exit 1" "$?" "1"
+check "secret in a commit message: nothing pushed" \
+  "$(git --git-dir="$WORK/msgleak-origin.git" log -1 --format=%s main)" "base"
+check "secret in a commit message: notified" "$(notified 'commit messages')" "1"
+
+new_pair sortfail
+echo change >"$WORK/sortfail/new.txt"
+mkdir "$WORK/bin-sortfail"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$WORK/bin-sortfail/sort"
+chmod +x "$WORK/bin-sortfail/sort"
+RUN_PATH="$WORK/bin-sortfail:$WORK/bin:$PATH" run_sync sortfail
+check "sort fails while listing candidates: exit non-zero" "$([ "$?" -ne 0 ] && echo yes)" "yes"
+check "sort fails while listing candidates: agent never ran" "$(wc -c <"$WORK/claude-args.log" | tr -d ' ')" "0"
+
+new_pair hugeceiling
+local_commit hugeceiling "local only"
+SYNC_MAX_FILE_BYTES=99999999999999999999 run_sync hugeceiling
+check "ceiling beyond 64 bits: exit 1" "$?" "1"
+check "ceiling beyond 64 bits: notified" "$(notified 'SYNC_MAX_FILE_BYTES')" "1"
 
 new_pair upstream
 git -C "$WORK/upstream" remote add upstream "$WORK/upstream-origin.git"
@@ -326,12 +370,25 @@ HELPER="$WORK/helper/.git/sync-agent-ignore"
 check "helper: newline in --reason refused" "$?" "1"
 check "helper: newline in --reason writes nothing" \
   "$(cat "$WORK/helper/.gitignore" 2>/dev/null | grep -c -x -F -e '!.env')" "0"
-(cd "$WORK/helper" && "$HELPER" '/*') >/dev/null 2>&1
-check "helper: '/*' (whole top level) refused" "$?" "1"
-(cd "$WORK/helper" && "$HELPER" '../outside') >/dev/null 2>&1
-check "helper: pathspec git rejects is refused, not read as untracked" "$?" "1"
-(cd "$WORK/helper" && "$HELPER" --reason scratch 'scratch.tmp') >/dev/null 2>&1
+helper_says() { (cd "$WORK/helper" && "$HELPER" "$@") 2>&1; }
+for p in '/*' '**/*' '* ' '.gitignore'; do
+  out="$(helper_says "$p")"; rc=$?
+  check "helper: '$p' refused as too broad" "$rc:$(grep -c 'too broad' <<<"$out")" "1:1"
+done
+mkdir -p "$WORK/helper/sub" && echo a >"$WORK/helper/sub/config.json"
+git -C "$WORK/helper" add sub/config.json && git -C "$WORK/helper" commit -q -m sub
+out="$(helper_says 'config.json')"; rc=$?
+check "helper: basename rule matching a nested tracked file refused" "$rc:$(grep -c 'already tracked' <<<"$out")" "1:1"
+helper_says '/build/' >/dev/null
+check "helper: anchored directory rule accepted" "$?" "0"
+helper_says --reason scratch 'scratch.tmp' >/dev/null
 check "helper: ordinary pattern still accepted" "$?" "0"
+# Over 64 KB of tracked matches: the refusal must still explain itself.
+blob="$(git -C "$WORK/helper" hash-object -w --stdin </dev/null)"
+for i in $(seq 1 4000); do printf '100644 %s\tmany/f_%04d_padding_padding_padding\n' "$blob" "$i"; done |
+  git -C "$WORK/helper" update-index --index-info
+out="$(helper_says 'f_*')"; rc=$?
+check "helper: refusal over many tracked matches still explains itself" "$rc:$(grep -c 'already tracked' <<<"$out")" "1:1"
 
 new_pair deleted
 git -C "$WORK/deleted" rm -q --cached base.txt && rm "$WORK/deleted/base.txt"
